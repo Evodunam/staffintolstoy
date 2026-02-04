@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1" />
+    <meta name="description" content="Tolstoy Staffing - Connect skilled workers with businesses" />
+    <meta name="theme-color" content="#000000" />
+    
+    <!-- Favicons -->
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="icon" type="image/png" sizes="32x32" href="/favicon.png" />
+    <link rel="icon" type="image/png" sizes="16x16" href="/favicon.png" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/favicon.png" />
+    <link rel="manifest" href="/site.webmanifest" />
+    <script>
+      // Suppress console warnings and errors for known issues
+      if (typeof window !== 'undefined' && typeof console !== 'undefined') {
+        // Prevent HMR from causing refresh loops
+        let hmrErrorCount = 0;
+        const MAX_HMR_ERRORS = 10;
+        
+        // Suppress console errors for HMR WebSocket issues and module loading errors
+        const originalError = console.error;
+        const originalWarn = console.warn;
+        
+        // Track if we've already warned about server being offline
+        let serverOfflineWarned = false;
+        
+        console.error = function(...args) {
+          const message = args.join(' ');
+          const fullMessage = args.map(arg => {
+            if (typeof arg === 'string') return arg;
+            if (arg?.message) return arg.message;
+            if (arg?.stack) return arg.stack;
+            return String(arg);
+          }).join(' ');
+          
+          // Filter out Vite HMR WebSocket errors
+          // Check for various WebSocket error patterns
+          const isHmrError = 
+            (message.includes('WebSocket connection') && 
+             (message.includes('vite-hmr') || message.includes('localhost:2000') || message.includes('ws://'))) ||
+            message.includes('[vite] failed to connect to websocket') ||
+            message.includes('WebSocket closed without opened') ||
+            message.includes('createConnection') ||
+            message.includes('connect @ client') ||
+            (fullMessage.includes('WebSocket') && fullMessage.includes('failed')) ||
+            (fullMessage.includes('vite-hmr') && (fullMessage.includes('failed') || fullMessage.includes('error'))) ||
+            (fullMessage.includes('ws://localhost:2000/vite-hmr') && fullMessage.includes('failed')) ||
+            (fullMessage.includes('WebSocket connection to') && fullMessage.includes('vite-hmr') && fullMessage.includes('failed')) ||
+            (args.some(arg => typeof arg === 'string' && arg.includes('ws://localhost:2000/vite-hmr')));
+          
+          if (isHmrError) {
+            hmrErrorCount++;
+            if (hmrErrorCount > MAX_HMR_ERRORS && window.__VITE_HMR__) {
+              try {
+                window.__VITE_HMR__.disconnect();
+              } catch (e) {
+                // Ignore disconnect errors
+              }
+            }
+            return; // Suppress this error
+          }
+          
+          // Filter out module loading errors when dev server is down
+          // Check for various patterns of connection errors
+          const isConnectionError = 
+            fullMessage.includes('ERR_CONNECTION_REFUSED') ||
+            fullMessage.includes('ERR_CONNECTION_RESET') ||
+            fullMessage.includes('Failed to load module') ||
+            fullMessage.includes('Loading chunk') && fullMessage.includes('failed') ||
+            (fullMessage.includes('GET') && (fullMessage.includes('localhost:2000') || fullMessage.includes('net::ERR'))) ||
+            (fullMessage.includes('http://localhost:2000') && fullMessage.includes('net::ERR')) ||
+            (fullMessage.includes('localhost:2000') && (fullMessage.includes('ERR_') || fullMessage.includes('Failed'))) ||
+            (fullMessage.includes('@fs/') && fullMessage.includes('localhost:2000')) ||
+            (fullMessage.includes('/src/') && fullMessage.includes('localhost:2000') && fullMessage.includes('ERR_')) ||
+            (fullMessage.includes('@react-refresh') && fullMessage.includes('localhost:2000')) ||
+            (fullMessage.includes('env.mjs') && fullMessage.includes('localhost:2000')) ||
+            (fullMessage.includes('vite/dist/client') && fullMessage.includes('localhost:2000')) ||
+            (fullMessage.includes('index.css') && fullMessage.includes('localhost:2000') && fullMessage.includes('ERR_')) ||
+            (fullMessage.includes('favicon') && fullMessage.includes('localhost:2000') && fullMessage.includes('ERR_')) ||
+            (fullMessage.includes('site.webmanifest') && fullMessage.includes('localhost:2000') && fullMessage.includes('ERR_'));
+          
+          if (isConnectionError) {
+            // Only log once to avoid spam
+            if (!serverOfflineWarned) {
+              serverOfflineWarned = true;
+              originalWarn('⚠️ Development server appears to be offline. Please run "npm run dev" to start the server.');
+            }
+            return; // Suppress the error
+          }
+          
+          // Suppress Content Security Policy font violations (e.g., from Stripe)
+          // These are report-only violations that don't affect functionality
+          if (message.includes('violates the following Content Security Policy directive') &&
+              (message.includes("font-src") || message.includes("font-src 'none'"))) {
+            return; // Suppress CSP font violations
+          }
+          
+          // Suppress Permissions-Policy header errors (may come from third-party scripts)
+          if (message.includes('Permissions-Policy header') ||
+              message.includes('Unrecognized feature') ||
+              message.includes('browsing-topics') ||
+              message.includes('run-ad-auction') ||
+              message.includes('join-ad-interest-group') ||
+              message.includes('private-state-token') ||
+              message.includes('private-aggregation') ||
+              message.includes('attribution-reporting') ||
+              message.includes('Origin trial controlled feature not enabled')) {
+            return; // Suppress Permissions-Policy errors
+          }
+          
+          // Suppress Cursor/Replit select-element tool truncation errors (payload > 225280 chars)
+          // when selecting large DOM elements. See CURSOR_SELECT_ELEMENT.md for workarounds.
+          if ((message.includes('truncated') && message.includes('225280')) ||
+              (message.includes('element_selected') && message.includes('stableId')) ||
+              (fullMessage.includes('sp.replit.com') && fullMessage.includes('400'))) {
+            return; // Suppress select-element telemetry truncation
+          }
+          
+          // Call original console.error for other errors
+          originalError.apply(console, args);
+        };
+        
+        // Also suppress warnings for connection issues and Google Places deprecation
+        console.warn = function(...args) {
+          const message = args.join(' ');
+          const fullMessage = args.map(arg => {
+            if (typeof arg === 'string') return arg;
+            if (arg?.message) return arg.message;
+            return String(arg);
+          }).join(' ');
+          
+          // Suppress Google Places Autocomplete deprecation warning
+          if (message.includes('google.maps.places.Autocomplete is not available to new customers') ||
+              message.includes('PlaceAutocompleteElement') ||
+              message.includes('As of March 1st, 2025') ||
+              message.includes('google.maps.places.Autocomplete is not scheduled to be discontinued')) {
+            return; // Suppress this specific warning
+          }
+          
+          // Suppress Permissions-Policy header warnings from Google services
+          if (message.includes('Permissions-Policy header') ||
+              message.includes('Unrecognized feature') ||
+              message.includes('browsing-topics') ||
+              message.includes('run-ad-auction') ||
+              message.includes('join-ad-interest-group') ||
+              message.includes('private-state-token') ||
+              message.includes('private-aggregation') ||
+              message.includes('attribution-reporting') ||
+              message.includes('Origin trial controlled feature not enabled')) {
+            return; // Suppress Permissions-Policy warnings
+          }
+          
+          // Suppress Content Security Policy font violations (e.g., from Stripe)
+          if (message.includes('violates the following Content Security Policy directive') &&
+              (message.includes("font-src") || message.includes("font-src 'none'"))) {
+            return; // Suppress CSP font violations (these are report-only and don't affect functionality)
+          }
+          
+          // Suppress warnings about connection issues
+          if (
+            fullMessage.includes('ERR_CONNECTION_REFUSED') ||
+            fullMessage.includes('ERR_CONNECTION_RESET') ||
+            (fullMessage.includes('localhost:2000') && fullMessage.includes('failed'))
+          ) {
+            return; // Suppress this warning
+          }
+          
+          // Call original console.warn for other warnings
+          originalWarn.apply(console, args);
+        };
+        
+        // Also catch unhandled promise rejections from HMR and module loading
+        window.addEventListener('unhandledrejection', (event) => {
+          const message = event.reason?.message || event.reason?.toString() || '';
+          const reason = event.reason;
+          
+          // Suppress WebSocket/HMR errors
+          if (
+            message.includes('WebSocket') && 
+            (message.includes('vite-hmr') || message.includes('closed without opened') || message.includes('failed'))
+          ) {
+            event.preventDefault(); // Suppress the error
+            hmrErrorCount++;
+            if (hmrErrorCount > MAX_HMR_ERRORS && window.__VITE_HMR__) {
+              try {
+                window.__VITE_HMR__.disconnect();
+              } catch (e) {
+                // Ignore disconnect errors
+              }
+            }
+            return;
+          }
+          
+          // Suppress connection errors
+          if (
+            message.includes('ERR_CONNECTION_REFUSED') ||
+            message.includes('ERR_CONNECTION_RESET') ||
+            message.includes('Failed to fetch') ||
+            (reason && typeof reason === 'object' && 'message' in reason && 
+             (reason.message?.includes('ERR_CONNECTION') || reason.message?.includes('Failed to fetch')))
+          ) {
+            event.preventDefault(); // Suppress the error
+            if (!serverOfflineWarned) {
+              serverOfflineWarned = true;
+              originalWarn('⚠️ Development server appears to be offline. Please run "npm run dev" to start the server.');
+            }
+            return;
+          }
+        });
+        
+        // Catch global errors (including network errors logged by browser)
+        window.addEventListener('error', (event) => {
+          const message = event.message || event.filename || '';
+          const error = event.error;
+          
+          // Suppress module loading errors
+          if (
+            message.includes('ERR_CONNECTION_REFUSED') ||
+            message.includes('ERR_CONNECTION_RESET') ||
+            message.includes('Failed to load') ||
+            message.includes('localhost:2000') ||
+            message.includes('@react-refresh') ||
+            message.includes('env.mjs') ||
+            message.includes('vite/dist/client') ||
+            message.includes('favicon') ||
+            message.includes('site.webmanifest') ||
+            (error && (
+              error.message?.includes('ERR_CONNECTION') ||
+              error.message?.includes('Failed to fetch') ||
+              error.message?.includes('localhost:2000')
+            ))
+          ) {
+            event.preventDefault(); // Suppress the error
+            if (!serverOfflineWarned) {
+              serverOfflineWarned = true;
+              originalWarn('⚠️ Development server appears to be offline. Please run "npm run dev" to start the server.');
+            }
+            return false; // Prevent default error handling
+          }
+        }, true); // Use capture phase to catch errors early
+      }
+    </script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Architects+Daughter&family=DM+Sans:ital,opsz,wght@0,9..40,100..1000;1,9..40,100..1000&family=Fira+Code:wght@300..700&family=Geist+Mono:wght@100..900&family=Geist:wght@100..900&family=IBM+Plex+Mono:ital,wght@0,100;0,200;0,300;0,400;0,500;0,600;0,700;1,100;1,200;1,300;1,400;1,500;1,600;1,700&family=IBM+Plex+Sans:ital,wght@0,100..700;1,100..700&family=Inter:ital,opsz,wght@0,14..32,100..900;1,14..32,100..900&family=JetBrains+Mono:ital,wght@0,100..800;1,100..800&family=Libre+Baskerville:ital,wght@0,400;0,700;1,400&family=Lora:ital,wght@0,400..700;1,400..700&family=Merriweather:ital,opsz,wght@0,18..144,300..900;1,18..144,300..900&family=Montserrat:ital,wght@0,100..900;1,100..900&family=Open+Sans:ital,wght@0,300..800;1,300..800&family=Outfit:wght@100..900&family=Oxanium:wght@200..800&family=Playfair+Display:ital,wght@0,400..900;1,400..900&family=Plus+Jakarta+Sans:ital,wght@0,200..800;1,200..800&family=Poppins:ital,wght@0,100;0,200;0,300;0,400;0,500;0,600;0,700;0,800;0,900;1,100;1,200;1,300;1,400;1,500;1,600;1,700;1,800;1,900&family=Roboto+Mono:ital,wght@0,100..700;1,100..700&family=Roboto:ital,wght@0,100..900;1,100..900&family=Source+Code+Pro:ital,wght@0,200..900;1,200..900&family=Source+Serif+4:ital,opsz,wght@0,8..60,200..900;1,8..60,200..900&family=Space+Grotesk:wght@300..700&family=Space+Mono:ital,wght@0,400;0,700;1,400;1,700&display=swap" rel="stylesheet">
+  </head>
+  <body>
+    <div id="root">
+      <!-- Fallback message if app fails to load -->
+      <noscript>
+        <div style="padding: 2rem; text-align: center; font-family: system-ui, sans-serif;">
+          <h1>JavaScript Required</h1>
+          <p>Please enable JavaScript to use this application.</p>
+        </div>
+      </noscript>
+    </div>
+    <!-- Dialog portal target (sibling of #root) so dialogs work in SES/lockdown environments that restrict body append -->
+    <div id="dialog-container"></div>
+    <script type="module" src="/src/main.tsx"></script>
+    <script>
+      // Show fallback message if modules fail to load after 5 seconds
+      setTimeout(() => {
+        const root = document.getElementById('root');
+        if (root && root.children.length === 0) {
+          root.innerHTML = `
+            <div style="padding: 2rem; max-width: 600px; margin: 2rem auto; font-family: system-ui, sans-serif;">
+              <h1 style="color: #dc2626; margin-bottom: 1rem;">Development Server Not Running</h1>
+              <p style="margin-bottom: 1rem;">The Vite development server is not running. Please start it to use the application.</p>
+              <div style="background: #1f2937; padding: 1rem; border-radius: 0.5rem; margin-bottom: 1rem;">
+                <code style="color: #10b981;">npm run dev</code>
+              </div>
+              <button onclick="window.location.reload()" style="padding: 0.5rem 1rem; background: #3b82f6; color: white; border: none; border-radius: 0.25rem; cursor: pointer;">
+                Retry Connection
+              </button>
+            </div>
+          `;
+        }
+      }, 5000);
+    </script>
+  </body>
+</html>

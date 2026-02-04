@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Tolstoy Staffing</string>
+    <string name="title_activity_main">Tolstoy Staffing</string>
+    <string name="package_name">com.tolstoy.staffing</string>
+    <string name="custom_url_scheme">com.tolstoy.staffing</string>
+    <!-- API base URL for native background ping - set in build/gradle for your deployment -->
+    <string name="api_base_url">http://10.0.2.2:5000</string>
+    
+    <!-- Location tracking -->
+    <string name="location_tracking_title">Location Tracking Active</string>
+    <string name="location_tracking_description">Tracking location during active jobs to automatically record work time.</string>
+    <string name="location_permission_rationale">Location access is required to automatically clock you in and out when you arrive at or leave job sites.</string>
+    <string name="background_location_rationale">Background location access allows automatic time tracking even when the app is closed. This ensures accurate payroll and prevents disputes.</string>
+    
+    <!-- Permission dialogs -->
+    <string name="permission_required">Permission Required</string>
+    <string name="grant_permission">Grant Permission</string>
+    <string name="deny_permission">Deny</string>
+</resources>

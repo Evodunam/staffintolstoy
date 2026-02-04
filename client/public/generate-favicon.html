@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Generate Favicon</title>
+</head>
+<body>
+  <h1>Favicon Generator</h1>
+  <p>This will generate a white background with black capital T favicon.</p>
+  <canvas id="canvas" width="512" height="512" style="border: 1px solid #ccc; display: block; margin: 20px 0;"></canvas>
+  <button onclick="generateFavicon()">Generate and Download Favicon</button>
+  <div id="output" style="margin-top: 20px;"></div>
+
+  <script>
+    function generateFavicon() {
+      const canvas = document.getElementById('canvas');
+      const ctx = canvas.getContext('2d');
+      
+      // White background
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, 512, 512);
+      
+      // Black capital T
+      ctx.fillStyle = '#000000';
+      ctx.font = 'bold 360px Arial';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('T', 256, 256);
+      
+      // Convert to blob and download
+      canvas.toBlob(function(blob) {
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'favicon.png';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        
+        document.getElementById('output').innerHTML = '<p style="color: green;">✓ Favicon generated! Check your downloads folder.</p><p>Replace <code>client/public/favicon.png</code> with the downloaded file.</p>';
+      }, 'image/png');
+    }
+    
+    // Generate preview on load
+    window.onload = function() {
+      const canvas = document.getElementById('canvas');
+      const ctx = canvas.getContext('2d');
+      
+      // White background
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, 512, 512);
+      
+      // Black capital T
+      ctx.fillStyle = '#000000';
+      ctx.font = 'bold 360px Arial';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('T', 256, 256);
+    };
+  </script>
+</body>
+</html>

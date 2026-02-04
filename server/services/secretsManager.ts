@@ -1,0 +1,198 @@
+import { SecretManagerServiceClient } from "@google-cloud/secret-manager";
+
+/**
+ * Google Cloud Secrets Manager service
+ * Fetches secrets from GCP Secret Manager in production
+ */
+class SecretsManagerService {
+  private client: SecretManagerServiceClient | null = null;
+  private projectId: string;
+  private cache: Map<string, { value: string; timestamp: number }> = new Map();
+  private readonly CACHE_TTL = 5 * 60 * 1000; // 5 minutes cache
+
+  constructor() {
+    // Get project ID from environment or default
+    this.projectId = process.env.GOOGLE_CLOUD_PROJECT_ID || 
+                     process.env.GCP_PROJECT_ID || 
+                     process.env.GOOGLE_CLOUD_PROJECT ||
+                     "tolstoy-staffing-23032"; // Default to your Firebase project ID
+
+    // Only initialize client in production
+    if (process.env.NODE_ENV === "production") {
+      try {
+        this.client = new SecretManagerServiceClient();
+        console.log(`[Secrets Manager] Initialized for project: ${this.projectId}`);
+      } catch (error) {
+        console.error("[Secrets Manager] Failed to initialize client:", error);
+        console.warn("[Secrets Manager] Falling back to environment variables");
+      }
+    }
+  }
+
+  /**
+   * Get a secret value from Google Cloud Secrets Manager
+   * Falls back to environment variable if not in production or if GCP fails
+   */
+  async getSecret(secretName: string, envVarName?: string): Promise<string | undefined> {
+    // In development, always use environment variables
+    if (process.env.NODE_ENV !== "production") {
+      return process.env[envVarName || secretName];
+    }
+
+    // Check cache first
+    const cached = this.cache.get(secretName);
+    if (cached && Date.now() - cached.timestamp < this.CACHE_TTL) {
+      return cached.value;
+    }
+
+    // Try to get from GCP Secret Manager
+    if (this.client) {
+      try {
+        const name = `projects/${this.projectId}/secrets/${secretName}/versions/latest`;
+        const [version] = await this.client.accessSecretVersion({ name });
+        
+        if (version.payload?.data) {
+          const secretValue = version.payload.data.toString();
+          
+          // Cache the value
+          this.cache.set(secretName, {
+            value: secretValue,
+            timestamp: Date.now(),
+          });
+          
+          console.log(`[Secrets Manager] ✅ Loaded secret: ${secretName}`);
+          return secretValue;
+        }
+      } catch (error: any) {
+        // If secret doesn't exist in GCP, fall back to env var
+        if (error.code === 5 || error.code === 'NOT_FOUND') {
+          console.warn(`[Secrets Manager] ⚠️  Secret "${secretName}" not found in GCP, using environment variable`);
+        } else {
+          console.error(`[Secrets Manager] ❌ Error fetching secret "${secretName}":`, error.message);
+        }
+      }
+    }
+
+    // Fallback to environment variable
+    return process.env[envVarName || secretName];
+  }
+
+  /**
+   * Load all secrets from GCP and set them as environment variables
+   * This should be called at server startup in production
+   */
+  async loadAllSecrets(): Promise<void> {
+    if (process.env.NODE_ENV !== "production" || !this.client) {
+      console.log("[Secrets Manager] Skipping (not in production or client not initialized)");
+      return;
+    }
+
+    console.log("[Secrets Manager] Loading secrets from Google Cloud Secret Manager...");
+
+    // List of all secrets that should be loaded
+    const secretsToLoad = [
+      // Database
+      { secretName: "DATABASE_URL", envVar: "DATABASE_URL" },
+      
+      // Session
+      { secretName: "SESSION_SECRET", envVar: "SESSION_SECRET" },
+      
+      // IDrive E2 Storage
+      { secretName: "IDRIVE_E2_ENDPOINT", envVar: "IDRIVE_E2_ENDPOINT" },
+      { secretName: "IDRIVE_E2_REGION", envVar: "IDRIVE_E2_REGION" },
+      { secretName: "IDRIVE_E2_ACCESS_KEY_ID", envVar: "IDRIVE_E2_ACCESS_KEY_ID" },
+      { secretName: "IDRIVE_E2_SECRET_ACCESS_KEY", envVar: "IDRIVE_E2_SECRET_ACCESS_KEY" },
+      
+      // Google OAuth
+      { secretName: "GOOGLE_CLIENT_ID", envVar: "GOOGLE_CLIENT_ID" },
+      { secretName: "GOOGLE_CLIENT_SECRET", envVar: "GOOGLE_CLIENT_SECRET" },
+      { secretName: "GOOGLE_API_KEY", envVar: "GOOGLE_API_KEY" },
+      
+      // Email (Resend)
+      { secretName: "RESEND_API_KEY", envVar: "RESEND_API_KEY" },
+      { secretName: "RESEND_FROM_EMAIL", envVar: "RESEND_FROM_EMAIL" },
+      
+      // Stripe
+      { secretName: "STRIPE_SECRET_KEY", envVar: "STRIPE_SECRET_KEY" },
+      { secretName: "STRIPE_PUBLISHABLE_KEY", envVar: "STRIPE_PUBLISHABLE_KEY" },
+      { secretName: "STRIPE_TEST_SECRET_KEY", envVar: "STRIPE_TEST_SECRET_KEY" },
+      { secretName: "STRIPE_TEST_PUBLISHABLE_KEY", envVar: "STRIPE_TEST_PUBLISHABLE_KEY" },
+      
+      // Firebase
+      { secretName: "FIREBASE_PRIVATE_KEY", envVar: "FIREBASE_PRIVATE_KEY" },
+      { secretName: "FIREBASE_PROJECT_ID", envVar: "FIREBASE_PROJECT_ID" },
+      { secretName: "FIREBASE_CLIENT_EMAIL", envVar: "FIREBASE_CLIENT_EMAIL" },
+      { secretName: "FIREBASE_PRIVATE_KEY_ID", envVar: "FIREBASE_PRIVATE_KEY_ID" },
+      { secretName: "FIREBASE_CLIENT_ID", envVar: "FIREBASE_CLIENT_ID" },
+      { secretName: "FIREBASE_CLIENT_CERT_URL", envVar: "FIREBASE_CLIENT_CERT_URL" },
+      { secretName: "FIREBASE_API_KEY", envVar: "FIREBASE_API_KEY" },
+      
+      // Unit Finance (DEPRECATED - migrated to Mercury + Stripe, Jan 2026)
+      // { secretName: "UNIT_API_TOKEN", envVar: "UNIT_API_TOKEN" },
+      // { secretName: "UNIT_API_URL", envVar: "UNIT_API_URL" },
+      
+      // Modern Treasury
+      { secretName: "MODERN_TREASURY_API_KEY", envVar: "MODERN_TREASURY_API_KEY" },
+      { secretName: "MODERN_TREASURY_ORG_ID", envVar: "MODERN_TREASURY_ORG_ID" },
+      { secretName: "MODERN_TREASURY_SANDBOX_API_KEY", envVar: "MODERN_TREASURY_SANDBOX_API_KEY" },
+      { secretName: "MODERN_TREASURY_SANDBOX_ORG_ID", envVar: "MODERN_TREASURY_SANDBOX_ORG_ID" },
+      { secretName: "MT_PLATFORM_INTERNAL_ACCOUNT_ID", envVar: "MT_PLATFORM_INTERNAL_ACCOUNT_ID" },
+      
+      // Apple
+      { secretName: "APPLE_BUNDLE_ID", envVar: "APPLE_BUNDLE_ID" },
+      { secretName: "APPLE_APNS_KEY_ID", envVar: "APPLE_APNS_KEY_ID" },
+      { secretName: "APPLE_TEAM_ID", envVar: "APPLE_TEAM_ID" },
+      { secretName: "APPLE_APNS_PRIVATE_KEY", envVar: "APPLE_APNS_PRIVATE_KEY" },
+      
+      // Other APIs
+      { secretName: "GITHUB_ACCESS_TOKEN", envVar: "GITHUB_ACCESS_TOKEN" },
+      { secretName: "GOOGLE_CALENDAR_ACCESS_TOKEN", envVar: "GOOGLE_CALENDAR_ACCESS_TOKEN" },
+      { secretName: "OUTLOOK_ACCESS_TOKEN", envVar: "OUTLOOK_ACCESS_TOKEN" },
+      { secretName: "OPENAI_API_KEY", envVar: "OPENAI_API_KEY" },
+      
+      // App Configuration
+      { secretName: "BASE_URL", envVar: "BASE_URL" },
+      { secretName: "APP_URL", envVar: "APP_URL" },
+      { secretName: "PORT", envVar: "PORT" },
+      
+      // Optional
+      { secretName: "PUBLIC_OBJECT_SEARCH_PATHS", envVar: "PUBLIC_OBJECT_SEARCH_PATHS" },
+    ];
+
+    let loadedCount = 0;
+    let failedCount = 0;
+
+    // Load secrets in parallel
+    const loadPromises = secretsToLoad.map(async ({ secretName, envVar }) => {
+      try {
+        const value = await this.getSecret(secretName, envVar);
+        if (value) {
+          process.env[envVar] = value;
+          loadedCount++;
+          return { secretName, success: true };
+        } else {
+          failedCount++;
+          return { secretName, success: false, reason: "No value found" };
+        }
+      } catch (error: any) {
+        failedCount++;
+        console.error(`[Secrets Manager] Failed to load ${secretName}:`, error.message);
+        return { secretName, success: false, reason: error.message };
+      }
+    });
+
+    await Promise.all(loadPromises);
+
+    console.log(`[Secrets Manager] ✅ Loaded ${loadedCount} secrets, ${failedCount} failed/not found`);
+  }
+
+  /**
+   * Clear the cache (useful for testing or forced refresh)
+   */
+  clearCache(): void {
+    this.cache.clear();
+  }
+}
+
+// Export singleton instance
+export const secretsManager = new SecretsManagerService();
