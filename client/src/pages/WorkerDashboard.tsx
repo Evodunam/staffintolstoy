@@ -7,6 +7,7 @@ import { useFindWorkInfinite, useDismissJob, useUndismissJob, FIND_WORK_TIMEOUT_
 import { useLocation, useSearch, useRoute } from "wouter";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { apiRequest, queryClient } from "@/lib/queryClient";
+import { showClientDevTools } from "@/lib/is-local-dev-host";
 import { Button } from "@/components/ui/button";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -1272,7 +1273,7 @@ export default function WorkerDashboard() {
   const [showDevFilterDialog, setShowDevFilterDialog] = useState(false);
   const [advancedDistanceOpen, setAdvancedDistanceOpen] = useState(false);
   const [devLocationFilterOff, setDevLocationFilterOff] = useState(() =>
-    typeof localStorage !== "undefined" && import.meta.env.DEV && localStorage.getItem("findWorkDevNoLocationFilter") === "1"
+    typeof localStorage !== "undefined" && showClientDevTools() && localStorage.getItem("findWorkDevNoLocationFilter") === "1"
   );
 
   // Geocoded points from account addresses when lat/lng missing (profile + teammates); key = "profile" | "member-{id}"
@@ -1746,7 +1747,7 @@ export default function WorkerDashboard() {
   const findWorkApiFilters = useMemo(
     () => ({
       maxDistanceMiles: effectiveMaxMilesForApi,
-      ...(import.meta.env.DEV && devLocationFilterOff ? { skipLocationFilter: true as const } : {}),
+      ...(showClientDevTools() && devLocationFilterOff ? { skipLocationFilter: true as const } : {}),
     }),
     [effectiveMaxMilesForApi, devLocationFilterOff]
   );
@@ -1859,7 +1860,7 @@ export default function WorkerDashboard() {
   // Sort and filter find work jobs (optional Find tab filters only: job type, skills, showOnlyMatching)
   const sortedFindWorkJobs = useMemo(() => {
     let jobs = [...findWorkJobsFromApi];
-    if (!(import.meta.env.DEV && devLocationFilterOff)) {
+    if (!(showClientDevTools() && devLocationFilterOff)) {
       if (findWorkFilters.jobType.length > 0) {
         jobs = jobs.filter(job => {
           const jobType = job.isOnDemand ? 'on_demand' : job.jobType || 'one_time';
@@ -4478,7 +4479,7 @@ export default function WorkerDashboard() {
                   )}
                 </Button>
                 {/* Dev: turn off location filter to see all jobs */}
-                {import.meta.env.DEV && (
+                {showClientDevTools() && (
                   <Button
                     variant={devLocationFilterOff ? "default" : "outline"}
                     size="sm"
@@ -4737,7 +4738,7 @@ export default function WorkerDashboard() {
               </Dialog>
 
               {/* Dev: Location & filter debug */}
-              {import.meta.env.DEV && (
+              {showClientDevTools() && (
                 <Button
                   variant="ghost"
                   size="sm"
@@ -4804,7 +4805,7 @@ export default function WorkerDashboard() {
                     <h4 className="font-medium mb-2">Dev: Location filter</h4>
                     <div className="font-mono text-xs space-y-1">
                       <div>Location filter: <strong>{devLocationFilterOff ? "OFF" : "ON"}</strong></div>
-                      <div>API request sent: maxDistanceMiles={effectiveMaxMilesForApi}{import.meta.env.DEV && devLocationFilterOff ? ", skipLocationFilter=1" : ""}</div>
+                      <div>API request sent: maxDistanceMiles={effectiveMaxMilesForApi}{showClientDevTools() && devLocationFilterOff ? ", skipLocationFilter=1" : ""}</div>
                       <p className="text-muted-foreground pt-1">
                         When OFF: server uses getJobs(undefined) and skips distance; client skips distance + job type + skills + showOnlyMatching.
                       </p>
@@ -4831,7 +4832,7 @@ export default function WorkerDashboard() {
                     <h4 className="font-medium mb-2">Client-side rules (this page)</h4>
                     <p className="text-muted-foreground text-xs mb-1">Applied after receiving API jobs:</p>
                     <ul className="list-disc list-inside text-muted-foreground space-y-0.5 text-xs">
-                      {import.meta.env.DEV && devLocationFilterOff ? (
+                      {showClientDevTools() && devLocationFilterOff ? (
                         <>
                           <li className="text-green-600 dark:text-green-400">Distance: skipped (dev location OFF)</li>
                           <li className="text-green-600 dark:text-green-400">Job type filter: skipped</li>
@@ -5984,7 +5985,7 @@ export default function WorkerDashboard() {
                                     {jobApps.length > 1 ? t("combinedPayout") : t("estPayout")}
                                   </p>
                                 </div>
-                                {import.meta.env.DEV && (
+                                {showClientDevTools() && (
                                   <Button
                                     size="sm"
                                     variant="outline"

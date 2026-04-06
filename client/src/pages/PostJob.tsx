@@ -1,6 +1,6 @@
 import { useState, useEffect, useMemo, useRef, useCallback } from "react";
 import { useAuth } from "@/hooks/use-auth";
-import { useProfile } from "@/hooks/use-profiles";
+import { useProfile, profileMeQueryKey } from "@/hooks/use-profiles";
 import { useLocation } from "wouter";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { queryClient, apiRequest } from "@/lib/queryClient";
@@ -31,6 +31,11 @@ import { Switch } from "@/components/ui/switch";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { HardHat, Wrench, Hammer, Zap, ChevronDown, ChevronRight } from "lucide-react";
 import { INDUSTRY_CATEGORIES, getAllRoles, type IndustryRole } from "@shared/industries";
+import {
+  computeBillableWorkerHours,
+  minimumLaborBudgetCentsForWorkerHours,
+} from "@shared/postJobBillableHours";
+import { PLATFORM_MIN_BILLABLE_HOURLY_USD } from "@shared/platformPayPolicy";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Calendar as DateCalendar } from "@/components/ui/calendar";
 import { GooglePlacesAutocomplete } from "@/components/GooglePlacesAutocomplete";
@@ -91,9 +96,11 @@ const SKILLSET_KEYWORDS: Record<string, string[]> = {
   "HR Coordinator": ["hr", "human resources", "coordinator", "recruiting", "onboarding"],
 };
 
+/** Wizard: 1 job+location, 2 schedule, 3 budget & auto-fulfill, 4 review */
 const TOTAL_STEPS = 4;
 
 type ShiftType = "on-demand" | "one-day" | "recurring" | "monthly";
+type AutoFulfillBudgetWindow = "one_day" | "weekly" | "monthly" | "custom";
 
 const SHIFT_TYPE_INFO: Record<ShiftType, { title: string; description: string; recommended?: boolean }> = {
   "on-demand": {
@@ -568,6 +575,29 @@ export default function PostJob() {
   
   const [onDemandBudget, setOnDemandBudget] = useState<number | null>(null);
 
+  const [jobBudgetDollars, setJobBudgetDollars] = useState<number | null>(null);
+  const [autoFulfillEnabled, setAutoFulfillEnabled] = useState(false);
+  const [autoFulfillLaborBudgetDollars, setAutoFulfillLaborBudgetDollars] = useState<number | null>(null);
+  const [autoFulfillBudgetWindow, setAutoFulfillBudgetWindow] = useState<AutoFulfillBudgetWindow>("one_day");
+  const [autoFulfillCustomStart, setAutoFulfillCustomStart] = useState("");
+  const [autoFulfillCustomEnd, setAutoFulfillCustomEnd] = useState("");
+  const [autoFulfillExpectedHoursOverride, setAutoFulfillExpectedHoursOverride] = useState("");
+  const [autoFulfillMinRating, setAutoFulfillMinRating] = useState("");
+  const [autoFulfillMinReviews, setAutoFulfillMinReviews] = useState(1);
+  const [autoFulfillMaxHourlyDollars, setAutoFulfillMaxHourlyDollars] = useState("");
+  const [autoFulfillMinHourlyDollars, setAutoFulfillMinHourlyDollars] = useState("");
+  const [autoFulfillTermsAck, setAutoFulfillTermsAck] = useState(false);
+  const [saveAfDefaults, setSaveAfDefaults] = useState(false);
+
+  const prevWizardStepRef = useRef(step);
+  useEffect(() => {
+    if (prevWizardStepRef.current === 2 && step === 3) {
+      setJobBudgetDollars((prev) => (prev == null && onDemandBudget != null ? onDemandBudget : prev));
+      setAutoFulfillLaborBudgetDollars((prev) => (prev == null && onDemandBudget != null ? onDemandBudget : prev));
+    }
+    prevWizardStepRef.current = step;
+  }, [step, onDemandBudget]);
+
   const getTomorrowStr = () => {
     const d = new Date();
     d.setDate(d.getDate() + 1);
@@ -772,15 +802,32 @@ export default function PostJob() {
       showCustomContactPopup,
       showAddTeamMemberPopup,
       newLocation: { ...newLocation, address2: newLocation.address2 || "" },
-      version: 1,
+      jobBudgetDollars,
+      autoFulfillEnabled,
+      autoFulfillLaborBudgetDollars,
+      autoFulfillBudgetWindow,
+      autoFulfillCustomStart,
+      autoFulfillCustomEnd,
+      autoFulfillExpectedHoursOverride,
+      autoFulfillMinRating,
+      autoFulfillMinReviews,
+      autoFulfillMaxHourlyDollars,
+      autoFulfillMinHourlyDollars,
+      autoFulfillTermsAck,
+      saveAfDefaults,
+      version: 2,
     }),
     [
       step, selectedLocationId, locationListExpanded, jobDescription, aiCategories,
       selectedSkillsets, lastAnalyzedDescription, userModifiedSkills, aiGeneratedTitle,
       companyJobTitle, mediaPreviews, workersNeeded, shiftType, scheduleError, onDemandBudget, onDemandDate,
-      onDemandDoneByDate, onDemandStartTime,       onDemandFormStep, oneDayFormStep, recurringFormStep, monthlyFormStep, oneDaySchedule, recurringSchedule, monthlySchedule,
+      onDemandDoneByDate, onDemandStartTime, onDemandFormStep, oneDayFormStep, recurringFormStep, monthlyFormStep, oneDaySchedule, recurringSchedule, monthlySchedule,
       showSchedulePopup, datePickerFor, showLocationPopup, editingLocationId, addLocationStep,
       showCustomContactPopup, showAddTeamMemberPopup, newLocation,
+      jobBudgetDollars, autoFulfillEnabled, autoFulfillLaborBudgetDollars, autoFulfillBudgetWindow,
+      autoFulfillCustomStart, autoFulfillCustomEnd, autoFulfillExpectedHoursOverride,
+      autoFulfillMinRating, autoFulfillMinReviews, autoFulfillMaxHourlyDollars, autoFulfillMinHourlyDollars,
+      autoFulfillTermsAck, saveAfDefaults,
     ]
   );
 
@@ -795,6 +842,7 @@ export default function PostJob() {
       setLastAnalyzedDescription(d.lastAnalyzedDescription);
       setUserModifiedSkills(d.userModifiedSkills);
       setAiGeneratedTitle(d.aiGeneratedTitle);
+      if (d.companyJobTitle != null) setCompanyJobTitle(d.companyJobTitle);
       setWorkersNeeded(d.workersNeeded);
       setShiftType(d.shiftType);
       setScheduleError(d.scheduleError);
@@ -840,6 +888,19 @@ export default function PostJob() {
         }));
         return restored.length > 0 ? restored : prev;
       });
+      setJobBudgetDollars(d.jobBudgetDollars ?? null);
+      setAutoFulfillEnabled(d.autoFulfillEnabled ?? false);
+      setAutoFulfillLaborBudgetDollars(d.autoFulfillLaborBudgetDollars ?? null);
+      if (d.autoFulfillBudgetWindow) setAutoFulfillBudgetWindow(d.autoFulfillBudgetWindow);
+      setAutoFulfillCustomStart(d.autoFulfillCustomStart ?? "");
+      setAutoFulfillCustomEnd(d.autoFulfillCustomEnd ?? "");
+      setAutoFulfillExpectedHoursOverride(d.autoFulfillExpectedHoursOverride ?? "");
+      setAutoFulfillMinRating(d.autoFulfillMinRating ?? "");
+      setAutoFulfillMinReviews(d.autoFulfillMinReviews ?? 1);
+      setAutoFulfillMaxHourlyDollars(d.autoFulfillMaxHourlyDollars ?? "");
+      setAutoFulfillMinHourlyDollars(d.autoFulfillMinHourlyDollars ?? "");
+      setAutoFulfillTermsAck(d.autoFulfillTermsAck ?? false);
+      setSaveAfDefaults(d.saveAfDefaults ?? false);
     },
     []
   );
@@ -870,6 +931,19 @@ export default function PostJob() {
     setShiftType(null);
     setScheduleError(null);
     setOnDemandBudget(null);
+    setJobBudgetDollars(null);
+    setAutoFulfillEnabled(false);
+    setAutoFulfillLaborBudgetDollars(null);
+    setAutoFulfillBudgetWindow("one_day");
+    setAutoFulfillCustomStart("");
+    setAutoFulfillCustomEnd("");
+    setAutoFulfillExpectedHoursOverride("");
+    setAutoFulfillMinRating("");
+    setAutoFulfillMinReviews(1);
+    setAutoFulfillMaxHourlyDollars("");
+    setAutoFulfillMinHourlyDollars("");
+    setAutoFulfillTermsAck(false);
+    setSaveAfDefaults(false);
     setOnDemandDate(getTomorrowStr());
     setOnDemandDoneByDate("");
     setOnDemandStartTime("09:00");
@@ -1123,26 +1197,28 @@ export default function PostJob() {
     return false;
   };
 
-  const getEstimatedHours = () => {
-    if (shiftType === "one-day") {
-      const start = parseInt(oneDaySchedule.startTime.split(":")[0]);
-      const end = parseInt(oneDaySchedule.endTime.split(":")[0]);
-      return (end - start) * workersNeeded;
-    }
-    if (shiftType === "recurring") {
-      const start = parseInt(recurringSchedule.startTime.split(":")[0]);
-      const end = parseInt(recurringSchedule.endTime.split(":")[0]);
-      const hoursPerDay = end - start;
-      return hoursPerDay * recurringSchedule.days.length * recurringSchedule.weeks * workersNeeded;
-    }
-    if (shiftType === "monthly") {
-      const start = parseInt(monthlySchedule.startTime.split(":")[0]);
-      const end = parseInt(monthlySchedule.endTime.split(":")[0]);
-      const hoursPerDay = end - start;
-      return hoursPerDay * monthlySchedule.days.length * monthlyMonthsCount * workersNeeded;
-    }
-    return 0;
-  };
+  const billableScheduleHours = useMemo(() => {
+    if (!shiftType) return 0;
+    return computeBillableWorkerHours({
+      shiftType,
+      workersNeeded,
+      onDemandDate,
+      onDemandDoneByDate,
+      oneDaySchedule,
+      recurringSchedule,
+      monthlySchedule,
+      monthlyMonthsCount,
+    });
+  }, [
+    shiftType,
+    workersNeeded,
+    onDemandDate,
+    onDemandDoneByDate,
+    oneDaySchedule,
+    recurringSchedule,
+    monthlySchedule,
+    monthlyMonthsCount,
+  ]);
 
   const ON_DEMAND_EST_HOURLY = 40;
   const ON_DEMAND_EST_HOURS_PER_DAY = 8;
@@ -1157,8 +1233,92 @@ export default function PostJob() {
 
   const calculateEstimatedCost = () => {
     if (shiftType === "on-demand") return null;
-    const hours = getEstimatedHours();
-    return hours * ESTIMATE_DISPLAY_RATE;
+    return billableScheduleHours * ESTIMATE_DISPLAY_RATE;
+  };
+
+  const effectiveEstimatedHoursForAutoFulfill = useMemo(() => {
+    const o = parseFloat(autoFulfillExpectedHoursOverride);
+    if (Number.isFinite(o) && o > 0) return o;
+    return billableScheduleHours;
+  }, [autoFulfillExpectedHoursOverride, billableScheduleHours]);
+
+  const minimumJobBudgetUsd = useMemo(
+    () =>
+      billableScheduleHours > 0
+        ? minimumLaborBudgetCentsForWorkerHours(billableScheduleHours) / 100
+        : 0,
+    [billableScheduleHours]
+  );
+
+  const minimumAfLaborBudgetUsd = useMemo(
+    () =>
+      effectiveEstimatedHoursForAutoFulfill > 0
+        ? minimumLaborBudgetCentsForWorkerHours(effectiveEstimatedHoursForAutoFulfill) / 100
+        : 0,
+    [effectiveEstimatedHoursForAutoFulfill]
+  );
+
+  const validateBudgetStep = (): string | null => {
+    if (billableScheduleHours > 0 && jobBudgetDollars != null && jobBudgetDollars > 0) {
+      const minCents = minimumLaborBudgetCentsForWorkerHours(billableScheduleHours);
+      if (jobBudgetDollars * 100 < minCents - 0.5) {
+        return `Your schedule is about ${Math.round(billableScheduleHours * 10) / 10} total worker-hours. At $${PLATFORM_MIN_BILLABLE_HOURLY_USD}/hr, plan at least $${(minCents / 100).toFixed(2)} for this posting.`;
+      }
+    }
+
+    if (!autoFulfillEnabled || isDirectRequest) return null;
+    const labor = autoFulfillLaborBudgetDollars;
+    if (labor == null || labor <= 0) return "Enter a labor budget for the auto-fulfill window.";
+    if (
+      effectiveEstimatedHoursForAutoFulfill > 0 &&
+      minimumLaborBudgetCentsForWorkerHours(effectiveEstimatedHoursForAutoFulfill) > 0
+    ) {
+      const minAfCents = minimumLaborBudgetCentsForWorkerHours(effectiveEstimatedHoursForAutoFulfill);
+      if (labor * 100 < minAfCents - 0.5) {
+        return `Labor budget must be at least $${(minAfCents / 100).toFixed(2)} for ~${Math.round(effectiveEstimatedHoursForAutoFulfill * 10) / 10} worker-hours at $${PLATFORM_MIN_BILLABLE_HOURLY_USD}/hr.`;
+      }
+    }
+    if (autoFulfillBudgetWindow === "custom") {
+      if (!autoFulfillCustomStart.trim() || !autoFulfillCustomEnd.trim()) {
+        return "Select start and end dates for your custom budget window.";
+      }
+      if (parseLocalDate(autoFulfillCustomEnd) < parseLocalDate(autoFulfillCustomStart)) {
+        return "Budget window end must be on or after the start date.";
+      }
+    }
+    const maxD = parseFloat(autoFulfillMaxHourlyDollars);
+    const hasMax = Number.isFinite(maxD) && maxD > 0;
+    const effH = effectiveEstimatedHoursForAutoFulfill;
+    if (!hasMax && (!Number.isFinite(effH) || effH <= 0)) {
+      return "Add expected hours or a max hourly rate so we can enforce pay limits.";
+    }
+    const minHr = parseFloat(autoFulfillMinHourlyDollars);
+    if (
+      autoFulfillMinHourlyDollars.trim() !== "" &&
+      Number.isFinite(minHr) &&
+      minHr > 0 &&
+      minHr < PLATFORM_MIN_BILLABLE_HOURLY_USD
+    ) {
+      return `Minimum hourly can't be below $${PLATFORM_MIN_BILLABLE_HOURLY_USD}/hr.`;
+    }
+    if (hasMax && maxD < PLATFORM_MIN_BILLABLE_HOURLY_USD) {
+      return `Max hourly can't be below $${PLATFORM_MIN_BILLABLE_HOURLY_USD}/hr.`;
+    }
+    const minR = parseFloat(autoFulfillMinRating);
+    if (autoFulfillMinRating.trim() !== "" && (!Number.isFinite(minR) || minR < 0 || minR > 5)) {
+      return "Minimum rating must be between 0 and 5.";
+    }
+    if (!autoFulfillTermsAck) return "Confirm the Auto-fulfill terms to continue.";
+    return null;
+  };
+
+  const handleContinueFromBudgetStep = () => {
+    const err = validateBudgetStep();
+    if (err) {
+      toast({ title: "Budget & auto-fulfill", description: err, variant: "destructive" });
+      return;
+    }
+    setStep(4);
   };
 
   const { uploadFile } = useUpload();
@@ -1287,7 +1447,6 @@ export default function PostJob() {
       let startDate: Date;
       let endDate: Date | undefined;
       let jobType: "one_time" | "recurring" | "on_demand" = "one_time";
-      let estimatedHours: number | undefined;
 
       if (shiftType === "on-demand") {
         startDate = onDemandDate ? new Date(`${onDemandDate}T${onDemandStartTime}:00`) : new Date();
@@ -1295,9 +1454,6 @@ export default function PostJob() {
       } else if (shiftType === "one-day") {
         startDate = new Date(`${oneDaySchedule.date}T${oneDaySchedule.startTime}:00`);
         endDate = new Date(`${oneDaySchedule.date}T${oneDaySchedule.endTime}:00`);
-        const startHour = parseInt(oneDaySchedule.startTime.split(":")[0]);
-        const endHour = parseInt(oneDaySchedule.endTime.split(":")[0]);
-        estimatedHours = endHour - startHour;
         jobType = "one_time";
       } else if (shiftType === "recurring") {
         // For recurring, start from selected date or today with the specified time
@@ -1315,9 +1471,6 @@ export default function PostJob() {
           endDateObj.setDate(endDateObj.getDate() + (recurringSchedule.weeks * 7));
           endDate = endDateObj;
         }
-        const startHour = parseInt(recurringSchedule.startTime.split(":")[0]);
-        const endHour = parseInt(recurringSchedule.endTime.split(":")[0]);
-        estimatedHours = (endHour - startHour) * recurringSchedule.days.length * recurringSchedule.weeks;
         jobType = "recurring";
       } else if (shiftType === "monthly") {
         const startDateStr = monthlySchedule.startDate || todayStr;
@@ -1328,13 +1481,24 @@ export default function PostJob() {
         const [eh, em] = monthlySchedule.endTime.split(":").map(Number);
         startDate = new Date(startLocal.getFullYear(), startLocal.getMonth(), startLocal.getDate(), sh, sm || 0, 0, 0);
         endDate = new Date(endLocal.getFullYear(), endLocal.getMonth(), endLocal.getDate(), eh, em || 0, 0, 0);
-        const startHour = parseInt(monthlySchedule.startTime.split(":")[0]);
-        const endHour = parseInt(monthlySchedule.endTime.split(":")[0]);
-        estimatedHours = (endHour - startHour) * monthlySchedule.days.length * monthlyMonthsCount * workersNeeded;
         jobType = "recurring";
       } else {
         startDate = new Date();
       }
+
+      const estimatedHours: number | undefined =
+        shiftType != null
+          ? computeBillableWorkerHours({
+              shiftType,
+              workersNeeded,
+              onDemandDate,
+              onDemandDoneByDate,
+              oneDaySchedule,
+              recurringSchedule,
+              monthlySchedule,
+              monthlyMonthsCount,
+            })
+          : undefined;
 
       // Map first skillset to trade (matching the trades enum)
       const primarySkill = selectedSkillsets[0] || "General Labor";
@@ -1375,6 +1539,51 @@ export default function PostJob() {
         .filter(m => m.type === "video" && m.permanentUrl)
         .map(m => m.permanentUrl);
 
+      const budgetDollarsCombined = jobBudgetDollars ?? onDemandBudget;
+      const maxHourlyCents =
+        autoFulfillMaxHourlyDollars.trim() !== "" &&
+        Number.isFinite(parseFloat(autoFulfillMaxHourlyDollars)) &&
+        parseFloat(autoFulfillMaxHourlyDollars) > 0
+          ? Math.round(parseFloat(autoFulfillMaxHourlyDollars) * 100)
+          : undefined;
+      const minHourlyCents =
+        autoFulfillMinHourlyDollars.trim() !== "" &&
+        Number.isFinite(parseFloat(autoFulfillMinHourlyDollars)) &&
+        parseFloat(autoFulfillMinHourlyDollars) > 0
+          ? Math.round(parseFloat(autoFulfillMinHourlyDollars) * 100)
+          : undefined;
+      const expHoursOverride = parseFloat(autoFulfillExpectedHoursOverride);
+      const autoFulfillExpectedHoursStr =
+        Number.isFinite(expHoursOverride) && expHoursOverride > 0
+          ? String(expHoursOverride)
+          : undefined;
+      const minRatingVal = parseFloat(autoFulfillMinRating);
+      const autoFulfillMinWorkerRating =
+        autoFulfillMinRating.trim() !== "" && Number.isFinite(minRatingVal) ? minRatingVal : undefined;
+
+      const autoFulfillPayload =
+        !isDirectRequest && autoFulfillEnabled
+          ? {
+              autoFulfillEnabled: true,
+              autoFulfillBudgetCents: Math.round((autoFulfillLaborBudgetDollars ?? 0) * 100),
+              autoFulfillBudgetWindow: autoFulfillBudgetWindow,
+              autoFulfillWindowStart:
+                autoFulfillBudgetWindow === "custom" && autoFulfillCustomStart.trim()
+                  ? parseLocalDate(autoFulfillCustomStart.trim()).toISOString()
+                  : undefined,
+              autoFulfillWindowEnd:
+                autoFulfillBudgetWindow === "custom" && autoFulfillCustomEnd.trim()
+                  ? parseLocalDate(autoFulfillCustomEnd.trim()).toISOString()
+                  : undefined,
+              autoFulfillExpectedHours: autoFulfillExpectedHoursStr,
+              autoFulfillMinWorkerRating,
+              autoFulfillMinWorkerReviews: autoFulfillMinReviews,
+              autoFulfillMaxHourlyCents: maxHourlyCents,
+              autoFulfillMinHourlyCents: minHourlyCents,
+              autoFulfillPolicy: "first_match" as const,
+            }
+          : { autoFulfillEnabled: false };
+
       // Create job payload - link to company location for proper grouping in dashboard
       const jobData = {
         title: jobTitle,
@@ -1405,7 +1614,11 @@ export default function PostJob() {
         endTime: shiftType === "recurring" ? recurringSchedule.endTime : (shiftType === "monthly" ? monthlySchedule.endTime : (shiftType === "one-day" ? oneDaySchedule.endTime : undefined)),
         recurringWeeks: shiftType === "recurring" ? recurringSchedule.weeks : (shiftType === "monthly" ? undefined : undefined),
         recurringMonths: shiftType === "monthly" ? monthlyMonthsCount : undefined,
-        budgetCents: onDemandBudget ? onDemandBudget * 100 : undefined, // Convert to cents
+        budgetCents:
+          budgetDollarsCombined != null && budgetDollarsCombined > 0
+            ? Math.round(budgetDollarsCombined * 100)
+            : undefined,
+        ...autoFulfillPayload,
       };
 
       // For direct requests, create an inquiry instead of a job
@@ -1439,7 +1652,10 @@ export default function PostJob() {
           endTime: shiftType === "recurring" ? recurringSchedule.endTime : (shiftType === "monthly" ? monthlySchedule.endTime : (shiftType === "one-day" ? oneDaySchedule.endTime : undefined)),
           recurringWeeks: shiftType === "recurring" ? recurringSchedule.weeks : undefined,
           recurringMonths: shiftType === "monthly" ? monthlyMonthsCount : undefined,
-          budgetCents: onDemandBudget ? onDemandBudget * 100 : undefined,
+          budgetCents:
+            budgetDollarsCombined != null && budgetDollarsCombined > 0
+              ? Math.round(budgetDollarsCombined * 100)
+              : undefined,
           fallbackToPublic,
         };
         
@@ -1464,7 +1680,11 @@ export default function PostJob() {
         });
       } else {
         // Regular job posting (or save as draft)
-        const payload = saveAsDraft ? { ...jobData, status: "draft" as const } : jobData;
+        const payload = {
+          ...(saveAsDraft ? { ...jobData, status: "draft" as const } : jobData),
+          autoFulfillTermsAcknowledged:
+            !isDirectRequest && autoFulfillEnabled && autoFulfillTermsAck,
+        };
         const response = await apiRequest("POST", "/api/jobs", payload);
         const createdJob = await response.json();
 
@@ -1476,6 +1696,23 @@ export default function PostJob() {
           toast({ title: t("draftSaved", "Draft saved"), description: t("draftSavedDesc", "Publish from Your Jobs when you're ready.") });
           setTimeout(() => setLocation("/company-dashboard?tab=jobs"), 1500);
         } else {
+          if (saveAfDefaults && autoFulfillEnabled && !isDirectRequest) {
+            try {
+              await apiRequest("PUT", "/api/company/auto-fulfill-defaults", {
+                defaults: {
+                  autoFulfillBudgetWindow,
+                  autoFulfillMinRating,
+                  autoFulfillMinReviews,
+                  autoFulfillMaxHourlyDollars,
+                  autoFulfillMinHourlyDollars,
+                  autoFulfillExpectedHoursOverride,
+                },
+              });
+              queryClient.invalidateQueries({ queryKey: profileMeQueryKey(user?.id) });
+            } catch {
+              /* non-fatal */
+            }
+          }
           confetti({ particleCount: 100, spread: 70, origin: { y: 0.6 } });
           toast({ title: t("jobPostedSuccessfully"), description: t("workersWillBeNotified") });
           setTimeout(() => setLocation("/company-dashboard?tab=team"), 2000);
@@ -1514,7 +1751,15 @@ export default function PostJob() {
   const stepTitles: Record<number, string> = {
     1: "Post a new job",
     2: "Schedule & workers",
-    3: "Review & confirm",
+    3: "Budget & auto-fulfill",
+    4: "Review & confirm",
+  };
+
+  const afWindowLabels: Record<AutoFulfillBudgetWindow, string> = {
+    one_day: "One day",
+    weekly: "Weekly",
+    monthly: "Monthly",
+    custom: "Custom range",
   };
 
   return (
@@ -2327,6 +2572,292 @@ export default function PostJob() {
           <Card>
             <CardHeader>
               <CardTitle className="flex items-center gap-2">
+                <DollarSign className="w-5 h-5" />
+                Budget &amp; hiring
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-6">
+              {billableScheduleHours > 0 && (
+                <div className="rounded-lg border border-border bg-muted/30 p-4 space-y-2 text-sm">
+                  <p className="font-medium flex items-center gap-2">
+                    <Calendar className="w-4 h-4 shrink-0 text-muted-foreground" />
+                    Budget vs. your schedule
+                  </p>
+                  <p className="text-muted-foreground leading-relaxed">
+                    From the times you chose, we estimate about{" "}
+                    <strong>
+                      {billableScheduleHours.toLocaleString(undefined, { maximumFractionDigits: 1 })} total worker-hours
+                    </strong>{" "}
+                    (shift length × days in scope × workers). At{" "}
+                    <strong>${PLATFORM_MIN_BILLABLE_HOURLY_USD}/hr</strong> minimum, that implies roughly{" "}
+                    <strong>${minimumJobBudgetUsd.toFixed(2)}</strong> in labor before fees — budgets below that
+                    can&apos;t be posted.
+                  </p>
+                  {shiftType === "on-demand" && (
+                    <p className="text-xs text-muted-foreground">
+                      On-demand uses each calendar day from start through &ldquo;done by&rdquo; × 8 hours × workers. Tighten
+                      the date range in the schedule step if you need a smaller footprint.
+                    </p>
+                  )}
+                </div>
+              )}
+
+              <div className="space-y-2">
+                <Label htmlFor="job-budget-usd">Total job budget (optional)</Label>
+                <p className="text-xs text-muted-foreground">
+                  If you enter an amount, it must cover your scheduled worker-hours at ${PLATFORM_MIN_BILLABLE_HOURLY_USD}/hr
+                  minimum{minimumJobBudgetUsd > 0 ? ` (~$${minimumJobBudgetUsd.toFixed(0)}+)` : ""}.
+                </p>
+                <div className="relative">
+                  <span className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground text-sm">$</span>
+                  <Input
+                    id="job-budget-usd"
+                    type="number"
+                    min={0}
+                    step={1}
+                    placeholder={minimumJobBudgetUsd > 0 ? `e.g. ${Math.ceil(minimumJobBudgetUsd)}+` : "e.g. 1200"}
+                    className="pl-7"
+                    value={jobBudgetDollars ?? ""}
+                    onChange={(e) => {
+                      const v = e.target.value;
+                      if (v === "") setJobBudgetDollars(null);
+                      else {
+                        const n = Number(v);
+                        setJobBudgetDollars(Number.isFinite(n) ? Math.max(0, n) : null);
+                      }
+                    }}
+                    data-testid="input-job-budget"
+                  />
+                </div>
+              </div>
+
+              {!isDirectRequest && (
+                <div className="rounded-xl border border-border p-4 space-y-4">
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="space-y-1 min-w-0">
+                      <div className="flex items-center gap-2">
+                        <Sparkles className="w-4 h-4 text-primary shrink-0" />
+                        <span className="font-medium">Auto-fulfill</span>
+                      </div>
+                      <p className="text-sm text-muted-foreground">
+                        Automatically accept the first qualified applicant who fits your rules (rate, rating, reviews). You agree to platform payment terms when this is on.
+                      </p>
+                    </div>
+                    <Switch
+                      checked={autoFulfillEnabled}
+                      onCheckedChange={(v) => {
+                        setAutoFulfillEnabled(v);
+                        if (v) {
+                          if (shiftType === "recurring") setAutoFulfillBudgetWindow("weekly");
+                          else if (shiftType === "monthly") setAutoFulfillBudgetWindow("monthly");
+                          else setAutoFulfillBudgetWindow("one_day");
+                        } else {
+                          setAutoFulfillTermsAck(false);
+                          setSaveAfDefaults(false);
+                        }
+                      }}
+                      data-testid="switch-auto-fulfill"
+                    />
+                  </div>
+
+                  {autoFulfillEnabled && (
+                    <div className="space-y-4 pt-2 border-t border-border">
+                      <div className="space-y-2">
+                        <Label>Labor budget for this window (USD)</Label>
+                        <p className="text-xs text-muted-foreground">
+                          Maximum labor spend we use to evaluate hourly limits for auto-accepted workers.
+                          {minimumAfLaborBudgetUsd > 0 && (
+                            <>
+                              {" "}
+                              Minimum for your hours: <strong>${minimumAfLaborBudgetUsd.toFixed(2)}</strong>.
+                            </>
+                          )}
+                        </p>
+                        <div className="relative max-w-xs">
+                          <span className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground text-sm">$</span>
+                          <Input
+                            type="number"
+                            min={0}
+                            step={1}
+                            className="pl-7"
+                            placeholder={
+                              minimumAfLaborBudgetUsd > 0
+                                ? `Min ${Math.ceil(minimumAfLaborBudgetUsd)}+`
+                                : "Required"
+                            }
+                            value={autoFulfillLaborBudgetDollars ?? ""}
+                            onChange={(e) => {
+                              const v = e.target.value;
+                              if (v === "") setAutoFulfillLaborBudgetDollars(null);
+                              else {
+                                const n = Number(v);
+                                setAutoFulfillLaborBudgetDollars(Number.isFinite(n) ? Math.max(0, n) : null);
+                              }
+                            }}
+                            data-testid="input-auto-fulfill-labor-budget"
+                          />
+                        </div>
+                      </div>
+
+                      <div className="space-y-2">
+                        <Label>Budget window</Label>
+                        <Select
+                          value={autoFulfillBudgetWindow}
+                          onValueChange={(v) => setAutoFulfillBudgetWindow(v as AutoFulfillBudgetWindow)}
+                        >
+                          <SelectTrigger data-testid="select-af-window">
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            {(Object.keys(afWindowLabels) as AutoFulfillBudgetWindow[]).map((k) => (
+                              <SelectItem key={k} value={k}>
+                                {afWindowLabels[k]}
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                      </div>
+
+                      {autoFulfillBudgetWindow === "custom" && (
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                          <div className="space-y-1">
+                            <Label htmlFor="af-win-start">Window start</Label>
+                            <Input
+                              id="af-win-start"
+                              type="date"
+                              value={autoFulfillCustomStart}
+                              onChange={(e) => setAutoFulfillCustomStart(e.target.value)}
+                              min={todayStr}
+                            />
+                          </div>
+                          <div className="space-y-1">
+                            <Label htmlFor="af-win-end">Window end</Label>
+                            <Input
+                              id="af-win-end"
+                              type="date"
+                              value={autoFulfillCustomEnd}
+                              onChange={(e) => setAutoFulfillCustomEnd(e.target.value)}
+                              min={autoFulfillCustomStart || todayStr}
+                            />
+                          </div>
+                        </div>
+                      )}
+
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                        <div className="space-y-1">
+                          <Label htmlFor="af-exp-hrs">Expected hours (optional)</Label>
+                          <Input
+                            id="af-exp-hrs"
+                            type="number"
+                            min={0}
+                            step={0.5}
+                            placeholder={
+                              effectiveEstimatedHoursForAutoFulfill > 0
+                                ? `From schedule: ~${effectiveEstimatedHoursForAutoFulfill}`
+                                : "Override schedule"
+                            }
+                            value={autoFulfillExpectedHoursOverride}
+                            onChange={(e) => setAutoFulfillExpectedHoursOverride(e.target.value)}
+                          />
+                        </div>
+                        <div className="space-y-1">
+                          <Label htmlFor="af-max-hr">Max hourly pay ($)</Label>
+                          <Input
+                            id="af-max-hr"
+                            type="number"
+                            min={PLATFORM_MIN_BILLABLE_HOURLY_USD}
+                            step={1}
+                            placeholder={`${PLATFORM_MIN_BILLABLE_HOURLY_USD}+ or leave blank`}
+                            value={autoFulfillMaxHourlyDollars}
+                            onChange={(e) => setAutoFulfillMaxHourlyDollars(e.target.value)}
+                          />
+                        </div>
+                      </div>
+
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                        <div className="space-y-1">
+                          <Label htmlFor="af-min-rating">Min worker rating (0–5)</Label>
+                          <Input
+                            id="af-min-rating"
+                            type="number"
+                            min={0}
+                            max={5}
+                            step={0.1}
+                            placeholder="No minimum"
+                            value={autoFulfillMinRating}
+                            onChange={(e) => setAutoFulfillMinRating(e.target.value)}
+                          />
+                        </div>
+                        <div className="space-y-1">
+                          <Label htmlFor="af-min-reviews">Min reviews</Label>
+                          <Input
+                            id="af-min-reviews"
+                            type="number"
+                            min={0}
+                            step={1}
+                            value={autoFulfillMinReviews}
+                            onChange={(e) => setAutoFulfillMinReviews(Math.max(0, parseInt(e.target.value, 10) || 0))}
+                          />
+                        </div>
+                      </div>
+
+                      <div className="space-y-1">
+                        <Label htmlFor="af-min-hr">Min hourly pay ($, optional)</Label>
+                        <Input
+                          id="af-min-hr"
+                          type="number"
+                          min={PLATFORM_MIN_BILLABLE_HOURLY_USD}
+                          step={1}
+                          placeholder={`Default floor $${PLATFORM_MIN_BILLABLE_HOURLY_USD}+`}
+                          value={autoFulfillMinHourlyDollars}
+                          onChange={(e) => setAutoFulfillMinHourlyDollars(e.target.value)}
+                        />
+                      </div>
+
+                      <div className="flex items-start gap-2 rounded-lg border border-border bg-muted/20 p-3">
+                        <Checkbox
+                          id="af-terms"
+                          checked={autoFulfillTermsAck}
+                          onCheckedChange={(c) => setAutoFulfillTermsAck(c === true)}
+                          data-testid="checkbox-af-terms"
+                        />
+                        <label htmlFor="af-terms" className="text-sm leading-snug cursor-pointer">
+                          I agree to the Auto-fulfill and auto-pay terms described in the{" "}
+                          <a href="/terms" className="text-primary underline underline-offset-2" target="_blank" rel="noreferrer">
+                            Terms of Service
+                          </a>
+                          .
+                        </label>
+                      </div>
+
+                      <div className="flex items-center gap-2">
+                        <Checkbox
+                          id="af-save-defaults"
+                          checked={saveAfDefaults}
+                          onCheckedChange={(c) => setSaveAfDefaults(c === true)}
+                        />
+                        <label htmlFor="af-save-defaults" className="text-sm cursor-pointer">
+                          Save these auto-fulfill settings as defaults for future jobs
+                        </label>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {isDirectRequest && (
+                <p className="text-sm text-muted-foreground">
+                  Auto-fulfill applies to public job posts. This direct request uses your budget only.
+                </p>
+              )}
+            </CardContent>
+          </Card>
+        )}
+
+        {step === 4 && (
+          <Card>
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2">
                 <Check className="w-5 h-5" />
                 Review & Confirm
               </CardTitle>
@@ -2430,6 +2961,59 @@ export default function PostJob() {
                       )}
                     </div>
                   </li>
+
+                  {(() => {
+                    const b = jobBudgetDollars ?? onDemandBudget;
+                    return b != null && b > 0 ? (
+                      <li className="flex items-center gap-2">
+                        <Check className="w-4 h-4 text-green-500 flex-shrink-0" />
+                        <span>
+                          Budget: <strong>${b.toLocaleString()}</strong>
+                        </span>
+                      </li>
+                    ) : null;
+                  })()}
+
+                  {!isDirectRequest && autoFulfillEnabled && (
+                    <li className="flex items-start gap-2 py-3">
+                      <Sparkles className="w-4 h-4 text-primary mt-0.5 flex-shrink-0" />
+                      <div className="flex-1 space-y-1">
+                        <span className="font-medium">Auto-fulfill: On</span>
+                        <div className="text-muted-foreground text-xs space-y-0.5">
+                          <div>
+                            Labor budget:{" "}
+                            <strong>
+                              {autoFulfillLaborBudgetDollars != null
+                                ? `$${autoFulfillLaborBudgetDollars.toLocaleString()}`
+                                : "—"}
+                            </strong>{" "}
+                            · Window: <strong>{afWindowLabels[autoFulfillBudgetWindow]}</strong>
+                          </div>
+                          {autoFulfillBudgetWindow === "custom" && (autoFulfillCustomStart || autoFulfillCustomEnd) && (
+                            <div>
+                              {autoFulfillCustomStart} → {autoFulfillCustomEnd}
+                            </div>
+                          )}
+                          {autoFulfillMinRating.trim() !== "" && (
+                            <div>
+                              Min rating <strong>{autoFulfillMinRating}</strong>, min reviews{" "}
+                              <strong>{autoFulfillMinReviews}</strong>
+                            </div>
+                          )}
+                          {(autoFulfillMaxHourlyDollars.trim() !== "" || autoFulfillMinHourlyDollars.trim() !== "") && (
+                            <div>
+                              {autoFulfillMaxHourlyDollars.trim() !== "" && (
+                                <>Max <strong>${autoFulfillMaxHourlyDollars}</strong>/hr </>
+                              )}
+                              {autoFulfillMinHourlyDollars.trim() !== "" && (
+                                <>· Min <strong>${autoFulfillMinHourlyDollars}</strong>/hr</>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    </li>
+                  )}
                   
                   {selectedLocation && (
                     <>
@@ -2600,6 +3184,21 @@ export default function PostJob() {
           {step === 3 && (
             <>
               <Button variant="outline" onClick={() => setStep(2)} disabled={isSubmitting}>
+                <ArrowLeft className="w-4 h-4 mr-2" /> Back
+              </Button>
+              <Button
+                onClick={handleContinueFromBudgetStep}
+                disabled={isSubmitting}
+                className="flex-1 sm:flex-none sm:min-w-[140px]"
+                data-testid="button-budget-continue"
+              >
+                Continue <ArrowRight className="w-4 h-4 ml-2" />
+              </Button>
+            </>
+          )}
+          {step === 4 && (
+            <>
+              <Button variant="outline" onClick={() => setStep(3)} disabled={isSubmitting}>
                 <ArrowLeft className="w-4 h-4 mr-2" /> Back
               </Button>
               {!isDirectRequest && (

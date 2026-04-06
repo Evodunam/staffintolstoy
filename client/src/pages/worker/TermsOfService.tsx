@@ -46,6 +46,7 @@ const termsProse = (
       <h2 className="text-xl font-semibold">6. Payment Terms</h2>
       <p>Companies must maintain a $2,000 deposit before hiring workers. Payments are drawn from this deposit as workers log hours. Auto-billing occurs when the balance drops to $200.</p>
       <p>Subcontractors are paid weekly for completed work. Payouts are processed to the connected bank account or debit card on file.</p>
+      <p className="mt-3">Companies may enable <strong>Auto-fulfill</strong> so applicants who meet configured rules can be accepted automatically. Timesheets may be paid after company approval or after the platform&apos;s review period (auto-approval). Companies may dispute charges only within the timeframe described in platform rules.</p>
     </section>
     <section>
       <h2 className="text-xl font-semibold">7. Referral Program</h2>

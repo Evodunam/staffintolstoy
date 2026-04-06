@@ -33,6 +33,7 @@ export default function PrivacyPolicy() {
               <li>Payment information (processed securely through third-party providers)</li>
               <li>Job and application data</li>
               <li>Communication records</li>
+              <li>Work verification data such as clock-in/out times and location associated with shifts, used for billing, safety, and fraud prevention (including when jobs use Auto-fulfill or automatic timesheet approval)</li>
             </ul>
             
             <h2 className="text-2xl font-bold taskrabbit-text mb-4">2. How We Use Your Information</h2>

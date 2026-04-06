@@ -19,6 +19,13 @@ import crypto from "crypto";
 import { geocodeAddress, geocodeFullAddress } from "./geocoding";
 import { buildJobGeocodeQuery } from "@shared/jobGeocode";
 import { displayJobTitle } from "@shared/job-display";
+import {
+  validateAutoFulfillJobPayload,
+  applyAutoFulfillLegalAck,
+  evaluateAutoFulfillAccept,
+} from "./lib/autoFulfill";
+import { isLocalDevHostFromRequest } from "./lib/isLocalDevRequest";
+import { minimumLaborBudgetCentsForWorkerHours } from "@shared/postJobBillableHours";
 import * as calendarIntegration from "./services/calendarIntegration";
 import { Client as GoogleMapsClient } from "@googlemaps/google-maps-services-js";
 import { triggerAutoReplenishmentForCompany } from "./auto-replenishment-scheduler";
@@ -550,6 +557,37 @@ export async function registerRoutes(
   app: Express
 ): Promise<Server> {
   const BASE_URL = process.env.BASE_URL || process.env.APP_URL || "http://localhost:5000";
+
+  /** Email + replenishment only (caller sends WebSocket via notifyApplicationUpdate). */
+  async function sendApplicationAcceptedEmailAndReplenish(params: {
+    job: Job;
+    worker: (typeof profiles.$inferSelect) | null | undefined;
+    companyProfile: typeof profiles.$inferSelect;
+  }): Promise<void> {
+    const { job, worker, companyProfile } = params;
+    const companyName =
+      companyProfile?.companyName ||
+      (companyProfile ? `${companyProfile.firstName} ${companyProfile.lastName}`.trim() : "") ||
+      "Company";
+    const companyIdForReplenishment = job.companyId;
+    if (worker?.email && worker.emailNotifications) {
+      sendEmail({
+        to: worker.email,
+        type: "application_accepted",
+        data: {
+          jobTitle: job.title,
+          jobId: job.id,
+          companyName,
+          startDate: job.startDate ? new Date(job.startDate).toLocaleDateString() : "TBD",
+          location: job.location || `${job.city}, ${job.state}`,
+          hourlyRate: job.hourlyRate ? (job.hourlyRate / 100).toFixed(0) : "0",
+        },
+      }).catch((err) => console.error("Failed to send application accepted email:", err));
+    }
+    triggerAutoReplenishmentForCompany(companyIdForReplenishment).catch((err) =>
+      console.error("Failed to trigger auto-replenishment:", err)
+    );
+  }
   
   // WebSocket setup for real-time notifications
   setupWebSocket(httpServer, app);
@@ -2307,6 +2345,33 @@ export async function registerRoutes(
     res.json(list);
   });
 
+  /** Persist JSON defaults for the job-posting Auto-fulfill step (company only). */
+  app.put("/api/company/auto-fulfill-defaults", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    const profile = req.profile;
+    if (!profile || profile.role !== "company") {
+      return res.status(403).json({ message: "Only company accounts can save Auto-fulfill defaults" });
+    }
+    let jsonStr: string;
+    if (typeof (req.body as any)?.defaultsJson === "string") {
+      jsonStr = (req.body as any).defaultsJson;
+    } else if ((req.body as any)?.defaults && typeof (req.body as any).defaults === "object") {
+      jsonStr = JSON.stringify((req.body as any).defaults);
+    } else if (req.body && typeof req.body === "object" && Object.keys(req.body).length > 0) {
+      jsonStr = JSON.stringify(req.body);
+    } else {
+      return res.status(400).json({ message: "Provide defaults object or defaultsJson string" });
+    }
+    if (jsonStr.length > 32000) {
+      return res.status(400).json({ message: "Defaults payload too large" });
+    }
+    await db
+      .update(profiles)
+      .set({ autoFulfillDefaultsJson: jsonStr, updatedAt: new Date() })
+      .where(eq(profiles.id, profile.id));
+    res.json({ success: true });
+  });
+
   app.put(api.profiles.update.path, async (req, res) => {
     if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
     try {
@@ -4006,8 +4071,31 @@ Respond ONLY in this exact JSON format:
     }
     
     try {
-      const input = api.jobs.create.input.parse(req.body);
+      const rawBody = (req.body || {}) as Record<string, unknown>;
+      const { autoFulfillTermsAcknowledged, ...jobBody } = rawBody;
+      const termsAck = autoFulfillTermsAcknowledged === true || autoFulfillTermsAcknowledged === "true";
+      const input = api.jobs.create.input.parse(jobBody);
       const saveAsDraft = (req.body as { status?: string })?.status === "draft";
+
+      if ((input as any).autoFulfillEnabled) {
+        const afErr = validateAutoFulfillJobPayload(input as any);
+        if (afErr) {
+          return res.status(400).json({ message: afErr });
+        }
+      }
+      const withAfAck = applyAutoFulfillLegalAck(input as any, termsAck);
+      let jobInput = { ...input, ...withAfAck } as typeof input;
+      if (
+        !saveAsDraft &&
+        (jobInput as any).autoFulfillEnabled &&
+        !(jobInput as any).autoFulfillLegalAckAt
+      ) {
+        return res.status(400).json({
+          message:
+            "Auto-fulfill requires acknowledging the Auto-fulfill and auto-pay terms (send autoFulfillTermsAcknowledged: true).",
+          code: "AUTO_FULFILL_ACK_REQUIRED",
+        });
+      }
 
       // For published jobs (not draft), require contract and payment method
       if (!saveAsDraft && !isDev) {
@@ -4017,6 +4105,20 @@ Respond ONLY in this exact JSON format:
         const paymentMethods = await db.select().from(companyPaymentMethods).where(eq(companyPaymentMethods.profileId, profile.id));
         if (paymentMethods.length === 0) {
           return res.status(403).json({ message: "You must add a payment method before posting jobs" });
+        }
+      }
+
+      if (!saveAsDraft) {
+        const bc = (input as { budgetCents?: number | null }).budgetCents;
+        const eh = (input as { estimatedHours?: number | null }).estimatedHours;
+        if (bc != null && bc > 0 && eh != null && eh > 0) {
+          const minB = minimumLaborBudgetCentsForWorkerHours(eh);
+          if (minB > 0 && bc < minB) {
+            return res.status(400).json({
+              message: `Job budget is too low for this schedule: at least $${(minB / 100).toFixed(2)} required for ${eh} worker-hours at the platform minimum rate.`,
+              code: "JOB_BUDGET_BELOW_FLOOR",
+            });
+          }
         }
       }
 
@@ -4039,7 +4141,7 @@ Respond ONLY in this exact JSON format:
       const timezone = getTimezoneForState(input.state);
       
       const job = await storage.createJob({
-        ...input,
+        ...jobInput,
         latitude,
         longitude,
         companyId: profile.id,
@@ -5765,8 +5867,42 @@ Respond ONLY in this exact JSON format:
         throw createErr;
       }
 
-      // Send notifications to company about worker inquiry
       const job = await storage.getJob(input.jobId);
+      if (job) {
+        const appsForCount = await storage.getJobApplications(job.id);
+        const acceptedCount = appsForCount.filter((a: any) => a.status === "accepted").length;
+        const decision = evaluateAutoFulfillAccept({
+          job: job as any,
+          worker: profile,
+          proposedRateCents: input.proposedRate,
+          acceptedApplicationCount: acceptedCount,
+        });
+        if (decision.accept) {
+          await storage.updateApplicationStatus(application.id, "accepted");
+          await db.update(applications).set({ autoAccepted: true }).where(eq(applications.id, application.id));
+          const [refetched] = await db.select().from(applications).where(eq(applications.id, application.id));
+          if (refetched) application = refetched;
+          const companyProfileAf = await storage.getProfile(job.companyId);
+          notifyApplicationUpdate(profile.id, {
+            jobId: job.id,
+            jobTitle: job.title,
+            applicationId: application.id,
+            status: "accepted",
+          });
+          if (companyProfileAf) {
+            await sendApplicationAcceptedEmailAndReplenish({
+              job,
+              worker: profile,
+              companyProfile: companyProfileAf,
+            });
+          }
+          console.log(`[AutoFulfill] Auto-accepted application ${application.id} for job ${job.id}`);
+        } else if (decision.reason !== "disabled") {
+          console.log(`[AutoFulfill] No auto-accept for application ${application.id}: ${decision.reason}`);
+        }
+      }
+
+      // Send notifications to company about worker inquiry
       if (job) {
         const company = await storage.getProfile(job.companyId);
         const workerName = `${profile.firstName} ${profile.lastName}`;
@@ -5969,7 +6105,6 @@ Respond ONLY in this exact JSON format:
       const worker = await storage.getProfile(application.workerId);
       const companyProfile = isCompany ? profile : await storage.getProfile(job.companyId);
       const companyName = companyProfile?.companyName || (companyProfile ? `${companyProfile.firstName} ${companyProfile.lastName}` : "Company");
-      const companyIdForReplenishment = job.companyId;
       
       // Real-time WebSocket notification to worker
       notifyApplicationUpdate(application.workerId, {
@@ -5982,21 +6117,9 @@ Respond ONLY in this exact JSON format:
       // Send email to worker based on status
       if (worker?.email && worker.emailNotifications) {
         if (input.status === 'accepted') {
-          sendEmail({
-            to: worker.email,
-            type: 'application_accepted',
-            data: {
-              jobTitle: job.title,
-              jobId: job.id,
-              companyName,
-              startDate: job.startDate ? new Date(job.startDate).toLocaleDateString() : 'TBD',
-              location: job.location || `${job.city}, ${job.state}`,
-              hourlyRate: job.hourlyRate ? (job.hourlyRate / 100).toFixed(0) : '0',
-            }
-          }).catch(err => console.error('Failed to send application accepted email:', err));
-          
-          triggerAutoReplenishmentForCompany(companyIdForReplenishment)
-            .catch(err => console.error('Failed to trigger auto-replenishment:', err));
+          if (companyProfile) {
+            await sendApplicationAcceptedEmailAndReplenish({ job, worker, companyProfile });
+          }
         } else if (input.status === 'rejected') {
           sendEmail({
             to: worker.email,
@@ -6008,11 +6131,8 @@ Respond ONLY in this exact JSON format:
             }
           }).catch(err => console.error('Failed to send application rejected email:', err));
         }
-      }
-      
-      if (input.status === 'accepted' && (!worker?.email || !worker?.emailNotifications)) {
-        triggerAutoReplenishmentForCompany(companyIdForReplenishment)
-          .catch(err => console.error('Failed to trigger auto-replenishment:', err));
+      } else if (input.status === 'accepted' && companyProfile) {
+        await sendApplicationAcceptedEmailAndReplenish({ job, worker, companyProfile });
       }
 
       res.json(updated);
@@ -10303,8 +10423,9 @@ Respond ONLY in this exact JSON format:
     if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
     const profile = req.profile;
     if (!profile || profile.role !== "company") return res.status(403).json({ message: "Company only" });
-    const isDev = process.env.NODE_ENV === "development" || req.query.dev === "1";
-    if (!isDev) return res.status(404).json({ message: "Not available" });
+    if (process.env.NODE_ENV !== "development" || !isLocalDevHostFromRequest(req)) {
+      return res.status(404).json({ message: "Not available" });
+    }
 
     try {
       const companyId = profile.id;

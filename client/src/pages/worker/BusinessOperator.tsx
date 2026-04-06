@@ -18,6 +18,7 @@ import { Slider } from "@/components/ui/slider";
 import { Progress } from "@/components/ui/progress";
 import { useToast } from "@/hooks/use-toast";
 import { apiRequest, queryClient } from "@/lib/queryClient";
+import { showClientDevTools } from "@/lib/is-local-dev-host";
 import * as faceapi from "@vladmandic/face-api";
 import { useTranslation } from "react-i18next";
 import { GooglePlacesAutocomplete } from "@/components/GooglePlacesAutocomplete";
@@ -918,7 +919,7 @@ export function BusinessOperatorContent({ embedded = false }: { embedded?: boole
                                     <RefreshCw className="w-4 h-4 mr-2" />
                                     {t("resendInvitation")}
                                   </DropdownMenuItem>
-                                  {import.meta.env.DEV && (
+                                  {showClientDevTools() && (
                                     <DropdownMenuItem 
                                       onClick={() => autoAcceptInviteMutation.mutate(member.id)}
                                       disabled={autoAcceptInviteMutation.isPending}
@@ -932,7 +933,7 @@ export function BusinessOperatorContent({ embedded = false }: { embedded?: boole
                                 </>
                               )}
                               
-                              {import.meta.env.DEV && member.status === "active" && (
+                              {showClientDevTools() && member.status === "active" && (
                                 <DropdownMenuItem 
                                   onClick={() => handleImpersonateTeamMember(member.id)}
                                   className="text-purple-600"
@@ -1077,7 +1078,7 @@ export function BusinessOperatorContent({ embedded = false }: { embedded?: boole
                                         <RefreshCw className="w-4 h-4 mr-2" />
                                         {t("resendInvitation")}
                                       </DropdownMenuItem>
-                                      {import.meta.env.DEV && (
+                                      {showClientDevTools() && (
                                         <DropdownMenuItem onClick={() => autoAcceptInviteMutation.mutate(member.id)} disabled={autoAcceptInviteMutation.isPending} className="text-amber-600" data-testid={`menu-auto-accept-${member.id}`}>
                                           <CheckCircle className="w-4 h-4 mr-2" />
                                           {t("autoAcceptDev")}
@@ -1085,7 +1086,7 @@ export function BusinessOperatorContent({ embedded = false }: { embedded?: boole
                                       )}
                                     </>
                                   )}
-                                  {import.meta.env.DEV && member.status === "active" && (
+                                  {showClientDevTools() && member.status === "active" && (
                                     <DropdownMenuItem onClick={() => handleImpersonateTeamMember(member.id)} className="text-purple-600" data-testid={`menu-impersonate-${member.id}`}>
                                       <UserCog className="w-4 h-4 mr-2" />
                                       {t("impersonateDev")}
@@ -1235,7 +1236,7 @@ export function BusinessOperatorContent({ embedded = false }: { embedded?: boole
                                         <RefreshCw className="w-4 h-4 mr-2" />
                                         {t("resendInvitation")}
                                       </DropdownMenuItem>
-                                      {import.meta.env.DEV && (
+                                      {showClientDevTools() && (
                                         <DropdownMenuItem 
                                           onClick={() => autoAcceptInviteMutation.mutate(member.id)}
                                           disabled={autoAcceptInviteMutation.isPending}
@@ -1249,7 +1250,7 @@ export function BusinessOperatorContent({ embedded = false }: { embedded?: boole
                                     </>
                                   )}
                                   
-                                  {import.meta.env.DEV && member.status === "active" && (
+                                  {showClientDevTools() && member.status === "active" && (
                                     <DropdownMenuItem 
                                       onClick={() => handleImpersonateTeamMember(member.id)}
                                       className="text-purple-600"
@@ -1397,7 +1398,7 @@ export function BusinessOperatorContent({ embedded = false }: { embedded?: boole
                                             <RefreshCw className="w-4 h-4 mr-2" />
                                             {t("resendInvitation")}
                                           </DropdownMenuItem>
-                                          {import.meta.env.DEV && (
+                                          {showClientDevTools() && (
                                             <DropdownMenuItem onClick={() => autoAcceptInviteMutation.mutate(member.id)} disabled={autoAcceptInviteMutation.isPending} className="text-amber-600" data-testid={`menu-auto-accept-${member.id}`}>
                                               <CheckCircle className="w-4 h-4 mr-2" />
                                               {t("autoAcceptDev")}
@@ -1405,7 +1406,7 @@ export function BusinessOperatorContent({ embedded = false }: { embedded?: boole
                                           )}
                                         </>
                                       )}
-                                      {import.meta.env.DEV && member.status === "active" && (
+                                      {showClientDevTools() && member.status === "active" && (
                                         <DropdownMenuItem onClick={() => handleImpersonateTeamMember(member.id)} className="text-purple-600" data-testid={`menu-impersonate-${member.id}`}>
                                           <UserCog className="w-4 h-4 mr-2" />
                                           {t("impersonateDev")}

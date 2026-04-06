@@ -1,0 +1,280 @@
+# Page snapshot
+
+```yaml
+- generic:
+  - generic:
+    - generic:
+      - button:
+        - generic:
+          - img
+          - generic:
+            - paragraph: E2E Flow 1773803848482
+            - paragraph: Since 11:05 PM · 00:00:45
+        - img
+    - generic:
+      - banner:
+        - generic:
+          - generic:
+            - generic: Tolstoy Staffing
+            - navigation:
+              - button:
+                - img
+                - generic: Find
+              - button:
+                - img
+                - generic: Jobs
+              - button:
+                - img
+                - generic: Today
+              - button:
+                - img
+                - generic: Calendar
+              - button:
+                - img
+                - generic: Messages
+          - generic:
+            - button:
+              - img
+            - generic:
+              - img
+      - generic:
+        - generic:
+          - button:
+            - text: Today
+            - generic: "7"
+          - button:
+            - text: This Week
+            - generic: "7"
+          - button:
+            - text: This Month
+            - generic: "7"
+          - button:
+            - img
+            - text: Offline
+      - generic:
+        - generic:
+          - generic:
+            - generic:
+              - generic:
+                - generic:
+                  - img
+                  - generic: Saturday, March 21
+                - generic:
+                  - generic:
+                    - generic: Active / In Progress
+                    - generic: 1 job
+                  - generic:
+                    - button:
+                      - generic:
+                        - generic:
+                          - generic:
+                            - generic: B
+                          - generic:
+                            - img
+                        - generic:
+                          - generic:
+                            - generic: General Labor Assignment
+                            - generic: Clocked In
+                          - generic:
+                            - img
+                            - generic: BuildRight Inc
+                          - generic:
+                            - generic:
+                              - img
+                              - text: E2E site
+                          - generic:
+                            - img
+                            - generic: Mar 16 (Past)
+                - generic:
+                  - generic:
+                    - img
+                    - generic: Flexible / On-Demand
+                    - generic: 6 job
+                  - generic:
+                    - button:
+                      - generic:
+                        - generic:
+                          - generic:
+                            - generic: B
+                          - generic:
+                            - img
+                        - generic:
+                          - generic:
+                            - generic: General Labor Assignment
+                            - generic: In Progress
+                          - generic:
+                            - img
+                            - generic: BuildRight Inc
+                          - generic:
+                            - generic:
+                              - img
+                              - text: E2E site
+                          - generic:
+                            - img
+                            - generic: Mar 16 (Past)
+                    - button:
+                      - generic:
+                        - generic:
+                          - generic:
+                            - generic: B
+                          - generic:
+                            - img
+                        - generic:
+                          - generic:
+                            - generic: General Labor Assignment
+                            - generic: In Progress
+                          - generic:
+                            - img
+                            - generic: BuildRight Inc
+                          - generic:
+                            - generic:
+                              - img
+                              - text: E2E site
+                          - generic:
+                            - img
+                            - generic: Mar 16 (Past)
+                    - button:
+                      - generic:
+                        - generic:
+                          - generic:
+                            - generic: A
+                          - generic:
+                            - img
+                        - generic:
+                          - generic:
+                            - generic: General Labor Assignment
+                            - generic: In Progress
+                          - generic:
+                            - img
+                            - generic: Acme Construction
+                          - generic:
+                            - generic:
+                              - img
+                              - text: E2E site
+                          - generic:
+                            - img
+                            - generic: Mar 16 (Past)
+                    - button:
+                      - generic:
+                        - generic:
+                          - generic:
+                            - generic: A
+                          - generic:
+                            - img
+                        - generic:
+                          - generic:
+                            - generic: General Labor Assignment
+                            - generic: In Progress
+                          - generic:
+                            - img
+                            - generic: Acme Construction
+                          - generic:
+                            - generic:
+                              - img
+                              - text: E2E site
+                          - generic:
+                            - img
+                            - generic: Mar 18 (Past)
+                    - button:
+                      - generic:
+                        - generic:
+                          - generic:
+                            - generic: A
+                          - generic:
+                            - img
+                        - generic:
+                          - generic:
+                            - generic: General Labor Assignment
+                            - generic: In Progress
+                          - generic:
+                            - img
+                            - generic: Acme Construction
+                          - generic:
+                            - generic:
+                              - img
+                              - text: E2E site
+                          - generic:
+                            - img
+                            - generic: Mar 18 (Past)
+                    - button:
+                      - generic:
+                        - generic:
+                          - generic:
+                            - generic: A
+                          - generic:
+                            - img
+                        - generic:
+                          - generic:
+                            - generic: General Labor Assignment
+                            - generic: In Progress
+                          - generic:
+                            - img
+                            - generic: Acme Construction
+                          - generic:
+                            - generic:
+                              - img
+                              - text: E2E site
+                          - generic:
+                            - img
+                            - generic: Mar 20 (Past)
+  - dialog "Dialog" [active] [ref=e2]:
+    - heading "Dialog" [level=2] [ref=e3]
+    - paragraph [ref=e4]: Dialog content
+    - heading "Dialog" [level=2] [ref=e5]
+    - paragraph [ref=e6]: General Labor -
+    - generic [ref=e7]:
+      - generic [ref=e9]:
+        - generic [ref=e14]: General Labor Assignment
+        - button "Job actions" [ref=e16] [cursor=pointer]:
+          - img [ref=e17]
+        - button "Close" [ref=e21] [cursor=pointer]:
+          - img [ref=e22]
+      - generic [ref=e27]:
+        - generic [ref=e28]:
+          - heading "General Labor Assignment" [level=2] [ref=e30]
+          - generic [ref=e31]:
+            - generic [ref=e32]: In Progress
+            - button "One-Day" [ref=e33] [cursor=pointer]:
+              - img [ref=e34]
+              - text: One-Day
+            - generic [ref=e36] [cursor=pointer]:
+              - img [ref=e38]
+              - text: Demo Worker
+        - generic [ref=e39]:
+          - generic [ref=e40]:
+            - img [ref=e41]
+            - generic [ref=e44]:
+              - paragraph [ref=e45]: Mar 20 (Past)
+              - paragraph [ref=e46]: Friday, March 20, 2026
+          - button "0 min drive" [ref=e47] [cursor=pointer]:
+            - img [ref=e48]
+            - paragraph [ref=e52]:
+              - img [ref=e53]
+              - text: 0 min drive
+            - img [ref=e57]
+        - generic [ref=e63]:
+          - heading "Posted By" [level=3] [ref=e64]:
+            - img [ref=e65]
+            - text: Posted By
+          - generic [ref=e69]:
+            - generic [ref=e71]: A
+            - generic [ref=e72]:
+              - paragraph [ref=e73]: Acme Construction
+              - paragraph [ref=e74]:
+                - img [ref=e75]
+                - text: San Francisco, CA
+        - generic [ref=e78]:
+          - heading "Job Description" [level=3] [ref=e79]
+          - paragraph [ref=e80]: E2E seeded job
+        - generic [ref=e81]:
+          - button "Clock In" [disabled]:
+            - img
+            - text: Clock In
+          - generic [ref=e82]:
+            - button "Directions (0 min drive)" [ref=e83] [cursor=pointer]:
+              - img
+              - text: Directions (0 min drive)
+            - button "Chat" [ref=e84] [cursor=pointer]:
+              - img
+              - text: Chat
+```

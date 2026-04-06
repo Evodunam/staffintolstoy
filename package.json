@@ -41,6 +41,7 @@
     "db:migrate:029": "dotenv -e .env.development -- tsx script/run-sql-migration.ts migrations/029_clear_all_stripe_customer_ids.sql",
     "db:migrate:030": "dotenv -e .env.development -- tsx script/run-sql-migration.ts migrations/030_jobs_recurring_months.sql",
     "db:migrate:033": "dotenv -e .env.development -- tsx script/run-sql-migration.ts migrations/033_timesheet_material_invoice.sql",
+    "db:migrate:035": "dotenv -e .env.development -- tsx script/run-sql-migration.ts migrations/035_job_auto_fulfill.sql",
     "secrets:upload": "dotenv -e .env.production -- tsx script/upload-secrets-to-gcp.ts",
     "stripe:cleanup-duplicate-customers": "dotenv -e .env.development -- tsx script/cleanup-duplicate-stripe-customers.ts",
     "stripe:cleanup-duplicate-customers:delete": "dotenv -e .env.development -- tsx script/cleanup-duplicate-stripe-customers.ts --delete",

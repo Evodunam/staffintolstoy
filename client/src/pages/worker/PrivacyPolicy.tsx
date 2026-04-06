@@ -32,6 +32,7 @@ const privacyProse = (
                 <li>Device information (IP address, browser type)</li>
                 <li>Usage data and analytics</li>
                 <li>Location data when using the mobile app</li>
+                <li>Clock-in/out times and job-site-related location used to verify shifts, calculate pay, and support Auto-fulfill / automatic timesheet approval flows</li>
               </ul>
             </section>
 

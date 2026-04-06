@@ -47,6 +47,14 @@ export default function TermsOfService() {
             <p className="taskrabbit-text-muted mb-6">
               Payment terms are specified in individual job agreements. Companies are responsible for payment for services rendered. Workers are independent contractors and are responsible for their own taxes and insurance.
             </p>
+
+            <h2 className="text-2xl font-bold taskrabbit-text mb-4">5a. Auto-fulfill and automatic payments</h2>
+            <p className="taskrabbit-text-muted mb-6">
+              If you enable <strong>Auto-fulfill</strong> on a job, you instruct the platform to <strong>automatically accept</strong> applicants who meet the eligibility rules you configure (for example, budget-derived rate limits and minimum reputation thresholds). You must acknowledge the in-product terms when enabling this feature.
+            </p>
+            <p className="taskrabbit-text-muted mb-6">
+              Timesheets may be paid after you approve them or after the platform&apos;s <strong>review period</strong> expires and an <strong>auto-approval</strong> policy applies, using recorded hours and location/time data under our policies. You may <strong>dispute</strong> a timesheet or charge only within the timeframe stated in the platform rules; after that period, funds may be released to workers as described in our policies.
+            </p>
             
             <h2 className="text-2xl font-bold taskrabbit-text mb-4">6. Limitation of Liability</h2>
             <p className="taskrabbit-text-muted mb-6">

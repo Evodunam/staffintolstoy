@@ -53,10 +53,24 @@ export interface PostJobDraft {
     selectedPhoneOption: string;
     paymentMethodId?: number | null;
   };
+  /** Step 3 — optional overall job budget (USD), separate from on-demand flow budget */
+  jobBudgetDollars?: number | null;
+  autoFulfillEnabled?: boolean;
+  autoFulfillLaborBudgetDollars?: number | null;
+  autoFulfillBudgetWindow?: "one_day" | "weekly" | "monthly" | "custom";
+  autoFulfillCustomStart?: string;
+  autoFulfillCustomEnd?: string;
+  autoFulfillExpectedHoursOverride?: string;
+  autoFulfillMinRating?: string;
+  autoFulfillMinReviews?: number;
+  autoFulfillMaxHourlyDollars?: string;
+  autoFulfillMinHourlyDollars?: string;
+  autoFulfillTermsAck?: boolean;
+  saveAfDefaults?: boolean;
   version: number;
 }
 
-const DRAFT_VERSION = 1;
+const DRAFT_VERSION = 2;
 
 function storageKey(userId?: number): string {
   return userId ? `${STORAGE_KEY}_${userId}` : STORAGE_KEY;
@@ -67,6 +81,11 @@ export function getStoredDraft(userId?: number): PostJobDraft | null {
     const raw = sessionStorage.getItem(storageKey(userId));
     if (!raw) return null;
     const parsed = JSON.parse(raw) as PostJobDraft;
+    if (parsed.version === 1) {
+      const migrated = { ...parsed, version: 2 as const };
+      if (typeof migrated.step === "number" && migrated.step >= 3) migrated.step = migrated.step + 1;
+      return migrated;
+    }
     if (parsed.version !== DRAFT_VERSION) return null;
     return parsed;
   } catch {

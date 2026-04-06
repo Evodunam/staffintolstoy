@@ -277,6 +277,9 @@ export const profiles = pgTable("profiles", {
   
   // Language preference - auto-detected from device on first visit, can be manually changed
   language: text("language"), // Language code: 'en', 'es', 'zh', 'pt', 'fr'
+
+  /** JSON string: saved Auto-fulfill defaults for job posting (company only). */
+  autoFulfillDefaultsJson: text("auto_fulfill_defaults_json"),
   
   // Google My Business OAuth tokens (for syncing reviews)
   googleBusinessAccessToken: text("google_business_access_token"),
@@ -350,6 +353,21 @@ export const jobs = pgTable("jobs", {
   // Payment tracking
   totalPaid: integer("total_paid").default(0), // In cents
   budgetCents: integer("budget_cents"), // Optional project budget in cents
+
+  // Auto-fulfill (optional auto-accept when applicant meets budget/rating/rate rules)
+  autoFulfillEnabled: boolean("auto_fulfill_enabled").default(false).notNull(),
+  autoFulfillBudgetCents: integer("auto_fulfill_budget_cents"),
+  autoFulfillBudgetWindow: text("auto_fulfill_budget_window"), // one_day | weekly | monthly | custom
+  autoFulfillWindowStart: timestamp("auto_fulfill_window_start"),
+  autoFulfillWindowEnd: timestamp("auto_fulfill_window_end"),
+  autoFulfillExpectedHours: decimal("auto_fulfill_expected_hours", { precision: 8, scale: 2 }),
+  autoFulfillMinWorkerRating: decimal("auto_fulfill_min_worker_rating", { precision: 3, scale: 2 }),
+  autoFulfillMinWorkerReviews: integer("auto_fulfill_min_worker_reviews").default(1),
+  autoFulfillMaxHourlyCents: integer("auto_fulfill_max_hourly_cents"),
+  autoFulfillMinHourlyCents: integer("auto_fulfill_min_hourly_cents"),
+  autoFulfillPolicy: text("auto_fulfill_policy").default("first_match"),
+  autoFulfillLegalAckVersion: text("auto_fulfill_legal_ack_version"),
+  autoFulfillLegalAckAt: timestamp("auto_fulfill_legal_ack_at"),
   
   createdAt: timestamp("created_at").defaultNow(),
 }, (table) => [
@@ -385,6 +403,7 @@ export const applications = pgTable("applications", {
   proposedRate: integer("proposed_rate"), // Worker can propose different rate
   responseDeadline: timestamp("response_deadline"),
   respondedAt: timestamp("responded_at"),
+  autoAccepted: boolean("auto_accepted").default(false).notNull(),
   createdAt: timestamp("created_at").defaultNow(),
 }, (table) => [
   uniqueIndex("idx_application_unique").on(table.jobId, table.workerId),
@@ -1194,6 +1213,8 @@ export const insertJobSchema = createInsertSchema(jobs, {
   // Coerce date strings to Date objects for API requests
   startDate: z.coerce.date(),
   endDate: z.coerce.date().optional(),
+  autoFulfillWindowStart: z.coerce.date().optional(),
+  autoFulfillWindowEnd: z.coerce.date().optional(),
 }).omit({ 
   id: true, 
   createdAt: true,
@@ -1212,6 +1233,7 @@ export const insertApplicationSchema = createInsertSchema(applications).omit({
   createdAt: true, 
   status: true,
   respondedAt: true,
+  autoAccepted: true,
 });
 
 export const insertJobAssignmentSchema = createInsertSchema(jobAssignments).omit({ 

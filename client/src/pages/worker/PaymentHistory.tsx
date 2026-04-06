@@ -31,10 +31,21 @@ import type { Timesheet, Profile, Job } from "@shared/schema";
 import { useTranslation } from "react-i18next";
 import { useProfile } from "@/hooks/use-profiles";
 import { useAuth } from "@/hooks/use-auth";
-import { getDisplayJobTitle } from "@/lib/job-display";
+import { displayJobTitle, getDisplayJobTitle } from "@/lib/job-display";
 import { useTimesheetApprovalInvoice } from "@/contexts/TimesheetApprovalInvoiceContext";
 
 type TimesheetWithDetails = Timesheet & { company: Profile; job: Job; worker?: Profile };
+
+/** Sanitize raw job title embedded in server-built payout descriptions (e.g. held W-9 / bank setup). */
+function formatPayoutListDescription(description: string | null | undefined): string {
+  if (description == null || !String(description).trim()) return "–";
+  const d = String(description);
+  const heldW9 = "Held pending W-9 upload - ";
+  const heldBank = "Held pending bank account setup - ";
+  if (d.startsWith(heldW9)) return heldW9 + displayJobTitle(d.slice(heldW9.length), null);
+  if (d.startsWith(heldBank)) return heldBank + displayJobTitle(d.slice(heldBank.length), null);
+  return d;
+}
 
 /** Payout record (deposit to worker's linked Mercury/bank account) from GET /api/worker/payouts */
 interface WorkerPayoutRow {
@@ -477,14 +488,15 @@ export function PaymentHistoryContent({ embedded = false }: { embedded?: boolean
           ) : (
             <div className="space-y-3">
               {recipientPayouts.map((p) => {
-                const canOpenInvoice = p.timesheetId != null && p.timesheetId > 0;
+                const tsId = p.timesheetId != null ? Number(p.timesheetId) : NaN;
+                const canOpenInvoice = Number.isFinite(tsId) && tsId > 0;
                 const canOpenJob = (p.jobId != null && p.jobId > 0) || canOpenInvoice;
                 const goToJob = (e: MouseEvent<HTMLButtonElement>) => {
                   e.stopPropagation();
                   if (p.jobId != null && p.jobId > 0) {
                     setLocation(`/dashboard/jobs?jobId=${p.jobId}&tab=active`);
                   } else if (canOpenInvoice) {
-                    setLocation(`/dashboard/jobs?timesheetId=${p.timesheetId}`);
+                    setLocation(`/dashboard/jobs?timesheetId=${tsId}`);
                   }
                 };
                 return (
@@ -497,20 +509,20 @@ export function PaymentHistoryContent({ embedded = false }: { embedded?: boolean
                       canOpenInvoice && "cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                     )}
                     onClick={() => {
-                      if (canOpenInvoice) openTimesheetApprovalInvoice(p.timesheetId!);
+                      if (canOpenInvoice) openTimesheetApprovalInvoice(tsId);
                     }}
                     onKeyDown={(e) => {
                       if (!canOpenInvoice) return;
                       if (e.key === "Enter" || e.key === " ") {
                         e.preventDefault();
-                        openTimesheetApprovalInvoice(p.timesheetId!);
+                        openTimesheetApprovalInvoice(tsId);
                       }
                     }}
                   >
                     <CardContent className="py-4 px-4 sm:pt-[21px] sm:pb-[21px]">
                       <div className="flex flex-wrap items-start justify-between gap-3">
                         <div className="min-w-0 space-y-1 flex-1">
-                          <p className="font-medium">{p.description || "–"}</p>
+                          <p className="font-medium">{formatPayoutListDescription(p.description)}</p>
                           <p className="text-sm text-muted-foreground">
                             {p.completedAt ? format(new Date(p.completedAt), "MMM d, yyyy") : format(new Date(p.createdAt), "MMM d, yyyy")}
                             {p.mercuryPaymentId && (
@@ -596,8 +608,22 @@ export function PaymentHistoryContent({ embedded = false }: { embedded?: boolean
                         {rows.map((ts) => {
                           const payout = payoutByTimesheetId.get(ts.id);
                           const w = ts.worker as Profile | undefined;
+                          const jobIdNum = ts.jobId != null ? Number(ts.jobId) : NaN;
+                          const canJobLink = Number.isFinite(jobIdNum) && jobIdNum > 0;
                           return (
-                            <div key={ts.id} className="px-4 py-3 flex flex-wrap items-center justify-between gap-2">
+                            <div
+                              key={ts.id}
+                              role="button"
+                              tabIndex={0}
+                              className="px-4 py-3 flex flex-wrap items-center justify-between gap-2 cursor-pointer hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+                              onClick={() => openTimesheetApprovalInvoice(ts.id)}
+                              onKeyDown={(e) => {
+                                if (e.key === "Enter" || e.key === " ") {
+                                  e.preventDefault();
+                                  openTimesheetApprovalInvoice(ts.id);
+                                }
+                              }}
+                            >
                               <div className="flex items-center gap-2 min-w-0">
                                 <Avatar className="h-8 w-8 flex-shrink-0">
                                   <AvatarImage src={normalizeAvatarUrl(w?.avatarUrl ?? profile?.avatarUrl) ?? undefined} />
@@ -611,7 +637,23 @@ export function PaymentHistoryContent({ embedded = false }: { embedded?: boolean
                                   </p>
                                 </div>
                               </div>
-                              <div className="flex items-center gap-2">
+                              <div className="flex items-center gap-1 sm:gap-2">
+                                {canJobLink && (
+                                  <Button
+                                    type="button"
+                                    variant="ghost"
+                                    size="icon"
+                                    className="h-9 w-9 shrink-0 text-muted-foreground hover:text-foreground"
+                                    aria-label={t("openRelatedJob")}
+                                    title={t("openRelatedJob")}
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      setLocation(`/dashboard/jobs?jobId=${jobIdNum}&tab=active`);
+                                    }}
+                                  >
+                                    <Link2 className="h-4 w-4" />
+                                  </Button>
+                                )}
                                 <span className="font-medium">{formatPay(ts.totalPay)}</span>
                                 <Badge className={cn(getPaymentStatus(ts).color, "text-[10px]")} variant="secondary">{getPaymentStatus(ts).label}</Badge>
                               </div>
@@ -642,12 +684,42 @@ export function PaymentHistoryContent({ embedded = false }: { embedded?: boolean
                         <div className="divide-y">
                           {rows.map((ts) => {
                             const payout = payoutByTimesheetId.get(ts.id);
+                            const jobIdNum = ts.jobId != null ? Number(ts.jobId) : NaN;
+                            const canJobLink = Number.isFinite(jobIdNum) && jobIdNum > 0;
                             return (
-                              <div key={ts.id} className="px-4 py-3 flex flex-wrap items-center justify-between gap-2">
-                                <p className="font-medium truncate">
+                              <div
+                                key={ts.id}
+                                role="button"
+                                tabIndex={0}
+                                className="px-4 py-3 flex flex-wrap items-center justify-between gap-2 cursor-pointer hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+                                onClick={() => openTimesheetApprovalInvoice(ts.id)}
+                                onKeyDown={(e) => {
+                                  if (e.key === "Enter" || e.key === " ") {
+                                    e.preventDefault();
+                                    openTimesheetApprovalInvoice(ts.id);
+                                  }
+                                }}
+                              >
+                                <p className="font-medium truncate min-w-0 flex-1">
                                   {ts.job ? getDisplayJobTitle(ts.job) : "–"}
                                 </p>
-                                <div className="flex items-center gap-2">
+                                <div className="flex items-center gap-1 sm:gap-2 flex-shrink-0">
+                                  {canJobLink && (
+                                    <Button
+                                      type="button"
+                                      variant="ghost"
+                                      size="icon"
+                                      className="h-9 w-9 shrink-0 text-muted-foreground hover:text-foreground"
+                                      aria-label={t("openRelatedJob")}
+                                      title={t("openRelatedJob")}
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        setLocation(`/dashboard/jobs?jobId=${jobIdNum}&tab=active`);
+                                      }}
+                                    >
+                                      <Link2 className="h-4 w-4" />
+                                    </Button>
+                                  )}
                                   <span className="font-medium">{formatPay(ts.totalPay)}</span>
                                   <Badge className={cn(getPaymentStatus(ts).color, "text-[10px]")} variant="secondary">{getPaymentStatus(ts).label}</Badge>
                                 </div>
@@ -660,10 +732,23 @@ export function PaymentHistoryContent({ embedded = false }: { embedded?: boolean
                   );
                 })
               : filteredTimesheets.map((ts) => {
-                  const w = ts.worker as Profile | undefined;
                   const payout = payoutByTimesheetId.get(ts.id);
+                  const jobIdNum = ts.jobId != null ? Number(ts.jobId) : NaN;
+                  const canJobLink = Number.isFinite(jobIdNum) && jobIdNum > 0;
                   return (
-                    <Card key={ts.id} className="rounded-xl border bg-card shadow-sm hover:shadow-md transition-shadow">
+                    <Card
+                      key={ts.id}
+                      role="button"
+                      tabIndex={0}
+                      className="rounded-xl border bg-card shadow-sm hover:shadow-md transition-shadow cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                      onClick={() => openTimesheetApprovalInvoice(ts.id)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" || e.key === " ") {
+                          e.preventDefault();
+                          openTimesheetApprovalInvoice(ts.id);
+                        }
+                      }}
+                    >
                       <CardContent className="py-4 px-4">
                         <div className="flex flex-wrap items-start justify-between gap-3">
                           <div className="min-w-0">
@@ -678,7 +763,23 @@ export function PaymentHistoryContent({ embedded = false }: { embedded?: boolean
                               {payout?.completedAt && ` · ${t("transferDate")}: ${format(new Date(payout.completedAt), "MMM d")}`}
                             </p>
                           </div>
-                          <div className="flex items-center gap-2 flex-shrink-0">
+                          <div className="flex items-center gap-1 sm:gap-2 flex-shrink-0">
+                            {canJobLink && (
+                              <Button
+                                type="button"
+                                variant="ghost"
+                                size="icon"
+                                className="h-9 w-9 shrink-0 text-muted-foreground hover:text-foreground"
+                                aria-label={t("openRelatedJob")}
+                                title={t("openRelatedJob")}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setLocation(`/dashboard/jobs?jobId=${jobIdNum}&tab=active`);
+                                }}
+                              >
+                                <Link2 className="h-4 w-4" />
+                              </Button>
+                            )}
                             <span className="font-bold text-green-600 dark:text-green-400">{formatPay(ts.totalPay)}</span>
                             <Badge className={cn(getPaymentStatus(ts).color)} variant="secondary">{getPaymentStatus(ts).label}</Badge>
                           </div>

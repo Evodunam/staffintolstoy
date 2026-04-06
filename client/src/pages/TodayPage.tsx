@@ -35,6 +35,7 @@ import { useTranslation } from "react-i18next";
 import { useTimesheetApprovalInvoice } from "@/contexts/TimesheetApprovalInvoiceContext";
 import { tryOpenTimesheetApprovalInvoiceFromNotification } from "@/lib/worker-timesheet-notification";
 import { getDisplayJobTitle } from "@/lib/job-display";
+import { showClientDevTools } from "@/lib/is-local-dev-host";
 
 type TimeFrame = "today" | "week" | "month";
 
@@ -353,7 +354,7 @@ export default function TodayPage() {
 
   // Dev only: simulate offline for testing (toggle in sticky bar)
   const [devForceOffline, setDevForceOffline] = useState(false);
-  const isOnlineEffective = import.meta.env.DEV ? (isOnline && !devForceOffline) : isOnline;
+  const isOnlineEffective = showClientDevTools() ? (isOnline && !devForceOffline) : isOnline;
 
   // Check if user is an employee (part of another business operator's team)
   const isEmployee = Boolean(profile?.teamId) || Boolean(user?.impersonation?.isEmployee);
@@ -5029,7 +5030,7 @@ export default function TodayPage() {
           aria-live="polite"
         >
           {t("offlineBanner")}
-          {import.meta.env.DEV && devForceOffline && (
+          {showClientDevTools() && devForceOffline && (
             <span className="ml-2 opacity-90">(simulated)</span>
           )}
         </div>
@@ -5251,7 +5252,7 @@ export default function TodayPage() {
               </span>
             )}
           </button>
-          {import.meta.env.DEV && (
+          {showClientDevTools() && (
             <Tooltip>
               <TooltipTrigger asChild>
                 <Button

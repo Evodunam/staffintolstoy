@@ -59,6 +59,7 @@ import confetti from "canvas-confetti";
 import { compressImageIfNeeded, assertMaxUploadSize } from "@/lib/image-compression";
 import { COMPANY_AGREEMENT_TEXT } from "@/lib/company-agreement-text";
 import { cn, normalizeAvatarUrl, parseLocalDate, validateOnDemandTime, isValidScheduleTime, SHIFT_TYPE_INFO, type ShiftType, getTimeSlots, getValidEndTimeSlots, getEarliestEndTime, formatTime12h } from "@/lib/utils";
+import { showClientDevTools } from "@/lib/is-local-dev-host";
 import { RescheduleScheduleFlow, type RescheduleScheduleData } from "@/components/RescheduleScheduleFlow";
 
 // Add Card Form Component for Add Payment Method dialog (saves card without payment)
@@ -4092,10 +4093,7 @@ export default function CompanyDashboard() {
     const jobsWithRealTimesheets = new Set(real.map(t => t.jobId));
     
     // Generate sample pending timesheets for in-progress jobs with no real timesheets (for testing)
-    const useSampleTimesheets = typeof window !== "undefined" && (
-      import.meta.env.DEV ||
-      new URLSearchParams(window.location.search).get("sampleTimesheets") === "1"
-    );
+    const useSampleTimesheets = typeof window !== "undefined" && showClientDevTools();
     if (!useSampleTimesheets || !jobsData.length) return real;
 
     const sample: TimesheetDisplay[] = [];
@@ -5480,7 +5478,7 @@ export default function CompanyDashboard() {
                       <DollarSign className="w-4 h-4" />
                     )}
                   </Button>
-                  {(import.meta.env.DEV || (typeof window !== "undefined" && new URLSearchParams(window.location.search).get("seed") === "1")) && (
+                  {showClientDevTools() && (
                     <Button
                       variant="outline"
                       size="sm"
@@ -5488,7 +5486,7 @@ export default function CompanyDashboard() {
                       disabled={!profile?.id}
                       onClick={async () => {
                         try {
-                          const res = await fetch("/api/timesheets/seed-pending?dev=1", { method: "POST", credentials: "include" });
+                          const res = await fetch("/api/timesheets/seed-pending", { method: "POST", credentials: "include" });
                           const data = await res.json().catch(() => ({}));
                           if (!res.ok) throw new Error(data.message || "Failed to seed");
                           queryClient.invalidateQueries({ queryKey: ["/api/timesheets/company"] });

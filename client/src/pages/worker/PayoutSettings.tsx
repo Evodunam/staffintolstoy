@@ -18,6 +18,7 @@ import type { PayoutAccount } from "@shared/schema";
 import { useTranslation } from "react-i18next";
 import { Switch } from "@/components/ui/switch";
 import { useTimesheetApprovalInvoice } from "@/contexts/TimesheetApprovalInvoiceContext";
+import { showClientDevTools } from "@/lib/is-local-dev-host";
 
 const BACK_URL = "/dashboard/menu";
 
@@ -571,7 +572,9 @@ export function PayoutSettingsContent({ embedded = false, openBankDialogOnMount 
             <p className="text-xs text-green-600 dark:text-green-400 mt-1">✓ Valid routing number</p>
           )}
           <p className="text-xs text-muted-foreground">Found at the bottom left of your check</p>
-          <p className="text-xs text-muted-foreground">Dev: use <strong>123456789</strong> to test without Mercury. Sandbox: <strong>021000021</strong> (Chase).</p>
+          {showClientDevTools() && (
+            <p className="text-xs text-muted-foreground">Dev: use <strong>123456789</strong> to test without Mercury. Sandbox: <strong>021000021</strong> (Chase).</p>
+          )}
         </div>
         <div className="space-y-2">
           <Label htmlFor="account-number">{t("accountNumber")}</Label>

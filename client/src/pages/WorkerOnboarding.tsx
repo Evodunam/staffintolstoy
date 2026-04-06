@@ -22,6 +22,7 @@ import { Switch } from "@/components/ui/switch";
 import { ResponsiveDialog } from "@/components/ui/responsive-dialog";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { apiRequest, queryClient } from "@/lib/queryClient";
+import { showClientDevTools } from "@/lib/is-local-dev-host";
 import {
   Collapsible,
   CollapsibleContent,
@@ -4774,7 +4775,7 @@ export default function WorkerOnboarding() {
                       <p className="text-xs text-destructive mt-1">{bankErrors.routingNumber}</p>
                     )}
                     <p className="text-xs text-muted-foreground mt-1">Found at the bottom left of your check</p>
-                    {import.meta.env.DEV && (
+                    {showClientDevTools() && (
                       <p className="text-xs text-muted-foreground mt-0.5">Dev: use <strong>123456789</strong> to test without Mercury. Sandbox: <strong>021000021</strong> (Chase).</p>
                     )}
                   </div>

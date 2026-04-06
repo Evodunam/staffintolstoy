@@ -16,6 +16,7 @@ import { Users, UserCog, ClipboardList, Building2, HardHat, Link2, ChevronRight,
 import { useLocation } from "wouter";
 import { useToast } from "@/hooks/use-toast";
 import { queryClient, apiRequest } from "@/lib/queryClient";
+import { showClientDevTools } from "@/lib/is-local-dev-host";
 
 interface TestAccount {
   userId: string;
@@ -33,23 +34,16 @@ export function DevAccountSwitcher() {
   const { toast } = useToast();
   const [, setLocation] = useLocation();
 
-  // Check if we're on localhost
-  const isLocalhost = typeof window !== 'undefined' && (
-    window.location.hostname === 'localhost' ||
-    window.location.hostname === '127.0.0.1' ||
-    window.location.hostname.startsWith('192.168.') ||
-    window.location.hostname.startsWith('10.') ||
-    window.location.port === '2000'
-  );
+  const allowDevSwitcher = typeof window !== "undefined" && showClientDevTools();
 
   useEffect(() => {
-    if (isLocalhost) {
+    if (allowDevSwitcher) {
       fetch("/api/dev/test-accounts")
         .then((res) => res.json())
         .then((data) => setTestAccounts(data || []))
         .catch(() => setTestAccounts([]));
     }
-  }, [isLocalhost]);
+  }, [allowDevSwitcher]);
 
   const handleSwitchAccount = async (userId: string) => {
     setIsLoading(true);
@@ -151,8 +145,7 @@ export function DevAccountSwitcher() {
     }
   };
 
-  // Always show on localhost, even if no accounts yet
-  if (!isLocalhost) {
+  if (!allowDevSwitcher) {
     return null;
   }
 

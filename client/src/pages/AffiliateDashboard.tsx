@@ -3,6 +3,7 @@ import { useAuth } from "@/hooks/use-auth";
 import { useLocation, Link } from "wouter";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { apiRequest, fetchAffiliateMe } from "@/lib/queryClient";
+import { showClientDevTools } from "@/lib/is-local-dev-host";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -367,7 +368,6 @@ export default function AffiliateDashboard() {
   const accountType = (affiliate as any)?.type === "sales" ? "Sales" : "URL-based";
   const code = (links as any)?.code ?? (affiliate as any)?.code ?? "";
   const origin = typeof window !== "undefined" ? window.location.origin : "";
-  const isLocalhost = typeof window !== "undefined" && (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1");
   // Unique referral URLs: worker/company onboarding with ref=affiliate code so signups are attributed to this affiliate
   const workerLink = (links as any)?.workerLink ?? (code && origin ? `${origin}/worker-onboarding?ref=${encodeURIComponent(code)}` : "");
   const companyLink = (links as any)?.companyLink ?? (code && origin ? `${origin}/company-onboarding?ref=${encodeURIComponent(code)}` : "");
@@ -498,7 +498,7 @@ export default function AffiliateDashboard() {
               </CardContent>
             </Card>
 
-            {isLocalhost && (
+            {showClientDevTools() && (
               <Card className="border-dashed border-amber-500/50 bg-amber-500/5">
                 <CardHeader>
                   <CardTitle className="text-base text-amber-700 dark:text-amber-400">Dev: Seed sample data</CardTitle>
@@ -1841,7 +1841,7 @@ function AffiliatePayoutContent({
             <div className="space-y-2">
               <Label htmlFor="aff-payout-routing">Routing number</Label>
               <Input id="aff-payout-routing" value={routingNumber} onChange={(e) => setRoutingNumber(e.target.value.replace(/\D/g, "").slice(0, 9))} placeholder="9 digits" maxLength={9} />
-              {typeof window !== "undefined" && (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1") && (
+              {showClientDevTools() && (
                 <p className="text-xs text-muted-foreground">Dev: use <strong>123456789</strong> to test without Mercury. Real sandbox: <strong>021000021</strong> (Chase).</p>
               )}
             </div>
