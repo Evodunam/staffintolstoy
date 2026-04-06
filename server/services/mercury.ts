@@ -11,6 +11,9 @@ interface MercuryConfig {
 // Cache for API config
 let cachedConfig: MercuryConfig | null = null;
 
+// Cache for default account ID (avoids GET /accounts on every sendPayment)
+let cachedDefaultAccountId: string | null = null;
+
 /** Normalize Mercury API key: trim whitespace, strip "secret-token:" prefix if present. Header value must be key only. */
 function normalizeMercuryToken(raw: string): string {
   let s = (raw || "").trim();
@@ -29,10 +32,10 @@ async function getMercuryConfig(): Promise<MercuryConfig> {
   const isDev = process.env.NODE_ENV === "development";
   
   if (isDev) {
-    // Development: Use sandbox token from .env
-    const raw = process.env.Mercury_Sandbox;
+    // Development: Use sandbox token from .env (either name; isConfigured() allows both)
+    const raw = process.env.Mercury_Sandbox || process.env.MERCURY_SANDBOX_API_TOKEN;
     if (!raw) {
-      throw new Error("Mercury_Sandbox not configured in .env.development");
+      throw new Error("Mercury_Sandbox or MERCURY_SANDBOX_API_TOKEN not configured in .env.development");
     }
     const apiToken = normalizeMercuryToken(raw);
     if (!apiToken) {
@@ -63,6 +66,18 @@ async function getMercuryConfig(): Promise<MercuryConfig> {
   }
   
   return cachedConfig;
+}
+
+/** Default ceiling so hung Mercury TCP never blocks Express (e.g. W-9 status polling). Callers may pass `signal` to override or combine. */
+const MERCURY_FETCH_TIMEOUT_MS = Number(process.env.MERCURY_FETCH_TIMEOUT_MS) || 45_000;
+
+function defaultMercuryAbortSignal(): AbortSignal {
+  if (typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function") {
+    return AbortSignal.timeout(MERCURY_FETCH_TIMEOUT_MS);
+  }
+  const c = new AbortController();
+  setTimeout(() => c.abort(), MERCURY_FETCH_TIMEOUT_MS);
+  return c.signal;
 }
 
 // Mercury API request wrapper
@@ -103,9 +118,12 @@ async function mercuryRequest<T>(
     }
   }
 
+  const signal = options.signal ?? defaultMercuryAbortSignal();
+
   const response = await fetch(url, {
     ...options,
     headers,
+    signal,
   });
   
   console.log(`[Mercury] Response status: ${response.status} ${response.statusText}`);
@@ -120,8 +138,10 @@ async function mercuryRequest<T>(
       errorMessage = errorJson.message || errorJson.error || errorMessage;
       errorDetails = errorJson;
     } catch {
-      errorMessage = errorText || errorMessage;
-      errorDetails = { raw: errorText };
+      if (errorText && !errorText.trimStart().startsWith("<") && errorText.length < 500) {
+        errorMessage = errorText || errorMessage;
+      }
+      errorDetails = { raw: errorText?.slice(0, 200) };
     }
     
     console.error(`[Mercury] ❌ API Error (${response.status}):`, {
@@ -178,13 +198,15 @@ async function mercuryMultipartRequest<T>(
   if (!response.ok) {
     const errorText = await response.text();
     let errorMessage = `Mercury API error: ${response.status} ${response.statusText}`;
-    let errorDetails: any = { raw: errorText };
+    let errorDetails: any = { raw: errorText?.slice(0, 200) };
     try {
       const errorJson = JSON.parse(errorText);
       errorMessage = errorJson.message || errorJson.error || errorMessage;
       errorDetails = errorJson;
     } catch {
-      errorMessage = errorText || errorMessage;
+      if (errorText && !errorText.trimStart().startsWith("<") && errorText.length < 500) {
+        errorMessage = errorText || errorMessage;
+      }
     }
     console.error(`[Mercury] ❌ API Error (${response.status}):`, { url, errorMessage, details: errorDetails });
     log(`Mercury API Error: ${errorMessage}`, "mercury");
@@ -310,6 +332,12 @@ export interface CreateRecipientParams {
   name: string;
   email?: string;
   emails?: string[];
+  /** Primary contact email (for payment receipts); per Mercury UI "Email (optional) For payment receipts" */
+  contactEmail?: string;
+  /** Recipient phone number */
+  phoneNumber?: string;
+  /** True = business recipient, false = person; per Mercury "This recipient is a" */
+  isBusiness?: boolean;
   nickname?: string;
   routingNumber: string;
   accountNumber: string;
@@ -423,10 +451,15 @@ export const mercuryService = {
    */
   async createArCustomer(params: CreateArCustomerParams): Promise<MercuryArCustomer> {
     try {
+      const email =
+        params.email?.trim() ||
+        (params.externalId != null
+          ? `mercury-ar-company-${params.externalId}@tolstoystaffing.invalid`
+          : "mercury-ar-unknown@tolstoystaffing.invalid");
       const payload: Record<string, unknown> = {
         name: params.name.trim(),
+        email,
       };
-      if (params.email?.trim()) payload.email = params.email.trim();
       if (params.externalId) payload.externalId = String(params.externalId);
 
       const customer = await mercuryRequest<MercuryArCustomer>('/ar/customers', {
@@ -488,6 +521,47 @@ export const mercuryService = {
     } catch (error: any) {
       log(`Error updating Mercury AR invoice: ${error.message}`, "mercury");
       throw error;
+    }
+  },
+
+  /**
+   * Ensure the company has a Mercury AR customer for invoicing. Creates one if missing and saves to profile.
+   * Call during onboarding or whenever we need the company in Mercury (e.g. with ensureCompanyStripeCustomer).
+   * See https://docs.mercury.com/reference/createcustomer
+   * Does not throw - logs errors so callers are not blocked.
+   */
+  async ensureMercuryArCustomerForCompany(
+    profile: { id: number; companyName?: string | null; firstName?: string | null; lastName?: string | null; email?: string | null; mercuryArCustomerId?: string | null }
+  ): Promise<string | null> {
+    if (!this.isConfigured()) {
+      log("Mercury not configured; skipping ensure AR customer", "mercury");
+      return null;
+    }
+    try {
+      const { storage } = await import("../storage");
+      const fresh = await storage.getProfile(profile.id);
+      const customerId = fresh?.mercuryArCustomerId ?? profile.mercuryArCustomerId;
+      if (customerId) return customerId;
+      const customerName = (
+        profile.companyName ||
+        [profile.firstName, profile.lastName].filter(Boolean).join(" ") ||
+        fresh?.email ||
+        profile.email ||
+        `Company ${profile.id}`
+      ).trim();
+      const customerEmail = (fresh?.email || profile.email)?.trim() || undefined;
+      const customer = await this.createArCustomer({
+        name: customerName,
+        email: customerEmail,
+        externalId: String(profile.id),
+      });
+      await storage.updateProfile(profile.id, { mercuryArCustomerId: customer.id });
+      log(`Created Mercury AR customer: ${customer.id} for company ${profile.id} (${customerName})`, "mercury");
+      return customer.id;
+    } catch (err: any) {
+      console.warn("[Mercury] ensureMercuryArCustomerForCompany failed (non-blocking):", err?.message ?? err);
+      log(`Mercury AR ensure customer failed: ${err?.message}`, "mercury");
+      return null;
     }
   },
 
@@ -594,15 +668,15 @@ export const mercuryService = {
 
       const payload: any = {
         name: params.name,
-        emails: emails.length > 0 ? emails : [], // Mercury requires emails field, use empty array if none provided
+        emails: emails.length > 0 ? emails : [], // Worker account email for payment receipts
         electronicRoutingInfo: electronicRoutingInfo,
         paymentMethod: params.paymentMethod || 'ach',
       };
 
-      // Add nickname if provided
-      if (params.nickname) {
-        payload.nickname = params.nickname;
-      }
+      if (params.nickname) payload.nickname = params.nickname;
+      if (params.contactEmail?.trim()) payload.contactEmail = params.contactEmail.trim();
+      if (params.phoneNumber?.trim()) payload.phoneNumber = params.phoneNumber.trim();
+      if (params.isBusiness !== undefined) payload.isBusiness = Boolean(params.isBusiness);
       
       // Remove undefined fields to avoid sending them (but keep empty arrays)
       Object.keys(payload).forEach(key => {
@@ -659,7 +733,8 @@ export const mercuryService = {
    */
   async getRecipient(recipientId: string): Promise<MercuryRecipient> {
     try {
-      const recipient = await mercuryRequest<MercuryRecipient>(`/recipients/${recipientId}`);
+      // Mercury API uses singular /recipient/{id} for single-recipient operations (docs.mercury.com/reference/getrecipient)
+      const recipient = await mercuryRequest<MercuryRecipient>(`/recipient/${recipientId}`);
       return recipient;
     } catch (error: any) {
       log(`Error getting recipient ${recipientId}: ${error.message}`, "mercury");
@@ -735,6 +810,9 @@ export const mercuryService = {
       if (updates.name) payload.name = updates.name;
       if (emails.length > 0) payload.emails = emails;
       if (updates.nickname !== undefined) payload.nickname = updates.nickname;
+      if (updates.contactEmail !== undefined) payload.contactEmail = updates.contactEmail?.trim() || undefined;
+      if (updates.phoneNumber !== undefined) payload.phoneNumber = updates.phoneNumber?.trim() || undefined;
+      if (updates.isBusiness !== undefined) payload.isBusiness = Boolean(updates.isBusiness);
 
       // Build electronicRoutingInfo if routing/account info is provided
       if (updates.routingNumber || updates.accountNumber || updates.accountType) {
@@ -876,11 +954,12 @@ export const mercuryService = {
         console.log(`[Mercury] Address in update:`, JSON.stringify(payload.electronicRoutingInfo.address, null, 2));
       }
 
-      console.log(`[Mercury] Sending POST request to /recipients/${recipientId}`);
+      // Mercury API: Edit recipient = POST /recipient/{recipientId} (singular; docs.mercury.com/reference/updaterecipient)
+      console.log(`[Mercury] Sending POST request to /recipient/${recipientId}`);
       console.log(`[Mercury] Request payload (final, before sending):`, JSON.stringify(payload, null, 2));
       
       try {
-        const recipient = await mercuryRequest<MercuryRecipient>(`/recipients/${recipientId}`, {
+        const recipient = await mercuryRequest<MercuryRecipient>(`/recipient/${recipientId}`, {
           method: 'POST',
           body: JSON.stringify(payload),
         });
@@ -936,8 +1015,9 @@ export const mercuryService = {
       const form = new FormData();
       form.append("file", blob, fileName);
       form.append("taxFormType", "w9");
+      // Mercury API uses singular "recipient" for update/attachments: POST /recipient/{id}/attachments (see docs.mercury.com/reference/updaterecipient)
       const result = await mercuryMultipartRequest<{ id: string; fileName?: string; [k: string]: unknown }>(
-        `/recipients/${recipientId}/attachments`,
+        `/recipient/${recipientId}/attachments`,
         form,
         { method: "POST" }
       );
@@ -958,11 +1038,12 @@ export const mercuryService = {
    */
   async sendPayment(params: CreatePaymentParams): Promise<MercuryPayment> {
     try {
-      let accountId = process.env.MERCURY_ACCOUNT_ID || process.env.Mercury_Account_Id;
+      let accountId = process.env.MERCURY_ACCOUNT_ID || process.env.Mercury_Account_Id || cachedDefaultAccountId;
       if (!accountId) {
         const accounts = await this.getAccounts();
         if (!accounts.length) throw new Error("No Mercury accounts found. Configure MERCURY_ACCOUNT_ID in .env or ensure your Mercury org has at least one account.");
         accountId = accounts[0].id;
+        cachedDefaultAccountId = accountId;
         if (process.env.NODE_ENV !== "production") {
           console.log(`[Mercury] Using first account ${accountId} (set MERCURY_ACCOUNT_ID to override)`);
         }
@@ -1064,11 +1145,11 @@ export const mercuryService = {
   },
 
   /**
-   * Get transaction by ID
+   * Get transaction by ID (https://docs.mercury.com/reference/gettransactionbyid)
    */
   async getTransaction(transactionId: string): Promise<MercuryTransaction> {
     try {
-      const transaction = await mercuryRequest<MercuryTransaction>(`/transactions/${transactionId}`);
+      const transaction = await mercuryRequest<MercuryTransaction>(`/transaction/${transactionId}`);
       return transaction;
     } catch (error: any) {
       log(`Error getting transaction ${transactionId}: ${error.message}`, "mercury");

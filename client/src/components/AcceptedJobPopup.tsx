@@ -26,6 +26,7 @@ import {
   X
 } from "lucide-react";
 import { apiRequest, queryClient } from "@/lib/queryClient";
+import { stripPhonesAndEmails } from "@/lib/utils";
 import type { Job, Profile, JobMessage } from "@shared/schema";
 
 interface AcceptedJobPopupProps {
@@ -79,7 +80,7 @@ export function AcceptedJobPopup({
         visibleToCompanyOnly: false,
         isRead: false,
         readAt: null,
-        createdAt: new Date().toISOString(),
+        createdAt: new Date(),
         sender: currentUser,
       };
       queryClient.setQueryData<JobMessageWithSender[]>(
@@ -111,8 +112,14 @@ export function AcceptedJobPopup({
   }, [open, job?.id, refetchMessages]);
 
   const handleSendMessage = () => {
-    if (!messageText.trim() || sendMessageMutation.isPending) return;
-    sendMessageMutation.mutate(messageText.trim());
+    const trimmed = messageText.trim();
+    if (!trimmed || sendMessageMutation.isPending) return;
+    const content = stripPhonesAndEmails(trimmed);
+    if (!content) {
+      setMessageText("");
+      return;
+    }
+    sendMessageMutation.mutate(content);
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {

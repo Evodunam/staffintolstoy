@@ -1,20 +1,30 @@
-import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { useQuery, useMutation, useQueryClient, type QueryClient } from "@tanstack/react-query";
+import { queryClient } from "@/lib/queryClient";
 import { api, buildUrl } from "@shared/routes";
 import { type InsertProfile, type Profile } from "@shared/schema";
 import { useToast } from "@/hooks/use-toast";
 
+/** Session-backed profile (same source as req.profile). userId in key avoids cross-account stale cache. */
+export const PROFILE_ME_QUERY_KEY_PREFIX = "/api/profiles/me";
+
+export function profileMeQueryKey(userId: string | undefined) {
+  return [PROFILE_ME_QUERY_KEY_PREFIX, userId] as const;
+}
+
+export function invalidateSessionProfileQueries(queryClient: QueryClient) {
+  queryClient.invalidateQueries({ queryKey: [PROFILE_ME_QUERY_KEY_PREFIX] });
+  queryClient.invalidateQueries({ queryKey: [api.profiles.get.path] });
+}
+
 export function useProfile(userId?: string) {
-  // If no userId is provided, we rely on the auth context user ID (usually handled by redirecting if no profile)
-  // But strictly for the API contract, we need a userId path param.
-  // In a real app, we might check `useAuth` hook first.
   const enabled = !!userId;
-  
+
   return useQuery({
-    queryKey: [api.profiles.get.path, userId],
+    queryKey: profileMeQueryKey(userId),
     queryFn: async () => {
       if (!userId) return null;
-      const url = buildUrl(api.profiles.get.path, { userId });
-      const res = await fetch(url, { credentials: "include" });
+      const res = await fetch(`${PROFILE_ME_QUERY_KEY_PREFIX}`, { credentials: "include" });
+      if (res.status === 401) return null;
       if (!res.ok) throw new Error("Failed to fetch profile");
       const data = await res.json();
       // Server returns 200 with null when user has no profile yet (e.g. onboarding)
@@ -22,9 +32,10 @@ export function useProfile(userId?: string) {
     },
     enabled,
     retry: false,
-    staleTime: 2 * 60 * 1000, // Cache for 2 minutes
-    gcTime: 5 * 60 * 1000, // Keep in cache for 5 minutes
-    refetchOnWindowFocus: false, // Don't refetch on window focus
+    staleTime: 60_000,
+    gcTime: 5 * 60 * 1000,
+    refetchOnWindowFocus: true,
+    refetchOnMount: true,
   });
 }
 
@@ -55,7 +66,7 @@ export function useCreateProfile() {
         if (!variables.skipToast) {
           toast({ title: "Welcome!", description: "Profile created successfully." });
         }
-        queryClient.invalidateQueries({ queryKey: [api.profiles.get.path] });
+        invalidateSessionProfileQueries(queryClient);
         queryClient.invalidateQueries({ queryKey: ["/api/auth/user"] });
       }, 0);
     },
@@ -82,8 +93,20 @@ export function useUpdateProfile() {
       });
 
       if (!res.ok) {
-        const error = await res.json();
-        throw new Error(error.message || "Failed to update profile");
+        let message = "Failed to update profile";
+        try {
+          const text = await res.text();
+          try {
+            const error = JSON.parse(text);
+            message = error?.message || message;
+          } catch {
+            if (text && text.length < 500 && !text.trimStart().startsWith("<")) message = text;
+            else message = res.statusText || message;
+          }
+        } catch {
+          message = res.statusText || message;
+        }
+        throw new Error(message);
       }
       return api.profiles.update.responses[200].parse(await res.json());
     },
@@ -92,11 +115,13 @@ export function useUpdateProfile() {
         if (!variables.skipToast) {
           toast({ title: "Updated", description: "Profile updated successfully." });
         }
-        queryClient.invalidateQueries({ queryKey: [api.profiles.get.path] });
+        invalidateSessionProfileQueries(queryClient);
       }, 0);
     },
-    onError: (error: Error) => {
-      toast({ title: "Error", description: error.message, variant: "destructive" });
+    onError: (error: Error, variables: UpdateProfileVariables) => {
+      if (!variables.skipToast) {
+        toast({ title: "Error", description: error.message, variant: "destructive" });
+      }
     }
   });
 }

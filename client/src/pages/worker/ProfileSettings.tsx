@@ -2,8 +2,7 @@ import { useState, useRef, useEffect } from "react";
 import { useLocation } from "wouter";
 import { useMutation } from "@tanstack/react-query";
 import { useAuth } from "@/hooks/use-auth";
-import { useProfile } from "@/hooks/use-profiles";
-import { api } from "@shared/routes";
+import { useProfile, invalidateSessionProfileQueries, profileMeQueryKey } from "@/hooks/use-profiles";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -20,6 +19,47 @@ import { Textarea } from "@/components/ui/textarea";
 import { Badge } from "@/components/ui/badge";
 
 const BACK_URL = "/dashboard/menu";
+
+/** Max distance (miles) between device location and saved address to allow save. 20 mi accommodates GPS variance and IP fallback (approximate location when GPS unavailable). */
+const ADDRESS_VERIFICATION_MAX_MILES = 20;
+
+function distanceMiles(lat1: number, lon1: number, lat2: number, lon2: number): number {
+  const R = 3959;
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLon = (lon2 - lon1) * Math.PI / 180;
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * Math.sin(dLon / 2) * Math.sin(dLon / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return R * c;
+}
+
+/** IP-based fallback for dev (non-HTTPS) where navigator.geolocation is denied or unavailable. */
+async function getDeviceLocationViaIp(): Promise<{ lat: number; lng: number }> {
+  const res = await fetch("https://ipapi.co/json/", { method: "GET" });
+  if (!res.ok) throw new Error("IP location failed");
+  const data = await res.json();
+  const lat = data.latitude != null ? Number(data.latitude) : NaN;
+  const lng = data.longitude != null ? Number(data.longitude) : NaN;
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) throw new Error("Invalid IP location");
+  return { lat, lng };
+}
+
+function getDeviceLocation(): Promise<{ lat: number; lng: number }> {
+  return new Promise((resolve, reject) => {
+    if (!navigator.geolocation) {
+      getDeviceLocationViaIp().then(resolve).catch(reject);
+      return;
+    }
+    navigator.geolocation.getCurrentPosition(
+      (pos) => resolve({ lat: pos.coords.latitude, lng: pos.coords.longitude }),
+      () => {
+        getDeviceLocationViaIp().then(resolve).catch(reject);
+      },
+      { enableHighAccuracy: true, timeout: 20000, maximumAge: 0 }
+    );
+  });
+}
 
 // Bio validation - detect and block personal information
 function validateBio(text: string): { isValid: boolean; error: string | null } {
@@ -107,6 +147,8 @@ export function ProfileSettingsContent({ embedded = false }: { embedded?: boolea
     city: "",
     state: "",
     zipCode: "",
+    latitude: "" as string | number | undefined,
+    longitude: "" as string | number | undefined,
     companyLogo: "",
     bio: "",
     interests: [] as string[],
@@ -211,16 +253,23 @@ export function ProfileSettingsContent({ embedded = false }: { embedded?: boolea
 
   useEffect(() => {
     if (profile) {
+      const addr = profile.address || "";
+      const city = profile.city || "";
+      const state = profile.state || "";
+      const zipCode = profile.zipCode || "";
+      const addressLine = addr.includes(",") ? addr : [addr, city, state, zipCode].filter(Boolean).join(", ") || addr;
       setFormData({
         firstName: profile.firstName || "",
         lastName: profile.lastName || "",
         email: profile.email || "",
         phone: profile.phone || "",
         businessName: profile.companyName || "",
-        address: profile.address || "",
-        city: profile.city || "",
-        state: profile.state || "",
-        zipCode: profile.zipCode || "",
+        address: addressLine,
+        city,
+        state,
+        zipCode,
+        latitude: (profile as any).latitude ?? "",
+        longitude: (profile as any).longitude ?? "",
         companyLogo: profile.companyLogo || "",
         bio: (profile as any).bio || "",
         interests: (profile as any).interests || [],
@@ -251,11 +300,11 @@ export function ProfileSettingsContent({ embedded = false }: { embedded?: boolea
       toast({ title: t("profileSaved"), description: t("changesHaveBeenSaved") });
       // Invalidate all profile-related queries to update avatars everywhere
       await queryClient.invalidateQueries({ queryKey: ["/api/profiles"] });
-      await queryClient.invalidateQueries({ queryKey: [api.profiles.get.path] });
+      invalidateSessionProfileQueries(queryClient);
       await queryClient.invalidateQueries({ queryKey: ["/api/today/assignments"] });
       await queryClient.invalidateQueries({ queryKey: ["/api/jobs"] });
       await queryClient.invalidateQueries({ queryKey: ["/api/jobs/find-work"] });
-      await queryClient.refetchQueries({ queryKey: [api.profiles.get.path, user?.id] });
+      await queryClient.refetchQueries({ queryKey: profileMeQueryKey(user?.id) });
     },
     onError: () => {
       toast({ title: tCommon("error"), description: t("couldNotSaveChanges"), variant: "destructive" });
@@ -371,11 +420,11 @@ export function ProfileSettingsContent({ embedded = false }: { embedded?: boolea
       
       // Invalidate all profile-related queries to update avatars everywhere
       await queryClient.invalidateQueries({ queryKey: ["/api/profiles"] });
-      await queryClient.invalidateQueries({ queryKey: [api.profiles.get.path] });
+      invalidateSessionProfileQueries(queryClient);
       await queryClient.invalidateQueries({ queryKey: ["/api/today/assignments"] });
       await queryClient.invalidateQueries({ queryKey: ["/api/jobs"] });
       await queryClient.invalidateQueries({ queryKey: ["/api/jobs/find-work"] });
-      await queryClient.refetchQueries({ queryKey: [api.profiles.get.path, user?.id] });
+      await queryClient.refetchQueries({ queryKey: profileMeQueryKey(user?.id) });
     } catch (error: any) {
       toast({
         title: t("uploadFailed"),
@@ -428,7 +477,7 @@ export function ProfileSettingsContent({ embedded = false }: { embedded?: boolea
     );
   }
 
-  const handleFieldSave = (field: string) => {
+  const handleFieldSave = async (field: string) => {
     // Validate bio before saving
     if (field === "bio") {
       const validation = validateBio(formData.bio);
@@ -441,8 +490,98 @@ export function ProfileSettingsContent({ embedded = false }: { embedded?: boolea
         return;
       }
     }
-    
-    saveMutation.mutate(formData);
+
+    const payload = { ...formData } as Record<string, unknown>;
+    // Never send empty string for numeric DB columns (crashes server)
+    if (payload.latitude === "" || payload.latitude == null) delete payload.latitude;
+    if (payload.longitude === "" || payload.longitude == null) delete payload.longitude;
+
+    // When saving address: require device location verification (pin) to prevent location fraud
+    if (field === "address") {
+      let addressLat: number;
+      let addressLng: number;
+      const hasLatLng = formData.latitude !== "" && formData.latitude != null && formData.longitude !== "" && formData.longitude != null;
+      if (hasLatLng) {
+        addressLat = typeof formData.latitude === "number" ? formData.latitude : Number(formData.latitude);
+        addressLng = typeof formData.longitude === "number" ? formData.longitude : Number(formData.longitude);
+      } else {
+        const addressQuery = [formData.address, formData.city, formData.state, formData.zipCode].filter(Boolean).join(", ");
+        if (!addressQuery || !import.meta.env.VITE_GOOGLE_API_KEY) {
+          toast({
+            title: "Address required",
+            description: "Enter a full address and select it from the dropdown so we can verify your location.",
+            variant: "destructive",
+          });
+          return;
+        }
+        try {
+          const res = await fetch(
+            `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(addressQuery)}&key=${import.meta.env.VITE_GOOGLE_API_KEY}`
+          );
+          const data = await res.json();
+          const loc = data?.results?.[0]?.geometry?.location;
+          if (!loc || typeof loc.lat !== "number" || typeof loc.lng !== "number") {
+            toast({
+              title: "Address not found",
+              description: "We couldn't find that address. Please select it from the dropdown.",
+              variant: "destructive",
+            });
+            return;
+          }
+          addressLat = loc.lat;
+          addressLng = loc.lng;
+        } catch {
+          toast({
+            title: "Address lookup failed",
+            description: "Please try again or select the address from the dropdown.",
+            variant: "destructive",
+          });
+          return;
+        }
+      }
+
+      if (!Number.isFinite(addressLat) || !Number.isFinite(addressLng)) {
+        toast({
+          title: "Invalid address",
+          description: "Select your address from the dropdown to save.",
+          variant: "destructive",
+        });
+        return;
+      }
+
+      let deviceLoc: { lat: number; lng: number };
+      try {
+        deviceLoc = await getDeviceLocation();
+      } catch (err: unknown) {
+        const code = (err as { code?: number })?.code;
+        const message = code === 1
+          ? "Location access was denied. Please allow location so we can verify you're at this address."
+          : code === 2 || code === 3
+            ? "We couldn't get your location. Please enable location and try again."
+            : "Please enable location access to verify you're at this address.";
+        toast({
+          title: "Location required",
+          description: message,
+          variant: "destructive",
+        });
+        return;
+      }
+
+      const miles = distanceMiles(deviceLoc.lat, deviceLoc.lng, addressLat, addressLng);
+      if (miles > ADDRESS_VERIFICATION_MAX_MILES) {
+        toast({
+          title: "Address too far from your location",
+          description: `Your device is about ${miles.toFixed(1)} mi away (we allow up to ${ADDRESS_VERIFICATION_MAX_MILES} mi). If you're on Wi‑Fi or dev mode we may be using approximate location—try again at the address or enable GPS.`,
+          variant: "destructive",
+        });
+        return;
+      }
+
+      payload.latitude = String(addressLat);
+      payload.longitude = String(addressLng);
+    }
+
+    saveMutation.mutate(payload as typeof formData & { avatarUrl?: string });
     setEditingField(null);
   };
 
@@ -750,7 +889,7 @@ export function ProfileSettingsContent({ embedded = false }: { embedded?: boolea
             )}
           </div>
 
-          {/* Address with Google Places Autocomplete */}
+          {/* Address: single-line Google Places picker (fills address, city, state, zip, lat/lng) */}
           <div className="p-4 hover:bg-muted/50 transition-colors">
             {editingField === "address" ? (
               <div className="space-y-3">
@@ -761,39 +900,26 @@ export function ProfileSettingsContent({ embedded = false }: { embedded?: boolea
                     setFormData({
                       ...formData,
                       address: address || "",
-                      city: components.city || "",
-                      state: components.state || "",
-                      zipCode: components.zipCode || "",
+                      city: components.city ?? formData.city,
+                      state: components.state ?? formData.state,
+                      zipCode: components.zipCode ?? formData.zipCode,
+                      ...(components.latitude != null && components.longitude != null && {
+                        latitude: components.latitude,
+                        longitude: components.longitude,
+                      }),
                     });
                   }}
                   placeholder="Search for an address..."
                 />
-                <div className="grid grid-cols-2 gap-3">
-                  <div>
-                    <Label htmlFor="city" className="text-sm">{t("city")}</Label>
-                    <Input
-                      id="city"
-                      value={formData.city}
-                      onChange={(e) => setFormData({ ...formData, city: e.target.value })}
-                    />
-                  </div>
-                  <div>
-                    <Label htmlFor="state" className="text-sm">{t("state")}</Label>
-                    <Input
-                      id="state"
-                      value={formData.state}
-                      onChange={(e) => setFormData({ ...formData, state: e.target.value })}
-                    />
-                  </div>
-                </div>
-                <div>
-                  <Label htmlFor="zipCode" className="text-sm">{t("zipCode")}</Label>
-                  <Input
-                    id="zipCode"
-                    value={formData.zipCode}
-                    onChange={(e) => setFormData({ ...formData, zipCode: e.target.value })}
-                  />
-                </div>
+                {(formData.city || formData.state || formData.zipCode) && (
+                  <p className="text-xs text-muted-foreground">
+                    {[formData.city, formData.state, formData.zipCode].filter(Boolean).join(", ")}
+                    {formData.latitude != null && formData.longitude != null && " · lat/lng saved"}
+                  </p>
+                )}
+                <p className="text-xs text-muted-foreground">
+                  When you save, we use your device location to confirm you are at or near this address.
+                </p>
                 <div className="flex gap-2">
                   <Button size="sm" onClick={() => handleFieldSave("address")} disabled={saveMutation.isPending}>
                     {saveMutation.isPending ? <Loader2 className="w-4 h-4 animate-spin" /> : <Check className="w-4 h-4 mr-1" />}

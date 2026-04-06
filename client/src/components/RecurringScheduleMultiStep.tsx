@@ -174,10 +174,10 @@ export function RecurringScheduleMultiStep({
   /* Single card: left = calendar + weeks, right = days + start/end time */
   return (
     <div className="space-y-4 py-2">
-      <div className="rounded-lg border border-border overflow-hidden">
+      <div className="rounded-none border border-border overflow-hidden">
         <div className="flex flex-row overflow-x-auto">
           {/* Left column: calendar + number of weeks */}
-          <div className="flex-[5] min-w-0 shrink-0 border-r border-border flex flex-col items-center p-4 bg-muted/20 gap-4 min-w-[200px]">
+          <div className="flex-[5] min-w-0 shrink-0 border-r border-border flex flex-col items-center px-[5px] py-4 bg-muted/20 gap-4 min-w-[200px]">
             <div className="w-full max-w-[260px]">
               <Label className="text-sm font-semibold">Start week</Label>
               <p className="text-xs text-muted-foreground mb-2">Pick the start date</p>
@@ -218,7 +218,11 @@ export function RecurringScheduleMultiStep({
                   variant="outline"
                   size="icon"
                   className="h-9 w-9 shrink-0 rounded-none border-0 border-r border-border"
-                  onClick={() => handleWeeksChange(Math.max(1, weeks - 1))}
+                  onClick={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    handleWeeksChange(Math.max(1, weeks - 1));
+                  }}
                   disabled={weeks <= 1}
                   aria-label="Decrease weeks"
                 >
@@ -240,7 +244,11 @@ export function RecurringScheduleMultiStep({
                   variant="outline"
                   size="icon"
                   className="h-9 w-9 shrink-0 rounded-none border-0 border-l border-border"
-                  onClick={() => handleWeeksChange(Math.min(52, weeks + 1))}
+                  onClick={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    handleWeeksChange(Math.min(52, weeks + 1));
+                  }}
                   disabled={weeks >= 52}
                   aria-label="Increase weeks"
                 >
@@ -250,7 +258,7 @@ export function RecurringScheduleMultiStep({
             </div>
           </div>
           {/* Right column: which days + start time + end time */}
-          <div className="flex-[4] min-w-0 p-4 min-h-[280px] min-w-[180px]">
+          <div className="flex-[4] min-w-0 px-[6px] py-4 min-h-[280px] min-w-[180px]">
             <ScrollArea className="h-full">
               <div className="space-y-4 pr-2">
                 <div>

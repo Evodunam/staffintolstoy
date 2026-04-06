@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useMemo, useRef, useEffect, useCallback } from "react";
 import { GoogleMap, useJsApiLoader, InfoWindow, Polyline, OverlayView } from "@react-google-maps/api";
 import { GOOGLE_MAPS_LOADER_ID, GOOGLE_MAPS_LIBRARIES } from "@/lib/google-maps";
 
@@ -55,9 +55,53 @@ function MapPillPin({
   );
 }
 
+/** Unique pin positions for bounds (dedupe ~1m). */
+function collectPinPoints(
+  jobSite: TimesheetMapProps["jobSite"],
+  clockIn: TimesheetMapProps["clockIn"],
+  clockOut: TimesheetMapProps["clockOut"]
+): google.maps.LatLngLiteral[] {
+  const pts: google.maps.LatLngLiteral[] = [];
+  const seen = new Set<string>();
+  const add = (lat?: number, lng?: number) => {
+    if (lat == null || lng == null || Number.isNaN(lat) || Number.isNaN(lng)) return;
+    const k = `${lat.toFixed(5)},${lng.toFixed(5)}`;
+    if (seen.has(k)) return;
+    seen.add(k);
+    pts.push({ lat, lng });
+  };
+  add(jobSite?.lat, jobSite?.lng);
+  add(clockIn?.lat, clockIn?.lng);
+  add(clockOut?.lat, clockOut?.lng);
+  return pts;
+}
+
+function applyBoundsToMap(map: google.maps.Map, points: google.maps.LatLngLiteral[]) {
+  if (points.length === 0) return;
+  if (points.length === 1) {
+    map.setCenter(points[0]);
+    map.setZoom(16);
+    return;
+  }
+  const bounds = new google.maps.LatLngBounds();
+  points.forEach((p) => bounds.extend(p));
+  const ne = bounds.getNorthEast();
+  const sw = bounds.getSouthWest();
+  const latSpan = Math.abs(ne.lat() - sw.lat());
+  const lngSpan = Math.abs(ne.lng() - sw.lng());
+  // Degenerate bounds (same spot) — avoid extreme zoom
+  if (latSpan < 1e-6 && lngSpan < 1e-6) {
+    map.setCenter(points[0]);
+    map.setZoom(16);
+    return;
+  }
+  map.fitBounds(bounds, { top: 36, right: 36, bottom: 36, left: 36 });
+}
+
 export function TimesheetMap({ jobSite, clockIn, clockOut, className, height = "300px", showLines = true, hideLegend = false }: TimesheetMapProps) {
   const [selectedMarker, setSelectedMarker] = useState<string | null>(null);
-  
+  const mapRef = useRef<google.maps.Map | null>(null);
+
   const apiKey = import.meta.env.VITE_GOOGLE_API_KEY || "";
   
   const { isLoaded, loadError } = useJsApiLoader({
@@ -66,11 +110,29 @@ export function TimesheetMap({ jobSite, clockIn, clockOut, className, height = "
     libraries: GOOGLE_MAPS_LIBRARIES,
   });
 
+  const pinPoints = useMemo(
+    () => collectPinPoints(jobSite, clockIn, clockOut),
+    [jobSite, clockIn, clockOut]
+  );
+
   const center = jobSite 
     ? { lat: jobSite.lat, lng: jobSite.lng }
     : clockIn 
       ? { lat: clockIn.lat, lng: clockIn.lng }
       : { lat: 30.2672, lng: -97.7431 };
+
+  const onMapLoad = useCallback(
+    (map: google.maps.Map) => {
+      mapRef.current = map;
+      applyBoundsToMap(map, pinPoints);
+    },
+    [pinPoints]
+  );
+
+  useEffect(() => {
+    if (!mapRef.current) return;
+    applyBoundsToMap(mapRef.current, pinPoints);
+  }, [pinPoints]);
 
   const formatDistance = (meters: number) => {
     if (meters < 1000) {
@@ -120,7 +182,8 @@ export function TimesheetMap({ jobSite, clockIn, clockOut, className, height = "
       <GoogleMap
         mapContainerStyle={{ ...containerStyle, height }}
         center={center}
-        zoom={17}
+        onLoad={onMapLoad}
+        options={{ mapTypeControl: false, streetViewControl: false }}
       >
         {showLines && polylinePath.length >= 2 && (
           <Polyline path={polylinePath} options={polylineOptions} />

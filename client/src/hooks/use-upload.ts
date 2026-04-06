@@ -2,7 +2,7 @@ import { useState, useCallback } from "react";
 import type { UppyFile } from "@uppy/core";
 import { compressImageIfNeeded, assertMaxUploadSize, MAX_UPLOAD_BYTES } from "@/lib/image-compression";
 
-export type StorageBucket = "avatar" | "bio" | "jobs" | "reviews";
+export type StorageBucket = "avatar" | "bio" | "jobs" | "reviews" | "receipts";
 
 interface UploadMetadata {
   name: string;

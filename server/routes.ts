@@ -14,12 +14,15 @@ import { profiles, jobs, type Job, digitalSignatures, deviceTokens, notification
 import { eq, and, asc, desc, inArray, isNull, isNotNull, or, gte, lte, sql } from "drizzle-orm";
 import { sendEmail, ALL_EMAIL_TYPES, getSampleDataForType } from "./email-service";
 import { setupWebSocket, notifyNewJob, notifyApplicationUpdate, notifyJobUpdate, notifyTimesheetUpdate, broadcastPresenceUpdate, notifyWorkerTeamPresence } from "./websocket";
-import { notifyWorkerInquiry, notifyWorkerAvailabilityUpdated, notifyNewJobInTerritory } from "./notification-service";
+import { notifyWorkerInquiry, notifyWorkerAvailabilityUpdated, notifyNewJobInTerritory, createNotification } from "./notification-service";
 import crypto from "crypto";
 import { geocodeAddress, geocodeFullAddress } from "./geocoding";
+import { buildJobGeocodeQuery } from "@shared/jobGeocode";
+import { displayJobTitle } from "@shared/job-display";
 import * as calendarIntegration from "./services/calendarIntegration";
 import { Client as GoogleMapsClient } from "@googlemaps/google-maps-services-js";
 import { triggerAutoReplenishmentForCompany } from "./auto-replenishment-scheduler";
+import { ensureCompanyStripeCustomer } from "./lib/company-stripe";
 import { addHours } from "date-fns";
 
 function generateInviteToken(): string {
@@ -41,6 +44,90 @@ function calculateDistanceMeters(
   return R * c;
 }
 
+/** Reject null-island / placeholder zeros and out-of-range values so we fall back to address geocode or state matching. */
+function isPlausibleLatLng(lat: number, lng: number): boolean {
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return false;
+  if (lat < -90 || lat > 90 || lng < -180 || lng > 180) return false;
+  if (Math.abs(lat) < 1e-5 && Math.abs(lng) < 1e-5) return false;
+  return true;
+}
+
+async function ensureJobGeofenceCoords(job: Job): Promise<{ lat: number; lng: number } | null> {
+  const savedLat = job.latitude != null ? parseFloat(String(job.latitude)) : NaN;
+  const savedLng = job.longitude != null ? parseFloat(String(job.longitude)) : NaN;
+  if (isPlausibleLatLng(savedLat, savedLng)) {
+    return { lat: savedLat, lng: savedLng };
+  }
+  const address = String((job as any).streetAddress || job.address || "").trim();
+  const city = String(job.city || "").trim();
+  const state = String(job.state || "").trim();
+  const zipCode = String(job.zipCode || "").trim();
+  const location = String(job.location || "").trim();
+  const broadQuery = buildJobGeocodeQuery(job) || "";
+  const exactQuery = [address, city, state, zipCode].filter(Boolean).join(", ");
+
+  const parseCoords = (coords: { latitude: string; longitude: string } | null): { lat: number; lng: number } | null => {
+    if (!coords) return null;
+    const lat = parseFloat(String(coords.latitude));
+    const lng = parseFloat(String(coords.longitude));
+    if (!isPlausibleLatLng(lat, lng)) return null;
+    return { lat, lng };
+  };
+
+  const candidates = [exactQuery, broadQuery, location].map((q) => q.trim()).filter(Boolean);
+  const uniqueCandidates = [...new Set(candidates)];
+
+  for (const query of uniqueCandidates) {
+    try {
+      // Prefer full address geocode when we have structured address fields.
+      const full = address && city && state && zipCode
+        ? parseCoords(await geocodeFullAddress(address, city, state, zipCode))
+        : null;
+      const fallback = full ?? parseCoords(await geocodeAddress(query));
+      if (!fallback) continue;
+      await storage.updateJob(job.id, {
+        latitude: fallback.lat.toString(),
+        longitude: fallback.lng.toString(),
+      });
+      return fallback;
+    } catch {
+      // try next candidate
+    }
+  }
+  return null;
+}
+
+async function geocodeCompanyLocationInBackground(input: {
+  address?: string | null;
+  address2?: string | null;
+  city?: string | null;
+  state?: string | null;
+  zipCode?: string | null;
+}): Promise<{ latitude?: string; longitude?: string }> {
+  const address = String(input.address || "").trim();
+  const address2 = String(input.address2 || "").trim();
+  const city = String(input.city || "").trim();
+  const state = String(input.state || "").trim();
+  const zipCode = String(input.zipCode || "").trim();
+
+  if (!address || !city || !state || !zipCode) return {};
+
+  try {
+    const fullAddress = [address, address2].filter(Boolean).join(", ");
+    const coords =
+      await geocodeFullAddress(fullAddress, city, state, zipCode) ||
+      await geocodeAddress([fullAddress, city, state, zipCode].filter(Boolean).join(", "));
+
+    if (!coords) return {};
+    const lat = parseFloat(String(coords.latitude));
+    const lng = parseFloat(String(coords.longitude));
+    if (!isPlausibleLatLng(lat, lng)) return {};
+    return { latitude: coords.latitude, longitude: coords.longitude };
+  } catch {
+    return {};
+  }
+}
+
 const METERS_PER_MILE = 1609.344;
 
 // Geofence radii: auto clock in/out requires closer proximity than manual
@@ -53,9 +140,86 @@ const MANUAL_GEOFENCE_RADIUS_METERS = MANUAL_GEOFENCE_RADIUS_MILES * METERS_PER_
 const GEOFENCE_RADIUS_MILES = MANUAL_GEOFENCE_RADIUS_MILES;
 const GEOFENCE_RADIUS_METERS = MANUAL_GEOFENCE_RADIUS_METERS;
 
+// When user comes back online after offline clock-in, we require their pin location. Within this radius we verify and the timesheet can be submitted for approval; beyond = reject timesheet + strike (we never submit the timesheet).
+const CLOCK_IN_VALIDATION_RADIUS_MILES = 50;
+const CLOCK_IN_VALIDATION_RADIUS_METERS = CLOCK_IN_VALIDATION_RADIUS_MILES * METERS_PER_MILE;
+
 // Rate limit: worker-triggered business-operator onboarding resend (once per 24h per worker)
 const workerResendBusinessOperatorReminderLastAt = new Map<number, number>();
 const WORKER_RESEND_BUSINESS_OPERATOR_COOLDOWN_MS = 24 * 60 * 60 * 1000;
+
+// Guard: only one W-9 payout release per worker at a time (avoids duplicate Mercury calls)
+const w9ReleaseInProgress = new Set<number>();
+// Throttle: don't trigger release from GET pending-w9-payouts more than once per worker per 90s (avoids infinite loop when banner polls every 5s)
+const w9ReleaseLastTriggeredAt = new Map<number, number>();
+const W9_RELEASE_TRIGGER_COOLDOWN_MS = 90_000;
+
+/** Run W-9 payout release in background: group all pending_w9 payouts for the worker, send one Mercury payment for the total, then mark all payouts completed. */
+async function runW9PayoutReleaseForWorker(profileId: number): Promise<void> {
+  if (w9ReleaseInProgress.has(profileId)) {
+    console.log(`[W9Release] Skipping duplicate run for worker ${profileId}`);
+    return;
+  }
+  w9ReleaseInProgress.add(profileId);
+  try {
+    const profile = await storage.getProfile(profileId);
+    if (!profile || profile.role !== "worker" || !profile.mercuryRecipientId || !profile.mercuryExternalAccountId) {
+      return;
+    }
+    const pendingW9Payouts = await storage.getWorkerPayoutsByStatus(profileId, "pending_w9");
+    if (pendingW9Payouts.length === 0) return;
+
+    const totalAmountCents = pendingW9Payouts.reduce((sum, p) => sum + (p.amount ?? 0), 0);
+    if (totalAmountCents <= 0) return;
+
+    const isInstantPayout = profile.instantPayoutEnabled || false;
+    let netAmountCents = totalAmountCents;
+    let instantPayoutFeeCents = 0;
+    if (isInstantPayout) {
+      instantPayoutFeeCents = Math.round(totalAmountCents * 0.01) + 30;
+      netAmountCents = totalAmountCents - instantPayoutFeeCents;
+    }
+
+    console.log(`[W9Release] Sending single grouped payment for worker ${profileId}: ${pendingW9Payouts.length} payouts, total $${(totalAmountCents / 100).toFixed(2)}${isInstantPayout ? `, net $${(netAmountCents / 100).toFixed(2)} (fee $${(instantPayoutFeeCents / 100).toFixed(2)})` : ""}`);
+
+    const { mercuryService } = await import("./services/mercury");
+    const payoutIds = pendingW9Payouts.map((p) => p.id).sort((a, b) => a - b);
+    const idempotencyKey = `w9-release-worker-${profileId}-${payoutIds.join("-")}`;
+    const payment = await mercuryService.sendPayment({
+      recipientId: profile.mercuryRecipientId,
+      amount: netAmountCents,
+      description: isInstantPayout
+        ? `W-9 release (${pendingW9Payouts.length} payouts) - Fee: $${(instantPayoutFeeCents / 100).toFixed(2)}`
+        : `W-9 release (${pendingW9Payouts.length} payouts)`,
+      idempotencyKey,
+      note: `Worker: ${profileId}, batch of ${pendingW9Payouts.length} payouts${isInstantPayout ? ", Instant" : ""}`,
+    });
+
+    const paymentStatus = payment.status === "completed" ? "completed" : "processing";
+    for (const payout of pendingW9Payouts) {
+      const pAmount = payout.amount ?? 0;
+      const proportionalFee = totalAmountCents > 0 && isInstantPayout
+        ? Math.round((instantPayoutFeeCents * pAmount) / totalAmountCents)
+        : undefined;
+      await storage.updateWorkerPayout(payout.id, {
+        status: paymentStatus,
+        mercuryPaymentId: payment.id,
+        mercuryPaymentStatus: payment.status,
+        isInstantPayout: isInstantPayout,
+        instantPayoutFee: proportionalFee,
+        originalAmount: pAmount,
+      });
+      if (payout.timesheetId) {
+        await storage.updateTimesheet(payout.timesheetId, { paymentStatus: "pending" });
+      }
+    }
+    console.log(`[W9Release] Done: 1 payment (${payment.id}) for ${pendingW9Payouts.length} payouts, worker ${profileId}`);
+  } catch (err: any) {
+    console.error(`[W9Release] Error for worker ${profileId}:`, err?.message ?? err);
+  } finally {
+    w9ReleaseInProgress.delete(profileId);
+  }
+}
 
 // Balance management constants (in cents)
 const COMPANY_TARGET_BALANCE_CENTS = 200000; // $2,000 minimum balance to maintain
@@ -417,6 +581,43 @@ export async function registerRoutes(
     res.json({ status: "ok", timestamp: new Date().toISOString() });
   });
 
+  // Worker payouts – register first so no other route shadows it (fixes 404 when client fetches recipient payments)
+  app.get("/api/worker/payouts", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    const profile = req.profile;
+    if (!profile || profile.role !== "worker") {
+      return res.status(403).json({ message: "Only workers can access payout information" });
+    }
+    try {
+      let payouts = await storage.getWorkerPayouts(profile.id);
+      const toSync = payouts.filter((p: any) => p.mercuryPaymentId && p.status !== "completed").slice(0, 5);
+      for (const p of toSync) {
+        const paymentId = p.mercuryPaymentId;
+        if (!paymentId) continue;
+        try {
+          const { mercuryService } = await import("./services/mercury");
+          const tx = await mercuryService.getTransaction(paymentId);
+          const txStatus = (tx?.status ?? "").toLowerCase();
+          if (txStatus === "completed" || txStatus === "sent" || txStatus === "posted") {
+            const completedAt = tx?.createdAt ? new Date(tx.createdAt) : new Date();
+            await storage.updateWorkerPayout(p.id, {
+              status: "completed",
+              mercuryPaymentStatus: tx?.status ?? "completed",
+              completedAt,
+            } as any);
+            payouts = await storage.getWorkerPayouts(profile.id);
+          }
+        } catch (syncErr: any) {
+          console.warn("[WorkerPayouts] Mercury sync for payout", p.id, ":", syncErr?.message ?? syncErr);
+        }
+      }
+      res.json(payouts);
+    } catch (err: any) {
+      console.error("[WorkerPayouts] Error:", err?.message ?? err);
+      res.status(200).json([]);
+    }
+  });
+
   // Map thumbnail proxy – serves job map image from our domain so email links match sending domain and API key is never in the email
   // For open jobs: allowed without auth (email previews). For in_progress/completed: require auth + job access.
   app.get("/api/map-thumbnail", async (req, res) => {
@@ -686,6 +887,71 @@ export async function registerRoutes(
           stack: error.stack,
         });
         res.status(500).json({ error: "Failed to fetch test accounts", message: error.message });
+      }
+    });
+
+    /** Seed open job + pending application for UI E2E (company hires → worker clocks in). No auth. */
+    app.post("/api/dev/e2e-flow-setup", async (_req, res) => {
+      try {
+        const [company] = await db.select().from(profiles).where(eq(profiles.role, "company")).limit(1);
+        if (!company) {
+          return res.status(400).json({ error: "No company profile in DB" });
+        }
+        const teamRows = await db.select({ ownerId: teams.ownerId }).from(teams);
+        const ownerIds = new Set(
+          teamRows.map((t) => t.ownerId).filter((id): id is number => typeof id === "number")
+        );
+        const workerCandidates = await db
+          .select()
+          .from(profiles)
+          .where(and(eq(profiles.role, "worker"), isNull(profiles.teamId)));
+        const worker =
+          workerCandidates.find((w) => !ownerIds.has(w.id)) ?? workerCandidates[0];
+        if (!worker) {
+          return res.status(400).json({ error: "No worker profile (try worker with team_id null)" });
+        }
+        await storage.updateProfile(company.id, {
+          depositAmount: Math.max(company.depositAmount ?? 0, 500_000),
+        });
+        const jobLat = "37.3382";
+        const jobLng = "-121.8863";
+        const start = new Date();
+        start.setDate(start.getDate() - 1);
+        start.setHours(0, 0, 0, 0);
+        const title = `E2E Flow ${Date.now()}`;
+        const job = await storage.createJob({
+          companyId: company.id,
+          title,
+          description: "E2E seeded job",
+          location: "1 Apple Park Way, Cupertino, CA",
+          locationName: "E2E site",
+          trade: "General Labor",
+          hourlyRate: 2500,
+          maxWorkersNeeded: 3,
+          startDate: start,
+          jobType: "one_time",
+          isOnDemand: false,
+          latitude: jobLat,
+          longitude: jobLng,
+        });
+        const application = await storage.createApplication({
+          jobId: job.id,
+          workerId: worker.id,
+          message: "E2E application",
+        });
+        res.json({
+          jobId: job.id,
+          applicationId: application.id,
+          companyUserId: company.userId,
+          workerUserId: worker.userId,
+          companyProfileId: company.id,
+          workerProfileId: worker.id,
+          jobLat: parseFloat(jobLat),
+          jobLng: parseFloat(jobLng),
+        });
+      } catch (e: any) {
+        console.error("[e2e-flow-setup]", e);
+        res.status(500).json({ error: String(e?.message || e) });
       }
     });
 
@@ -1635,7 +1901,8 @@ export async function registerRoutes(
     if (userId === "me") {
       if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
       const profile = req.profile;
-      if (!profile) return res.status(404).json({ message: "Profile not found" });
+      // Match UUID branch: 200 + null when no row yet (onboarding) so clients don’t treat as hard error
+      if (!profile) return res.status(200).json(null);
       return res.json(profile);
     }
     // Else: numeric param → profile id (e.g. company); otherwise → user id (UUID)
@@ -2045,13 +2312,19 @@ export async function registerRoutes(
     try {
       const id = Number(req.params.id);
       
-      // Pre-process date strings to Date objects before validation
+      // Pre-process date strings to Date objects and decimal fields to strings before validation
       const processedBody = { ...req.body };
       const dateFields = ['contractSignedAt', 'faceVerifiedAt', 'insuranceStartDate', 'insuranceEndDate', 'w9UploadedAt'];
       for (const field of dateFields) {
         if (typeof processedBody[field] === 'string') {
           processedBody[field] = new Date(processedBody[field]);
         }
+      }
+      if (processedBody.latitude !== undefined && processedBody.latitude !== null && typeof processedBody.latitude === 'number') {
+        processedBody.latitude = String(processedBody.latitude);
+      }
+      if (processedBody.longitude !== undefined && processedBody.longitude !== null && typeof processedBody.longitude === 'number') {
+        processedBody.longitude = String(processedBody.longitude);
       }
       
       // Validate bio if it's being updated
@@ -2089,14 +2362,13 @@ export async function registerRoutes(
         // Never persist client-sent w9UploadedAt; we only set it after successful Mercury upload
         delete (input as any).w9UploadedAt;
         
-        // Resolve recipient from the same profile that had the bank step (auth user's profile)
-        const user = req.user as any;
+        // Resolve recipient: prefer fresh DB profile (currentProfile) when updating the same user's profile,
+        // so we recognize Mercury recipient even if session cache is stale after add-bank.
         const profileFromBankStep = req.profile ?? null;
-        recipientIdForW9 = profileFromBankStep?.mercuryRecipientId ?? currentProfile?.mercuryRecipientId ?? null;
-        console.log(`[ProfileUpdate] W-9 flow: profile id=${id}, recipientId from bank-step profile=${profileFromBankStep?.id ?? 'n/a'} -> ${recipientIdForW9 ?? 'null'}`);
+        const sameProfile = profileFromBankStep && id === profileFromBankStep.id;
+        recipientIdForW9 = (sameProfile ? (currentProfile?.mercuryRecipientId ?? profileFromBankStep?.mercuryRecipientId) : (profileFromBankStep?.mercuryRecipientId ?? currentProfile?.mercuryRecipientId)) ?? null;
+        console.log(`[ProfileUpdate] W-9 flow: profile id=${id}, sameProfile=${sameProfile}, recipientId (currentProfile/req.profile)=${currentProfile?.mercuryRecipientId ?? 'null'}/${profileFromBankStep?.mercuryRecipientId ?? 'null'} -> ${recipientIdForW9 ?? 'null'}`);
         try {
-          const { validateW9Form } = await import("./services/w9-validator");
-          
           if (input.w9DocumentUrl.startsWith("data:")) {
             const matches = input.w9DocumentUrl.match(/^data:([^;]+);base64,(.+)$/);
             if (matches) {
@@ -2112,6 +2384,7 @@ export async function registerRoutes(
           else if (w9MimeType.includes("png")) w9FileName = "w9.png";
           else if (w9MimeType.includes("jpeg") || w9MimeType.includes("jpg")) w9FileName = "w9.jpg";
           
+          const { validateW9Form } = await import("./services/w9-validator");
           w9ValidationResult = await validateW9Form(w9FileBuffer, w9MimeType);
           if (!w9ValidationResult.isValid) {
             console.log(`[ProfileUpdate] W-9 validation failed for worker ${id}:`, w9ValidationResult.errors);
@@ -2124,16 +2397,8 @@ export async function registerRoutes(
           console.error(`[ProfileUpdate] W-9 validation error: ${w9Error.message}`);
         }
         
-        // Require Mercury recipient (same one created in bank step) to attach W-9
-        if (currentProfile?.role === 'worker' && !recipientIdForW9) {
-          console.log(`[ProfileUpdate] W-9 rejected: no Mercury recipient for worker ${id} (connect bank first)`);
-          return res.status(400).json({
-            message: "Connect your bank account first so we can attach your W-9 to Mercury.",
-            field: "w9DocumentUrl",
-          });
-        }
-        
-        // Upload to Mercury and record success only; remove document from input so we never persist it
+        // If worker has a Mercury recipient: attach W-9 to Mercury and set w9UploadedAt (do not persist document).
+        // If no recipient: persist w9DocumentUrl so we can attach when they connect bank in Payout Settings.
         if (recipientIdForW9 && w9FileBuffer) {
           try {
             console.log(`[ProfileUpdate] Attaching W-9 to Mercury recipient ${recipientIdForW9} for profile ${id} (file: ${w9FileName}, ${w9FileBuffer.length} bytes)`);
@@ -2153,20 +2418,100 @@ export async function registerRoutes(
               console.log(`[ProfileUpdate] Persisting Mercury recipient ${recipientIdForW9} on profile ${id} (from prior bank-connect step)`);
             }
             console.log(`[ProfileUpdate] W-9 attached successfully to Mercury recipient ${recipientIdForW9}`);
+            delete (input as any).w9DocumentUrl; // do not persist; we attached to Mercury
           } catch (mercuryErr: any) {
-            console.error(`[ProfileUpdate] Mercury W-9 attachment failed for worker ${id}:`, mercuryErr?.message ?? mercuryErr);
-            return res.status(500).json({
-              message: mercuryErr?.message || "Failed to attach W-9 to Mercury. Try again.",
+            const status = mercuryErr?.status ?? mercuryErr?.statusCode;
+            console.error(`[ProfileUpdate] Mercury W-9 attachment failed for worker ${id}:`, {
+              status,
+              statusCode: mercuryErr?.statusCode,
+              message: mercuryErr?.message,
+              details: mercuryErr?.details,
+              code: mercuryErr?.code,
+            });
+            const is404 = status === 404 || mercuryErr?.details?.errors?.notFound;
+            const is403 = status === 403;
+            // 404 = recipient not found → clear and ask to reconnect bank. 403 = permission/sandbox limit → do not clear recipient.
+            let message: string;
+            if (is404) {
+              message = "Your bank connection is no longer valid. Please go to Payout Settings and connect your bank again, then upload your W-9.";
+              try {
+                await storage.updateProfile(id, {
+                  mercuryRecipientId: null,
+                  mercuryExternalAccountId: null,
+                  bankAccountLinked: false,
+                });
+                clearProfileSnapshot(req);
+                console.log(`[ProfileUpdate] Cleared recipient and bankAccountLinked for profile ${id} (W-9 404)`);
+              } catch (clearErr: any) {
+                console.error(`[ProfileUpdate] Failed to clear recipient after Mercury W-9 error:`, clearErr?.message ?? clearErr);
+              }
+            } else if (is403) {
+              message = "We couldn't attach your W-9 (Mercury returned a permission error). Your bank connection is fine. You can add your W-9 in the Mercury dashboard or try again later.";
+            } else {
+              message = "We couldn't attach your W-9 to your bank account. Please go to Payout Settings, reconnect your bank, then upload your W-9 again.";
+              try {
+                await storage.updateProfile(id, {
+                  mercuryRecipientId: null,
+                  mercuryExternalAccountId: null,
+                  bankAccountLinked: false,
+                });
+                clearProfileSnapshot(req);
+                console.log(`[ProfileUpdate] Cleared recipient and bankAccountLinked for profile ${id} (W-9 other error)`);
+              } catch (clearErr: any) {
+                console.error(`[ProfileUpdate] Failed to clear recipient after Mercury W-9 error:`, clearErr?.message ?? clearErr);
+              }
+            }
+            return res.status(400).json({
+              message,
               field: "w9DocumentUrl",
             });
           }
+        } else if (currentProfile?.role === 'worker' && !recipientIdForW9 && input.w9DocumentUrl) {
+          // No recipient yet: persist W-9 so we can attach when they connect bank (payout-account flow)
+          const maxStoredW9Bytes = 4 * 1024 * 1024; // 4MB to avoid huge DB writes and timeouts
+          const w9Length = typeof input.w9DocumentUrl === "string" ? Buffer.byteLength(input.w9DocumentUrl, "utf8") : 0;
+          if (w9Length > maxStoredW9Bytes) {
+            console.log(`[ProfileUpdate] W-9 too large to store (${(w9Length / 1024).toFixed(0)}KB); max ${maxStoredW9Bytes / 1024 / 1024}MB`);
+            return res.status(400).json({
+              message: "W-9 file is too large. Please use a smaller file (under 3MB) or connect your bank first and upload from the W-9 tab.",
+              field: "w9DocumentUrl",
+            });
+          }
+          console.log(`[ProfileUpdate] Storing W-9 for worker ${id} (${(w9Length / 1024).toFixed(0)}KB); will attach to Mercury when they connect bank.`);
+          // keep input.w9DocumentUrl so updateProfile persists it
+        } else {
+          delete (input as any).w9DocumentUrl;
         }
-        
-        // Never persist the document URL
-        delete (input as any).w9DocumentUrl;
       }
       
-      const profile = await storage.updateProfile(id, input);
+      // Build plain updates object so Drizzle never gets "No values to set" (parsed input may be non-extensible)
+      const updates = { ...input } as Record<string, unknown>;
+      if (w9AttachmentUploadedThisRequest) {
+        delete updates.w9DocumentUrl; // do not persist; we attached to Mercury
+        updates.w9UploadedAt = new Date();
+        if (!currentProfile?.mercuryRecipientId && recipientIdForW9) {
+          updates.mercuryRecipientId = recipientIdForW9;
+          updates.mercuryExternalAccountId = recipientIdForW9;
+        }
+      }
+      // When no recipient we keep w9DocumentUrl in updates so it is persisted for later attach
+      if (Object.keys(updates).length === 0) {
+        return res.status(400).json({ message: "No profile fields to update.", field: "w9DocumentUrl" });
+      }
+      let profile: Awaited<ReturnType<typeof storage.updateProfile>>;
+      try {
+        profile = await storage.updateProfile(id, updates as Partial<typeof input>);
+      } catch (updateErr: any) {
+        console.error("[ProfileUpdate] storage.updateProfile failed:", updateErr?.message ?? updateErr);
+        console.error("[ProfileUpdate] update stack:", updateErr?.stack);
+        return res.status(500).json({
+          message: updateErr?.message || "Failed to save profile. Please try again.",
+        });
+      }
+      if (!profile) {
+        console.error(`[ProfileUpdate] No profile returned for id=${id}`);
+        return res.status(404).json({ message: "Profile not found or update had no effect." });
+      }
       if (req.profile && id === req.profile.id) clearProfileSnapshot(req);
 
       const w9WasJustUploaded = Boolean(
@@ -2272,72 +2617,21 @@ export async function registerRoutes(
         }
       }
       
-      // If W-9 was just uploaded, process any pending_w9 payouts
-      if (w9WasJustUploaded && profile.role === 'worker') {
-        console.log(`[ProfileUpdate] W-9 uploaded for worker ${profile.id} - processing pending payouts`);
-        try {
+      // If W-9 was just uploaded (or we attached in this request), schedule pending_w9 payout release in background (avoids request timeout)
+      const shouldReleaseW9Payouts = (w9WasJustUploaded || w9AttachmentUploadedThisRequest) && profile.role === 'worker';
+      let scheduleW9Release = false;
+      if (shouldReleaseW9Payouts) {
+        if (profile.mercuryRecipientId && profile.mercuryExternalAccountId) {
+          const pendingCount = (await storage.getWorkerPayoutsByStatus(profile.id, "pending_w9")).length;
+          if (pendingCount > 0) {
+            console.log(`[ProfileUpdate] W-9 uploaded for worker ${profile.id} - scheduling background release for ${pendingCount} payouts`);
+            scheduleW9Release = true;
+          }
+        } else {
+          // W-9 uploaded but no bank: move payouts to pending_bank_setup (quick, keep synchronous)
           const pendingW9Payouts = await storage.getWorkerPayoutsByStatus(profile.id, "pending_w9");
-          console.log(`[ProfileUpdate] Found ${pendingW9Payouts.length} pending W-9 payouts for worker ${profile.id}`);
-          
-          if (pendingW9Payouts.length > 0 && profile.mercuryRecipientId && profile.mercuryExternalAccountId) {
-            const { mercuryService } = await import("./services/mercury");
-            
-            for (const payout of pendingW9Payouts) {
-              try {
-                console.log(`[ProfileUpdate] Processing W-9 payout ${payout.id} - $${(payout.amount/100).toFixed(2)}`);
-                
-                // Check if instant payout is enabled and calculate fees
-                const isInstantPayout = profile.instantPayoutEnabled || false;
-                let payoutAmount = payout.amount;
-                let instantPayoutFee = 0;
-                let originalAmount = payout.amount;
-                
-                if (isInstantPayout) {
-                  // Calculate fee: 1% + $0.30 (30 cents)
-                  instantPayoutFee = Math.round(payout.amount * 0.01) + 30; // 1% in cents + 30 cents
-                  payoutAmount = payout.amount - instantPayoutFee;
-                  originalAmount = payout.amount;
-                  console.log(`[ProfileUpdate] Instant payout enabled - Original: $${(originalAmount/100).toFixed(2)}, Fee: $${(instantPayoutFee/100).toFixed(2)}, Net: $${(payoutAmount/100).toFixed(2)}`);
-                }
-                
-                // ACH credit: Send funds FROM platform account TO worker's bank
-                // Use net amount after fee deduction for instant payouts
-                const payment = await mercuryService.sendPayment({
-                  recipientId: profile.mercuryRecipientId!,
-                  amount: payoutAmount, // Use net amount after fee
-                  description: isInstantPayout 
-                    ? `Instant W-9 release - ${payout.description || 'Timesheet payout'} (Fee: $${(instantPayoutFee/100).toFixed(2)})`
-                    : `W-9 release - ${payout.description || 'Timesheet payout'}`,
-                  idempotencyKey: `w9-release-${payout.id}-${Date.now()}`,
-                  note: `Worker: ${profile.id}, Payout: ${payout.id}${isInstantPayout ? ', Instant' : ''}`,
-                });
-                
-                // Update payout record with fee information
-                await storage.updateWorkerPayout(payout.id, {
-                  status: payment.status === "completed" ? "completed" : "processing",
-                  mercuryPaymentId: payment.id,
-                  mercuryPaymentStatus: payment.status,
-                  amount: payoutAmount, // Update to net amount after fee
-                  isInstantPayout: isInstantPayout,
-                  instantPayoutFee: isInstantPayout ? instantPayoutFee : undefined,
-                  originalAmount: isInstantPayout ? originalAmount : undefined,
-                });
-                
-                // Update timesheet payment status
-                if (payout.timesheetId) {
-                  await storage.updateTimesheet(payout.timesheetId, {
-                    paymentStatus: "pending", // Will become completed via webhook
-                  });
-                }
-                
-                console.log(`[ProfileUpdate] Released W-9 payout ${payout.id} - Payment:`, payment.id);
-              } catch (payoutErr) {
-                console.error(`[ProfileUpdate] Failed to release W-9 payout ${payout.id}:`, payoutErr);
-              }
-            }
-          } else if (pendingW9Payouts.length > 0 && (!profile.mercuryRecipientId || !profile.mercuryExternalAccountId)) {
-            // W-9 uploaded but no bank account - change status to pending_bank_setup
-            console.log(`[ProfileUpdate] W-9 uploaded but no bank account - changing status to pending_bank_setup`);
+          if (pendingW9Payouts.length > 0) {
+            console.log(`[ProfileUpdate] W-9 uploaded but no bank - changing ${pendingW9Payouts.length} to pending_bank_setup`);
             for (const payout of pendingW9Payouts) {
               await storage.updateWorkerPayout(payout.id, {
                 status: "pending_bank_setup",
@@ -2345,8 +2639,6 @@ export async function registerRoutes(
               });
             }
           }
-        } catch (w9Err) {
-          console.error("[ProfileUpdate] Error processing W-9 payouts:", w9Err);
         }
       }
 
@@ -2393,16 +2685,26 @@ export async function registerRoutes(
           }
         }
       }
+
+      if (scheduleW9Release) {
+        setImmediate(() => runW9PayoutReleaseForWorker(profile.id).catch((e: any) => console.error("[ProfileUpdate] Background W-9 release error:", e?.message ?? e)));
+      }
       
       res.json(profile);
-    } catch (err) {
+    } catch (err: any) {
       if (err instanceof z.ZodError) {
         return res.status(400).json({
           message: err.errors[0].message,
           field: err.errors[0].path.join('.'),
         });
       }
-      throw err;
+      console.error("[ProfileUpdate] Error:", err?.message ?? err);
+      console.error("[ProfileUpdate] Stack:", err?.stack);
+      if (!res.headersSent) {
+        return res.status(500).json({
+          message: err?.message || "Failed to update profile. Please try again.",
+        });
+      }
     }
   });
 
@@ -2430,9 +2732,11 @@ export async function registerRoutes(
       trade: req.query.trade as string,
       location: req.query.location as string,
     };
+    // Dev only: skip location filter → fetch all open jobs (no trade/location filter on initial query)
+    const skipLocationFilter = process.env.NODE_ENV === "development" && req.query.skipLocationFilter === "1";
     
-    // Get all open jobs
-    const allJobs = await storage.getJobs(filters);
+    // Get all open jobs (when skipLocationFilter, do not pass trade/location so we get full list)
+    const allJobs = await storage.getJobs(skipLocationFilter ? undefined : filters);
     
     // Get worker's dismissed jobs
     const dismissedJobIds = await storage.getDismissedJobs(profile.id);
@@ -2449,10 +2753,11 @@ export async function registerRoutes(
       combinedSkillsets.push(...(profile as any).skillsets);
     }
     
-    // Check if worker has a team and get team members' skillsets
+    // Check if worker has a team and get team members' skillsets and locations
     const team = await storage.getWorkerTeam(profile.id);
+    let teamMembers: Awaited<ReturnType<typeof storage.getWorkerTeamMembers>> = [];
     if (team) {
-      const teamMembers = await storage.getWorkerTeamMembers(team.id);
+      teamMembers = await storage.getWorkerTeamMembers(team.id);
       for (const member of teamMembers) {
         if (member.status === 'active' && (member as any).skillsets && Array.isArray((member as any).skillsets)) {
           combinedSkillsets.push(...(member as any).skillsets);
@@ -2463,12 +2768,54 @@ export async function registerRoutes(
     // Remove duplicates
     combinedSkillsets = Array.from(new Set(combinedSkillsets));
     
-    // Get worker's coordinates for geospatial filtering
-    const workerLatRaw = profile.latitude ? parseFloat(profile.latitude) : NaN;
-    const workerLngRaw = profile.longitude ? parseFloat(profile.longitude) : NaN;
-    const workerLat = Number.isFinite(workerLatRaw) ? workerLatRaw : null;
-    const workerLng = Number.isFinite(workerLngRaw) ? workerLngRaw : null;
-    const maxDistanceMiles = 50; // Default radius in miles
+    // Use fresh profile from DB for location (avoids stale session cache so saved address lat/lng are always used)
+    const freshProfile = await storage.getProfile(profile.id);
+    const profileForLocation = freshProfile ?? profile;
+    
+    // Reference points for geospatial filtering: admin + teammates. Use saved lat/lng when present; otherwise geocode from address so OH admin + Monroe OH teammate are included (not just CA teammate).
+    const referencePoints: Array<{ lat: number; lng: number }> = [];
+    const workerLatRaw = profileForLocation?.latitude != null ? parseFloat(String(profileForLocation.latitude)) : NaN;
+    const workerLngRaw = profileForLocation?.longitude != null ? parseFloat(String(profileForLocation.longitude)) : NaN;
+    if (isPlausibleLatLng(workerLatRaw, workerLngRaw)) {
+      referencePoints.push({ lat: workerLatRaw, lng: workerLngRaw });
+    } else {
+      const addr = (profileForLocation?.address || '').trim();
+      const city = (profileForLocation?.city || '').trim();
+      const state = (profileForLocation?.state || '').trim();
+      const zip = (profileForLocation?.zipCode || '').trim();
+      if (addr || city || state || zip) {
+        const coords = addr
+          ? await geocodeFullAddress(addr, city || '', state || '', zip || '')
+          : await geocodeAddress([city, state, zip].filter(Boolean).join(', '));
+        if (coords) {
+          referencePoints.push({ lat: parseFloat(coords.latitude), lng: parseFloat(coords.longitude) });
+        }
+      }
+    }
+    for (const m of teamMembers) {
+      if (m.status !== 'active') continue;
+      const hasAddress = !!((m.address || '').trim() || (m.city || '').trim() || (m.state || '').trim() || (m.zipCode || '').trim());
+      if (!hasAddress) continue;
+      const mlat = m.latitude != null ? parseFloat(String(m.latitude)) : NaN;
+      const mlng = m.longitude != null ? parseFloat(String(m.longitude)) : NaN;
+      if (isPlausibleLatLng(mlat, mlng)) {
+        referencePoints.push({ lat: mlat, lng: mlng });
+      } else {
+        const addr = (m.address || '').trim();
+        const city = (m.city || '').trim();
+        const state = (m.state || '').trim();
+        const zip = (m.zipCode || '').trim();
+        const coords = addr
+          ? await geocodeFullAddress(addr, city, state, zip)
+          : await geocodeAddress([city, state, zip].filter(Boolean).join(', '));
+        if (coords) {
+          referencePoints.push({ lat: parseFloat(coords.latitude), lng: parseFloat(coords.longitude) });
+        }
+      }
+    }
+    // Radius from query: 1–50 mi from admin or any teammate; default 50
+    const rawMax = req.query.maxDistanceMiles != null ? Number(req.query.maxDistanceMiles) : NaN;
+    const maxDistanceMiles = Number.isFinite(rawMax) ? Math.min(50, Math.max(1, rawMax)) : 50;
     
     // Filter jobs
     const filteredJobs = allJobs.filter(job => {
@@ -2486,42 +2833,54 @@ export async function registerRoutes(
       // Only show open jobs
       if (job.status !== 'open') return false;
       
-      // Exclude expired jobs (start date in the past)
+      // Hide jobs 48 hours after start date (one-day, on-demand, recurring): workers have 48hrs after start to find and apply.
       if (job.startDate) {
-        const jobStartDate = new Date(job.startDate);
-        const now = new Date();
-        // Reset time to compare just dates (job is expired if start date is before today)
-        now.setHours(0, 0, 0, 0);
-        if (jobStartDate < now) return false;
+        const jobStart = new Date(job.startDate);
+        const cutoff = new Date(jobStart.getTime() + 48 * 60 * 60 * 1000);
+        if (Date.now() > cutoff.getTime()) return false;
       }
       
-      // Geospatial filtering: only show jobs within worker's territory
-      if (workerLat !== null && workerLng !== null) {
-        const jobLatRaw = job.latitude ? parseFloat(job.latitude) : NaN;
-        const jobLngRaw = job.longitude ? parseFloat(job.longitude) : NaN;
+      // Geospatial filtering: show jobs within maxDistanceMiles of any reference point (admin or teammate with address)
+      // In development, skip when skipLocationFilter=1 so dev can see all jobs
+      if (referencePoints.length > 0 && !skipLocationFilter) {
+        const jobLatRaw = job.latitude != null ? parseFloat(String(job.latitude)) : NaN;
+        const jobLngRaw = job.longitude != null ? parseFloat(String(job.longitude)) : NaN;
         const jobLat = Number.isFinite(jobLatRaw) ? jobLatRaw : null;
         const jobLng = Number.isFinite(jobLngRaw) ? jobLngRaw : null;
         
-        if (jobLat !== null && jobLng !== null) {
-          const distanceMeters = calculateDistanceMeters(workerLat, workerLng, jobLat, jobLng);
-          const distanceMiles = distanceMeters / 1609.34;
-          
-          // Exclude jobs outside the worker's service radius
-          if (distanceMiles > maxDistanceMiles) return false;
-          
-          // Store distance for sorting
-          (job as any)._distanceMiles = distanceMiles;
-        } else {
-          // Job doesn't have coordinates - fall back to city/state matching
-          const workerCity = (profile.city || '').toLowerCase().trim();
-          const workerState = (profile.state || '').toLowerCase().trim();
-          const jobCity = (job.city || '').toLowerCase().trim();
-          const jobState = (job.state || '').toLowerCase().trim();
-          
-          // If we can't match by location, exclude job unless city/state matches
-          if (workerState && jobState && workerState !== jobState) {
-            return false;
+        if (jobLat !== null && jobLng !== null && isPlausibleLatLng(jobLat, jobLng)) {
+          let minDistanceMiles = Infinity;
+          for (const ref of referencePoints) {
+            const distanceMeters = calculateDistanceMeters(ref.lat, ref.lng, jobLat, jobLng);
+            const distanceMiles = distanceMeters / METERS_PER_MILE;
+            if (distanceMiles < minDistanceMiles) minDistanceMiles = distanceMiles;
           }
+          if (minDistanceMiles > maxDistanceMiles) return false;
+          (job as any)._distanceMiles = minDistanceMiles;
+        } else {
+          // Job missing or junk coordinates — same-state fallback (use DB profile, not session)
+          const workerState = (profileForLocation.state || '').toLowerCase().trim();
+          const jobState = (job.state || '').toLowerCase().trim();
+          if (workerState && jobState && workerState !== jobState) return false;
+        }
+      } else if (referencePoints.length === 0 && !skipLocationFilter) {
+        // No usable reference points — same-state fallback
+        const workerState = (profileForLocation.state || '').toLowerCase().trim();
+        const jobState = (job.state || '').toLowerCase().trim();
+        if (workerState && jobState && workerState !== jobState) return false;
+        // If worker has no state either, show all jobs (better than showing nothing)
+      }
+      // When skipLocationFilter (dev): still attach _distanceMiles for sorting when we have refs and job coords
+      if (referencePoints.length > 0 && skipLocationFilter && job.latitude != null && job.longitude != null) {
+        const jobLat = parseFloat(String(job.latitude));
+        const jobLng = parseFloat(String(job.longitude));
+        if (isPlausibleLatLng(jobLat, jobLng)) {
+          let minDistanceMiles = Infinity;
+          for (const ref of referencePoints) {
+            const distanceMiles = calculateDistanceMeters(ref.lat, ref.lng, jobLat, jobLng) / METERS_PER_MILE;
+            if (distanceMiles < minDistanceMiles) minDistanceMiles = distanceMiles;
+          }
+          (job as any)._distanceMiles = minDistanceMiles;
         }
       }
       
@@ -2570,15 +2929,296 @@ export async function registerRoutes(
       delete (job as any)._distanceMiles;
     });
 
+    // Pagination params first: when limit is set (worker dashboard infinite scroll), only geocode + enrich
+    // the current page. Doing all jobs first caused multi-minute work and client timeouts on mobile.
+    const limitParam = req.query.limit != null ? parseInt(String(req.query.limit), 10) : 0;
+    const cursorParam = req.query.cursor != null ? parseInt(String(req.query.cursor), 10) : 0;
+    const usePagination = Number.isFinite(limitParam) && limitParam > 0;
+
+    let jobsToHydrate = sortedJobs;
+    let pageStartIndex = 0;
+    let pageLimit = 0;
+    if (usePagination) {
+      pageLimit = Math.min(100, Math.max(1, limitParam));
+      pageStartIndex = cursorParam
+        ? Math.max(0, sortedJobs.findIndex((j: any) => j.id === cursorParam) + 1)
+        : 0;
+      jobsToHydrate = sortedJobs.slice(pageStartIndex, pageStartIndex + pageLimit);
+    }
+
+    // Geocode jobs that have address but no usable lat/lng (align with client parseJobLatLng / null-island reject)
+    const hasCoords = (j: (typeof sortedJobs)[0]) => {
+      const lat = j.latitude != null ? parseFloat(String(j.latitude)) : NaN;
+      const lng = j.longitude != null ? parseFloat(String(j.longitude)) : NaN;
+      return Number.isFinite(lat) && Number.isFinite(lng) && isPlausibleLatLng(lat, lng);
+    };
+    for (const job of jobsToHydrate) {
+      if (hasCoords(job)) continue;
+      const geoQuery = buildJobGeocodeQuery(job);
+      if (!geoQuery) continue;
+      const coords = await geocodeAddress(geoQuery);
+      if (coords) {
+        (job as any).latitude = coords.latitude;
+        (job as any).longitude = coords.longitude;
+        try {
+          await storage.updateJob(job.id, { latitude: coords.latitude, longitude: coords.longitude });
+        } catch (e) {
+          // Non-fatal: response still has coords for this request
+        }
+      }
+    }
+
     // Enrich each job with location representative name (contact/team member for location)
     const enrichedJobs = await Promise.all(
-      sortedJobs.map(async (job) => {
+      jobsToHydrate.map(async (job) => {
         const locationRepresentativeName = await getLocationRepresentativeName(job, null);
         return { ...job, locationRepresentativeName };
       })
     );
-    
+
+    if (usePagination) {
+      const page = enrichedJobs;
+      const nextCursor =
+        page.length === pageLimit && pageStartIndex + pageLimit < sortedJobs.length
+          ? (page[page.length - 1] as any).id
+          : null;
+      return res.json({ jobs: page, nextCursor });
+    }
+
     res.json(enrichedJobs);
+  });
+
+  /**
+   * Diagnostics for "why don't I see jobs?" — same rules as GET /api/jobs/find-work.
+   * - Workers: always inspect their own profile (no params).
+   * - Admins (ADMIN_EMAILS): optional ?workerProfileId=123 to inspect another worker.
+   */
+  app.get("/api/jobs/find-work/debug", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    const session = req.profile;
+    if (!session) return res.status(401).json({ message: "Unauthorized" });
+
+    const adminRaw = process.env.ADMIN_EMAILS || process.env.ADMIN_EMAIL || "";
+    const adminEmails = new Set(
+      adminRaw.split(",").map((e: string) => e.trim().toLowerCase()).filter(Boolean)
+    );
+    const requesterEmail = ((req.user as any)?.claims?.email as string | undefined)?.toLowerCase();
+    const isAdmin = requesterEmail != null && adminEmails.has(requesterEmail);
+
+    const widParam = req.query.workerProfileId != null ? parseInt(String(req.query.workerProfileId), 10) : NaN;
+    let workerId: number;
+    if (Number.isFinite(widParam) && widParam > 0) {
+      if (!isAdmin) return res.status(403).json({ message: "workerProfileId is admin-only" });
+      workerId = widParam;
+    } else {
+      if (session.role !== "worker") {
+        return res.status(403).json({ message: "Workers only, or pass workerProfileId as an admin" });
+      }
+      workerId = session.id;
+    }
+
+    const profile = await storage.getProfile(workerId);
+    if (!profile || profile.role !== "worker") {
+      return res.status(404).json({ message: "Worker profile not found" });
+    }
+
+    const skipLocationFilter =
+      process.env.NODE_ENV === "development" && req.query.skipLocationFilter === "1";
+    const rawMax = req.query.maxDistanceMiles != null ? Number(req.query.maxDistanceMiles) : NaN;
+    const maxDistanceMiles = Number.isFinite(rawMax) ? Math.min(50, Math.max(1, rawMax)) : 50;
+    const filters = {
+      trade: req.query.trade as string,
+      location: req.query.location as string,
+    };
+    const allJobs = await storage.getJobs(skipLocationFilter ? undefined : filters);
+
+    const dismissedJobIds = await storage.getDismissedJobs(profile.id);
+    const workerApplications = await storage.getWorkerApplications(profile.id);
+    const appliedJobIds = workerApplications.map((a) => a.jobId);
+
+    const freshProfile = await storage.getProfile(profile.id);
+    const profileForLocation = freshProfile ?? profile;
+
+    const team = await storage.getWorkerTeam(profile.id);
+    let teamMembers: Awaited<ReturnType<typeof storage.getWorkerTeamMembers>> = [];
+    if (team) {
+      teamMembers = await storage.getWorkerTeamMembers(team.id);
+    }
+
+    const referencePoints: Array<{ lat: number; lng: number }> = [];
+    const workerLatRaw =
+      profileForLocation?.latitude != null ? parseFloat(String(profileForLocation.latitude)) : NaN;
+    const workerLngRaw =
+      profileForLocation?.longitude != null ? parseFloat(String(profileForLocation.longitude)) : NaN;
+    if (isPlausibleLatLng(workerLatRaw, workerLngRaw)) {
+      referencePoints.push({ lat: workerLatRaw, lng: workerLngRaw });
+    } else {
+      const addr = (profileForLocation?.address || "").trim();
+      const city = (profileForLocation?.city || "").trim();
+      const state = (profileForLocation?.state || "").trim();
+      const zip = (profileForLocation?.zipCode || "").trim();
+      if (addr || city || state || zip) {
+        const coords = addr
+          ? await geocodeFullAddress(addr, city || "", state || "", zip || "")
+          : await geocodeAddress([city, state, zip].filter(Boolean).join(", "));
+        if (coords) {
+          referencePoints.push({ lat: parseFloat(coords.latitude), lng: parseFloat(coords.longitude) });
+        }
+      }
+    }
+    for (const m of teamMembers) {
+      if (m.status !== "active") continue;
+      const hasAddress = !!(
+        (m.address || "").trim() ||
+        (m.city || "").trim() ||
+        (m.state || "").trim() ||
+        (m.zipCode || "").trim()
+      );
+      if (!hasAddress) continue;
+      const mlat = m.latitude != null ? parseFloat(String(m.latitude)) : NaN;
+      const mlng = m.longitude != null ? parseFloat(String(m.longitude)) : NaN;
+      if (isPlausibleLatLng(mlat, mlng)) {
+        referencePoints.push({ lat: mlat, lng: mlng });
+      } else {
+        const addr = (m.address || "").trim();
+        const city = (m.city || "").trim();
+        const state = (m.state || "").trim();
+        const zip = (m.zipCode || "").trim();
+        const coords = addr
+          ? await geocodeFullAddress(addr, city, state, zip)
+          : await geocodeAddress([city, state, zip].filter(Boolean).join(", "));
+        if (coords) {
+          referencePoints.push({ lat: parseFloat(coords.latitude), lng: parseFloat(coords.longitude) });
+        }
+      }
+    }
+
+    const SAMPLE_CAP = 12;
+    const pushSample = (arr: number[], id: number) => {
+      if (arr.length < SAMPLE_CAP) arr.push(id);
+    };
+
+    const counts: Record<string, number> = {
+      dismissed: 0,
+      applied: 0,
+      fully_staffed: 0,
+      not_open: 0,
+      past_start_cutoff: 0,
+      outside_radius: 0,
+      state_mismatch: 0,
+      passed: 0,
+    };
+    const samples: Record<string, number[]> = {
+      dismissed: [],
+      applied: [],
+      fully_staffed: [],
+      not_open: [],
+      past_start_cutoff: [],
+      outside_radius: [],
+      state_mismatch: [],
+      passed: [],
+    };
+
+    const inc = (key: keyof typeof counts, jobId: number) => {
+      counts[key]++;
+      pushSample(samples[key], jobId);
+    };
+
+    for (const job of allJobs) {
+      if (dismissedJobIds.includes(job.id)) {
+        inc("dismissed", job.id);
+        continue;
+      }
+      if (appliedJobIds.includes(job.id)) {
+        inc("applied", job.id);
+        continue;
+      }
+      const maxWorkers = job.maxWorkersNeeded || 1;
+      const workersHired = job.workersHired || 0;
+      if (workersHired >= maxWorkers) {
+        inc("fully_staffed", job.id);
+        continue;
+      }
+      if (job.status !== "open") {
+        inc("not_open", job.id);
+        continue;
+      }
+      if (job.startDate) {
+        const jobStart = new Date(job.startDate);
+        const cutoff = new Date(jobStart.getTime() + 48 * 60 * 60 * 1000);
+        if (Date.now() > cutoff.getTime()) {
+          inc("past_start_cutoff", job.id);
+          continue;
+        }
+      }
+
+      if (referencePoints.length > 0 && !skipLocationFilter) {
+        const jobLatRaw = job.latitude != null ? parseFloat(String(job.latitude)) : NaN;
+        const jobLngRaw = job.longitude != null ? parseFloat(String(job.longitude)) : NaN;
+        const jobLat = Number.isFinite(jobLatRaw) ? jobLatRaw : null;
+        const jobLng = Number.isFinite(jobLngRaw) ? jobLngRaw : null;
+
+        if (jobLat !== null && jobLng !== null && isPlausibleLatLng(jobLat, jobLng)) {
+          let minDistanceMiles = Infinity;
+          for (const ref of referencePoints) {
+            const distanceMeters = calculateDistanceMeters(ref.lat, ref.lng, jobLat, jobLng);
+            const distanceMiles = distanceMeters / METERS_PER_MILE;
+            if (distanceMiles < minDistanceMiles) minDistanceMiles = distanceMiles;
+          }
+          if (minDistanceMiles > maxDistanceMiles) {
+            inc("outside_radius", job.id);
+            continue;
+          }
+        } else {
+          const workerState = (profileForLocation.state || "").toLowerCase().trim();
+          const jobState = (job.state || "").toLowerCase().trim();
+          if (workerState && jobState && workerState !== jobState) {
+            inc("state_mismatch", job.id);
+            continue;
+          }
+        }
+      } else if (referencePoints.length === 0 && !skipLocationFilter) {
+        const workerState = (profileForLocation.state || "").toLowerCase().trim();
+        const jobState = (job.state || "").toLowerCase().trim();
+        if (workerState && jobState && workerState !== jobState) {
+          inc("state_mismatch", job.id);
+          continue;
+        }
+      }
+
+      inc("passed", job.id);
+    }
+
+    return res.json({
+      workerProfileId: workerId,
+      openJobsFromGetJobs: allJobs.length,
+      maxDistanceMiles,
+      skipLocationFilter,
+      tradeFilter: filters.trade || null,
+      locationFilter: filters.location || null,
+      referencePointCount: referencePoints.length,
+      referencePoints,
+      teammateReferenceRowsConsidered: teamMembers.filter((m) => m.status === "active").length,
+      profileLocation: {
+        rawLatitude: profileForLocation.latitude ?? null,
+        rawLongitude: profileForLocation.longitude ?? null,
+        savedCoordsPlausible: isPlausibleLatLng(workerLatRaw, workerLngRaw),
+        city: profileForLocation.city ?? null,
+        state: profileForLocation.state ?? null,
+        zipCode: profileForLocation.zipCode ?? null,
+        hasAddressLine: !!(profileForLocation.address || "").trim(),
+      },
+      counts,
+      sampleJobIdsByReason: samples,
+      hint:
+        counts.passed === 0 && counts.outside_radius > 0
+          ? "Jobs exist but are farther than maxDistanceMiles from every reference point (you + teammates with addresses). Check saved lat/lng and radius."
+          : counts.passed === 0 && referencePoints.length === 0
+            ? "No reference points: add plausible lat/lng or a resolvable address (you and/or teammates)."
+            : counts.passed === 0 && counts.applied === allJobs.length
+              ? "You may have already applied to every open job in the query."
+              : undefined,
+    });
   });
 
   // Nearby jobs (must be before /api/jobs/:id so "nearby" is not matched as job id)
@@ -2609,6 +3249,22 @@ export async function registerRoutes(
 
     const locationRepresentativeName = await getLocationRepresentativeName(job, company);
     res.json({ ...job, company, locationRepresentativeName });
+  });
+
+  // Application rate stats for a job (for suggested rate: first applicant vs competitive)
+  app.get("/api/jobs/:id/application-rate-stats", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    const jobId = Number(req.params.id);
+    if (isNaN(jobId)) return res.status(400).json({ message: "Invalid job ID" });
+    const job = await storage.getJob(jobId);
+    if (!job) return res.status(404).json({ message: "Job not found" });
+    const list = await storage.getApplicationsByJob(jobId);
+    const withRate = list.filter((a) => a.status === "pending" || a.status === "accepted").filter((a) => a.proposedRate != null && a.proposedRate > 0);
+    const rates = withRate.map((a) => a.proposedRate!);
+    const applicationCount = rates.length;
+    const minProposedRateCents = applicationCount > 0 ? Math.min(...rates) : null;
+    const maxProposedRateCents = applicationCount > 0 ? Math.max(...rates) : null;
+    res.json({ applicationCount, minProposedRateCents, maxProposedRateCents });
   });
 
   // Get company's jobs with applications and timesheets
@@ -3350,21 +4006,20 @@ Respond ONLY in this exact JSON format:
     }
     
     try {
-      // In dev mode, skip these checks for easier testing
-      if (!isDev) {
-        // Server-side enforcement: require agreement signature
+      const input = api.jobs.create.input.parse(req.body);
+      const saveAsDraft = (req.body as { status?: string })?.status === "draft";
+
+      // For published jobs (not draft), require contract and payment method
+      if (!saveAsDraft && !isDev) {
         if (!profile.contractSigned) {
           return res.status(403).json({ message: "You must sign the platform agreement before posting jobs" });
         }
-        
-        // Server-side enforcement: require payment method
         const paymentMethods = await db.select().from(companyPaymentMethods).where(eq(companyPaymentMethods.profileId, profile.id));
         if (paymentMethods.length === 0) {
           return res.status(403).json({ message: "You must add a payment method before posting jobs" });
         }
       }
 
-      const input = api.jobs.create.input.parse(req.body);
       
       // Geocode address if coordinates not provided
       let latitude = input.latitude;
@@ -3383,7 +4038,18 @@ Respond ONLY in this exact JSON format:
       // Set timezone based on job state
       const timezone = getTimezoneForState(input.state);
       
-      const job = await storage.createJob({ ...input, latitude, longitude, companyId: profile.id, timezone });
+      const job = await storage.createJob({
+        ...input,
+        latitude,
+        longitude,
+        companyId: profile.id,
+        timezone,
+        status: saveAsDraft ? "draft" : "open",
+      });
+
+      if (saveAsDraft) {
+        return res.status(201).json(job);
+      }
 
       // Send real-time WebSocket notification to matching workers
       notifyNewJob({
@@ -3618,6 +4284,47 @@ Respond ONLY in this exact JSON format:
     }
   });
 
+  // Publish a draft job (requires contract + payment; then status → open and notify workers)
+  app.post("/api/jobs/:id/publish", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    const profile = req.profile;
+    if (!profile || profile.role !== "company") {
+      return res.status(403).json({ message: "Only companies can publish jobs" });
+    }
+    const jobId = Number(req.params.id);
+    const job = await storage.getJob(jobId);
+    if (!job) return res.status(404).json({ message: "Job not found" });
+    if (job.companyId !== profile.id) return res.status(403).json({ message: "Unauthorized" });
+    if ((job as any).status !== "draft") {
+      return res.status(400).json({ message: "Job is not a draft" });
+    }
+    const isDev = process.env.NODE_ENV === "development";
+    if (!isDev) {
+      if (!profile.contractSigned) {
+        return res.status(403).json({ message: "You must sign the platform agreement before publishing jobs" });
+      }
+      const paymentMethods = await db.select().from(companyPaymentMethods).where(eq(companyPaymentMethods.profileId, profile.id));
+      if (paymentMethods.length === 0) {
+        return res.status(403).json({ message: "You must add a payment method before publishing jobs" });
+      }
+    }
+    const [updated] = await db.update(jobs).set({ status: "open" }).where(eq(jobs.id, jobId)).returning();
+    if (!updated) return res.status(500).json({ message: "Failed to update job" });
+    notifyNewJob({
+      id: updated.id,
+      title: updated.title,
+      trade: updated.trade,
+      serviceCategory: updated.serviceCategory || undefined,
+      hourlyRate: updated.hourlyRate,
+      latitude: updated.latitude || undefined,
+      longitude: updated.longitude || undefined,
+      location: updated.location,
+      city: updated.city || undefined,
+      state: updated.state || undefined,
+    });
+    res.json(updated);
+  });
+
   // Send alert to workers for a job
   app.post("/api/jobs/:id/send-alert", async (req, res) => {
     const isDev = process.env.NODE_ENV === "development";
@@ -3640,14 +4347,13 @@ Respond ONLY in this exact JSON format:
     } else {
       // Production mode: require authentication
       if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
-      
-      profile = await storage.getProfile((req.user as any).id);
-      
+      // Use req.profile (set by attachProfile from getProfileByUserId); fallback to lookup by auth userId so we use profile id, not user id
+      const userId = (req.user as any)?.claims?.sub ?? (req.user as any)?.id;
+      profile = req.profile ?? (userId ? await storage.getProfileByUserId(String(userId)) : undefined);
       if (!profile || profile.role !== "company") {
         return res.status(403).json({ message: "Only companies can send alerts" });
       }
-      
-      // In production, check if company owns this job
+      // Check if company owns this job (job.companyId is the profile id of the company that posted the job)
       if (job.companyId !== profile.id) {
         return res.status(403).json({ message: "You don't have permission to send alerts for this job" });
       }
@@ -4078,6 +4784,27 @@ Respond ONLY in this exact JSON format:
       senderId: profile.id,
     });
     
+    // "Start job now" request from worker: send dedicated Resend email to company so they can accept/decline in chat
+    if (isWorker && !isCompany && (bodyMetadata as any)?.type === "start_job_now_request") {
+      const companyProfile = await storage.getProfile(job.companyId);
+      if (companyProfile?.email && companyProfile.emailNotifications) {
+        try {
+          await sendEmail({
+            to: companyProfile.email,
+            type: 'worker_request_start_job_now',
+            data: {
+              workerName: profile.firstName || profile.companyName || 'A worker',
+              jobTitle: job.title,
+              jobId,
+              chatUrl: `/company-dashboard/chats/${jobId}`,
+            },
+          });
+        } catch (err) {
+          console.error('Failed to send start-job-now request email:', err);
+        }
+      }
+    }
+    
     // Send immediate email to @ mentioned users (direct notification)
     if (Array.isArray(mentionedProfileIds) && mentionedProfileIds.length > 0) {
       for (const mentionedId of mentionedProfileIds) {
@@ -4334,6 +5061,57 @@ Respond ONLY in this exact JSON format:
     const messages = await storage.getJobMessages(jobId);
     const fullMessage = messages.find((m: any) => m.id === updated.id);
     res.json(fullMessage || updated);
+  });
+
+  // Company responds to worker's "start job now" request (accept = move start date to today; decline = post message that time remains)
+  app.post("/api/jobs/:jobId/start-now-request/:messageId/respond", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    const profile = req.profile;
+    if (!profile) return res.status(403).json({ message: "Profile not found" });
+    const jobId = Number(req.params.jobId);
+    const messageId = Number(req.params.messageId);
+    const { action } = req.body || {};
+    if (action !== "accept" && action !== "decline") {
+      return res.status(400).json({ message: "action must be 'accept' or 'decline'" });
+    }
+    const job = await storage.getJob(jobId);
+    if (!job) return res.status(404).json({ message: "Job not found" });
+    const isCompanyOwner = job.companyId === profile.id;
+    const isLocationRep = await isLocationRepOrAssigned(profile, job);
+    if (!isCompanyOwner && !isLocationRep) {
+      return res.status(403).json({ message: "Only the company can respond to this request" });
+    }
+    const messages = await storage.getJobMessages(jobId);
+    const requestMessage = messages.find((m: any) => m.id === messageId);
+    if (!requestMessage) return res.status(404).json({ message: "Message not found" });
+    const meta = (requestMessage.metadata as Record<string, unknown>) || {};
+    if (meta.type !== "start_job_now_request" || meta.status === "accepted" || meta.status === "declined") {
+      return res.status(400).json({ message: "Invalid or already responded request" });
+    }
+    if (action === "accept") {
+      const oldStart = new Date((job as any).startDate);
+      const today = new Date();
+      today.setHours(oldStart.getHours(), oldStart.getMinutes(), oldStart.getSeconds(), 0);
+      await storage.updateJob(jobId, { startDate: today } as Partial<Job>);
+      await storage.updateJobMessageMetadata(jobId, messageId, { ...meta, status: "accepted" });
+      await storage.createJobMessage({
+        jobId,
+        senderId: profile.id,
+        content: "Start date has been updated to today. You can clock in now.",
+        metadata: { type: "start_job_now_accepted" },
+      });
+    } else {
+      await storage.updateJobMessageMetadata(jobId, messageId, { ...meta, status: "declined" });
+      await storage.createJobMessage({
+        jobId,
+        senderId: profile.id,
+        content: "The job time remains as scheduled.",
+        metadata: { type: "start_job_now_declined" },
+      });
+    }
+    const updatedJob = await storage.getJob(jobId);
+    const updatedMessages = await storage.getJobMessages(jobId);
+    res.json({ job: updatedJob, messages: updatedMessages });
   });
   
   // Get unread message count for a job
@@ -4875,7 +5653,36 @@ Respond ONLY in this exact JSON format:
           }
         }
       }
-      
+
+      // Attach today's completed timesheets (clocked out) per assignment for "Completed" section
+      if (assignments.length > 0) {
+        const now = new Date();
+        const startOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0);
+        const endOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59, 999);
+        const jobIds = [...new Set(assignments.map((a: any) => a.application.jobId))];
+        const workerIds = [...new Set(assignments.map((a: any) => a.application.workerId))];
+        const completedToday = await db.select()
+          .from(timesheets)
+          .where(and(
+            inArray(timesheets.jobId, jobIds),
+            inArray(timesheets.workerId, workerIds),
+            isNotNull(timesheets.clockOutTime),
+            gte(timesheets.clockInTime, startOfDay),
+            lte(timesheets.clockInTime, endOfDay)
+          ))
+          .orderBy(desc(timesheets.clockOutTime));
+        const byKey: Record<string, typeof completedToday> = {};
+        for (const ts of completedToday) {
+          const key = `${ts.jobId}-${ts.workerId}`;
+          if (!byKey[key]) byKey[key] = [];
+          byKey[key].push(ts);
+        }
+        for (const a of assignments) {
+          const key = `${a.application.jobId}-${a.application.workerId}`;
+          a.todayCompletedTimesheets = byKey[key] || [];
+        }
+      }
+
       res.json(assignments);
     } catch (err) {
       console.error("Today assignments error:", err);
@@ -4902,11 +5709,8 @@ Respond ONLY in this exact JSON format:
       return res.status(404).json({ message: "Application not found" });
     }
     
-    // Update application status to accepted
-    const [updated] = await db.update(applications)
-      .set({ status: 'accepted', respondedAt: new Date() })
-      .where(eq(applications.id, id))
-      .returning();
+    // Update application status to accepted (+ job_assignments row via storage)
+    const updated = await storage.updateApplicationStatus(id, "accepted");
     
     // Get job and company info
     const job = await storage.getJob(application.jobId);
@@ -4947,11 +5751,19 @@ Respond ONLY in this exact JSON format:
       }
 
       const input = api.applications.create.input.parse(req.body);
-      const application = await storage.createApplication({
-        ...input,
-        message: sanitizeMessage(input.message),
-        workerId: profile.id,
-      });
+      let application;
+      try {
+        application = await storage.createApplication({
+          ...input,
+          message: sanitizeMessage(input.message),
+          workerId: profile.id,
+        });
+      } catch (createErr: any) {
+        if (createErr?.code === "23505") {
+          return res.status(400).json({ message: "You have already applied to this job." });
+        }
+        throw createErr;
+      }
 
       // Send notifications to company about worker inquiry
       const job = await storage.getJob(input.jobId);
@@ -5127,32 +5939,37 @@ Respond ONLY in this exact JSON format:
     try {
       const user = req.user as any;
       const profile = req.profile;
-      if (!profile || profile.role !== "company") {
-        return res.status(403).json({ message: "Only companies can update application status" });
-      }
+      if (!profile) return res.status(403).json({ message: "Forbidden" });
 
       const id = Number(req.params.id);
       const input = api.applications.updateStatus.input.parse(req.body);
       
-      // Get application and verify company owns the job
       const [application] = await db.select().from(applications).where(eq(applications.id, id));
       if (!application) {
         return res.status(404).json({ message: "Application not found" });
       }
       
       const job = await storage.getJob(application.jobId);
-      if (!job || job.companyId !== profile.id) {
+      if (!job) return res.status(404).json({ message: "Job not found" });
+
+      // Company: must own the job. Dev only: worker may accept their own application (for testing).
+      const isCompany = profile.role === "company";
+      const isDevWorkerSelfAccept = process.env.NODE_ENV === "development" && profile.role === "worker" && application.workerId === profile.id;
+      if (!isCompany && !isDevWorkerSelfAccept) {
+        return res.status(403).json({ message: "Only companies can update application status" });
+      }
+      if (isCompany && job.companyId !== profile.id) {
         return res.status(403).json({ message: "Unauthorized" });
       }
 
-      // Update application status
-      const [updated] = await db.update(applications)
-        .set({ status: input.status })
-        .where(eq(applications.id, id))
-        .returning();
+      // Update application status (+ job_assignments on accept)
+      const updated = await storage.updateApplicationStatus(id, input.status);
 
       // Get worker profile for notifications
       const worker = await storage.getProfile(application.workerId);
+      const companyProfile = isCompany ? profile : await storage.getProfile(job.companyId);
+      const companyName = companyProfile?.companyName || (companyProfile ? `${companyProfile.firstName} ${companyProfile.lastName}` : "Company");
+      const companyIdForReplenishment = job.companyId;
       
       // Real-time WebSocket notification to worker
       notifyApplicationUpdate(application.workerId, {
@@ -5171,15 +5988,14 @@ Respond ONLY in this exact JSON format:
             data: {
               jobTitle: job.title,
               jobId: job.id,
-              companyName: profile.companyName || `${profile.firstName} ${profile.lastName}`,
+              companyName,
               startDate: job.startDate ? new Date(job.startDate).toLocaleDateString() : 'TBD',
               location: job.location || `${job.city}, ${job.state}`,
               hourlyRate: job.hourlyRate ? (job.hourlyRate / 100).toFixed(0) : '0',
             }
           }).catch(err => console.error('Failed to send application accepted email:', err));
           
-          // Trigger auto-replenishment check when commitments increase
-          triggerAutoReplenishmentForCompany(profile.id)
+          triggerAutoReplenishmentForCompany(companyIdForReplenishment)
             .catch(err => console.error('Failed to trigger auto-replenishment:', err));
         } else if (input.status === 'rejected') {
           sendEmail({
@@ -5187,16 +6003,15 @@ Respond ONLY in this exact JSON format:
             type: 'application_rejected',
             data: {
               jobTitle: job.title,
-              companyName: profile.companyName || `${profile.firstName} ${profile.lastName}`,
+              companyName,
               rejectionReason: input.rejectionReason || undefined,
             }
           }).catch(err => console.error('Failed to send application rejected email:', err));
         }
       }
       
-      // Also trigger auto-replenishment if email is disabled but application was accepted
       if (input.status === 'accepted' && (!worker?.email || !worker?.emailNotifications)) {
-        triggerAutoReplenishmentForCompany(profile.id)
+        triggerAutoReplenishmentForCompany(companyIdForReplenishment)
           .catch(err => console.error('Failed to trigger auto-replenishment:', err));
       }
 
@@ -5241,12 +6056,222 @@ Respond ONLY in this exact JSON format:
     res.json(sanitized);
   });
 
-  // Get applications by worker
+  // Get applications by worker (worker can only fetch their own)
   app.get("/api/applications/worker/:workerId", async (req, res) => {
     if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    const profile = req.profile;
     const workerId = Number(req.params.workerId);
+    if (!profile || profile.role !== "worker" || profile.id !== workerId)
+      return res.status(403).json({ message: "Forbidden" });
     const applications = await storage.getWorkerApplications(workerId);
     res.json(applications);
+  });
+
+  // Worker abandonment flow for accepted jobs
+  app.post("/api/applications/:id/abandon", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+
+    try {
+      const profile = req.profile;
+      if (!profile || profile.role !== "worker") {
+        return res.status(403).json({ message: "Only workers can abandon jobs" });
+      }
+
+      const applicationId = Number(req.params.id);
+      const reason = String(req.body?.reason || "").trim().slice(0, 64);
+      const details = String(req.body?.details || "").trim().slice(0, 1000);
+      if (!reason) {
+        return res.status(400).json({ message: "Abandon reason is required" });
+      }
+
+      const [application] = await db.select().from(applications).where(eq(applications.id, applicationId));
+      if (!application) return res.status(404).json({ message: "Application not found" });
+      if (application.workerId !== profile.id) return res.status(403).json({ message: "Unauthorized" });
+      if (application.status !== "accepted") {
+        return res.status(400).json({ message: "Only accepted jobs can be abandoned from this flow" });
+      }
+
+      const job = await storage.getJob(application.jobId);
+      if (!job) return res.status(404).json({ message: "Job not found" });
+
+      // Hard stop if worker is currently clocked in for this job.
+      const activeTimesheet = await db
+        .select({ id: timesheets.id })
+        .from(timesheets)
+        .where(and(
+          eq(timesheets.jobId, job.id),
+          eq(timesheets.workerId, profile.id),
+          isNull(timesheets.clockOutTime)
+        ))
+        .limit(1);
+      if (activeTimesheet.length > 0) {
+        return res.status(409).json({ message: "Clock out before abandoning this job", code: "CLOCK_OUT_REQUIRED" });
+      }
+
+      const allWorkerJobTimesheets = await db
+        .select({
+          id: timesheets.id,
+          status: timesheets.status,
+          submittedAt: timesheets.submittedAt,
+          clockOutTime: timesheets.clockOutTime,
+          paymentStatus: timesheets.paymentStatus,
+        })
+        .from(timesheets)
+        .where(and(
+          eq(timesheets.jobId, job.id),
+          eq(timesheets.workerId, profile.id)
+        ));
+
+      const timesheetSummary = allWorkerJobTimesheets.reduce((acc, ts) => {
+        const hasEnded = !!ts.clockOutTime;
+        const isDraft = hasEnded && !ts.submittedAt;
+        if (isDraft) acc.endedDraftCount += 1;
+        if (ts.status === "pending") acc.pendingReviewCount += 1;
+        if (ts.status === "approved") acc.approvedCount += 1;
+        if (ts.status === "disputed") acc.disputedCount += 1;
+        if (ts.status === "rejected") acc.rejectedCount += 1;
+        return acc;
+      }, { endedDraftCount: 0, pendingReviewCount: 0, approvedCount: 0, disputedCount: 0, rejectedCount: 0 });
+
+      // Preserve audit history: withdraw application rather than deleting row.
+      const updatedApplication = await storage.updateApplicationStatus(applicationId, "withdrawn");
+
+      // Cancel assignment mapping for this worker + job.
+      await db
+        .update(jobAssignments)
+        .set({
+          status: "cancelled",
+          completedAt: new Date(),
+        })
+        .where(and(
+          eq(jobAssignments.jobId, job.id),
+          eq(jobAssignments.workerId, profile.id)
+        ));
+
+      const workerName = `${profile.firstName || ""} ${profile.lastName || ""}`.trim() || "Worker";
+      const reasonLabelMap: Record<string, string> = {
+        emergency: "Emergency",
+        transportation: "Transportation issue",
+        schedule_conflict: "Schedule conflict",
+        safety_concern: "Safety concern",
+        rate_scope: "Rate/scope mismatch",
+        other: "Other",
+      };
+      const reasonLabel = reasonLabelMap[reason] || reason.replace(/_/g, " ");
+      const abandonedAtIso = new Date().toISOString();
+
+      // In-system chat message (worker + company can both see this abandonment event).
+      await db.insert(jobMessages).values({
+        jobId: job.id,
+        senderId: profile.id,
+        content: `${workerName} abandoned this job. Reason: ${reasonLabel}${details ? ` — ${details}` : ""}`,
+        messageType: "text",
+        metadata: {
+          type: "job_abandonment",
+          reason,
+          reasonLabel,
+          details: details || null,
+          abandonedAt: abandonedAtIso,
+          applicationId,
+          timesheetSummary,
+        },
+      });
+
+      const baseUrl = process.env.BASE_URL || process.env.APP_URL || "http://localhost:5000";
+      const companyChatUrl = `${baseUrl}/company-dashboard/chats/${job.id}`;
+      const workerChatUrl = `${baseUrl}/dashboard/chats/${job.id}`;
+      const repostPath = `/post-job?new=1&repost=1&sourceJobId=${job.id}`;
+      const repostUrl = `${baseUrl}${repostPath}`;
+
+      const companyProfile = await storage.getProfile(job.companyId);
+      if (companyProfile?.email && companyProfile.emailNotifications) {
+        sendEmail({
+          to: companyProfile.email,
+          type: "job_abandoned_company",
+          data: {
+            jobId: job.id,
+            jobTitle: job.title || "Job",
+            workerName,
+            reasonLabel,
+            details: details || null,
+            chatUrl: companyChatUrl,
+            repostUrl,
+            abandonedAt: abandonedAtIso,
+          },
+        }).catch((err) => console.error("Failed to send company abandonment email:", err));
+      }
+
+      if (profile.email && profile.emailNotifications) {
+        sendEmail({
+          to: profile.email,
+          type: "job_abandoned_worker",
+          data: {
+            jobId: job.id,
+            jobTitle: job.title || "Job",
+            companyName: companyProfile?.companyName || `${companyProfile?.firstName || ""} ${companyProfile?.lastName || ""}`.trim() || "Company",
+            reasonLabel,
+            details: details || null,
+            chatUrl: workerChatUrl,
+            strikeWarning: true,
+            reviewWarning: true,
+            abandonedAt: abandonedAtIso,
+          },
+        }).catch((err) => console.error("Failed to send worker abandonment email:", err));
+      }
+
+      // Keep notifications inside existing enum values while still surfacing the event.
+      await db.insert(notifications).values({
+        profileId: job.companyId,
+        type: "worker_inquiry",
+        title: "Worker abandoned assignment",
+        body: `${workerName} abandoned "${job.title || "job"}". Reason: ${reasonLabel}. Tap to repost and set a new timeframe.`,
+        url: repostPath,
+        data: {
+          jobId: job.id,
+          applicationId,
+          reason,
+          reasonLabel,
+          details: details || null,
+          repostUrl: repostPath,
+          chatUrl: `/company-dashboard/chats/${job.id}`,
+        },
+      });
+      notifyJobUpdate(job.companyId, {
+        jobId: job.id,
+        jobTitle: job.title || "Job",
+        type: "new_application",
+        workerName,
+        message: `${workerName} abandoned assignment for "${job.title || "job"}". Repost with a new timeframe.`,
+      });
+      await db.insert(notifications).values({
+        profileId: profile.id,
+        type: "application_rejected",
+        title: "Job abandoned",
+        body: `You abandoned "${job.title || "job"}". Company may review this event and your account standing may be impacted.`,
+        url: `/dashboard/chats/${job.id}`,
+        data: { jobId: job.id, applicationId, reason, reasonLabel, details: details || null },
+      });
+
+      notifyApplicationUpdate(profile.id, {
+        applicationId,
+        jobId: job.id,
+        jobTitle: job.title || "Job",
+        status: "withdrawn",
+      });
+
+      res.json({
+        success: true,
+        application: updatedApplication,
+        timesheetSummary,
+        warnings: {
+          strikePossible: true,
+          reviewPossible: true,
+        },
+      });
+    } catch (err) {
+      console.error("Error abandoning job:", err);
+      res.status(500).json({ message: "Failed to abandon job" });
+    }
   });
 
   // Delete application
@@ -5548,14 +6573,106 @@ Respond ONLY in this exact JSON format:
       
       const members = await storage.getWorkerTeamMembers(teamId);
       
-      // Get all recent location pings for the operator profile
-      // (In production, each team member would have their own profile and location pings)
-      const recentPings = await db
-        .select()
-        .from(locationPings)
-        .where(eq(locationPings.workerProfileId, profile.id))
-        .orderBy(desc(locationPings.createdAt))
-        .limit(20); // Get last 20 pings to distribute among team members
+      // Optional historical date support: /members?date=YYYY-MM-DD
+      const dateParam = typeof req.query.date === "string" ? req.query.date.trim() : "";
+      let rangeStart: Date | null = null;
+      let rangeEnd: Date | null = null;
+      if (/^\d{4}-\d{2}-\d{2}$/.test(dateParam)) {
+        const parsed = new Date(`${dateParam}T00:00:00`);
+        if (!Number.isNaN(parsed.getTime())) {
+          rangeStart = parsed;
+          rangeEnd = new Date(parsed.getTime());
+          rangeEnd.setDate(rangeEnd.getDate() + 1);
+          rangeEnd.setMilliseconds(rangeEnd.getMilliseconds() - 1);
+        }
+      }
+      
+      // Resolve teamMember -> workerProfile links from applications (authoritative for job ownership).
+      const memberIds = members.map((m) => m.id);
+      const appStatuses: Array<"accepted" | "pending"> = ["accepted", "pending"];
+      const memberAppRows = memberIds.length === 0
+        ? []
+        : rangeStart && rangeEnd
+          ? await db
+              .select({
+                teamMemberId: applications.teamMemberId,
+                workerId: applications.workerId,
+                jobId: applications.jobId,
+              })
+              .from(applications)
+              .innerJoin(jobs, eq(applications.jobId, jobs.id))
+              .where(
+                and(
+                  inArray(applications.teamMemberId, memberIds),
+                  inArray(applications.status, appStatuses),
+                  gte(jobs.startDate, rangeStart),
+                  lte(jobs.startDate, rangeEnd)
+                )
+              )
+          : await db
+              .select({
+                teamMemberId: applications.teamMemberId,
+                workerId: applications.workerId,
+                jobId: applications.jobId,
+              })
+              .from(applications)
+              .where(and(inArray(applications.teamMemberId, memberIds), inArray(applications.status, appStatuses)));
+
+      const memberToWorkerIds = new Map<number, Set<number>>();
+      const memberToJobIds = new Map<number, Set<number>>();
+      const allWorkerIds = new Set<number>();
+      for (const row of memberAppRows) {
+        if (row.teamMemberId == null) continue;
+        const teammateId = row.teamMemberId;
+        if (!memberToWorkerIds.has(teammateId)) memberToWorkerIds.set(teammateId, new Set<number>());
+        if (!memberToJobIds.has(teammateId)) memberToJobIds.set(teammateId, new Set<number>());
+        memberToWorkerIds.get(teammateId)!.add(row.workerId);
+        memberToJobIds.get(teammateId)!.add(row.jobId);
+        allWorkerIds.add(row.workerId);
+      }
+
+      // Pull pings for all mapped worker profiles. If no mappings exist yet, fall back to operator profile pings.
+      const pingRows = allWorkerIds.size > 0
+        ? await db
+            .select({
+              workerProfileId: locationPings.workerProfileId,
+              jobId: locationPings.jobId,
+              latitude: locationPings.latitude,
+              longitude: locationPings.longitude,
+              createdAt: locationPings.createdAt,
+            })
+            .from(locationPings)
+            .where(
+              rangeStart && rangeEnd
+                ? and(
+                    inArray(locationPings.workerProfileId, Array.from(allWorkerIds)),
+                    gte(locationPings.createdAt, rangeStart),
+                    lte(locationPings.createdAt, rangeEnd)
+                  )
+                : inArray(locationPings.workerProfileId, Array.from(allWorkerIds))
+            )
+            .orderBy(desc(locationPings.createdAt))
+            .limit(2000)
+        : await db
+            .select({
+              workerProfileId: locationPings.workerProfileId,
+              jobId: locationPings.jobId,
+              latitude: locationPings.latitude,
+              longitude: locationPings.longitude,
+              createdAt: locationPings.createdAt,
+            })
+            .from(locationPings)
+            .where(
+              rangeStart && rangeEnd
+                ? and(
+                    eq(locationPings.workerProfileId, profile.id),
+                    gte(locationPings.createdAt, rangeStart),
+                    lte(locationPings.createdAt, rangeEnd)
+                  )
+                : eq(locationPings.workerProfileId, profile.id)
+            )
+            .orderBy(desc(locationPings.createdAt))
+            .limit(200);
       
       // Map members with their work locations and live locations
       // Work location = latitude/longitude from database (home base address)
@@ -5564,16 +6681,27 @@ Respond ONLY in this exact JSON format:
         // Work location is stored in member.latitude/longitude (home base)
         const workLat = member.latitude ? parseFloat(member.latitude) : null;
         const workLng = member.longitude ? parseFloat(member.longitude) : null;
-        
-        // Find a recent ping that might correspond to this team member
-        // (In production, pings would be associated with team member profiles)
-        const memberPing = recentPings[index % recentPings.length] || recentPings[0];
+
+        const workerIds = memberToWorkerIds.get(member.id) ?? new Set<number>();
+        const jobIds = memberToJobIds.get(member.id) ?? new Set<number>();
+        const relevantPings = pingRows.filter((p) => workerIds.has(p.workerProfileId));
+        const matchedToJobs = relevantPings.filter((p) => p.jobId != null && jobIds.has(p.jobId));
+        const effectivePings = matchedToJobs.length > 0 ? matchedToJobs : relevantPings;
+        const fallbackPing = pingRows.length > 0 ? pingRows[index % pingRows.length] || pingRows[0] : null;
+        const memberPing = effectivePings[0] || fallbackPing;
         const pingTimestamp = memberPing?.createdAt || new Date();
-        
-        // Live location from location pings (current GPS position)
-        // If no ping found, use work location as fallback
+
         const liveLat = memberPing?.latitude ? parseFloat(memberPing.latitude) : workLat;
         const liveLng = memberPing?.longitude ? parseFloat(memberPing.longitude) : workLng;
+        const liveLocationPath = effectivePings
+          .slice(0, 120)
+          .reverse()
+          .map((p) => ({
+            lat: parseFloat(String(p.latitude)),
+            lng: parseFloat(String(p.longitude)),
+            createdAt: p.createdAt,
+          }))
+          .filter((pt) => Number.isFinite(pt.lat) && Number.isFinite(pt.lng));
         
         return {
           ...member,
@@ -5582,6 +6710,7 @@ Respond ONLY in this exact JSON format:
           liveLocationLat: liveLat,
           liveLocationLng: liveLng,
           liveLocationTimestamp: pingTimestamp,
+          liveLocationPath,
         };
       });
       
@@ -5608,7 +6737,7 @@ Respond ONLY in this exact JSON format:
         return res.status(403).json({ message: "Not authorized to manage this team" });
       }
       
-      const { firstName, lastName, email, phone, address, city, state, zipCode, role, hourlyRate, skillsets, avatarUrl } = req.body;
+      const { firstName, lastName, email, phone, address, city, state, zipCode, latitude, longitude, role, hourlyRate, skillsets, avatarUrl } = req.body;
       
       // Generate invite token
       const crypto = await import("crypto");
@@ -5624,6 +6753,8 @@ Respond ONLY in this exact JSON format:
         city,
         state,
         zipCode,
+        latitude: latitude != null && latitude !== "" ? String(latitude) : undefined,
+        longitude: longitude != null && longitude !== "" ? String(longitude) : undefined,
         avatarUrl,
         role: role || "employee",
         hourlyRate,
@@ -5679,9 +6810,12 @@ Respond ONLY in this exact JSON format:
       }
 
       const updates: Record<string, unknown> = { ...req.body };
-      const { address, city, state, zipCode } = req.body;
+      const { address, city, state, zipCode, latitude, longitude } = req.body;
 
-      if (address && typeof address === "string" && address.trim()) {
+      if (latitude != null && longitude != null && latitude !== "" && longitude !== "") {
+        updates.latitude = String(latitude);
+        updates.longitude = String(longitude);
+      } else if (address && typeof address === "string" && address.trim()) {
         const coords = (city && state && zipCode)
           ? await geocodeFullAddress(address.trim(), String(city), String(state), String(zipCode))
           : await geocodeAddress(address.trim());
@@ -6118,6 +7252,13 @@ Respond ONLY in this exact JSON format:
       return res.json({ attached, recipientId });
     } catch (err: any) {
       console.error("[W9Status] Error checking Mercury:", err?.message ?? err);
+      const is404 = err?.status === 404 || err?.statusCode === 404 || err?.details?.errors?.notFound;
+      if (is404 && profile?.id) {
+        await storage.updateProfile(profile.id, { mercuryRecipientId: null, mercuryExternalAccountId: null, bankAccountLinked: false });
+        clearProfileSnapshot(req);
+        console.log(`[W9Status] Cleared recipient and bankAccountLinked for profile ${profile.id} (Mercury 404)`);
+        return res.json({ attached: false, recipientId: null, recipientInvalid: true });
+      }
       return res.json({ attached: false, recipientId });
     }
   });
@@ -6462,6 +7603,10 @@ Respond ONLY in this exact JSON format:
           ipAddress: req.ip || (req.headers["x-forwarded-for"] as string) || null,
         })
         .returning();
+      // Keep profile in sync so agreement and payment modals don't reappear
+      if (agreementType === "hiring_agreement") {
+        await db.update(profiles).set({ contractSigned: true, contractSignedAt: new Date() }).where(eq(profiles.id, profile.id));
+      }
       res.status(201).json(row);
     } catch (error: any) {
       console.error("Failed to save company agreement:", error);
@@ -6489,24 +7634,13 @@ Respond ONLY in this exact JSON format:
       
       const input = api.companyLocations.create.input.parse(req.body);
       
-      // Geocode the address to get lat/lng
-      let latitude: string | undefined;
-      let longitude: string | undefined;
-      
-      if (input.address && input.city && input.state && input.zipCode) {
-        // Combine address and address2 for geocoding
-        const fullAddress = [input.address, (input as any).address2].filter(Boolean).join(", ");
-        const coords = await geocodeFullAddress(
-          fullAddress,
-          input.city,
-          input.state,
-          input.zipCode
-        );
-        if (coords) {
-          latitude = coords.latitude;
-          longitude = coords.longitude;
-        }
-      }
+      const { latitude, longitude } = await geocodeCompanyLocationInBackground({
+        address: input.address,
+        address2: (input as any).address2,
+        city: input.city,
+        state: input.state,
+        zipCode: input.zipCode,
+      });
       
       const location = await storage.createCompanyLocation({ 
         ...input, 
@@ -6541,30 +7675,14 @@ Respond ONLY in this exact JSON format:
       
       const input = api.companyLocations.update.input.parse(req.body);
       
-      // If address fields are being updated, re-geocode
-      let latitude = existingLocation.latitude;
-      let longitude = existingLocation.longitude;
-      
       const address = input.address || existingLocation.address;
       const address2 = input.address2 !== undefined ? input.address2 : existingLocation.address2;
       const city = input.city || existingLocation.city;
       const state = input.state || existingLocation.state;
       const zipCode = input.zipCode || existingLocation.zipCode;
-      
-      if (address && city && state && zipCode) {
-        // Combine address and address2 for geocoding
-        const fullAddress = [address, address2].filter(Boolean).join(", ");
-        const coords = await geocodeFullAddress(
-          fullAddress,
-          city,
-          state,
-          zipCode
-        );
-        if (coords) {
-          latitude = coords.latitude;
-          longitude = coords.longitude;
-        }
-      }
+      const geocoded = await geocodeCompanyLocationInBackground({ address, address2, city, state, zipCode });
+      const latitude = geocoded.latitude ?? existingLocation.latitude ?? undefined;
+      const longitude = geocoded.longitude ?? existingLocation.longitude ?? undefined;
       
       const updateData = {
         ...input,
@@ -7119,24 +8237,13 @@ Respond ONLY in this exact JSON format:
     const profile = req.profile;
     if (!profile) return res.status(404).json({ message: "Profile not found" });
     
-    // Geocode the address to get lat/lng
-    let latitude: string | undefined;
-    let longitude: string | undefined;
-    
-    if (req.body.address && req.body.city && req.body.state && req.body.zipCode) {
-      // Combine address and address2 for geocoding
-      const fullAddress = [req.body.address, req.body.address2].filter(Boolean).join(", ");
-      const coords = await geocodeFullAddress(
-        fullAddress,
-        req.body.city,
-        req.body.state,
-        req.body.zipCode
-      );
-      if (coords) {
-        latitude = coords.latitude;
-        longitude = coords.longitude;
-      }
-    }
+    const { latitude, longitude } = await geocodeCompanyLocationInBackground({
+      address: req.body.address,
+      address2: req.body.address2,
+      city: req.body.city,
+      state: req.body.state,
+      zipCode: req.body.zipCode,
+    });
     
     const locationData = {
       ...req.body,
@@ -7181,30 +8288,14 @@ Respond ONLY in this exact JSON format:
       }
     }
     
-    // If address fields are being updated, re-geocode
-    let latitude = existing.latitude;
-    let longitude = existing.longitude;
-    
     const address = req.body.address || existing.address;
     const address2 = req.body.address2 !== undefined ? req.body.address2 : existing.address2;
     const city = req.body.city || existing.city;
     const state = req.body.state || existing.state;
     const zipCode = req.body.zipCode || existing.zipCode;
-    
-    if (address && city && state && zipCode) {
-      // Combine address and address2 for geocoding
-      const fullAddress = [address, address2].filter(Boolean).join(", ");
-      const coords = await geocodeFullAddress(
-        fullAddress,
-        city,
-        state,
-        zipCode
-      );
-      if (coords) {
-        latitude = coords.latitude;
-        longitude = coords.longitude;
-      }
-    }
+    const geocoded = await geocodeCompanyLocationInBackground({ address, address2, city, state, zipCode });
+    const latitude = geocoded.latitude ?? existing.latitude ?? undefined;
+    const longitude = geocoded.longitude ?? existing.longitude ?? undefined;
     
     const updateData = {
       ...req.body,
@@ -7352,7 +8443,11 @@ Respond ONLY in this exact JSON format:
           clockOutTime: timesheets.clockOutTime,
           adjustedHours: timesheets.adjustedHours,
           hourlyRate: timesheets.hourlyRate,
+          totalPay: timesheets.totalPay,
           status: timesheets.status,
+          workerNotes: timesheets.workerNotes,
+          timesheetType: timesheets.timesheetType,
+          receiptUrl: timesheets.receiptUrl,
           workerFirstName: profiles.firstName,
           workerLastName: profiles.lastName,
           workerAvatarUrl: profiles.avatarUrl,
@@ -7469,6 +8564,9 @@ Respond ONLY in this exact JSON format:
         adjustedHours: timesheets.adjustedHours,
         hourlyRate: timesheets.hourlyRate,
         totalPay: timesheets.totalPay,
+        workerNotes: timesheets.workerNotes,
+        timesheetType: timesheets.timesheetType,
+        receiptUrl: timesheets.receiptUrl,
         clockInDistanceFromJob: timesheets.clockInDistanceFromJob,
         clockOutDistanceFromJob: timesheets.clockOutDistanceFromJob,
         locationVerified: timesheets.locationVerified,
@@ -7494,6 +8592,70 @@ Respond ONLY in this exact JSON format:
     }
     
     res.json(jobTimesheets);
+  });
+
+  // Submit a material invoice (worker): upload receipt, amount, optional description; appears on company timesheets
+  app.post("/api/timesheets/material-invoice", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    const profile = req.profile;
+    if (!profile || profile.role !== "worker") return res.status(403).json({ message: "Workers only" });
+
+    const { jobId, amountCents, description, receiptUrl } = req.body;
+    if (!jobId || amountCents == null || amountCents < 0) {
+      return res.status(400).json({ message: "jobId and amountCents (non-negative) are required" });
+    }
+    if (!receiptUrl || typeof receiptUrl !== "string" || !receiptUrl.startsWith("/objects/")) {
+      return res.status(400).json({ message: "Receipt photo is required (upload receipt first)" });
+    }
+
+    const job = await storage.getJob(Number(jobId));
+    if (!job) return res.status(404).json({ message: "Job not found" });
+    if (job.companyId == null) return res.status(400).json({ message: "Job has no company" });
+
+    // Worker must have an accepted application (direct or as team member)
+    const directApp = await db.select().from(applications)
+      .where(and(
+        eq(applications.jobId, jobId),
+        eq(applications.workerId, profile.id),
+        eq(applications.status, "accepted")
+      ))
+      .then(r => r[0]);
+    let teamApp: any = null;
+    if (profile.teamId && profile.email) {
+      const member = await db.select({ id: workerTeamMembers.id }).from(workerTeamMembers)
+        .where(and(eq(workerTeamMembers.teamId, profile.teamId), eq(workerTeamMembers.email, profile.email)))
+        .then(r => r[0]);
+      if (member) {
+        teamApp = await db.select().from(applications)
+          .where(and(
+            eq(applications.jobId, jobId),
+            eq(applications.teamMemberId, member.id),
+            eq(applications.status, "accepted")
+          ))
+          .then(r => r[0]);
+      }
+    }
+    if (!directApp && !teamApp) {
+      return res.status(403).json({ message: "You must be assigned to this job to submit a material invoice" });
+    }
+
+    const now = new Date();
+    const [created] = await db.insert(timesheets).values({
+      jobId: Number(jobId),
+      workerId: profile.id,
+      companyId: job.companyId,
+      clockInTime: now,
+      clockOutTime: now,
+      totalHours: "0",
+      adjustedHours: "0",
+      hourlyRate: 0,
+      totalPay: Math.round(Number(amountCents)),
+      workerNotes: description ? String(description).slice(0, 2000) : null,
+      timesheetType: "material_invoice",
+      receiptUrl: receiptUrl.slice(0, 2048),
+      status: "pending",
+    }).returning();
+    res.status(201).json(created);
   });
   
   app.get("/api/timesheets/active/:workerId", async (req, res) => {
@@ -7575,22 +8737,25 @@ Respond ONLY in this exact JSON format:
     const payload = {
       ...activeTimesheet,
       jobTitle: job?.title || undefined,
+      jobTrade: job?.trade || undefined,
       jobLocation: job ? [job.address, job.city, job.state].filter(Boolean).join(", ") || job.location || undefined : undefined,
     };
     res.json(payload);
   });
 
-  // Get all timesheets for a worker (for payment history)
+  // Get all timesheets for a worker (for payment history). If query ?team=1 and profile is team owner, returns timesheets for entire team with worker info (business operator view).
   app.get("/api/timesheets/worker", async (req, res) => {
     if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
-    
-    const user = req.user as any;
     const profile = req.profile;
-    
-    if (!profile || profile.role !== 'worker') {
+    if (!profile || profile.role !== "worker") {
       return res.status(403).json({ message: "Only workers can view their payment history" });
     }
-    
+    const teamView = req.query.team === "1" || req.query.team === "true";
+    const team = teamView ? await storage.getWorkerTeam(profile.id) : null;
+    if (teamView && team) {
+      const teamTimesheets = await storage.getTimesheetsByTeamOwner(profile.id);
+      return res.json(teamTimesheets);
+    }
     const workerTimesheets = await storage.getTimesheetsByWorker(profile.id);
     res.json(workerTimesheets);
   });
@@ -7726,41 +8891,61 @@ Respond ONLY in this exact JSON format:
       if (!job) {
         return res.status(404).json({ message: "Job not found" });
       }
-      
+
+      // Require accepted application or job assignment for this job (prevent clock-in to arbitrary jobs)
+      const [hasAssignment] = await db.select().from(jobAssignments).where(and(
+        eq(jobAssignments.jobId, jobId),
+        eq(jobAssignments.workerId, actualWorkerId),
+        eq(jobAssignments.status, "assigned")
+      )).limit(1);
+      const acceptedApps = await db.select().from(applications).where(and(
+        eq(applications.jobId, jobId),
+        eq(applications.status, "accepted")
+      ));
+      const hasAcceptedApp = acceptedApps.some(app =>
+        (app.workerId === actualWorkerId && !app.teamMemberId) ||
+        (clockingTeamMemberId != null && app.teamMemberId === clockingTeamMemberId)
+      );
+      if (!hasAssignment && !hasAcceptedApp) {
+        return res.status(403).json({
+          message: "You must be accepted for this job before clocking in.",
+          code: "NOT_ACCEPTED_FOR_JOB",
+        });
+      }
+
       const existingActive = await storage.getActiveTimesheet(actualWorkerId);
       if (existingActive) {
         return res.status(400).json({ message: "Already clocked in to a job" });
       }
       
-      // Location is REQUIRED for clock-in - must verify worker is near job site
-      if (!latitude || !longitude) {
+      const hasLocation = latitude != null && longitude != null && Number.isFinite(latitude) && Number.isFinite(longitude);
+      let distanceFromJob: number | null = null;
+      const locationVerified = true;
+
+      // Strict geofence enforcement: location is required and must match job geofence.
+      if (!hasLocation) {
         return res.status(400).json({
           message: "Location required",
           code: "LOCATION_REQUIRED",
           details: "You must enable location services to clock in. Please allow location access and try again."
         });
       }
-      
-      // Job must have coordinates for geofence verification
-      if (!job.latitude || !job.longitude) {
+      const jobCoords = await ensureJobGeofenceCoords(job);
+      if (!jobCoords) {
         return res.status(400).json({
           message: "Job location not set",
           code: "JOB_LOCATION_MISSING",
           details: "This job does not have a verified location. Please contact support."
         });
       }
-      
-      const distanceFromJob = calculateDistanceMeters(
+      distanceFromJob = calculateDistanceMeters(
         latitude, longitude,
-        parseFloat(job.latitude), parseFloat(job.longitude)
+        jobCoords.lat, jobCoords.lng
       );
-      
-      // Use appropriate geofence radius based on manual vs automatic clock-in
       const requiredRadiusMiles = isAutomatic ? AUTO_GEOFENCE_RADIUS_MILES : MANUAL_GEOFENCE_RADIUS_MILES;
-      
       if (!isWithinGeofence(distanceFromJob, isAutomatic)) {
         const distanceMiles = metersToMiles(distanceFromJob);
-        return res.status(403).json({ 
+        return res.status(403).json({
           message: "Too far from job site",
           code: "OUTSIDE_GEOFENCE",
           distanceMeters: Math.round(distanceFromJob),
@@ -7770,45 +8955,44 @@ Respond ONLY in this exact JSON format:
         });
       }
       
-      // No time restriction - workers can clock in anytime for accepted jobs
-      
       const timesheet = await storage.createTimesheet({
         jobId,
         workerId: actualWorkerId,
         companyId: job.companyId,
         clockInTime: new Date(),
-        clockInLatitude: latitude?.toString(),
-        clockInLongitude: longitude?.toString(),
-        clockInDistanceFromJob: distanceFromJob ? Math.round(distanceFromJob) : null,
+        clockInLatitude: hasLocation ? latitude?.toString() : null,
+        clockInLongitude: hasLocation ? longitude?.toString() : null,
+        clockInDistanceFromJob: distanceFromJob != null ? Math.round(distanceFromJob) : null,
         hourlyRate: job.hourlyRate,
         workerNotes: isAutomatic ? "Auto clocked in based on location" : null,
         autoClockedIn: isAutomatic || false,
+        locationVerified,
       });
       
       await db.insert(timesheetEvents).values({
         timesheetId: timesheet.id,
         eventType: isAutomatic ? "auto_clock_in" : "manual_clock_in",
-        latitude: latitude?.toString(),
-        longitude: longitude?.toString(),
-        distanceFromJob: distanceFromJob ? Math.round(distanceFromJob) : null,
-        metadata: { source: isAutomatic ? "geofence" : "manual" },
+        latitude: hasLocation ? latitude?.toString() : null,
+        longitude: hasLocation ? longitude?.toString() : null,
+        distanceFromJob: distanceFromJob != null ? Math.round(distanceFromJob) : null,
+        metadata: { source: isAutomatic ? "geofence" : "manual", unvalidated: false },
       });
       
-      // Create system message for clock-in event (visible to company only)
       const workerName = `${profile.firstName || ''} ${profile.lastName || ''}`.trim() || 'Worker';
       const clockInTimeFormatted = new Date().toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
       await db.insert(jobMessages).values({
         jobId,
         senderId: profile.id,
-        content: `${workerName} clocked in at ${clockInTimeFormatted}${isAutomatic ? ' (auto)' : ''}`,
+        content: `${workerName} clocked in at ${clockInTimeFormatted}${isAutomatic ? ' (auto)' : ''}${!locationVerified ? ' (location pending)' : ''}`,
         messageType: 'clock_in',
         timesheetId: timesheet.id,
         metadata: {
-          latitude: latitude || null,
-          longitude: longitude || null,
-          distanceFromJob: distanceFromJob ? Math.round(distanceFromJob) : null,
+          latitude: hasLocation ? latitude : null,
+          longitude: hasLocation ? longitude : null,
+          distanceFromJob: distanceFromJob != null ? Math.round(distanceFromJob) : null,
           isAutomatic: isAutomatic || false,
           timesheetId: timesheet.id,
+          locationVerified,
         },
         visibleToCompanyOnly: true,
       });
@@ -7840,8 +9024,8 @@ Respond ONLY in this exact JSON format:
         teamMemberName: null,
         teamMemberAvatarUrl: null,
         action: 'clock_in',
-        latitude: latitude || null,
-        longitude: longitude || null,
+        latitude: hasLocation ? latitude : null,
+        longitude: hasLocation ? longitude : null,
         jobId: job.id,
         jobTitle: job.title,
         timestamp: Date.now(),
@@ -7851,6 +9035,83 @@ Respond ONLY in this exact JSON format:
     } catch (err) {
       console.error("Clock in error:", err);
       res.status(500).json({ message: "Failed to clock in" });
+    }
+  });
+
+  /**
+   * Submit clock-in location for an unvalidated timesheet (e.g. after offline clock-in).
+   * When the user comes back online, we require them to provide their pin location before the timesheet can be submitted for approval.
+   * Within 50mi of job site → mark verified and timesheet is eligible for approval.
+   * Beyond 50mi or if location is never submitted → we never submit the timesheet (beyond 50mi = reject + strike for time theft).
+   */
+  app.post("/api/timesheets/:id/submit-clock-in-location", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    const profile = req.profile;
+    if (!profile) return res.status(403).json({ message: "Unauthorized" });
+    const id = Number(req.params.id);
+    const { latitude, longitude } = req.body;
+    if (latitude == null || longitude == null || !Number.isFinite(latitude) || !Number.isFinite(longitude)) {
+      return res.status(400).json({ message: "latitude and longitude are required" });
+    }
+    const timesheet = await storage.getTimesheet(id);
+    if (!timesheet) return res.status(404).json({ message: "Timesheet not found" });
+    if (timesheet.workerId !== profile.id) return res.status(403).json({ message: "Not your timesheet" });
+    if (timesheet.clockOutTime != null) return res.status(400).json({ message: "Cannot submit location for a completed timesheet" });
+    const hadLocation = timesheet.clockInLatitude != null && timesheet.clockInLongitude != null;
+    if (hadLocation) return res.status(400).json({ message: "This timesheet already has a clock-in location" });
+    const job = await storage.getJob(timesheet.jobId);
+    if (!job) return res.status(404).json({ message: "Job not found" });
+    try {
+      const jobCoords = await ensureJobGeofenceCoords(job);
+      if (jobCoords) {
+        const distanceMeters = calculateDistanceMeters(latitude, longitude, jobCoords.lat, jobCoords.lng);
+        if (distanceMeters > CLOCK_IN_VALIDATION_RADIUS_METERS) {
+          // Reject timesheet and issue strike (worker sees strike on account status / strikes page)
+          await storage.updateTimesheet(id, {
+            status: "rejected",
+            rejectionReason: "Clock-in location was more than 50 miles from the job site. This timesheet has been rejected and a strike was issued for attempted time theft.",
+          });
+          const strikeExplanation = "Attempted time theft: clock-in was submitted with a location more than 50 miles from the job site. Timesheet rejected.";
+          await storage.createTimesheetReport({
+            timesheetId: id,
+            reportedBy: job.companyId,
+            workerId: timesheet.workerId,
+            explanation: strikeExplanation,
+            isStrike: true,
+          });
+          notifyTimesheetUpdate(timesheet.workerId, {
+            timesheetId: id,
+            jobId: timesheet.jobId,
+            status: "rejected",
+            jobTitle: job.title || "Job",
+          });
+          return res.status(403).json({
+            message: "Too far from job site",
+            code: "LOCATION_VALIDATION_FAILED",
+            details: "Your clock-in location was more than 50 miles from the job site. This timesheet has been rejected and a strike has been added to your account.",
+          });
+        }
+        const distanceFromJob = Math.round(distanceMeters);
+        await storage.updateTimesheet(id, {
+          clockInLatitude: String(latitude),
+          clockInLongitude: String(longitude),
+          clockInDistanceFromJob: distanceFromJob,
+          locationVerified: true,
+          workerNotes: timesheet.workerNotes ? timesheet.workerNotes.replace("Clock-in unvalidated — location required for approval", "Clock-in location submitted and verified.").trim() : "Clock-in location submitted and verified.",
+        });
+      } else {
+        await storage.updateTimesheet(id, {
+          clockInLatitude: String(latitude),
+          clockInLongitude: String(longitude),
+          locationVerified: true,
+          workerNotes: timesheet.workerNotes ? timesheet.workerNotes.replace("Clock-in unvalidated — location required for approval", "Clock-in location submitted (job has no coordinates to verify distance).").trim() : "Clock-in location submitted.",
+        });
+      }
+      const updated = await storage.getTimesheet(id);
+      res.json(updated);
+    } catch (err) {
+      console.error("Submit clock-in location error:", err);
+      res.status(500).json({ message: "Failed to submit location" });
     }
   });
 
@@ -8681,31 +9942,23 @@ Respond ONLY in this exact JSON format:
 
   // Drive time calculation using Google Maps Distance Matrix API
   app.post("/api/maps/drive-time", async (req, res) => {
+    const { originLat, originLng, destLat, destLng } = req.body ?? {};
+    const hasCoords =
+      typeof originLat === "number" && typeof originLng === "number" &&
+      typeof destLat === "number" && typeof destLng === "number";
+
+    if (!hasCoords) {
+      return res.status(400).json({ message: "Origin and destination coordinates are required" });
+    }
+
     try {
-      const { originLat, originLng, destLat, destLng } = req.body;
-      
-      if (!originLat || !originLng || !destLat || !destLng) {
-        return res.status(400).json({ message: "Origin and destination coordinates are required" });
-      }
-      
       const apiKey = process.env.GOOGLE_API_KEY;
       if (!apiKey) {
-        // Fallback to straight-line distance estimation
-        const distanceMeters = calculateDistanceMeters(originLat, originLng, destLat, destLng);
-        const distanceMiles = metersToMiles(distanceMeters);
-        const estimatedMinutes = Math.round(distanceMiles * 2); // Rough estimate: 30mph average
-        
-        return res.json({
-          distance: `~${distanceMiles.toFixed(1)} miles`,
-          duration: `~${estimatedMinutes} min`,
-          durationValue: estimatedMinutes * 60,
-          isEstimate: true,
-        });
+        return driveTimeFallback(originLat, originLng, destLat, destLng, res);
       }
-      
+
       // Use Google Distance Matrix API
       const mapsClient = new GoogleMapsClient({});
-      
       const response = await mapsClient.distancematrix({
         params: {
           origins: [{ lat: originLat, lng: originLng }],
@@ -8715,33 +9968,40 @@ Respond ONLY in this exact JSON format:
         },
         timeout: 5000,
       });
-      
+
       if (response.data.rows?.[0]?.elements?.[0]?.status === "OK") {
         const element = response.data.rows[0].elements[0];
-        res.json({
+        return res.json({
           distance: element.distance?.text || "Unknown",
           duration: element.duration?.text || "Unknown",
           durationValue: element.duration?.value || 0,
           isEstimate: false,
         });
-      } else {
-        // Fallback
-        const distanceMeters = calculateDistanceMeters(originLat, originLng, destLat, destLng);
-        const distanceMiles = metersToMiles(distanceMeters);
-        const estimatedMinutes = Math.round(distanceMiles * 2);
-        
-        res.json({
-          distance: `~${distanceMiles.toFixed(1)} miles`,
-          duration: `~${estimatedMinutes} min`,
-          durationValue: estimatedMinutes * 60,
-          isEstimate: true,
-        });
       }
+      return driveTimeFallback(originLat, originLng, destLat, destLng, res);
     } catch (err) {
       console.error("Drive time calculation error:", err);
-      res.status(500).json({ message: "Failed to calculate drive time" });
+      return driveTimeFallback(originLat, originLng, destLat, destLng, res);
     }
   });
+
+  function driveTimeFallback(
+    originLat: number,
+    originLng: number,
+    destLat: number,
+    destLng: number,
+    res: { json: (body: object) => any }
+  ) {
+    const distanceMeters = calculateDistanceMeters(originLat, originLng, destLat, destLng);
+    const distanceMiles = metersToMiles(distanceMeters);
+    const estimatedMinutes = Math.round(distanceMiles * 2);
+    return res.json({
+      distance: `~${distanceMiles.toFixed(1)} miles`,
+      duration: `~${estimatedMinutes} min`,
+      durationValue: estimatedMinutes * 60,
+      isEstimate: true,
+    });
+  }
 
   // Test endpoint: GET /api/geolocation/ip/test — returns raw ipapi response to verify ipapi works
   app.get("/api/geolocation/ip/test", async (_req, res) => {
@@ -8900,10 +10160,12 @@ Respond ONLY in this exact JSON format:
         updates.longitude = longitude.toString();
       }
       
-      // Handle hourlyRate conversion (client sends in dollars, DB stores in cents)
+      // worker_team_members.hourly_rate is whole dollars (schema). Client sends dollars; legacy DB may have cents.
       if (updates.hourlyRate !== undefined && typeof updates.hourlyRate === 'number') {
-        // If it's already in cents (large number), use as-is, otherwise convert
-        updates.hourlyRate = updates.hourlyRate > 1000 ? updates.hourlyRate : Math.round(updates.hourlyRate * 100);
+        updates.hourlyRate = updates.hourlyRate > 1000 ? Math.round(updates.hourlyRate / 100) : Math.round(updates.hourlyRate);
+      }
+      if (Array.isArray(req.body.skillsets)) {
+        updates.skillsets = req.body.skillsets;
       }
       
       const updated = await storage.updateWorkerTeamMember(memberId, updates);
@@ -9047,22 +10309,23 @@ Respond ONLY in this exact JSON format:
     try {
       const companyId = profile.id;
       const companyJobs = await storage.getCompanyJobs(companyId);
-      const inProgressJobs = companyJobs.filter(
-        (j: any) => (j.status === "in_progress" || j.status === "open") && (j.workersHired ?? 0) > 0
-      );
-      if (inProgressJobs.length === 0) {
+      const openOrInProgressJobIds = companyJobs
+        .filter((j: any) => j.status === "in_progress" || j.status === "open")
+        .map((j: any) => j.id);
+      if (openOrInProgressJobIds.length === 0) {
         return res.status(400).json({
-          message: "No in-progress jobs with workers. Create a job and accept at least one worker first.",
+          message: "No open or in-progress jobs. Create a job first.",
         });
       }
-      const jobIds = inProgressJobs.map((j: any) => j.id);
-      const allApps = await storage.getJobApplicationsForJobIds(jobIds);
+      const allApps = await storage.getJobApplicationsForJobIds(openOrInProgressJobIds);
       const accepted = allApps.filter((a: any) => a.status === "accepted");
       if (accepted.length === 0) {
         return res.status(400).json({
-          message: "No accepted workers on in-progress jobs. Accept at least one worker on a job first.",
+          message: "No accepted workers on your jobs. Accept at least one worker on a job first.",
         });
       }
+      const jobIdsWithAccepted = [...new Set(accepted.map((a: any) => a.jobId))];
+      const inProgressJobs = companyJobs.filter((j: any) => jobIdsWithAccepted.includes(j.id));
       const count = Math.min(10, 10);
       const today = new Date();
       today.setHours(0, 0, 0, 0);
@@ -9205,6 +10468,14 @@ Respond ONLY in this exact JSON format:
             if (firstUsable) await storage.updateCompanyPaymentMethod(firstUsable.id, { isPrimary: true });
           }
 
+          // Resolve company Stripe customer once (create if missing) so all charges use the same customer
+          let companyStripeCustomerId: string | null = null;
+          try {
+            companyStripeCustomerId = await ensureCompanyStripeCustomer({ ...company, userId: (company as any).userId ?? "" });
+          } catch (e) {
+            console.warn("[AutoApproval] Could not ensure Stripe customer for company", company.id, (e as Error).message);
+          }
+
           // Try to charge the location's payment method
           let paymentCharged = false;
           
@@ -9216,7 +10487,7 @@ Respond ONLY in this exact JSON format:
               
               if (paymentMethod) {
                 // Handle card payment via Stripe
-                if (paymentMethod.type === "card" && paymentMethod.stripePaymentMethodId && company.stripeCustomerId) {
+                if (paymentMethod.type === "card" && paymentMethod.stripePaymentMethodId && companyStripeCustomerId) {
                   console.log(`[AutoApproval] Charging location card (${paymentMethod.cardBrand} ...${paymentMethod.lastFour})`);
                   
                   try {
@@ -9226,7 +10497,7 @@ Respond ONLY in this exact JSON format:
                     
                     const chargeResult = await chargeCardOffSession({
                       amount: totalWithFee,
-                      customerId: company.stripeCustomerId,
+                      customerId: companyStripeCustomerId,
                       paymentMethodId: paymentMethod.stripePaymentMethodId,
                       description: `Auto-approved Timesheet #${ts.id} - ${location.name}`,
                       metadata: {
@@ -9265,7 +10536,7 @@ Respond ONLY in this exact JSON format:
                   }
                 }
                 // Handle ACH payment via Stripe (saved via SetupIntent; no fee)
-                else if (paymentMethod.type === "ach" && paymentMethod.stripePaymentMethodId && company.stripeCustomerId) {
+                else if (paymentMethod.type === "ach" && paymentMethod.stripePaymentMethodId && companyStripeCustomerId) {
                   console.log(`[AutoApproval] Charging location Stripe ACH (${paymentMethod.bankName} ...${paymentMethod.lastFour})`);
                   
                   try {
@@ -9273,7 +10544,7 @@ Respond ONLY in this exact JSON format:
                     
                     const chargeResult = await chargeAchOffSession({
                       amount: totalAmount,
-                      customerId: company.stripeCustomerId,
+                      customerId: companyStripeCustomerId,
                       paymentMethodId: paymentMethod.stripePaymentMethodId,
                       description: `Auto-approved Timesheet #${ts.id} - ${location.name}`,
                       metadata: {
@@ -9353,7 +10624,7 @@ Respond ONLY in this exact JSON format:
             // Try company's primary payment method
             const primaryPaymentMethod = await storage.getPrimaryPaymentMethod(company.id);
             
-            if (primaryPaymentMethod && primaryPaymentMethod.type === "card" && primaryPaymentMethod.stripePaymentMethodId && company.stripeCustomerId) {
+            if (primaryPaymentMethod && primaryPaymentMethod.type === "card" && primaryPaymentMethod.stripePaymentMethodId && companyStripeCustomerId) {
               console.log(`[AutoApproval] Charging primary card (${primaryPaymentMethod.cardBrand} ...${primaryPaymentMethod.lastFour})`);
               
               try {
@@ -9363,7 +10634,7 @@ Respond ONLY in this exact JSON format:
                 
                 const chargeResult = await chargeCardOffSession({
                   amount: totalWithFee,
-                  customerId: company.stripeCustomerId,
+                  customerId: companyStripeCustomerId,
                   paymentMethodId: primaryPaymentMethod.stripePaymentMethodId,
                   description: `Auto-approved Timesheet #${ts.id}`,
                   metadata: {
@@ -9427,14 +10698,15 @@ Respond ONLY in this exact JSON format:
             }
           }
           
-          // If all payment methods failed, mark the timesheet with payment_failed status
+          // If all payment methods failed, mark the timesheet with payment_failed status and set profile so global popup shows
           if (!paymentCharged) {
             console.warn(`[AutoApproval] All payment methods failed for timesheet ${ts.id} - marking as payment_failed`);
             await storage.updateTimesheet(ts.id, { 
               paymentStatus: "failed",
               companyNotes: 'Auto-approved after 48 hours - payment failed, retry required',
             });
-            // Don't pay the worker if company payment failed
+            const failedMethodId = primaryPaymentMethod?.id ?? autoApprovalMethods.find((m: any) => m.isPrimary ?? m.is_primary)?.id ?? autoApprovalMethods[0]?.id;
+            if (failedMethodId) await storage.updateProfile(company.id, { lastFailedPaymentMethodId: failedMethodId });
             failedCount++;
             continue;
           }
@@ -9448,7 +10720,7 @@ Respond ONLY in this exact JSON format:
                 recipientId: worker.mercuryRecipientId,
                 amount: totalPay,
                 description: `Payment for ${job.title} - Auto-approved Timesheet #${ts.id}`,
-                idempotencyKey: `payout-worker-${worker.id}-timesheet-${ts.id}-${Date.now()}`,
+                idempotencyKey: `timesheet-payout-${ts.id}`,
                 note: `Worker: ${worker.id}, Timesheet: ${ts.id}`,
               });
               
@@ -9492,6 +10764,7 @@ Respond ONLY in this exact JSON format:
           if (worker) {
             notifyTimesheetUpdate(ts.workerId, {
               timesheetId: ts.id,
+              jobId: ts.jobId,
               jobTitle: job.title,
               status: 'approved',
               amount: totalPay,
@@ -9522,15 +10795,145 @@ Respond ONLY in this exact JSON format:
     const profile = req.profile;
     if (!profile || profile.role !== "company") return res.status(403).json({ message: "Unauthorized" });
     try {
-      const allTimesheets = await storage.getTimesheetsByCompany(profile.id, "approved");
+      // Use profile from DB so we always have current stripe_customer_id (not cached session)
+      const freshProfile = await storage.getProfile(profile.id);
+      if (!freshProfile) return res.status(404).json({ message: "Profile not found" });
+      const profileToUse = freshProfile as any;
+
+      const allTimesheets = await storage.getTimesheetsByCompany(profileToUse.id, "approved");
       const failedTimesheets = allTimesheets.filter((ts: any) => ts.paymentStatus === "failed" || ts.payment_status === "failed");
       if (failedTimesheets.length === 0) {
+        await storage.updateProfile(profileToUse.id, { lastFailedPaymentMethodId: null });
         return res.json({ retried: 0, message: "No failed payments to retry" });
       }
-      // Reset paymentStatus to "pending" so process-timesheet-payouts or auto-approval can pick them up
-      // Note: The charge happens during approval. For already-approved, we need to attempt charge again.
-      // For now, return 0 - full retry logic would replicate the approval charge flow.
-      return res.json({ retried: 0, failedCount: failedTimesheets.length, message: "Go to Timesheets to retry" });
+
+      const platformConfig = await storage.getPlatformConfig();
+      const platformFeePerHourCents = platformConfig?.platformFeePerHourCents ?? 1300;
+      const primaryMethod = await storage.getPrimaryPaymentMethod(profileToUse.id);
+      const userId = user?.claims?.sub ?? user?.id ?? user?.sub ?? profileToUse.userId;
+      const profileForStripe = { ...profileToUse, userId: userId ? String(userId) : "" };
+      const customerId = await ensureCompanyStripeCustomer(profileForStripe);
+      const canChargePrimary = primaryMethod && customerId && (
+        (primaryMethod.type === "card" && primaryMethod.stripePaymentMethodId) ||
+        (primaryMethod.type === "ach" && (primaryMethod.isVerified === true) && primaryMethod.stripePaymentMethodId)
+      );
+      if (!canChargePrimary) {
+        return res.status(400).json({ message: "No valid primary payment method to retry with. Please set or add a card in Payment Methods." });
+      }
+
+      // Verify primary PM is attached to our customer and usable (avoids "PaymentMethod may not be used again")
+      const pmId = primaryMethod.stripePaymentMethodId ?? (primaryMethod as any).stripe_payment_method_id;
+      if (pmId) {
+        try {
+          const stripeService = (await import("./services/stripe")).default;
+          const stripe = stripeService.getStripe();
+          const pm = await stripe.paymentMethods.retrieve(pmId);
+          const pmCustomerId = typeof (pm as any).customer === "string" ? (pm as any).customer : (pm as any).customer?.id ?? null;
+          if (pmCustomerId !== customerId) {
+            await storage.deleteCompanyPaymentMethod(primaryMethod.id);
+            return res.status(400).json({
+              message: "Your primary payment method is no longer valid (wrong customer). Please set a new primary in Payment Methods and try again.",
+            });
+          }
+        } catch (pmErr: any) {
+          const msg = String(pmErr?.message ?? "").toLowerCase();
+          const unusable = msg.includes("may not be used again") || msg.includes("no such payment_method") || msg.includes("detached");
+          if (unusable) {
+            await storage.deleteCompanyPaymentMethod(primaryMethod.id);
+            return res.status(400).json({
+              message: "Your primary payment method can no longer be used. Please set a new primary in Payment Methods and try again.",
+            });
+          }
+          throw pmErr;
+        }
+      }
+
+      let retried = 0;
+      for (const ts of failedTimesheets) {
+        const hoursWorked = parseFloat(String(ts.adjustedHours ?? ts.totalHours ?? 0)) || 0;
+        const totalPay = ts.totalPay ?? Math.round(hoursWorked * (ts.hourlyRate ?? 0));
+        const platformFee = Math.round(hoursWorked * platformFeePerHourCents);
+        const totalAmount = totalPay + platformFee;
+        if (totalAmount <= 0) continue;
+
+        let charged = false;
+        if (primaryMethod.type === "card" && primaryMethod.stripePaymentMethodId) {
+          try {
+            const { chargeCardOffSession, CARD_FEE_PERCENTAGE } = await import("./services/stripe");
+            const cardFee = Math.round(totalAmount * (CARD_FEE_PERCENTAGE / 100));
+            const chargeResult = await chargeCardOffSession({
+              amount: totalAmount + cardFee,
+              customerId,
+              paymentMethodId: primaryMethod.stripePaymentMethodId,
+              description: `Timesheet #${ts.id} - Retry failed payment`,
+              metadata: { companyId: profileToUse.id.toString(), timesheetId: ts.id.toString(), type: "timesheet_retry_charge" },
+            });
+            if (chargeResult.success && chargeResult.paymentIntentId) {
+              charged = true;
+              await storage.createCompanyTransaction({
+                profileId: profileToUse.id,
+                type: "charge",
+                amount: totalAmount,
+                description: `Timesheet #${ts.id} - Retry failed payment (card)`,
+                paymentMethod: "card",
+                stripePaymentIntentId: chargeResult.paymentIntentId,
+                cardFee,
+              });
+            } else {
+              await storage.updateProfile(profileToUse.id, { lastFailedPaymentMethodId: primaryMethod.id });
+            }
+          } catch (e: any) {
+            console.warn(`[RetryFailed] Card charge failed for timesheet ${ts.id}:`, e?.message);
+            await storage.updateProfile(profileToUse.id, { lastFailedPaymentMethodId: primaryMethod.id });
+          }
+        } else if (primaryMethod.type === "ach" && primaryMethod.stripePaymentMethodId) {
+          try {
+            const { chargeAchOffSession } = await import("./services/stripe");
+            const chargeResult = await chargeAchOffSession({
+              amount: totalAmount,
+              customerId,
+              paymentMethodId: primaryMethod.stripePaymentMethodId,
+              description: `Timesheet #${ts.id} - Retry failed payment`,
+              metadata: { companyId: profileToUse.id.toString(), timesheetId: ts.id.toString(), type: "timesheet_retry_charge" },
+            });
+            if (chargeResult.success && chargeResult.paymentIntentId) {
+              charged = true;
+              await storage.createCompanyTransaction({
+                profileId: profileToUse.id,
+                type: "charge",
+                amount: totalAmount,
+                description: `Timesheet #${ts.id} - Retry failed payment (ACH)`,
+                paymentMethod: "ach",
+                stripePaymentIntentId: chargeResult.paymentIntentId,
+                cardFee: 0,
+              });
+            } else {
+              await storage.updateProfile(profileToUse.id, { lastFailedPaymentMethodId: primaryMethod.id });
+            }
+          } catch (e: any) {
+            console.warn(`[RetryFailed] ACH charge failed for timesheet ${ts.id}:`, e?.message);
+            await storage.updateProfile(profileToUse.id, { lastFailedPaymentMethodId: primaryMethod.id });
+          }
+        }
+
+        if (charged) {
+          await storage.updateTimesheet(ts.id, { paymentStatus: "pending" });
+          retried++;
+        }
+      }
+
+      const stillFailed = (await storage.getTimesheetsByCompany(profileToUse.id, "approved")).filter(
+        (ts: any) => ts.paymentStatus === "failed" || ts.payment_status === "failed"
+      );
+      if (stillFailed.length === 0) {
+        await storage.updateProfile(profileToUse.id, { lastFailedPaymentMethodId: null });
+      }
+
+      return res.json({
+        retried,
+        failedCount: stillFailed.length,
+        message: retried > 0 ? `Charged ${retried} payment(s). Worker payouts will process shortly.` : (stillFailed.length > 0 ? "Charges failed. Please update your payment method and try again." : "No failed payments to retry"),
+      });
     } catch (err: any) {
       console.error("Retry failed payments error:", err);
       return res.status(500).json({ message: err?.message || "Failed to retry" });
@@ -9575,8 +10978,194 @@ Respond ONLY in this exact JSON format:
     if (!isCompanyOwner && !isWorker && !isTeamMember) {
       return res.status(403).json({ message: "Unauthorized" });
     }
-    
-    res.json(timesheet);
+
+    let timesheetOut = timesheet;
+    const workerProfile = await storage.getProfile(timesheet.workerId);
+    let payout = await storage.getWorkerPayoutByTimesheetId(id);
+
+    // Live Mercury status: refresh payout + timesheet payment fields when a payment is in flight
+    if (
+      payout?.mercuryPaymentId &&
+      payout.status !== "completed" &&
+      payout.status !== "failed"
+    ) {
+      try {
+        const { mercuryService } = await import("./services/mercury");
+        const tx = await mercuryService.getTransaction(payout.mercuryPaymentId);
+        const txStatus = (tx?.status ?? "").toLowerCase();
+        if (txStatus === "completed" || txStatus === "sent" || txStatus === "posted") {
+          const completedAt = tx?.createdAt ? new Date(tx.createdAt) : new Date();
+          await storage.updateWorkerPayout(payout.id, {
+            status: "completed",
+            mercuryPaymentStatus: tx?.status ?? "completed",
+            completedAt,
+          } as any);
+          await storage.updateTimesheet(id, { paymentStatus: "completed", paidAt: completedAt });
+          payout = (await storage.getWorkerPayoutByTimesheetId(id)) ?? payout;
+          timesheetOut = (await storage.getTimesheet(id)) ?? timesheetOut;
+        } else if (tx?.status && tx.status !== payout.mercuryPaymentStatus) {
+          await storage.updateWorkerPayout(payout.id, {
+            mercuryPaymentStatus: tx.status,
+          } as any);
+          payout = (await storage.getWorkerPayoutByTimesheetId(id)) ?? payout;
+        }
+      } catch (syncErr: any) {
+        console.warn(`[TimesheetGET] Mercury sync timesheet ${id}:`, syncErr?.message ?? syncErr);
+      }
+    }
+
+    let businessOperatorPreview: {
+      id: number;
+      firstName?: string | null;
+      lastName?: string | null;
+      avatarUrl?: string | null;
+    } | null = null;
+    if (workerProfile?.teamId) {
+      const team = await storage.getTeamById(workerProfile.teamId);
+      if (team?.ownerId && team.ownerId !== workerProfile.id) {
+        const bo = await storage.getProfile(team.ownerId);
+        if (bo) {
+          businessOperatorPreview = {
+            id: bo.id,
+            firstName: bo.firstName,
+            lastName: bo.lastName,
+            avatarUrl: bo.avatarUrl,
+          };
+        }
+      }
+    }
+
+    /** Teammate row from accepted application (employee profile often has empty name/avatar; roster has the real display). */
+    let teamMemberFromApp: (typeof workerTeamMembers.$inferSelect) | null = null;
+    if (workerProfile && timesheetOut.jobId) {
+      const [byWorkerTm] = await db
+        .select({ m: workerTeamMembers })
+        .from(applications)
+        .innerJoin(workerTeamMembers, eq(applications.teamMemberId, workerTeamMembers.id))
+        .where(
+          and(
+            eq(applications.jobId, timesheetOut.jobId),
+            eq(applications.status, "accepted"),
+            eq(applications.workerId, workerProfile.id),
+            isNotNull(applications.teamMemberId)
+          )
+        )
+        .limit(1);
+      teamMemberFromApp = byWorkerTm?.m ?? null;
+
+      if (!teamMemberFromApp && workerProfile.email) {
+        const [byEmailTm] = await db
+          .select({ m: workerTeamMembers })
+          .from(applications)
+          .innerJoin(workerTeamMembers, eq(applications.teamMemberId, workerTeamMembers.id))
+          .where(
+            and(
+              eq(applications.jobId, timesheetOut.jobId),
+              eq(applications.status, "accepted"),
+              eq(workerTeamMembers.email, workerProfile.email)
+            )
+          )
+          .limit(1);
+        teamMemberFromApp = byEmailTm?.m ?? null;
+      }
+
+      // Owner / teammate on roster: profile may be empty but worker_team_members has display + avatar
+      if (!teamMemberFromApp && workerProfile.teamId && workerProfile.email) {
+        const [rosterMatch] = await db
+          .select()
+          .from(workerTeamMembers)
+          .where(
+            and(
+              eq(workerTeamMembers.teamId, workerProfile.teamId),
+              eq(workerTeamMembers.email, workerProfile.email),
+              eq(workerTeamMembers.status, "active")
+            )
+          )
+          .limit(1);
+        teamMemberFromApp = rosterMatch ?? null;
+      }
+    }
+
+    let jobPreview: {
+      id: number;
+      title: string | null;
+      trade: string | null;
+      company: {
+        companyName?: string | null;
+        firstName?: string | null;
+        lastName?: string | null;
+      } | null;
+    } | null = null;
+    if (timesheetOut.jobId) {
+      const j = await storage.getJob(timesheetOut.jobId);
+      if (j) {
+        const jc = await storage.getProfile(j.companyId);
+        jobPreview = {
+          id: j.id,
+          title: displayJobTitle(j.title, j.trade),
+          trade: j.trade,
+          company: jc
+            ? {
+                companyName: jc.companyName,
+                firstName: jc.firstName,
+                lastName: jc.lastName,
+              }
+            : null,
+        };
+      }
+    }
+
+    let workerPreviewOut: {
+      id: number;
+      firstName?: string | null;
+      lastName?: string | null;
+      avatarUrl?: string | null;
+    } | null = null;
+    if (workerProfile) {
+      const needsName =
+        !String(workerProfile.firstName || "").trim() && !String(workerProfile.lastName || "").trim();
+      const needsAvatar = !String(workerProfile.avatarUrl || "").trim();
+      workerPreviewOut = {
+        id: workerProfile.id,
+        firstName: workerProfile.firstName,
+        lastName: workerProfile.lastName,
+        avatarUrl: workerProfile.avatarUrl,
+      };
+      if (teamMemberFromApp && (needsName || needsAvatar)) {
+        workerPreviewOut = {
+          id: workerProfile.id,
+          firstName: needsName ? teamMemberFromApp.firstName : workerProfile.firstName,
+          lastName: needsName ? teamMemberFromApp.lastName : workerProfile.lastName,
+          avatarUrl: needsAvatar ? teamMemberFromApp.avatarUrl : workerProfile.avatarUrl,
+        };
+      } else if (businessOperatorPreview && (needsName || needsAvatar)) {
+        workerPreviewOut = {
+          id: workerProfile.id,
+          firstName: needsName ? businessOperatorPreview.firstName : workerProfile.firstName,
+          lastName: needsName ? businessOperatorPreview.lastName : workerProfile.lastName,
+          avatarUrl: needsAvatar ? businessOperatorPreview.avatarUrl : workerProfile.avatarUrl,
+        };
+      }
+    }
+
+    res.json({
+      ...timesheetOut,
+      jobPreview,
+      workerPreview: workerPreviewOut,
+      businessOperatorPreview,
+      payoutPreview: payout
+        ? {
+            status: payout.status,
+            mercuryPaymentStatus: payout.mercuryPaymentStatus,
+            processedAt: payout.processedAt,
+            completedAt: payout.completedAt,
+            isInstantPayout: payout.isInstantPayout,
+            createdAt: payout.createdAt,
+            errorMessage: payout.errorMessage,
+            mercuryPaymentId: payout.mercuryPaymentId,
+          }
+        : null,
+    });
   });
 
   /** When a job's estimated labor budget (budgetCents) is met, send company one "close project" review email with URL to review flow.
@@ -9621,8 +11210,7 @@ Respond ONLY in this exact JSON format:
     
     const id = Number(req.params.id);
     const { adjustedHours, companyNotes } = req.body;
-    
-    console.log(`[TimesheetApproval] Starting approval for timesheet ${id}`);
+    console.log(`[TimesheetApproval] Approve requested for timesheet ${id} (Mercury payout logs will follow in this terminal).`);
     
     const timesheet = await storage.getTimesheet(id);
     if (!timesheet) {
@@ -9654,7 +11242,32 @@ Respond ONLY in this exact JSON format:
     if (!isCompanyOwner && !isTeamMember) {
       return res.status(403).json({ message: "Unauthorized" });
     }
-    
+
+    // Idempotent replay: already approved — no double charge / duplicate payout
+    if (timesheet.status === "approved") {
+      const [balanceRowApproved] = await db
+        .select({ depositAmount: profiles.depositAmount })
+        .from(profiles)
+        .where(eq(profiles.id, profile.id))
+        .limit(1);
+      const companyBalanceCents = Number(balanceRowApproved?.depositAmount ?? profile.depositAmount ?? 0);
+      return res.json({ ...timesheet, companyBalanceCents, alreadyApproved: true });
+    }
+
+    if (timesheet.status === "disputed") {
+      return res.status(400).json({
+        message: "This timesheet is disputed. Resolve the dispute before approving.",
+        code: "TIMESHEET_DISPUTED",
+      });
+    }
+
+    // Location/geofence is informational in the UI only; company may still approve.
+    if (timesheet.locationVerified === false) {
+      console.log(
+        `[TimesheetApproval] Timesheet ${id}: location not verified (approving anyway per product policy)`
+      );
+    }
+
     const originalHours = timesheet.totalHours ?? "0";
     const finalHours = adjustedHours ?? timesheet.adjustedHours ?? timesheet.totalHours ?? "0";
     const hoursNum = parseFloat(String(finalHours)) || 0;
@@ -9665,6 +11278,18 @@ Respond ONLY in this exact JSON format:
       if (notes.length < 30) {
         return res.status(400).json({ message: "When editing hours, a reason is required (at least 30 characters) so the worker can see why the timesheet was changed." });
       }
+    }
+
+    // Reject approval when company balance is insufficient (prevent approving more than available)
+    const [balanceRow] = await db.select({ depositAmount: profiles.depositAmount }).from(profiles).where(eq(profiles.id, profile.id)).limit(1);
+    const balanceCents = Number(balanceRow?.depositAmount ?? profile.depositAmount ?? 0);
+    if (balanceCents < totalPay) {
+      return res.status(402).json({
+        message: "Insufficient balance to approve this timesheet. Add funds in Payment Methods to continue.",
+        code: "INSUFFICIENT_BALANCE",
+        balanceCents,
+        requiredCents: totalPay,
+      });
     }
 
     console.log(`[TimesheetApproval] Updating timesheet ${id} to approved status`);
@@ -9687,6 +11312,7 @@ Respond ONLY in this exact JSON format:
     // Real-time WebSocket notification to worker
     notifyTimesheetUpdate(timesheet.workerId, {
       timesheetId: id,
+      jobId: timesheet.jobId,
       jobTitle: job?.title || 'Unknown Job',
       status: wasEdited ? 'edited' : 'approved',
       amount: totalPay,
@@ -9786,401 +11412,36 @@ Respond ONLY in this exact JSON format:
       });
       
       console.log(`[TimesheetApproval] Auto-generated invoice ${invoiceNumber} for timesheet ${id}`);
-      
-      // Ensure company has a primary payment method (required for catch-all fallback)
-      const allMethods = await storage.getCompanyPaymentMethods(profile.id);
-      const hasPrimaryMethod = allMethods.some((m: any) => m.isPrimary ?? m.is_primary);
-      if (!hasPrimaryMethod && allMethods.length > 0) {
-        const firstUsable = allMethods.find((m: any) => {
-          const hasStripe = !!(m.stripePaymentMethodId ?? m.stripe_payment_method_id);
-          const isMercury = !!((m.mercuryRecipientId ?? m.mercury_recipient_id) || (m.mercuryExternalAccountId ?? m.mercury_external_account_id));
-          return hasStripe && !isMercury && (m.type === "card" || (m.type === "ach" && (m.isVerified ?? m.is_verified)));
-        }) ?? allMethods.find((m: any) => (m.stripePaymentMethodId ?? m.stripe_payment_method_id) && !(m.mercuryRecipientId ?? m.mercury_recipient_id)) ?? allMethods[0];
-        if (firstUsable) {
-          await storage.updateCompanyPaymentMethod(firstUsable.id, { isPrimary: true });
-        }
-      }
 
-      // Check if job has a location with an assigned payment method for auto-charging
-      let locationPaymentCharged = false;
-      let locationPaymentMethod = null;
-      let locationPaymentIntentId: string | null = null;
-      
-      if (job?.companyLocationId) {
-        console.log(`[TimesheetApproval] Job has companyLocationId: ${job.companyLocationId}, checking for location payment method`);
-        const location = await storage.getCompanyLocation(job.companyLocationId);
-        
-        if (location && location.paymentMethodId) {
-          console.log(`[TimesheetApproval] Location ${location.name} has paymentMethodId: ${location.paymentMethodId}`);
-          const paymentMethod = await storage.getCompanyPaymentMethod(location.paymentMethodId);
-          
-          if (paymentMethod) {
-            locationPaymentMethod = paymentMethod;
-            
-            // Handle card payment via Stripe (with 3.5% fee)
-            if (paymentMethod.type === "card" && paymentMethod.stripePaymentMethodId && profile.stripeCustomerId) {
-              console.log(`[TimesheetApproval] Charging location's card (${paymentMethod.cardBrand} ...${paymentMethod.lastFour})`);
-              
-              const { chargeCardOffSession, CARD_FEE_PERCENTAGE } = await import("./services/stripe");
-              const cardFee = Math.round(totalAmount * (CARD_FEE_PERCENTAGE / 100));
-              const totalWithFee = totalAmount + cardFee;
-              
-              const chargeResult = await chargeCardOffSession({
-                amount: totalWithFee,
-                customerId: profile.stripeCustomerId,
-                paymentMethodId: paymentMethod.stripePaymentMethodId,
-                description: `Timesheet #${id} - Auto-charge for ${location.name}`,
-                metadata: {
-                  companyId: profile.id.toString(),
-                  timesheetId: id.toString(),
-                  locationId: location.id.toString(),
-                  locationName: location.name,
-                  type: "location_timesheet_charge",
-                  baseAmount: totalAmount.toString(),
-                  cardFee: cardFee.toString(),
-                },
-              });
-              
-              if (chargeResult.success && chargeResult.paymentIntentId) {
-                locationPaymentIntentId = chargeResult.paymentIntentId;
-                locationPaymentCharged = true;
-                
-                // Record the charge transaction with card payment method
-                await storage.createCompanyTransaction({
-                  profileId: profile.id,
-                  type: "charge",
-                  amount: totalAmount,
-                  description: `Timesheet #${id} - ${workerName} (${finalHours} hrs) - Auto-charged to ${location.name}`,
-                  paymentMethod: "card",
-                  stripePaymentIntentId: chargeResult.paymentIntentId,
-                  cardFee: cardFee,
-                });
-                
-                console.log(`[TimesheetApproval] Location card charged successfully. PaymentIntent: ${chargeResult.paymentIntentId}, Total: $${(totalWithFee / 100).toFixed(2)} (includes $${(cardFee / 100).toFixed(2)} fee)`);
-              } else {
-                // Card charge failed - log the reason and fall back to balance deduction
-                if (chargeResult.requiresAction) {
-                  console.warn(`[TimesheetApproval] Location card requires customer action. Cannot charge off-session. Falling back to balance deduction.`);
-                } else {
-                  console.warn(`[TimesheetApproval] Location card charge failed: ${chargeResult.error || 'Unknown error'}. Falling back to balance deduction.`);
-                }
-                locationPaymentCharged = false;
-              }
-            }
-            // Handle ACH payment via Stripe (saved via SetupIntent; no fee)
-            else if (paymentMethod.type === "ach" && paymentMethod.stripePaymentMethodId && profile.stripeCustomerId) {
-              console.log(`[TimesheetApproval] Charging location's Stripe ACH (${paymentMethod.bankName} ...${paymentMethod.lastFour})`);
-              
-              try {
-                const { chargeAchOffSession } = await import("./services/stripe");
-                
-                const chargeResult = await chargeAchOffSession({
-                  amount: totalAmount,
-                  customerId: profile.stripeCustomerId,
-                  paymentMethodId: paymentMethod.stripePaymentMethodId,
-                  description: `Timesheet #${id} - Auto-charge for ${location.name}`,
-                  metadata: {
-                    companyId: profile.id.toString(),
-                    timesheetId: id,
-                    locationId: location.id.toString(),
-                    type: "timesheet_approval_charge",
-                  },
-                });
-                
-                if (chargeResult.success && chargeResult.paymentIntentId) {
-                  locationPaymentCharged = true;
-                  await storage.createCompanyTransaction({
-                    profileId: profile.id,
-                    type: "charge",
-                    amount: totalAmount,
-                    description: `Timesheet #${id} - ${workerName} (${finalHours} hrs) - Auto-charged to ${location.name} (ACH)`,
-                    paymentMethod: "ach",
-                    stripePaymentIntentId: chargeResult.paymentIntentId,
-                    cardFee: 0,
-                  });
-                  console.log(`[TimesheetApproval] Location Stripe ACH charged. PaymentIntent: ${chargeResult.paymentIntentId}`);
-                } else {
-                  console.warn(`[TimesheetApproval] Stripe ACH charge failed: ${chargeResult.error}`);
-                  locationPaymentCharged = false;
-                }
-              } catch (achErr: any) {
-                console.warn(`[TimesheetApproval] Stripe ACH charge failed: ${achErr.message}. Falling back to balance deduction.`);
-                locationPaymentCharged = false;
-              }
-            }
-            // Handle ACH payment via Mercury Bank (legacy; no fee)
-            else if (paymentMethod.type === "ach" && paymentMethod.mercuryRecipientId && paymentMethod.mercuryExternalAccountId) {
-              console.log(`[TimesheetApproval] Charging location's Mercury ACH (${paymentMethod.bankName} ...${paymentMethod.lastFour})`);
-              
-              try {
-                const { mercuryService } = await import("./services/mercury");
-                
-                // ACH debit: Pull funds FROM company's payment method TO platform account
-                const payment = await mercuryService.requestDebit({
-                  recipientId: paymentMethod.mercuryRecipientId,
-                  externalAccountId: paymentMethod.mercuryExternalAccountId,
-                  amount: totalAmount, // No fee for ACH
-                  description: `Timesheet #${id} - Auto-charge for ${location.name}`,
-                  idempotencyKey: `location-timesheet-${id}-${location.id}-${Date.now()}`,
-                  note: `Company: ${profile.id}, Timesheet: ${id}, Location: ${location.id} (${location.name})`,
-                });
-                
-                locationPaymentCharged = true;
-                
-                // Record the charge transaction with ACH payment method (no fee)
-                await storage.createCompanyTransaction({
-                  profileId: profile.id,
-                  type: "charge",
-                  amount: totalAmount,
-                  description: `Timesheet #${id} - ${workerName} (${finalHours} hrs) - Auto-charged to ${location.name} (ACH)`,
-                  paymentMethod: "ach",
-                  mercuryPaymentId: payment.id,
-                  mercuryPaymentStatus: payment.status,
-                  cardFee: 0, // No fee for ACH
-                });
-                
-                console.log(`[TimesheetApproval] Location ACH charged successfully. Payment: ${payment.id}, Status: ${payment.status}, Amount: $${(totalAmount / 100).toFixed(2)} (no fee)`);
-              } catch (achErr: any) {
-                console.warn(`[TimesheetApproval] Location ACH charge failed: ${achErr.message}. Falling back to balance deduction.`);
-                locationPaymentCharged = false;
-              }
-            }
-          }
-        }
-      }
-      
-      // Catch-all: if location payment failed (or no location method), try primary payment method
-      if (!locationPaymentCharged) {
-        const primaryMethod = await storage.getPrimaryPaymentMethod(profile.id);
-        const locationPmId = locationPaymentMethod?.id;
-        if (primaryMethod && primaryMethod.id !== locationPmId && profile.stripeCustomerId) {
-          const canChargePrimary = (primaryMethod.type === "card" && primaryMethod.stripePaymentMethodId)
-            || (primaryMethod.type === "ach" && (primaryMethod.isVerified ?? primaryMethod.is_verified) && primaryMethod.stripePaymentMethodId);
-          if (canChargePrimary) {
-            console.log(`[TimesheetApproval] Location payment failed or unavailable — trying primary (${primaryMethod.type} ...${primaryMethod.lastFour})`);
-            if (primaryMethod.type === "card" && primaryMethod.stripePaymentMethodId) {
-              try {
-                const { chargeCardOffSession, CARD_FEE_PERCENTAGE } = await import("./services/stripe");
-                const cardFee = Math.round(totalAmount * (CARD_FEE_PERCENTAGE / 100));
-                const totalWithFee = totalAmount + cardFee;
-                const chargeResult = await chargeCardOffSession({
-                  amount: totalWithFee,
-                  customerId: profile.stripeCustomerId,
-                  paymentMethodId: primaryMethod.stripePaymentMethodId,
-                  description: `Timesheet #${id} - Fallback to primary method`,
-                  metadata: { companyId: profile.id.toString(), timesheetId: id.toString(), type: "timesheet_approval_charge", fallback: "primary" },
-                });
-                if (chargeResult.success && chargeResult.paymentIntentId) {
-                  locationPaymentCharged = true;
-                  await storage.createCompanyTransaction({
-                    profileId: profile.id,
-                    type: "charge",
-                    amount: totalAmount,
-                    description: `Timesheet #${id} - ${workerName} (${finalHours} hrs) - Charged to primary (location method failed)`,
-                    paymentMethod: "card",
-                    stripePaymentIntentId: chargeResult.paymentIntentId,
-                    cardFee,
-                  });
-                  console.log(`[TimesheetApproval] Primary card charged successfully as fallback`);
-                }
-              } catch (e: any) {
-                console.warn(`[TimesheetApproval] Primary card fallback failed: ${e?.message}`);
-              }
-            } else if (primaryMethod.type === "ach" && primaryMethod.stripePaymentMethodId) {
-              try {
-                const { chargeAchOffSession } = await import("./services/stripe");
-                const chargeResult = await chargeAchOffSession({
-                  amount: totalAmount,
-                  customerId: profile.stripeCustomerId,
-                  paymentMethodId: primaryMethod.stripePaymentMethodId,
-                  description: `Timesheet #${id} - Fallback to primary method`,
-                  metadata: { companyId: profile.id.toString(), timesheetId: id.toString(), type: "timesheet_approval_charge", fallback: "primary" },
-                });
-                if (chargeResult.success && chargeResult.paymentIntentId) {
-                  locationPaymentCharged = true;
-                  await storage.createCompanyTransaction({
-                    profileId: profile.id,
-                    type: "charge",
-                    amount: totalAmount,
-                    description: `Timesheet #${id} - ${workerName} (${finalHours} hrs) - Charged to primary ACH (location method failed)`,
-                    paymentMethod: "ach",
-                    stripePaymentIntentId: chargeResult.paymentIntentId,
-                    cardFee: 0,
-                  });
-                  console.log(`[TimesheetApproval] Primary ACH charged successfully as fallback`);
-                }
-              } catch (e: any) {
-                console.warn(`[TimesheetApproval] Primary ACH fallback failed: ${e?.message}`);
-              }
-            }
-          }
-        }
-      }
-
-      // If payment was charged (location or primary fallback), skip balance deduction
-      if (locationPaymentCharged) {
-        console.log(`[TimesheetApproval] Payment method was charged, skipping balance deduction`);
-      } else {
-        // Deduct total amount from company balance and check for auto-replenishment
-        // Use company's custom threshold if set, otherwise default to $2,000
-        const currentBalance = profile.depositAmount || 0;
-        console.log(`[TimesheetApproval] Company current balance: $${(currentBalance / 100).toFixed(2)}`);
-        
-        // Check if company has sufficient balance
-        if (currentBalance < totalAmount) {
-          // Insufficient balance - check if auto-replenishment is possible
-          const hasLinkedBank = profile.mercuryRecipientId && profile.mercuryExternalAccountId;
-          if (!hasLinkedBank) {
-            console.error(`[TimesheetApproval] FAILED: Insufficient balance ($${(currentBalance / 100).toFixed(2)}) and no linked bank for replenishment`);
-            return res.status(400).json({ 
-              error: `Insufficient balance to approve timesheet. Current balance: $${(currentBalance / 100).toFixed(2)}, Required: $${(totalAmount / 100).toFixed(2)}. Please add funds or link a bank account for auto-replenishment.` 
-            });
-          }
-        }
-      
-      const { shouldReplenish, replenishAmount, newBalanceAfterCharge, targetBalance } = calculateReplenishmentAmount(
-        currentBalance,
-        totalAmount,
-        profile.autoReplenishThreshold
-      );
-      
-      console.log(`[TimesheetApproval] Balance calculation: current=$${(currentBalance/100).toFixed(2)}, charge=$${(totalAmount/100).toFixed(2)}, newBalance=$${(newBalanceAfterCharge/100).toFixed(2)}, shouldReplenish=${shouldReplenish}`);
-      
-      // If balance would go negative and replenishment is needed, do replenishment first
-      let replenishmentSuccess = true;
-      let replenishmentOrderId: string | null = null;
-      let replenishmentStatus = "pending";
-      
-      if (newBalanceAfterCharge < 0 && profile.mercuryRecipientId && profile.mercuryExternalAccountId) {
-        // Balance is insufficient - must replenish before deducting
-        try {
-          const { mercuryService } = await import("./services/mercury");
-          
-          const payment = await mercuryService.requestDebit({
-            recipientId: profile.mercuryRecipientId!,
-            externalAccountId: profile.mercuryExternalAccountId!,
-            amount: replenishAmount,
-            description: `Auto-replenishment for ${profile.companyName || profile.firstName}`,
-            idempotencyKey: `replenish-ts${id}-company-${profile.id}-${Date.now()}`,
-            note: `Company: ${profile.id}, Auto-replenishment (timesheet ${id})`,
-          });
-          replenishmentOrderId = payment.id;
-          replenishmentStatus = payment.status;
-          
-          // Record in Mercury AR (invoice for this company payment, mark paid)
-          mercuryService.recordCompanyPaymentAsMercuryInvoice(
-            profile,
-            replenishAmount,
-            `Auto-replenishment triggered by low balance (timesheet #${id})`,
-            replenishmentOrderId ?? undefined
-          ).catch((e) => console.warn("[Mercury] AR invoice failed (non-blocking):", e?.message));
-          
-          // Record the replenishment transaction
-          await storage.createCompanyTransaction({
-            profileId: profile.id,
-            type: "deposit",
-            amount: replenishAmount,
-            description: `Auto-replenishment triggered by low balance`,
-            mercuryPaymentId: replenishmentOrderId,
-            mercuryPaymentStatus: replenishmentStatus,
-          });
-          
-          console.log(`[TimesheetApproval] Auto-replenishment initiated: $${(replenishAmount / 100).toFixed(2)} (Payment: ${replenishmentOrderId})`);
-        } catch (replenishErr: any) {
-          console.error('Auto-replenishment failed:', replenishErr.message);
-          replenishmentSuccess = false;
-          // Balance is insufficient and replenishment failed - cannot proceed
-          return res.status(400).json({ 
-            error: `Unable to process payment. Insufficient balance ($${(currentBalance / 100).toFixed(2)}) and auto-replenishment failed: ${replenishErr.message}. Please add funds manually.` 
-          });
-        }
-      }
-      
-      // Now deduct the charge (balance is either sufficient or replenishment succeeded)
-      const finalBalanceAfterCharge = replenishmentSuccess && newBalanceAfterCharge < 0 
-        ? (newBalanceAfterCharge + replenishAmount) // After replenishment
-        : newBalanceAfterCharge;
-      
-      await storage.updateProfile(profile.id, {
-        depositAmount: Math.max(finalBalanceAfterCharge, 0),
-      });
-      
-      console.log(`[TimesheetApproval] Updated company balance to $${(Math.max(finalBalanceAfterCharge, 0) / 100).toFixed(2)}`);
-      
-      // Record the charge transaction
+      // Reduce company balance on approve so the company sees the deduction immediately (whether worker is paid now or held in escrow).
+      const [balanceBeforeRow] = await db.select({ depositAmount: profiles.depositAmount }).from(profiles).where(eq(profiles.id, profile.id)).limit(1);
+      const balanceBefore = Number(balanceBeforeRow?.depositAmount ?? profile.depositAmount ?? 0);
+      const newBalance = Math.max(0, balanceBefore - totalPay);
+      await storage.updateProfile(profile.id, { depositAmount: newBalance });
+      const workerNameForTx = worker ? `${worker.firstName || ''} ${worker.lastName || ''}`.trim() || 'Worker' : 'Worker';
       await storage.createCompanyTransaction({
         profileId: profile.id,
         type: "charge",
-        amount: totalAmount,
-        description: `Timesheet #${id} - ${workerName} (${finalHours} hrs @ $${((timesheet.hourlyRate + platformFeePerHourCents) / 100).toFixed(2)}/hr)`,
+        amount: totalPay,
+        description: `Timesheet #${id} - ${workerNameForTx} (approved) - ${finalHours} hrs`,
       });
-      
-      console.log(`[TimesheetApproval] Deducted $${(totalAmount / 100).toFixed(2)} from company balance. New balance: $${(finalBalanceAfterCharge / 100).toFixed(2)}`);
-      
-      // If balance is positive but dropped below threshold, do optional replenishment (non-blocking)
-      if (shouldReplenish && newBalanceAfterCharge >= 0 && profile.mercuryRecipientId && profile.mercuryExternalAccountId) {
-        try {
-          const { mercuryService } = await import("./services/mercury");
-          
-          const payment = await mercuryService.requestDebit({
-            recipientId: profile.mercuryRecipientId,
-            externalAccountId: profile.mercuryExternalAccountId,
-            amount: replenishAmount,
-            description: `Auto-replenishment for ${profile.companyName || profile.firstName}`,
-            idempotencyKey: `optional-replenish-ts${id}-company-${profile.id}-${Date.now()}`,
-            note: `Company: ${profile.id}, Optional auto-replenishment (timesheet ${id})`,
-          });
-          
-          // Record in Mercury AR (invoice for this company payment, mark paid)
-          mercuryService.recordCompanyPaymentAsMercuryInvoice(
-            profile,
-            replenishAmount,
-            `Auto-replenishment triggered by low balance (timesheet #${id})`,
-            payment.id
-          ).catch((e) => console.warn("[Mercury] AR invoice failed (non-blocking):", e?.message));
-          
-          // Update balance with replenishment
-          const finalBalance = finalBalanceAfterCharge + replenishAmount;
-          await storage.updateProfile(profile.id, {
-            depositAmount: finalBalance,
-          });
-          
-          // Record the replenishment transaction
-          await storage.createCompanyTransaction({
-            profileId: profile.id,
-            type: "deposit",
-            amount: replenishAmount,
-            description: `Auto-replenishment triggered by low balance`,
-            mercuryPaymentId: payment.id,
-            mercuryPaymentStatus: payment.status,
-          });
-          
-          console.log(`[TimesheetApproval] Auto-replenishment initiated: $${(replenishAmount / 100).toFixed(2)} (Payment: ${payment.id})`);
-        } catch (replenishErr: any) {
-          console.error('Auto-replenishment failed (non-critical):', replenishErr.message);
-          // This is non-critical since balance was sufficient - approval can proceed
-        }
-      } else if (shouldReplenish && (!profile.mercuryRecipientId || !profile.mercuryExternalAccountId)) {
-        console.log(`Company ${profile.id} needs replenishment but has no linked bank account`);
-      }
-      } // End of else block for !locationPaymentCharged
-      
-      // Pay the worker via ACH if they have a payout account set up
-      // Re-fetch worker to ensure we have latest data
+      console.log(`[TimesheetApproval] Reduced company balance by $${(totalPay / 100).toFixed(2)} (timesheet approved). Previous: $${(balanceBefore / 100).toFixed(2)}, New: $${(newBalance / 100).toFixed(2)}`);
+    } catch (invoiceErr: any) {
+      console.error('[TimesheetApproval] Failed to auto-generate invoice:', invoiceErr?.message || invoiceErr);
+      console.error('[TimesheetApproval] Stack:', invoiceErr?.stack);
+    }
+
+    // Platform pays worker from Mercury when they have W-9 + bank; balance was already deducted above.
+    try {
+      console.log(`[Mercury] Approved timesheet ${id}: triggering platform → worker payout. workerId=${timesheet.workerId}, totalPay=$${(totalPay/100).toFixed(2)}`);
       const workerForPayout = await storage.getProfile(timesheet.workerId);
-      
-      console.log(`[TimesheetApproval] Worker payout check: workerId=${timesheet.workerId}, hasMTCounterparty=${!!workerForPayout?.mercuryRecipientId}, hasMTExternalAccount=${!!workerForPayout?.mercuryExternalAccountId}, totalPay=$${(totalPay/100).toFixed(2)}`);
-      
-      // Check for W-9 requirement first
       const hasW9 = workerForPayout?.w9UploadedAt != null;
-      const hasBankAccount = workerForPayout?.mercuryRecipientId && workerForPayout.mercuryExternalAccountId;
+      const hasBankAccount = !!(workerForPayout?.mercuryRecipientId && workerForPayout?.mercuryExternalAccountId);
+      console.log(`[Mercury] Timesheet ${id} approved. Worker payout: workerId=${timesheet.workerId}, totalPay=$${(totalPay/100).toFixed(2)}, hasW9=${hasW9}, hasBankAccount=${hasBankAccount}. Platform will transfer to this worker's recipient when both true.`);
       
       if (workerForPayout && totalPay > 0) {
         if (!hasW9) {
-          // Worker doesn't have W-9 - create escrow payout record (pending_w9)
-          // Company has already been charged, funds are held until worker uploads W-9
           console.log(`[TimesheetApproval] Worker ${workerForPayout.id} has no W-9 - creating escrow payout`);
-          
           await storage.createWorkerPayout({
             workerId: workerForPayout.id,
             timesheetId: id,
@@ -10191,15 +11452,9 @@ Respond ONLY in this exact JSON format:
             hoursWorked: finalHours,
             hourlyRate: timesheet.hourlyRate,
           });
-          
-          await storage.updateTimesheet(id, {
-            paymentStatus: "pending",
-          });
-          
-          // Send email to worker with link to upload W-9 (worker documents tab)
+          await storage.updateTimesheet(id, { paymentStatus: "pending" });
           if (workerForPayout.email) {
             const baseUrl = process.env.BASE_URL || process.env.APP_URL || 'http://localhost:5000';
-            console.log(`[TimesheetApproval] Sending W-9 requirement email to worker ${workerForPayout.id}`);
             sendEmail({
               to: workerForPayout.email,
               type: 'payout_pending_w9',
@@ -10211,10 +11466,8 @@ Respond ONLY in this exact JSON format:
               }
             }).catch(err => console.error('Failed to send W-9 requirement email:', err));
           }
-          
           console.log(`Worker ${workerForPayout.id} does not have W-9 uploaded - $${(totalPay/100).toFixed(2)} held in escrow`);
         } else if (hasW9 && hasBankAccount) {
-          // Worker has W-9 and bank account - process payment
           console.log(`[TimesheetApproval] Processing worker payout for worker ${workerForPayout.id}`);
           
           // Check if instant payout is enabled and calculate fees
@@ -10237,9 +11490,10 @@ Respond ONLY in this exact JSON format:
           
           try {
             const { mercuryService } = await import("./services/mercury");
-            
+            // Main Mercury account (platform) sends payment TO recipient (worker)
+            console.log(`[Mercury] MAIN ACCOUNT → RECIPIENT: Initiating transfer from platform Mercury account to recipient workerId=${workerForPayout.id}, mercuryRecipientId=${workerForPayout.mercuryRecipientId}, amountCents=${payoutAmount}, timesheetId=${id}`);
             try {
-              // ACH credit: Send funds FROM platform account TO worker's bank
+              // ACH credit: Send funds FROM platform Mercury account TO worker's bank
               // Use net amount after fee deduction for instant payouts
               const payment = await mercuryService.sendPayment({
                 recipientId: workerForPayout.mercuryRecipientId!,
@@ -10247,14 +11501,15 @@ Respond ONLY in this exact JSON format:
                 description: isInstantPayout 
                   ? `Instant payment for ${job?.title || 'work'} - Timesheet #${id} (Fee: $${(instantPayoutFee/100).toFixed(2)})`
                   : `Payment for ${job?.title || 'work'} - Timesheet #${id}`,
-                idempotencyKey: `payout-worker-${workerForPayout.id}-timesheet-${id}-${Date.now()}`,
+                idempotencyKey: `timesheet-payout-${id}`,
                 note: `Worker: ${workerForPayout.id}, Timesheet: ${id}, Company: ${profile.id}${isInstantPayout ? ', Instant' : ''}`,
               });
               payoutOrderId = payment.id;
               payoutStatus = payment.status;
               payoutSuccess = true;
+              console.log(`[Mercury] MAIN ACCOUNT → RECIPIENT: Transfer completed workerId=${workerForPayout.id}, paymentOrderId=${payoutOrderId}, status=${payoutStatus}, timesheetId=${id}`);
             } catch (achError: any) {
-              console.error("Worker payout ACH error:", achError.message);
+              console.error("[Mercury] Worker payout ACH error:", achError.message);
               throw achError;
             }
           } catch (payoutErr: any) {
@@ -10303,13 +11558,43 @@ Respond ONLY in this exact JSON format:
             }).catch(err => console.error('Failed to send payout sent email:', err));
           }
           if (payoutSuccess) {
-            console.log(`Worker payout initiated: $${(totalPay / 100).toFixed(2)} to worker ${workerForPayout.id} (Payment Order: ${payoutOrderId})`);
+            console.log(`[TimesheetApproval] Worker payout initiated: $${(totalPay / 100).toFixed(2)} to worker ${workerForPayout.id} (Payment Order: ${payoutOrderId}). Balance was already deducted on approve.`);
+            // If recipient is a business operator (team owner), payment went to them; log and ensure they get payout_sent email
+            const operatorTeam = await storage.getWorkerTeam(workerForPayout.id);
+            if (operatorTeam) {
+              console.log(`[TimesheetApproval] Payment sent to business operator (workerId=${workerForPayout.id}); payout_sent email sent to business operator.`);
+              if (workerForPayout.email && !workerForPayout.emailNotifications) {
+                sendEmail({
+                  to: workerForPayout.email,
+                  type: 'payout_sent',
+                  data: {
+                    jobTitle: job?.title || 'Job',
+                    amount: (totalPay / 100).toFixed(2),
+                    netAmount: (payoutAmount / 100).toFixed(2),
+                    feeAmount: isInstantPayout ? (instantPayoutFee / 100).toFixed(2) : undefined,
+                    isInstantPayout: !!isInstantPayout,
+                  }
+                }).catch(err => console.error('Failed to send payout_sent to business operator:', err));
+              }
+            }
           } else {
             console.log(`Worker payout failed for timesheet ${id} - marked as failed for retry`);
+            if (workerForPayout.email) {
+              sendEmail({
+                to: workerForPayout.email,
+                type: 'payout_failed_fix_bank',
+                data: {
+                  workerName: `${workerForPayout.firstName || ''} ${workerForPayout.lastName || ''}`.trim(),
+                  amount: (totalPay / 100).toFixed(2),
+                  jobTitle: job?.title || 'Job',
+                  dashboardLink: `${process.env.BASE_URL || process.env.APP_URL || 'http://localhost:5000'}/worker`,
+                }
+              }).catch(err => console.error('Failed to send payout failed email:', err));
+            }
           }
         } else if (hasW9 && !hasBankAccount) {
-          // Worker has W-9 but no bank account - create escrow payout record (pending_bank_setup)
-          console.log(`[TimesheetApproval] Worker ${workerForPayout.id} has W-9 but no bank account - creating escrow payout`);
+          // Worker has W-9 but no bank account - create escrow payout record (pending_bank_setup). No Mercury transfer until they add bank.
+          console.log(`[Mercury] No transfer to recipient: worker ${workerForPayout.id} has W-9 but no Mercury recipient/bank account. Creating escrow payout.`);
           
           await storage.createWorkerPayout({
             workerId: workerForPayout.id,
@@ -10344,15 +11629,43 @@ Respond ONLY in this exact JSON format:
           console.log(`Worker ${workerForPayout.id} does not have a payout account configured - $${(totalPay/100).toFixed(2)} held in escrow`);
         }
       }
-    } catch (invoiceErr: any) {
-      console.error('[TimesheetApproval] Failed to auto-generate invoice:', invoiceErr?.message || invoiceErr);
-      console.error('[TimesheetApproval] Stack:', invoiceErr?.stack);
+    } catch (payoutSectionErr: any) {
+      console.error("[Mercury] Worker payout section error (continuing to send response):", payoutSectionErr?.message || payoutSectionErr);
+      console.error("[Mercury] Stack:", payoutSectionErr?.stack);
     }
 
     checkBudgetMetAndSendReviewEmail(timesheet.jobId).catch(() => {});
-    
-    console.log(`[TimesheetApproval] Completed processing for timesheet ${id}. Returning response.`);
-    res.json(updatedTimesheet);
+
+    // Expected pay timing for company UI and worker notification
+    let expectedPayTiming: string | undefined;
+    if (worker && totalPay > 0) {
+      if (!worker.w9UploadedAt) expectedPayTiming = "Worker will be paid after W-9 is uploaded";
+      else if (!worker.mercuryRecipientId || !worker.mercuryExternalAccountId) expectedPayTiming = "Worker will be paid after bank account is added";
+      else if (worker.instantPayoutEnabled) expectedPayTiming = "Instant payout: funds on the way (fee applied)";
+      else expectedPayTiming = "Standard ACH: 2-3 business days";
+    }
+
+    // In-app notification for worker (with pay timing in body)
+    if (worker && job) {
+      const payTimingText = expectedPayTiming || "Payment on the way.";
+      createNotification({
+        profileId: timesheet.workerId,
+        type: "timesheet_approved",
+        title: "Timesheet approved",
+        body: `Your timesheet for "${job.title}" was approved. ${payTimingText}`,
+        url: `/dashboard?tab=timesheets&timesheetId=${id}`,
+        data: { timesheetId: id, jobId: job.id, jobTitle: job.title, expectedPayTiming: expectedPayTiming ?? null },
+      }).catch(err => console.error("Failed to create timesheet_approved notification:", err));
+    }
+
+    // Return current company balance so client can update UI in real time (balance is withdrawn in DB to pay worker; payment to worker is from platform Mercury)
+    const [balanceAfterApprove] = await db.select({ depositAmount: profiles.depositAmount })
+      .from(profiles)
+      .where(eq(profiles.id, profile.id))
+      .limit(1);
+    const companyBalanceCents = Number(balanceAfterApprove?.depositAmount ?? profile.depositAmount ?? 0);
+    console.log(`[TimesheetApproval] Completed processing for timesheet ${id}. Company balance (real-time): $${(companyBalanceCents / 100).toFixed(2)}. Sending companyBalanceCents=${companyBalanceCents} in response.`);
+    res.json({ ...updatedTimesheet, companyBalanceCents, expectedPayTiming });
   });
 
   // Bulk approve timesheets endpoint
@@ -10389,25 +11702,53 @@ Respond ONLY in this exact JSON format:
           continue;
         }
         
+        if (timesheet.status === "approved") {
+          results.push({ id, success: true, skipped: true });
+          continue;
+        }
+
+        if (timesheet.status === "disputed") {
+          results.push({ id, success: false, error: "Timesheet is disputed; resolve before approving." });
+          continue;
+        }
+
         if (timesheet.status !== "pending") {
           results.push({ id, success: false, error: "Timesheet already processed" });
           continue;
         }
+
+        const adjParsed =
+          timesheet.adjustedHours != null && String(timesheet.adjustedHours).trim() !== ""
+            ? parseFloat(String(timesheet.adjustedHours))
+            : NaN;
+        const hoursNum = Number.isFinite(adjParsed)
+          ? adjParsed
+          : (() => {
+              const t = parseFloat(String(timesheet.totalHours ?? "0"));
+              return Number.isFinite(t) ? t : 0;
+            })();
+        const totalPay = Math.round(hoursNum * timesheet.hourlyRate);
+        const [bulkBalanceCheck] = await db.select({ depositAmount: profiles.depositAmount }).from(profiles).where(eq(profiles.id, profile.id)).limit(1);
+        const balanceBeforeBulk = Number(bulkBalanceCheck?.depositAmount ?? profile.depositAmount ?? 0);
+        if (balanceBeforeBulk < totalPay) {
+          results.push({ id, success: false, error: "Insufficient balance to approve this timesheet. Add funds in Payment Methods." });
+          continue;
+        }
         
-        // Approve the timesheet
+        // Approve the timesheet (mirror single-approve: persist hours + totalPay)
         const updatedTimesheet = await storage.updateTimesheet(id, {
           status: "approved",
           approvedAt: new Date(),
           approvedBy: profile.id,
+          adjustedHours: String(hoursNum),
+          totalPay,
         });
         
         // Platform fee from config; affiliate commission when worker was referred
         const platformConfigBulk = await storage.getPlatformConfig();
         const platformFeePerHourCentsBulk = platformConfigBulk?.platformFeePerHourCents ?? 1300;
         const affiliateCommissionPercentBulk = platformConfigBulk?.affiliateCommissionPercent ?? 20;
-        const adjustedHoursNum = timesheet.adjustedHours ? parseFloat(String(timesheet.adjustedHours)) : 0;
-        const totalPay = Math.round(adjustedHoursNum * timesheet.hourlyRate);
-        const platformFee = Math.round(adjustedHoursNum * platformFeePerHourCentsBulk);
+        const platformFee = Math.round(hoursNum * platformFeePerHourCentsBulk);
         const totalAmount = totalPay + platformFee;
         
         const workerForPayout = await storage.getProfile(timesheet.workerId);
@@ -10419,6 +11760,20 @@ Respond ONLY in this exact JSON format:
             await storage.createAffiliateCommission({ affiliateId: workerForPayout.referredByAffiliateId, timesheetId: id, amountCents: commissionCents, status: "pending" });
           }
         }
+
+        // Reduce company balance on approve (same as single-approve flow)
+        const [bulkBalanceRow] = await db.select({ depositAmount: profiles.depositAmount }).from(profiles).where(eq(profiles.id, profile.id)).limit(1);
+        const bulkBalanceBefore = Number(bulkBalanceRow?.depositAmount ?? profile.depositAmount ?? 0);
+        const bulkNewBalance = Math.max(0, bulkBalanceBefore - totalPay);
+        await storage.updateProfile(profile.id, { depositAmount: bulkNewBalance });
+        const bulkWorkerName = workerForPayout ? `${workerForPayout.firstName || ''} ${workerForPayout.lastName || ''}`.trim() || 'Worker' : 'Worker';
+        await storage.createCompanyTransaction({
+          profileId: profile.id,
+          type: "charge",
+          amount: totalPay,
+          description: `Timesheet #${id} - ${bulkWorkerName} (approved) - ${hoursNum} hrs`,
+        });
+        console.log(`[BulkApproval] Timesheet ${id}: reduced company balance by $${(totalPay / 100).toFixed(2)}. Previous: $${(bulkBalanceBefore / 100).toFixed(2)}, New: $${(bulkNewBalance / 100).toFixed(2)}`);
         
         // Process payment - same logic as single approve
         // Check for W-9 requirement first
@@ -10435,7 +11790,7 @@ Respond ONLY in this exact JSON format:
               amount: totalPay,
               status: "pending_w9",
               description: `Held pending W-9 upload - ${job?.title || 'Job'}`,
-              hoursWorked: timesheet.adjustedHours,
+              hoursWorked: String(hoursNum),
               hourlyRate: timesheet.hourlyRate,
             });
             
@@ -10477,7 +11832,7 @@ Respond ONLY in this exact JSON format:
                   description: isInstantPayout 
                     ? `Instant payment for ${job?.title || 'work'} - Timesheet #${id} (Fee: $${(instantPayoutFee/100).toFixed(2)})`
                     : `Payment for ${job?.title || 'work'} - Timesheet #${id}`,
-                  idempotencyKey: `bulk-approval-payout-${id}-${Date.now()}`,
+                  idempotencyKey: `timesheet-payout-${id}`,
                   note: `Worker: ${workerForPayout.id}, Timesheet: ${id}, Company: ${profile.id}${isInstantPayout ? ', Instant' : ''}`,
                 });
                 payoutOrderId = payment.id;
@@ -10514,6 +11869,19 @@ Respond ONLY in this exact JSON format:
               paymentStatus: payoutSuccess ? (payoutStatus === "completed" ? "completed" : "pending") : "failed",
             });
             
+            if (!payoutSuccess && workerForPayout.email) {
+              sendEmail({
+                to: workerForPayout.email,
+                type: 'payout_failed_fix_bank',
+                data: {
+                  workerName: `${workerForPayout.firstName || ''} ${workerForPayout.lastName || ''}`.trim(),
+                  amount: (totalPay / 100).toFixed(2),
+                  jobTitle: job?.title || 'Job',
+                  dashboardLink: `${process.env.BASE_URL || process.env.APP_URL || 'http://localhost:5000'}/worker`,
+                }
+              }).catch(err => console.error('[BulkApproval] Failed to send payout failed email:', err));
+            }
+            
             results.push({ id, success: true });
             
           } else if (hasW9 && !hasBankAccount) {
@@ -10525,7 +11893,7 @@ Respond ONLY in this exact JSON format:
               amount: totalPay,
               status: 'pending_bank_setup',
               description: `Held pending bank account setup - ${job?.title || 'Job'}`,
-              hoursWorked: timesheet.adjustedHours,
+              hoursWorked: String(hoursNum),
               hourlyRate: timesheet.hourlyRate,
             });
             
@@ -10565,6 +11933,7 @@ Respond ONLY in this exact JSON format:
         if (workerForPayout) {
           notifyTimesheetUpdate(timesheet.workerId, {
             timesheetId: id,
+            jobId: timesheet.jobId,
             jobTitle: job?.title || 'Unknown Job',
             status: 'approved',
             amount: totalPay / 100
@@ -10654,6 +12023,7 @@ Respond ONLY in this exact JSON format:
     // Real-time WebSocket notification
     notifyTimesheetUpdate(timesheet.workerId, {
       timesheetId: id,
+      jobId: timesheet.jobId,
       jobTitle: job?.title || 'Unknown Job',
       status: 'rejected',
     });
@@ -10860,46 +12230,164 @@ Respond ONLY in this exact JSON format:
   // Seed function call disabled - use /api/dev/seed endpoint instead
   // seedDatabase().then(() => console.log("✅ Seed complete")).catch((err: any) => console.error("❌ Seed failed:", err));
   
-  // Add manual seed trigger endpoint (development only)
-  if (process.env.NODE_ENV !== "production") {
-    app.post("/api/dev/seed", async (req, res) => {
-      try {
-        console.log("🔄 Manually triggering seed function...");
-        await seedDatabase();
-        res.json({ success: true, message: "Seed function completed" });
-      } catch (err: any) {
-        console.error("❌ Manual seed failed:", err);
-        console.error("❌ Error details:", {
-          message: err?.message,
-          stack: err?.stack,
-          cause: err?.cause,
+  // Add manual seed trigger endpoint (development only; route always registered so 404 is not returned)
+  app.post("/api/dev/seed", async (req, res) => {
+    if (process.env.NODE_ENV === "production") return res.status(403).json({ message: "Not available in production" });
+    try {
+      console.log("🔄 Manually triggering seed function...");
+      await seedDatabase();
+      res.json({ success: true, message: "Seed function completed" });
+    } catch (err: any) {
+      console.error("❌ Manual seed failed:", err);
+      console.error("❌ Error details:", {
+        message: err?.message,
+        stack: err?.stack,
+        cause: err?.cause,
+      });
+      res.status(500).json({ success: false, error: String(err) });
+    }
+  });
+
+  // Dev: create a recurring job (4 weeks, 9am–5pm) with operator@demo.com (+ teammates) and pending timesheets (1 click)
+  app.post("/api/dev/seed-operator-job", async (req, res) => {
+    if (process.env.NODE_ENV === "production") return res.status(403).json({ message: "Not available in production" });
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    const profile = req.profile;
+    if (!profile || profile.role !== "company") return res.status(403).json({ message: "Company only" });
+    try {
+        const operatorUser = await authStorage.getUserByEmail("operator@demo.com");
+        if (!operatorUser) return res.status(400).json({ message: "operator@demo.com not found. Run /api/dev/seed first." });
+        const operator = await storage.getProfileByUserId(operatorUser.id);
+        if (!operator) return res.status(400).json({ message: "Operator profile not found. Run /api/dev/seed first." });
+        const operatorTeam = await storage.getWorkerTeam(operator.id);
+        const teamMembers = operatorTeam ? await storage.getWorkerTeamMembers(operatorTeam.id) : [];
+        const startDate = new Date();
+        startDate.setHours(0, 0, 0, 0);
+        const endDate = new Date(startDate);
+        endDate.setDate(endDate.getDate() + 4 * 7);
+        const HOURLY_RATE_CENTS = 4000; // $40/hr for dev seed
+        const job = await storage.createJob({
+          companyId: profile.id,
+          title: "Dev recurring job (operator + team)",
+          description: "Recurring 4 weeks, 9am-5pm. Created by dev seed.",
+          location: "San Jose, CA",
+          address: "500 W Santa Clara St",
+          city: "San Jose",
+          state: "CA",
+          zipCode: "95113",
+          latitude: "37.3382",
+          longitude: "-121.8863",
+          trade: "Electrical",
+          serviceCategory: "Electrical",
+          skillLevel: "elite",
+          hourlyRate: HOURLY_RATE_CENTS,
+          maxWorkersNeeded: Math.max(1, 1 + teamMembers.length),
+          workersHired: 1,
+          status: "in_progress",
+          startDate,
+          endDate,
+          scheduledTime: "9:00 AM - 5:00 PM",
+          endTime: "17:00",
+          estimatedHours: 8,
+          jobType: "recurring",
+          scheduleDays: ["monday", "tuesday", "wednesday", "thursday", "friday"],
+          recurringWeeks: 4,
         });
-        res.status(500).json({ success: false, error: String(err) });
-      }
-    });
-  }
+        const application = await storage.createApplication({
+          jobId: job.id,
+          workerId: operator.id,
+          teamMemberId: null,
+          status: "accepted",
+          proposedRate: HOURLY_RATE_CENTS,
+          respondedAt: new Date(),
+        });
+        const today = new Date();
+        today.setHours(0, 0, 0, 0);
+        const jobLat = 37.3382;
+        const jobLng = -121.8863;
+        let created = 0;
+        for (let i = 0; i < 5; i++) {
+          const clockIn = new Date(today);
+          clockIn.setDate(clockIn.getDate() - (i % 4));
+          clockIn.setHours(9, 0, 0, 0);
+          const clockOut = new Date(clockIn);
+          clockOut.setHours(17, 0, 0, 0);
+          const hours = 8;
+          await storage.createTimesheet({
+            jobId: job.id,
+            workerId: operator.id,
+            companyId: profile.id,
+            clockInTime: clockIn,
+            clockOutTime: clockOut,
+            clockInLatitude: String(jobLat),
+            clockInLongitude: String(jobLng),
+            clockOutLatitude: String(jobLat),
+            clockOutLongitude: String(jobLng),
+            totalHours: String(hours),
+            adjustedHours: String(hours),
+            hourlyRate: HOURLY_RATE_CENTS,
+            clockInDistanceFromJob: 0,
+            clockOutDistanceFromJob: 0,
+            locationVerified: true,
+            status: "pending",
+            workerNotes: i === 0 ? "Dev seed timesheet" : null,
+          });
+          created++;
+        }
+        res.json({
+          success: true,
+          jobId: job.id,
+          jobTitle: job.title,
+          applicationId: application.id,
+          timesheetsCreated: created,
+          message: `Created recurring job "${job.title}" (4 weeks, 9am-5pm) with operator@demo.com and ${created} pending timesheet(s).`,
+        });
+    } catch (e: any) {
+      console.error("Seed operator job error:", e);
+      res.status(500).json({ message: e?.message || "Failed to seed operator job", error: String(e) });
+    }
+  });
 
   // === Notifications API ===
   
-  // Get notifications for a profile
+  // Get notifications for a profile (own profile only)
   app.get("/api/notifications/:profileId", async (req, res) => {
     if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    const profile = req.profile;
+    if (!profile) return res.status(403).json({ message: "Forbidden" });
     const profileId = Number(req.params.profileId);
-    
+    if (profileId !== profile.id) return res.status(403).json({ message: "You can only view your own notifications" });
+
+    const limit = Math.min(100, Math.max(1, parseInt(String(req.query.limit), 10) || 50));
+    const offset = Math.max(0, parseInt(String(req.query.offset), 10) || 0);
+    const unreadOnly =
+      String(req.query.unreadOnly) === "1" ||
+      String(req.query.unreadOnly).toLowerCase() === "true";
+    const typeParam = String(req.query.type || "").trim();
+    const typeFilter = typeParam ? typeParam.split(",").map((s: string) => s.trim()).filter(Boolean) : [];
+    const conditions = [eq(notifications.profileId, profileId)];
+    if (unreadOnly) conditions.push(eq(notifications.isRead, false));
+    if (typeFilter.length > 0) conditions.push(inArray(notifications.type, typeFilter));
+    const whereClause = conditions.length > 1 ? and(...conditions) : conditions[0];
     const result = await db.select()
       .from(notifications)
-      .where(eq(notifications.profileId, profileId))
+      .where(whereClause)
       .orderBy(desc(notifications.createdAt))
-      .limit(50);
-    
+      .limit(limit)
+      .offset(offset);
+
     res.json(result);
   });
-  
-  // Mark notification as read
+
+  // Mark notification as read (only own notifications)
   app.patch("/api/notifications/:id/read", async (req, res) => {
     if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    const profile = req.profile;
+    if (!profile) return res.status(403).json({ message: "Forbidden" });
     const id = Number(req.params.id);
-    
+    const [row] = await db.select({ profileId: notifications.profileId }).from(notifications).where(eq(notifications.id, id));
+    if (!row || row.profileId !== profile.id) return res.status(404).json({ message: "Notification not found" });
+
     const [updated] = await db.update(notifications)
       .set({ isRead: true })
       .where(eq(notifications.id, id))
@@ -10908,15 +12396,18 @@ Respond ONLY in this exact JSON format:
     res.json(updated);
   });
   
-  // Mark all notifications as read for a profile
+  // Mark all notifications as read for a profile (own profile only)
   app.patch("/api/notifications/read-all", async (req, res) => {
     if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    const profile = req.profile;
+    if (!profile) return res.status(403).json({ message: "Forbidden" });
     const { profileId } = req.body;
-    
+    if (Number(profileId) !== profile.id) return res.status(403).json({ message: "You can only mark your own notifications as read" });
+
     await db.update(notifications)
       .set({ isRead: true })
       .where(and(
-        eq(notifications.profileId, profileId),
+        eq(notifications.profileId, profile.id),
         eq(notifications.isRead, false)
       ));
     
@@ -12688,10 +14179,47 @@ Respond ONLY in this exact JSON format:
   });
 
   // ========================
-  // COMPANY PAYMENT METHODS
+  // COMPANY PAYMENT METHODS & AUTO-CHARGE
   // ========================
 
-  // Get all company payment methods (Stripe-only for funding; Mercury is for worker payouts only)
+  // Trigger auto-charge when pending + commitments exceed balance. Charges shortfall + 30% buffer via primary/verified method. On failure sets lastFailedPaymentMethodId so client shows add-payment modal.
+  app.post("/api/company/trigger-auto-charge", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    const profile = req.profile;
+    if (!profile || profile.role !== "company") return res.status(403).json({ message: "Company only" });
+    try {
+      const body = (req.body || {}) as { clientShortfallCents?: number; clientBalanceCents?: number; clientTotalNeededCents?: number };
+      let clientShortfallCents: number | undefined;
+      if (typeof body.clientShortfallCents === "number" && body.clientShortfallCents >= 0) {
+        clientShortfallCents = body.clientShortfallCents;
+      } else if (typeof body.clientBalanceCents === "number" && typeof body.clientTotalNeededCents === "number") {
+        clientShortfallCents = Math.max(0, body.clientTotalNeededCents - body.clientBalanceCents);
+      }
+      if (clientShortfallCents !== undefined && clientShortfallCents > 0) {
+        console.log(`[trigger-auto-charge] Company ${profile.id}: client shortfall $${(clientShortfallCents / 100).toFixed(2)}`);
+      }
+      const result = await triggerAutoReplenishmentForCompany(profile.id, {
+        clientShortfallCents: clientShortfallCents && clientShortfallCents > 0 ? clientShortfallCents : undefined,
+      });
+      if (result.success) {
+        return res.json({ success: true, message: "Balance replenished successfully." });
+      }
+      return res.json({
+        success: false,
+        noChargeNeeded: result.noChargeNeeded,
+        message: result.noChargeNeeded
+          ? "Balance is sufficient; no charge needed."
+          : "Payment failed. Add or update a payment method to cover your pending and job commitments.",
+      });
+    } catch (e: any) {
+      console.error("[trigger-auto-charge]", e);
+      return res.status(500).json({ success: false, noChargeNeeded: false, message: e?.message || "Failed to process auto-charge" });
+    }
+  });
+
+  // Get all company payment methods (Stripe-only for funding; Mercury is for worker payouts only).
+  // Policy: Stripe customer ID and payment method IDs are always persisted to DB when we create/attach in Stripe.
+  // Precheck from DB only: use profiles.stripe_customer_id and company_payment_methods.stripe_payment_method_id; no need to fetch list from Stripe.
   app.get("/api/company/payment-methods", async (req, res) => {
     if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
     const user = req.user as any;
@@ -12701,50 +14229,139 @@ Respond ONLY in this exact JSON format:
     }
 
     try {
-      let methods = await storage.getCompanyPaymentMethods(profile.id);
-      // Ensure at least one primary — auto-assign if none (user must always have a primary)
-      const hasPrimary = methods.some((m: any) => m.isPrimary ?? m.is_primary);
-      if (!hasPrimary && methods.length > 0) {
-        const firstUsable = methods.find((m: any) => {
-          const hasStripe = !!(m.stripePaymentMethodId ?? m.stripe_payment_method_id);
-          const isMercury = !!((m.mercuryRecipientId ?? m.mercury_recipient_id) || (m.mercuryExternalAccountId ?? m.mercury_external_account_id));
-          if (!hasStripe || isMercury) return false;
-          return m.type === "card" || (m.type === "ach" && (m.isVerified ?? m.is_verified));
-        }) ?? methods[0];
-        await storage.updateCompanyPaymentMethod(firstUsable.id, { isPrimary: true });
-        methods = await storage.getCompanyPaymentMethods(profile.id);
-      }
-      // Only this account's payment methods (already scoped by profile.id). Show only Stripe-linked methods used for company funding.
-      // Mercury-linked accounts are for workers who need to get paid — never show them in company payment methods.
-      const stripeOnly = methods.filter((m: any) => {
-        const hasStripe = !!(m.stripePaymentMethodId ?? m.stripe_payment_method_id);
-        const isMercuryLinked = !!((m.mercuryRecipientId ?? m.mercury_recipient_id) || (m.mercuryExternalAccountId ?? m.mercury_external_account_id));
-        return hasStripe && !isMercuryLinked;
-      });
+      const profileForStripe = (await storage.getProfile(profile.id)) ?? profile;
+      const targetCustomerId = await ensureCompanyStripeCustomer(profileForStripe);
+      const stripeService = (await import("./services/stripe")).default;
+      const stripe = stripeService.isStripeConfigured() ? stripeService.getStripe() : null;
 
-      // Fetch live status from Stripe for all ACH methods so UI shows actual verification state
-      const stripeAchMethods = stripeOnly.filter((m: any) => m.type === "ach" && (m.stripePaymentMethodId ?? m.stripe_payment_method_id));
-      if (stripeAchMethods.length > 0) {
-        try {
-          const stripeService = (await import("./services/stripe")).default;
-          const stripe = stripeService.getStripe();
-          for (const m of stripeAchMethods) {
-            const pmId = m.stripePaymentMethodId ?? m.stripe_payment_method_id;
-            const pm = await stripe.paymentMethods.retrieve(pmId);
-            const usBank = (pm as any).us_bank_account;
-            const stripeStatus = usBank?.status ?? null;
-            (m as any).stripeBankStatus = stripeStatus;
-            // status "verified" = bank can be charged; persist when Stripe confirms
-            const verified = stripeStatus === "verified";
-            if (verified && !(m.isVerified ?? m.is_verified)) {
-              await storage.updateCompanyPaymentMethod(m.id, { isVerified: true });
-              m.isVerified = true;
-            }
+      // Source of truth: fetch customer's payment methods directly from Stripe, then ensure each has a DB row
+      const stripeOnly: any[] = [];
+      if (stripe) {
+        const limit = 100;
+        const [cardList, achList] = await Promise.all([
+          stripe.paymentMethods.list({ customer: targetCustomerId, type: "card", limit }),
+          stripe.paymentMethods.list({ customer: targetCustomerId, type: "us_bank_account", limit }),
+        ]);
+        const existingByStripeId = new Map<string, any>();
+        for (const row of await storage.getCompanyPaymentMethods(profile.id)) {
+          const sid = row.stripePaymentMethodId ?? (row as any).stripe_payment_method_id;
+          if (sid) existingByStripeId.set(sid, row);
+        }
+        const ensureDbRow = async (pm: any): Promise<any> => {
+          const pmId = pm.id;
+          if (!pmId) return null;
+          const existing = existingByStripeId.get(pmId);
+          if (existing) return existing;
+          const isCard = !!(pm as any).card;
+          const isAch = !!(pm as any).us_bank_account;
+          if (isCard) {
+            const last4 = (pm as any).card?.last4 ?? "****";
+            const brand = (pm as any).card?.brand ?? null;
+            const created = await storage.createCompanyPaymentMethod({
+              profileId: profile.id,
+              type: "card",
+              lastFour: last4,
+              cardBrand: brand,
+              stripePaymentMethodId: pmId,
+              isPrimary: false,
+              isVerified: true,
+            });
+            existingByStripeId.set(pmId, created);
+            return created;
           }
-        } catch (syncErr: any) {
-          console.warn("[Payment methods] Stripe ACH status fetch skipped:", syncErr?.message);
+          if (isAch) {
+            const usBank = (pm as any).us_bank_account;
+            const last4 = usBank?.last4 ?? "****";
+            const bankName = usBank?.bank_name ?? "Bank";
+            const created = await storage.createCompanyPaymentMethod({
+              profileId: profile.id,
+              type: "ach",
+              lastFour: last4,
+              bankName,
+              stripePaymentMethodId: pmId,
+              isPrimary: false,
+              isVerified: usBank?.status === "verified",
+            });
+            (created as any).stripeBankStatus = usBank?.status ?? null;
+            existingByStripeId.set(pmId, created);
+            return created;
+          }
+          return null;
+        };
+        for (const pm of cardList.data) {
+          const row = await ensureDbRow(pm);
+          if (row) stripeOnly.push(row);
+        }
+        for (const pm of achList.data) {
+          const row = await ensureDbRow(pm);
+          if (row) {
+            try {
+              const retrieved = await stripe.paymentMethods.retrieve(pm.id);
+              const usBank = (retrieved as any).us_bank_account;
+              const status = usBank?.status ?? null;
+              (row as any).stripeBankStatus = status;
+              if (status === "verified" && !row.isVerified) {
+                await storage.updateCompanyPaymentMethod(row.id, { isVerified: true });
+                row.isVerified = true;
+              }
+            } catch (_) {}
+            stripeOnly.push(row);
+          }
         }
       }
+
+      // Ensure at least one primary
+      let methods = await storage.getCompanyPaymentMethods(profile.id);
+      const hasPrimary = stripeOnly.some((m: any) => m.isPrimary ?? m.is_primary);
+      if (!hasPrimary && stripeOnly.length > 0) {
+        const first = stripeOnly[0];
+        await storage.updateCompanyPaymentMethod(first.id, { isPrimary: true });
+        first.isPrimary = true;
+        methods = await storage.getCompanyPaymentMethods(profile.id);
+      }
+
+      const pmCustomerId = (pm: any) => {
+        const raw = (pm && (pm as any).customer) ?? null;
+        if (typeof raw === "string") return raw;
+        if (raw && typeof raw === "object" && typeof (raw as any).id === "string") return (raw as any).id;
+        return null;
+      };
+      const lastFailedId = (profile as any).lastFailedPaymentMethodId ?? (profile as any).last_failed_payment_method_id;
+      let clearFailedId = false;
+      if (lastFailedId != null) {
+        const failedMethod = methods.find((m: any) => m.id === lastFailedId);
+        const pmId = failedMethod && (failedMethod.stripePaymentMethodId ?? (failedMethod as any).stripe_payment_method_id);
+        if (pmId && stripe) {
+          try {
+            const pm = await stripe.paymentMethods.retrieve(pmId);
+            if (pmCustomerId(pm) !== targetCustomerId) clearFailedId = true;
+          } catch (_) {}
+        }
+      }
+
+      // Sync profile cache: primary payment method id, verified flag, and Stripe verification status (for verify-cents popup)
+      const primary = stripeOnly.find((m: any) => m.isPrimary ?? m.is_primary) ?? stripeOnly.find((m: any) => (m.type === "card" || (m.type === "ach" && (m.isVerified ?? m.is_verified))));
+      const primaryId = primary?.id ?? null;
+      const primaryVerified = primary ? (primary.type === "card" || (primary.type === "ach" && (primary.isVerified ?? primary.is_verified))) : false;
+      let primaryVerificationStatus: string | null = null;
+      if (primary) {
+        if (primary.id === lastFailedId && !clearFailedId) {
+          primaryVerificationStatus = "failed";
+        } else if (primary.type === "card") {
+          primaryVerificationStatus = "verified";
+        } else if (primary.type === "ach") {
+          const stripeStatus = (primary as any).stripeBankStatus ?? (primary as any).stripe_bank_status;
+          primaryVerificationStatus = stripeStatus === "verified" ? "verified" : stripeStatus === "verification_failed" ? "verification_failed" : "pending";
+        }
+      }
+      // Clear stale lastFailedPaymentMethodId when company has a verified primary (avoids add-payment modal on every refresh for users with valid payment methods)
+      const clearStaleFailure = clearFailedId || (primaryVerified && lastFailedId != null);
+      await storage.updateProfile(profile.id, {
+        primaryPaymentMethodId: primaryId,
+        primaryPaymentMethodVerified: primaryVerified,
+        primaryPaymentMethodVerificationStatus: primaryVerificationStatus,
+        ...(clearStaleFailure ? { lastFailedPaymentMethodId: null } : {}),
+      });
 
       // Return all Stripe payment methods; ACH includes stripeBankStatus from live Stripe API
       res.json(stripeOnly);
@@ -12881,10 +14498,14 @@ Respond ONLY in this exact JSON format:
       // Set this one as primary
       await storage.updateCompanyPaymentMethod(methodId, { isPrimary: true });
 
-      // Update profile with primary Modern Treasury counterparty
+      const verified = method.type === "card" || (method.type === "ach" && (method.isVerified ?? method.is_verified));
+      // Update profile with primary counterparty and cached payment method (for popup logic without fetching)
       await storage.updateProfile(profile.id, {
         mercuryRecipientId: method.mercuryRecipientId,
         mercuryExternalAccountId: method.mercuryExternalAccountId,
+        primaryPaymentMethodId: methodId,
+        primaryPaymentMethodVerified: verified,
+        lastFailedPaymentMethodId: null, // clear failure flag when they explicitly set primary
       });
 
       res.json({ success: true });
@@ -13053,17 +14674,29 @@ Respond ONLY in this exact JSON format:
       if (method.isPrimary) {
         const remainingMethods = await storage.getCompanyPaymentMethods(profile.id);
         if (remainingMethods.length > 0) {
-          await storage.updateCompanyPaymentMethod(remainingMethods[0].id, { isPrimary: true });
+          const newPrimary = remainingMethods[0];
+          await storage.updateCompanyPaymentMethod(newPrimary.id, { isPrimary: true });
+          const verified = newPrimary.type === "card" || (newPrimary.type === "ach" && (newPrimary.isVerified ?? newPrimary.is_verified));
           await storage.updateProfile(profile.id, {
-            mercuryRecipientId: remainingMethods[0].mercuryRecipientId,
-            mercuryExternalAccountId: remainingMethods[0].mercuryExternalAccountId,
+            mercuryRecipientId: newPrimary.mercuryRecipientId,
+            mercuryExternalAccountId: newPrimary.mercuryExternalAccountId,
+            primaryPaymentMethodId: newPrimary.id,
+            primaryPaymentMethodVerified: verified,
+            lastFailedPaymentMethodId: (profile as any).lastFailedPaymentMethodId === methodId ? null : undefined,
           });
         } else {
-          // No more payment methods - clear profile references
+          // No more payment methods - clear profile references and cache
           await storage.updateProfile(profile.id, {
             mercuryRecipientId: null,
             mercuryExternalAccountId: null,
+            primaryPaymentMethodId: null,
+            primaryPaymentMethodVerified: false,
+            lastFailedPaymentMethodId: (profile as any).lastFailedPaymentMethodId === methodId ? null : undefined,
           });
+        }
+      } else {
+        if ((profile as any).lastFailedPaymentMethodId === methodId) {
+          await storage.updateProfile(profile.id, { lastFailedPaymentMethodId: null });
         }
       }
 
@@ -13158,6 +14791,14 @@ Respond ONLY in this exact JSON format:
     try {
       const pendingPayouts = await storage.getWorkerPayoutsByStatus(profile.id, "pending_w9");
       const totalAmount = pendingPayouts.reduce((sum, p) => sum + (p.amount || 0), 0);
+      // If worker has W-9 on file and bank linked but still has pending_w9 payouts, trigger background release at most once per cooldown (avoids infinite loop when banner polls every 5s)
+      if (pendingPayouts.length > 0 && profile.w9UploadedAt && profile.mercuryRecipientId) {
+        const lastAt = w9ReleaseLastTriggeredAt.get(profile.id) ?? 0;
+        if (Date.now() - lastAt >= W9_RELEASE_TRIGGER_COOLDOWN_MS) {
+          w9ReleaseLastTriggeredAt.set(profile.id, Date.now());
+          setImmediate(() => runW9PayoutReleaseForWorker(profile.id).catch((e: any) => console.error("[PendingW9Payouts] Background release error:", e?.message ?? e)));
+        }
+      }
       res.json({ 
         payouts: pendingPayouts,
         count: pendingPayouts.length,
@@ -13282,7 +14923,7 @@ Respond ONLY in this exact JSON format:
       if (region) addressParams.region = region;
       if (postalCode) addressParams.postalCode = postalCode;
 
-      // Validate all required address fields are present
+      // Validate all required address fields are present (needed for Mercury and for dev mock)
       if (!addressParams.address1 || !addressParams.city || !addressParams.region || !addressParams.postalCode) {
         const missing = [];
         if (!addressParams.address1) missing.push('address');
@@ -13292,6 +14933,43 @@ Respond ONLY in this exact JSON format:
         console.error(`[PayoutAccountSetup] ❌ Missing required address fields:`, missing);
         return res.status(400).json({
           message: `Missing required address: ${missing.join(', ')}. Please complete the Location step with full address (street, city, state, zip) before connecting a bank account.`,
+        });
+      }
+
+      // Dev-only: bypass Mercury when using test routing number 123456789 (same as client hint)
+      const isDevTestRouting = process.env.NODE_ENV === "development" && routingNumber === "123456789";
+      if (isDevTestRouting) {
+        const mockRecipientId = `dev_recipient_${profile.id}_${Date.now()}`;
+        console.log(`[PayoutAccountSetup] Dev bypass: using test routing 123456789 — skipping Mercury, mock recipient ${mockRecipientId}`);
+        await storage.updateProfile(profile.id, {
+          mercuryRecipientId: mockRecipientId,
+          mercuryExternalAccountId: mockRecipientId,
+          mercuryBankVerified: false,
+          bankAccountLinked: true,
+        });
+        try {
+          await storage.createPayoutAccount({
+            profileId: profile.id,
+            provider: "mercury",
+            externalAccountId: mockRecipientId,
+            accountType: accountType,
+            bankName: bankName || "Dev Test Bank",
+            accountLastFour: accountNumber.slice(-4),
+            isDefault: true,
+          });
+        } catch (e: any) {
+          if (e?.code !== "23505" && !e?.message?.includes("unique")) throw e;
+        }
+        clearProfileSnapshot(req);
+        return res.json({
+          success: true,
+          lastFour: accountNumber.slice(-4),
+          recipientId: mockRecipientId,
+          externalAccountId: mockRecipientId,
+          mercuryRecipientId: mockRecipientId,
+          bankAccountLinked: true,
+          profileId: profile.id,
+          message: "Bank account added (dev test mode — use real routing in production).",
         });
       }
       
@@ -13339,9 +15017,14 @@ Respond ONLY in this exact JSON format:
           country: addressParams.country,
         });
         
+        const workerEmail = recipientEmail || profile.email || undefined;
         const recipient = await mercuryService.createRecipient({
           name: recipientName,
-          email: recipientEmail || undefined,
+          email: workerEmail,
+          emails: workerEmail ? [workerEmail] : undefined,
+          contactEmail: workerEmail,
+          phoneNumber: profile.phone || undefined,
+          isBusiness,
           nickname: nickname,
           accountType: finalAccountType as any,
           routingNumber,
@@ -13397,10 +15080,15 @@ Respond ONLY in this exact JSON format:
           country: addressParams.country,
         });
         
+        const workerEmail = recipientEmail || profile.email || undefined;
         try {
           const recipient = await mercuryService.updateRecipient(recipientId, {
             name: recipientName,
-            email: recipientEmail || undefined,
+            email: workerEmail,
+            emails: workerEmail ? [workerEmail] : undefined,
+            contactEmail: workerEmail,
+            phoneNumber: profile.phone || undefined,
+            isBusiness,
             nickname: nickname,
             accountType: finalAccountType as any,
             routingNumber,
@@ -13440,7 +15128,11 @@ Respond ONLY in this exact JSON format:
             try {
             const recipient = await mercuryService.createRecipient({
               name: recipientName,
-              email: recipientEmail || undefined,
+              email: workerEmail,
+              emails: workerEmail ? [workerEmail] : undefined,
+              contactEmail: workerEmail,
+              phoneNumber: profile.phone || undefined,
+              isBusiness,
               nickname: nickname,
               accountType: finalAccountType as any,
               routingNumber,
@@ -13471,16 +15163,39 @@ Respond ONLY in this exact JSON format:
         }
       }
 
+      // If worker had uploaded W-9 before connecting bank (stored on profile), attach it to the new recipient now
+      const profileForW9 = await storage.getProfile(profile.id);
+      let w9AttachedThisRequest = false;
+      if (profileForW9?.w9DocumentUrl && recipientId && typeof profileForW9.w9DocumentUrl === "string") {
+        try {
+          const w9Raw = profileForW9.w9DocumentUrl;
+          const dataUrlMatch = w9Raw.match(/^data:([^;]+);base64,(.+)$/);
+          const base64 = dataUrlMatch ? dataUrlMatch[2] : w9Raw;
+          const mimeType = dataUrlMatch ? dataUrlMatch[1] : "application/pdf";
+          const w9Buffer = Buffer.from(base64, "base64");
+          const w9FileName = mimeType.includes("pdf") ? "w9.pdf" : mimeType.includes("png") ? "w9.png" : "w9.jpg";
+          console.log(`[PayoutAccountSetup] Attaching stored W-9 to new recipient ${recipientId} (${w9Buffer.length} bytes)`);
+          await mercuryService.uploadRecipientAttachment(recipientId, w9Buffer, w9FileName, mimeType);
+          w9AttachedThisRequest = true;
+          console.log(`[PayoutAccountSetup] ✅ W-9 attached to recipient ${recipientId}`);
+        } catch (w9Err: any) {
+          console.error("[PayoutAccountSetup] Failed to attach stored W-9 to recipient:", w9Err?.message ?? w9Err);
+          // Don't fail bank connect; W-9 can be re-uploaded on Account & Documents
+        }
+      }
+
       // Store bank info on worker profile (Mercury Bank)
-      // Ensure recipient is always linked to the worker profile
+      // Ensure recipient is always linked to the worker profile; clear stored W-9 and set w9UploadedAt if we just attached it
       await storage.updateProfile(profile.id, {
         mercuryRecipientId: recipientId,
         mercuryExternalAccountId: externalAccountId,
         mercuryBankVerified: false,
         bankAccountLinked: !!recipientId,
+        ...(w9AttachedThisRequest ? { w9UploadedAt: new Date(), w9DocumentUrl: null } : {}),
       });
       
-      console.log(`[PayoutAccountSetup] ✅ Linked Mercury recipient ${recipientId} to worker profile ${profile.id}`);
+      console.log(`[PayoutAccountSetup] ✅ Profile ${profile.id} updated: mercuryRecipientId=${recipientId}, mercuryExternalAccountId=${externalAccountId ?? "null"}, bankAccountLinked=true`);
+      clearProfileSnapshot(req);
 
       // Also store in payout_accounts table (upsert-like: create or ignore duplicate)
       try {
@@ -13503,76 +15218,65 @@ Respond ONLY in this exact JSON format:
         console.log("[PayoutAccountSetup] Payout account record already exists, skipping insert");
       }
 
-      // AUTO-RELEASE: Process any pending payouts held in escrow for this worker
+      // AUTO-RELEASE: Group all pending_bank_setup payouts and send one payment for the total to this recipient
       let releasedPayouts: any[] = [];
       try {
         const pendingPayouts = await storage.getWorkerPayoutsByStatus(profile.id, "pending_bank_setup");
-        console.log(`[PayoutAccountSetup] Found ${pendingPayouts.length} pending payouts for worker ${profile.id}`);
-        
         if (pendingPayouts.length > 0 && externalAccountId && recipientId) {
-          
-          for (const payout of pendingPayouts) {
-            try {
-              console.log(`[PayoutAccountSetup] Processing escrow payout ${payout.id} - $${(payout.amount/100).toFixed(2)}`);
-              
-              // Check if instant payout is enabled and calculate fees
-              const isInstantPayout = profile.instantPayoutEnabled || false;
-              let payoutAmount = payout.amount;
-              let instantPayoutFee = 0;
-              let originalAmount = payout.amount;
-              
-              if (isInstantPayout) {
-                // Calculate fee: 1% + $0.30 (30 cents)
-                instantPayoutFee = Math.round(payout.amount * 0.01) + 30; // 1% in cents + 30 cents
-                payoutAmount = payout.amount - instantPayoutFee;
-                originalAmount = payout.amount;
-                console.log(`[PayoutAccountSetup] Instant payout enabled - Original: $${(originalAmount/100).toFixed(2)}, Fee: $${(instantPayoutFee/100).toFixed(2)}, Net: $${(payoutAmount/100).toFixed(2)}`);
-              }
-              
-              // ACH credit: Send funds FROM platform account TO worker's bank
-              // Use net amount after fee deduction for instant payouts
-              const payment = await mercuryService.sendPayment({
-                recipientId: recipientId,
-                amount: payoutAmount, // Use net amount after fee
-                description: isInstantPayout 
-                  ? `Instant escrow release - ${payout.description || 'Timesheet payout'} (Fee: $${(instantPayoutFee/100).toFixed(2)})`
-                  : `Escrow release - ${payout.description || 'Timesheet payout'}`,
-                idempotencyKey: `escrow-release-${payout.id}-${Date.now()}`,
-                note: `Worker: ${profile.id}, Payout: ${payout.id}${isInstantPayout ? ', Instant' : ''}`,
-              });
-              
-              // Update payout record with fee information
+          const totalAmountCents = pendingPayouts.reduce((sum, p) => sum + (p.amount ?? 0), 0);
+          if (totalAmountCents > 0) {
+            const isInstantPayout = profile.instantPayoutEnabled || false;
+            let netAmountCents = totalAmountCents;
+            let instantPayoutFeeCents = 0;
+            if (isInstantPayout) {
+              instantPayoutFeeCents = Math.round(totalAmountCents * 0.01) + 30;
+              netAmountCents = totalAmountCents - instantPayoutFeeCents;
+            }
+            console.log(`[PayoutAccountSetup] Sending grouped escrow release for worker ${profile.id}: ${pendingPayouts.length} payouts, total $${(totalAmountCents / 100).toFixed(2)}`);
+            const escrowPayoutIds = pendingPayouts.map((p) => p.id).sort((a, b) => a - b);
+            const idempotencyKey = `escrow-release-worker-${profile.id}-${escrowPayoutIds.join("-")}`;
+            const payment = await mercuryService.sendPayment({
+              recipientId,
+              amount: netAmountCents,
+              description: isInstantPayout
+                ? `Escrow release (${pendingPayouts.length} payouts) - Fee: $${(instantPayoutFeeCents / 100).toFixed(2)}`
+                : `Escrow release (${pendingPayouts.length} payouts)`,
+              idempotencyKey,
+              note: `Worker: ${profile.id}, batch of ${pendingPayouts.length}${isInstantPayout ? ", Instant" : ""}`,
+            });
+            const paymentStatus = payment.status === "completed" ? "completed" : "processing";
+            for (const payout of pendingPayouts) {
+              const pAmount = payout.amount ?? 0;
+              const proportionalFee = totalAmountCents > 0 && isInstantPayout
+                ? Math.round((instantPayoutFeeCents * pAmount) / totalAmountCents)
+                : undefined;
               await storage.updateWorkerPayout(payout.id, {
-                status: payment.status === "completed" ? "completed" : "processing",
+                status: paymentStatus,
                 mercuryPaymentId: payment.id,
                 mercuryPaymentStatus: payment.status,
-                amount: payoutAmount, // Update to net amount after fee
-                isInstantPayout: isInstantPayout,
-                instantPayoutFee: isInstantPayout ? instantPayoutFee : undefined,
-                originalAmount: isInstantPayout ? originalAmount : undefined,
+                isInstantPayout: isInstantPayout || undefined,
+                instantPayoutFee: proportionalFee,
+                originalAmount: pAmount,
               });
-              
-              // Update timesheet payment status
               if (payout.timesheetId) {
-                await storage.updateTimesheet(payout.timesheetId, {
-                  paymentStatus: "pending", // Will become completed via webhook
-                });
+                await storage.updateTimesheet(payout.timesheetId, { paymentStatus: "pending" });
               }
-              
-              releasedPayouts.push({
-                id: payout.id,
-                amount: payout.amount / 100,
-                status: "processing"
-              });
-              
-              console.log(`[PayoutAccountSetup] Released escrow payout ${payout.id} - Payment:`, payment.id);
-            } catch (payoutErr) {
-              console.error(`[PayoutAccountSetup] Failed to release payout ${payout.id}:`, payoutErr);
+              releasedPayouts.push({ id: payout.id, amount: pAmount / 100, status: paymentStatus });
             }
+            console.log(`[PayoutAccountSetup] Released ${pendingPayouts.length} escrow payouts - Payment:`, payment.id);
           }
         }
-      } catch (escrowErr) {
-        console.error("[PayoutAccountSetup] Error processing escrow payouts:", escrowErr);
+      } catch (escrowErr: any) {
+        console.error("[PayoutAccountSetup] Error processing escrow payouts:", escrowErr?.message ?? escrowErr);
+      }
+
+      // If we attached a stored W-9 to the new recipient, schedule grouped W-9 release in background (same as runW9PayoutReleaseForWorker)
+      if (w9AttachedThisRequest && recipientId) {
+        setImmediate(() => runW9PayoutReleaseForWorker(profile.id).catch((e: any) => console.error("[PayoutAccountSetup] W-9 release error:", e?.message ?? e)));
+        const pendingW9 = await storage.getWorkerPayoutsByStatus(profile.id, "pending_w9");
+        if (pendingW9.length > 0) {
+          console.log(`[PayoutAccountSetup] Scheduled grouped W-9 release for ${pendingW9.length} payouts (worker ${profile.id})`);
+        }
       }
 
       res.json({ 
@@ -13580,7 +15284,9 @@ Respond ONLY in this exact JSON format:
         lastFour, 
         recipientId,
         externalAccountId,
-        mercuryRecipientId: recipientId, // Explicitly include for clarity
+        mercuryRecipientId: recipientId,
+        bankAccountLinked: true,
+        profileId: profile.id,
         mercuryDashboardUrl: process.env.NODE_ENV === "development" 
           ? `https://sandbox.mercury.com/recipients/${recipientId}`
           : `https://app.mercury.com/recipients/${recipientId}`,
@@ -13605,24 +15311,26 @@ Respond ONLY in this exact JSON format:
         });
       }
       
-      // Check if it's a Mercury API error
-      if (err?.response || err?.status) {
+      // Check if it's a Mercury API error (service sets err.status and err.details, not err.response)
+      if (err?.status != null || err?.response) {
         console.error("[PayoutAccountSetup] Mercury API error response:", {
           status: err?.status,
           statusText: err?.statusText,
-          data: err?.response?.data || err?.data,
+          message: err?.message,
+          details: err?.details,
         });
-        const mercuryMessage = err?.response?.data?.message || err?.message || "";
-        const mercuryDetails = err?.response?.data || err?.data || err?.details;
-        const invalidRouting = mercuryMessage?.includes("Invalid routing number") ||
-          mercuryDetails?.errors?.message?.includes("Invalid routing number");
+        const mercuryMessage = err?.response?.data?.message ?? err?.details?.error ?? err?.details?.message ?? err?.message ?? "";
+        const mercuryDetails = err?.response?.data ?? err?.details ?? err?.data;
+        const errStr = mercuryDetails?.errors?.message ?? mercuryDetails?.errors ?? "";
+        const invalidRouting = (mercuryMessage && String(mercuryMessage).toLowerCase().includes("routing")) ||
+          (errStr && String(errStr).toLowerCase().includes("routing"));
         const userMessage = invalidRouting && process.env.NODE_ENV === "development"
-          ? "Invalid routing number. In sandbox use test routing number 021000021 (Chase)."
+          ? "Invalid routing number. In sandbox use test routing 021000021 (Chase), or use 123456789 for dev bypass (no Mercury call)."
           : (mercuryMessage || "Failed to set up bank account");
         return res.status(500).json({
           message: userMessage,
           error: "Mercury API error",
-          details: process.env.NODE_ENV === "development" ? (err?.response?.data || err?.data) : undefined
+          details: process.env.NODE_ENV === "development" ? mercuryDetails : undefined
         });
       }
       
@@ -13923,7 +15631,7 @@ Respond ONLY in this exact JSON format:
             recipientId: worker.mercuryRecipientId,
             amount: ts.totalPay,
             description: `Payout for ${ts.job?.title || 'job'}`,
-            idempotencyKey: `timesheet-payout-${ts.id}-${Date.now()}`,
+            idempotencyKey: `timesheet-payout-${ts.id}`,
             note: `Worker: ${ts.workerId}, Timesheet: ${ts.id}, Job: ${ts.jobId}`,
           });
 
@@ -13947,6 +15655,7 @@ Respond ONLY in this exact JSON format:
           // Notify worker
           notifyTimesheetUpdate(ts.workerId, {
             timesheetId: ts.id,
+            jobId: ts.jobId,
             jobTitle: ts.job?.title || 'Job',
             status: 'approved',
             amount: ts.totalPay,
@@ -14170,12 +15879,12 @@ Respond ONLY in this exact JSON format:
     }
   });
 
-  // Fund company balance via ACH debit
+  // Fund company balance — Stripe only. We do NOT use Mercury for companies; Mercury is for worker payouts only.
   app.post("/api/mt/company/fund", async (req, res) => {
     if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
     const user = req.user as any;
     const profile = req.profile;
-    
+
     if (!profile || profile.role !== "company") {
       return res.status(403).json({ message: "Only companies can fund their balance" });
     }
@@ -14186,123 +15895,93 @@ Respond ONLY in this exact JSON format:
       return res.status(400).json({ message: "Amount must be at least $1.00" });
     }
 
-    // If a specific payment method is provided, use it; otherwise use the primary payment method
-    let counterpartyId: string | null = null;
-    let externalAccountId: string | null = null;
-    
-    if (paymentMethodId) {
-      const paymentMethod = await storage.getCompanyPaymentMethod(paymentMethodId);
-      if (paymentMethod && paymentMethod.profileId === profile.id) {
-        counterpartyId = paymentMethod.mercuryRecipientId;
-        externalAccountId = paymentMethod.mercuryExternalAccountId;
-      }
-    } else {
-      // Find the primary payment method
-      const paymentMethods = await storage.getCompanyPaymentMethods(profile.id);
-      const primaryMethod = paymentMethods.find((m: any) => m.isPrimary);
-      if (primaryMethod) {
-        counterpartyId = primaryMethod.mercuryRecipientId;
-        externalAccountId = primaryMethod.mercuryExternalAccountId;
-      }
+    // Company funding is Stripe only (card or Stripe ACH). Do not use Mercury for companies.
+    const paymentMethod = paymentMethodId
+      ? await storage.getCompanyPaymentMethod(paymentMethodId)
+      : (await storage.getCompanyPaymentMethods(profile.id)).find((m: any) => m.isPrimary);
+    if (!paymentMethod || paymentMethod.profileId !== profile.id) {
+      return res.status(400).json({
+        message: "Select a payment method. Company funding uses Stripe (card or bank added via Stripe).",
+        code: "NO_PAYMENT_METHOD",
+      });
     }
-
-    if (!counterpartyId || !externalAccountId) {
-      return res.status(400).json({ message: "Please link a bank account first" });
+    if (!paymentMethod.stripePaymentMethodId) {
+      return res.status(400).json({
+        message: "Company balance funding is via Stripe only (card or add a bank through Stripe). Mercury is not used for companies.",
+        code: "STRIPE_ONLY",
+      });
     }
 
     try {
-      const { mercuryService } = await import("./services/mercury");
-      
-      // Create payment in Mercury Bank
-      // For company top-ups: ACH debit pulls funds FROM company's external account TO platform account
-      console.log("Creating Mercury ACH debit for balance top-up:", {
-        recipientId: counterpartyId,
-        externalAccountId: externalAccountId,
-        amount: amountCents,
-      });
-      
-      let paymentId: string;
-      let paymentStatus: string;
-      
-      try {
-        // ACH Debit: Pull funds from company's bank account to platform account
-        const payment = await mercuryService.requestDebit({
-          recipientId: counterpartyId,
-          externalAccountId: externalAccountId,
-          amount: amountCents,
-          description: `Balance top-up for ${profile.companyName || profile.firstName}`,
-          idempotencyKey: `company-topup-${profile.id}-${Date.now()}`,
-          note: `Company: ${profile.id}, Type: balance_funding`,
+      const stripeService = (await import("./services/stripe")).default;
+      const customerId = await (await import("./lib/company-stripe")).ensureCompanyStripeCustomer(profile);
+      const isCard = paymentMethod.type === "card";
+      const cardFee = isCard ? stripeService.calculateCardFee(amountCents) : 0;
+      const amountToCharge = amountCents + cardFee;
+      const chargeResult = isCard
+        ? await stripeService.chargeCardOffSession({
+            amount: amountToCharge,
+            customerId,
+            paymentMethodId: paymentMethod.stripePaymentMethodId,
+            description: `Balance top-up for ${profile.companyName || profile.firstName}`,
+            metadata: { companyId: String(profile.id), type: "balance_funding" },
+          })
+        : await stripeService.chargeAchOffSession({
+            amount: amountCents,
+            customerId,
+            paymentMethodId: paymentMethod.stripePaymentMethodId,
+            description: `Balance top-up for ${profile.companyName || profile.firstName}`,
+            metadata: { companyId: String(profile.id), type: "balance_funding" },
+          });
+
+      if (!chargeResult.success) {
+        return res.status(402).json({
+          message: chargeResult.error || "Payment failed. Try another payment method.",
+          code: "PAYMENT_FAILED",
         });
-        
-        paymentId = payment.id;
-        paymentStatus = payment.status;
-        console.log("Mercury payment created:", { paymentId, paymentStatus });
-      } catch (achError: any) {
-        console.error("Mercury payment creation error:", achError.message);
-        throw new Error(`Failed to create payment: ${achError.message}`);
       }
 
-      // Mercury Bank: No ledger transactions needed - use database transaction log
-      /*
-      // Removed Modern Treasury ledger transaction recording
-      let ledgerTransactionId = null;
-          // Find a platform ledger account to credit from (cash account)
-          const ledgers = await modernTreasuryService.listLedgers();
-          const ledgersArray = [];
-          for await (const ledger of ledgers) {
-            ledgersArray.push(ledger);
-          }
-          
-          if (ledgersArray.length > 0 && paymentOrderId) {
-            // Create pending ledger transaction for the deposit
-            const ledgerTransaction = await modernTreasuryService.createLedgerTransaction({
-              description: `Balance funding via ACH debit - Payment Order ${paymentOrderId}`,
-              ledgerEntries: [
-                {
-                  ledgerAccountId: profile.mtLedgerAccountId, // OLD MT field
-                  amount: amountCents,
-                  direction: "credit",
-                },
-              ],
-              metadata: {
-                paymentOrderId: paymentOrderId,
-                companyId: profile.id.toString(),
-                type: "balance_funding",
-              },
-            });
-            ledgerTransactionId = ledgerTransaction.id;
-          }
-        } catch (ledgerErr: any) {
-          console.log("Ledger transaction optional - skipping:", ledgerErr.message);
-        }
-      */
-
-      // Update company deposit amount (pending - will be confirmed when payment settles)
       const newDepositAmount = (profile.depositAmount || 0) + amountCents;
       await storage.updateProfile(profile.id, {
         depositAmount: newDepositAmount,
+        lastFailedPaymentMethodId: null,
       });
 
-      // Record transaction
       await storage.createCompanyTransaction({
         profileId: profile.id,
         type: "deposit",
         amount: amountCents,
-        description: "Balance top-up via ACH",
-        paymentMethod: "ach",
+        description: isCard
+          ? `Balance top-up via card (${paymentMethod.cardBrand} ...${paymentMethod.lastFour})`
+          : "Balance top-up via ACH (Stripe)",
+        paymentMethod: isCard ? "card" : "ach",
+        stripePaymentIntentId: chargeResult.paymentIntentId,
         initiatedById: profile.id,
-        mercuryPaymentId: paymentId,
-        mercuryPaymentStatus: paymentStatus,
       });
+      if (isCard && cardFee > 0) {
+        await storage.createCompanyTransaction({
+          profileId: profile.id,
+          type: "card_fee",
+          amount: -cardFee,
+          description: "Card processing fee (3.5%) for balance top-up",
+          paymentMethod: "card",
+          stripePaymentIntentId: chargeResult.paymentIntentId,
+          initiatedById: profile.id,
+        });
+      }
+
+      const depositDescription = isCard
+        ? `Balance top-up via card (${paymentMethod.cardBrand} ...${paymentMethod.lastFour})`
+        : "Balance top-up via ACH (Stripe)";
+      const { mercuryService } = await import("./services/mercury");
+      await mercuryService.recordCompanyPaymentAsMercuryInvoice(profile, amountCents, depositDescription, chargeResult.paymentIntentId);
 
       res.json({
         success: true,
-        paymentId,
-        paymentStatus,
+        paymentIntentId: chargeResult.paymentIntentId,
         amountCents,
         newBalance: newDepositAmount,
-        message: "Funding initiated. Payment created in Mercury Bank. Balance will update when ACH clears.",
+        message: isCard ? "Balance updated. Card charged successfully." : "Funding initiated via Stripe ACH. Balance updated.",
       });
     } catch (err: any) {
       console.error("Company funding error:", err);
@@ -14310,7 +15989,7 @@ Respond ONLY in this exact JSON format:
     }
   });
 
-  // Get company balance
+  // Get company balance (always from DB so it matches trigger-auto-charge; avoids session cache mismatch)
   app.get("/api/mt/company/balance", async (req, res) => {
     if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
     const user = req.user as any;
@@ -14321,11 +16000,16 @@ Respond ONLY in this exact JSON format:
     }
 
     try {
-      // Return the deposit amount from profile (ledger-based tracking)
+      const [fresh] = await db.select({
+        depositAmount: profiles.depositAmount,
+      })
+        .from(profiles)
+        .where(eq(profiles.id, profile.id))
+        .limit(1);
+      const p = fresh ?? profile;
       res.json({
-        balanceCents: profile.depositAmount || 0,
-        hasBankLinked: !!(profile.mercuryRecipientId && profile.mercuryExternalAccountId),
-        // hasVirtualAccount: Mercury doesn't use virtual accounts - removed
+        balanceCents: p.depositAmount ?? 0,
+        hasBankLinked: false,
       });
     } catch (err: any) {
       console.error("Get company balance error:", err);
@@ -14459,11 +16143,13 @@ Respond ONLY in this exact JSON format:
       const stripeService = (await import("./services/stripe")).default;
       const publishableKey = stripeService.getPublishableKey();
       const isConfigured = stripeService.isStripeConfigured();
-      
+      const mode = stripeService.getStripeKeyMode();
       res.json({
         publishableKey,
         configured: isConfigured,
         cardFeePercentage: stripeService.CARD_FEE_PERCENTAGE,
+        mode,
+        useSandbox: mode === "test",
       });
     } catch (err: any) {
       console.error("Stripe config error:", err);
@@ -14503,25 +16189,12 @@ Respond ONLY in this exact JSON format:
       const cardFee = includeCardFee ? stripeService.calculateCardFee(amount) : 0;
       const totalAmount = amount + cardFee;
       
-      // Ensure company has a Stripe customer (create if missing for saved card usage)
-      let stripeCustomerId = profile?.stripeCustomerId;
-      if (profile && !stripeCustomerId) {
-        console.log(`[Stripe] Creating Stripe customer for company ${profile.id} during payment intent creation...`);
-        const customer = await stripe.customers.create({
-          email: profile.email || undefined,
-          name: profile.companyName || `${profile.firstName} ${profile.lastName}`.trim() || undefined,
-          metadata: {
-            profileId: profile.id.toString(),
-            userId: profile.userId,
-            role: "company",
-          },
-        });
-        stripeCustomerId = customer.id;
-        await storage.updateProfile(profile.id, { stripeCustomerId });
-        console.log(`[Stripe] Created Stripe customer ${stripeCustomerId} for company ${profile.id}`);
-      }
-      
-      // When topping up with a saved card: verify it belongs to this company, attach to customer if needed, then create PI for that method (charge only, no save)
+      // Ensure company has a Stripe customer (create once if missing; this ID is the account's forever)
+      const stripeCustomerId = profile
+        ? await ensureCompanyStripeCustomer(profile)
+        : undefined;
+
+      // When topping up with a saved card: verify it belongs to this company, attach to customer only if not already attached (never attach a detached PM)
       let paymentMethodForIntent: string | undefined;
       if (savedPaymentMethodId && profile && stripeCustomerId) {
         const existingMethods = await storage.getCompanyPaymentMethods(profile.id);
@@ -14531,17 +16204,41 @@ Respond ONLY in this exact JSON format:
         if (!authorized) {
           return res.status(403).json({ message: "Payment method not found or not authorized for this account" });
         }
-        // Attach payment method to customer so PI create with payment_method succeeds (Stripe requires pm to be attached)
+        let pmAttachedToCustomer = false;
         try {
-          await stripe.paymentMethods.attach(savedPaymentMethodId, { customer: stripeCustomerId });
-        } catch (attachErr: any) {
-          const msg = String(attachErr?.message ?? "").toLowerCase();
-          if (msg.includes("already been attached")) {
-            // already attached, continue
-          } else if (msg.includes("no such paymentmethod") || msg.includes("exists on one of your connected accounts")) {
-            return res.status(400).json({ message: "This saved card is no longer valid. Please remove it in Payment Methods and add your card again." });
-          } else {
-            throw attachErr;
+          const pm = await stripe.paymentMethods.retrieve(savedPaymentMethodId);
+          const pmCustomer = typeof (pm as any).customer === "string" ? (pm as any).customer : (pm as any).customer?.id ?? null;
+          if (pmCustomer === stripeCustomerId) {
+            pmAttachedToCustomer = true;
+          } else if (pmCustomer !== null && pmCustomer !== undefined) {
+            return res.status(400).json({ message: "This card is linked to a different account. Please remove it in Payment Methods and add your card again." });
+          }
+        } catch (retrieveErr: any) {
+          return res.status(400).json({ message: "This saved card is no longer valid. Please remove it in Payment Methods and add your card again." });
+        }
+        if (!pmAttachedToCustomer) {
+          try {
+            await stripe.paymentMethods.attach(savedPaymentMethodId, { customer: stripeCustomerId });
+          } catch (attachErr: any) {
+            const msg = String(attachErr?.message ?? "").toLowerCase();
+            if (msg.includes("already been attached")) {
+              // continue
+            } else if (msg.includes("may not be used again") || msg.includes("detached from a customer") || msg.includes("previously used without being attached")) {
+              try {
+                const dead = existingMethods.find((x: any) => (x.stripePaymentMethodId ?? x.stripe_payment_method_id) === savedPaymentMethodId);
+                if (dead) await storage.deleteCompanyPaymentMethod(dead.id);
+              } catch (_) {}
+              return res.status(400).json({
+                message: "This card can no longer be used and has been removed from your payment methods. Please add your card again.",
+                code: "PAYMENT_METHOD_REMOVED",
+              });
+            } else if (msg.includes("no such paymentmethod") || msg.includes("exists on one of your connected accounts")) {
+              const dead = existingMethods.find((x: any) => (x.stripePaymentMethodId ?? x.stripe_payment_method_id) === savedPaymentMethodId);
+              if (dead) await storage.deleteCompanyPaymentMethod(dead.id).catch(() => {});
+              return res.status(400).json({ message: "This saved card is no longer valid. Please add your card again." });
+            } else {
+              throw attachErr;
+            }
           }
         }
         paymentMethodForIntent = savedPaymentMethodId;
@@ -14806,50 +16503,82 @@ Respond ONLY in this exact JSON format:
   app.post("/api/stripe/create-setup-intent", async (req, res) => {
     if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
     const user = req.user as any;
-    const userId = user.claims.sub;
+    const userId = user?.claims?.sub ?? user?.id ?? user?.sub;
+    if (!userId) {
+      console.warn("[Stripe] create-setup-intent: no userId on req.user", { hasUser: !!user, keys: user ? Object.keys(user) : [] });
+      return res.status(401).json({ message: "Invalid session" });
+    }
     const profile = await storage.getProfileByUserId(userId);
-    
     if (!profile || profile.role !== "company") {
       return res.status(403).json({ message: "Only companies can add payment methods" });
     }
-    
     try {
       const stripeService = (await import("./services/stripe")).default;
+      if (!stripeService.isStripeConfigured()) {
+        return res.status(503).json({ message: "Payment system is not configured. Please try again later." });
+      }
       const stripe = stripeService.getStripe();
-      
-      let stripeCustomerId = profile.stripeCustomerId;
-      if (!stripeCustomerId) {
-        const customer = await stripe.customers.create({
-          email: profile.email || undefined,
-          name: profile.companyName || `${profile.firstName} ${profile.lastName}`.trim() || undefined,
+      if (process.env.NODE_ENV !== "production") {
+        console.log("[Stripe] create-setup-intent: creating (mode=" + stripeService.getStripeKeyMode() + ", profileId=" + profile.id + ")");
+      }
+      // Use account info (profile + auth user) so we can create a Stripe customer with email/name when missing on profile
+      const accountEmail = (profile.email && String(profile.email).trim()) || (user?.email && String(user.email).trim()) || undefined;
+      const accountName =
+        (profile.companyName && String(profile.companyName).trim()) ||
+        [profile.firstName, profile.lastName].filter(Boolean).map(String).join(" ").trim() ||
+        (accountEmail ? accountEmail.split("@")[0] : undefined) ||
+        "Company";
+      const profileForStripe = {
+        id: profile.id,
+        stripeCustomerId: profile.stripeCustomerId ?? undefined,
+        userId: String(userId),
+        email: accountEmail ?? profile.email ?? undefined,
+        companyName: (profile.companyName && String(profile.companyName).trim()) || accountName,
+        firstName: profile.firstName ?? undefined,
+        lastName: profile.lastName ?? undefined,
+      };
+      let stripeCustomerId = await ensureCompanyStripeCustomer(profileForStripe);
+      let setupIntent: Awaited<ReturnType<typeof stripe.setupIntents.create>>;
+      try {
+        setupIntent = await stripe.setupIntents.create({
+          customer: stripeCustomerId,
+          payment_method_types: ["card", "us_bank_account"],
+          usage: "off_session",
           metadata: {
             profileId: profile.id.toString(),
-            userId: profile.userId,
-            role: "company",
+            userId: String(userId),
           },
         });
-        stripeCustomerId = customer.id;
-        await storage.updateProfile(profile.id, { stripeCustomerId });
+      } catch (setupErr: any) {
+        const msg = String(setupErr?.message ?? "").toLowerCase();
+        const noSuchCustomer = msg.includes("no such customer") || setupErr?.code === "resource_missing";
+        if (noSuchCustomer && profile.stripeCustomerId) {
+          await db.update(profiles).set({ stripeCustomerId: null }).where(eq(profiles.id, profile.id));
+          console.log("[Stripe] create-setup-intent: cleared invalid customer for profile " + profile.id + ", retrying with new customer");
+          stripeCustomerId = await ensureCompanyStripeCustomer({ ...profileForStripe, stripeCustomerId: undefined });
+          setupIntent = await stripe.setupIntents.create({
+            customer: stripeCustomerId,
+            payment_method_types: ["card", "us_bank_account"],
+            usage: "off_session",
+            metadata: {
+              profileId: profile.id.toString(),
+              userId: String(userId),
+            },
+          });
+        } else {
+          throw setupErr;
+        }
       }
-      
-      // Card and ACH only for SetupIntent (saved methods); cashapp can require extra Stripe setup
-      const setupIntent = await stripe.setupIntents.create({
-        customer: stripeCustomerId,
-        payment_method_types: ["card", "us_bank_account"],
-        usage: "off_session",
-        metadata: {
-          profileId: profile.id.toString(),
-          userId: userId,
-        },
-      });
-      
+      if (process.env.NODE_ENV !== "production") {
+        console.log("[Stripe] create-setup-intent: success setupIntentId=" + setupIntent.id);
+      }
       res.json({
         clientSecret: setupIntent.client_secret,
         setupIntentId: setupIntent.id,
       });
     } catch (err: any) {
       console.error("Create setup intent error:", err);
-      res.status(500).json({ message: err.message });
+      res.status(500).json({ message: err?.message ?? "Failed to load payment form. Please try again." });
     }
   });
 
@@ -14858,8 +16587,14 @@ Respond ONLY in this exact JSON format:
     try {
       if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
       const user = req.user as any;
-      const userId = user?.claims?.sub;
-      if (!userId) return res.status(401).json({ message: "Invalid session" });
+      const userId = user?.claims?.sub ?? user?.id ?? user?.sub;
+      if (!userId) {
+        console.warn("[Stripe] confirm-setup: no userId on req.user", { hasUser: !!user, keys: user ? Object.keys(user) : [] });
+        return res.status(401).json({ message: "Invalid session" });
+      }
+      if (process.env.NODE_ENV !== "production") {
+        console.log("[Stripe] confirm-setup: request body keys=" + (req.body && typeof req.body === "object" ? Object.keys(req.body).join(",") : "none"));
+      }
 
       const stripeService = (await import("./services/stripe")).default;
       if (!stripeService.isStripeConfigured()) {
@@ -14909,72 +16644,161 @@ Respond ONLY in this exact JSON format:
         const msg = stripeErr?.message || stripeErr?.code || "Stripe error";
         return res.status(502).json({ message: `Could not load payment method: ${msg}. Please try again.` });
       }
+      // Only save payment methods that belong to this account's Stripe customer
+      const accountCustomerId = await ensureCompanyStripeCustomer(profile);
+      const pmCustomerRaw = (paymentMethod as any).customer;
+      const pmCustomerId = typeof pmCustomerRaw === "string"
+        ? pmCustomerRaw
+        : (pmCustomerRaw && typeof (pmCustomerRaw as any).id === "string" ? (pmCustomerRaw as any).id : null);
+      if (pmCustomerId !== accountCustomerId) {
+        console.warn(`[Stripe] confirm-setup: PM ${pmId} belongs to customer ${pmCustomerId}, account customer is ${accountCustomerId}; not saving`);
+        return res.status(400).json({
+          message: "This payment method is not linked to your account. Please add your card or bank again from Payment Methods.",
+        });
+      }
       const existingMethods = await storage.getCompanyPaymentMethods(profile.id);
-      const hasPrimary = existingMethods.some(m => m.isPrimary);
+
+      // If this exact Stripe PM is already saved for this profile, nothing to do — return its id so client can refetch/step2
+      const existingRow = existingMethods.find((m) => m.stripePaymentMethodId === pmId);
+      if (existingRow) {
+        return res.status(200).json({
+          success: true,
+          alreadySaved: true,
+          message: "This payment method is already saved",
+          paymentMethodId: existingRow.id,
+        });
+      }
+
+      const stripePmJson = (pm: any) => ({
+        id: pm.id,
+        object: pm.object,
+        type: pm.type,
+        livemode: pm.livemode,
+        created: pm.created,
+        ...(pm.card && {
+          card: {
+            brand: pm.card.brand,
+            last4: pm.card.last4,
+            exp_month: pm.card.exp_month,
+            exp_year: pm.card.exp_year,
+            country: pm.card.country,
+          },
+        }),
+        ...(pm.us_bank_account && {
+          us_bank_account: {
+            bank_name: pm.us_bank_account.bank_name,
+            last4: pm.us_bank_account.last4,
+            verification_status: (pm.us_bank_account as any).verification_status ?? null,
+            routing_number: (pm.us_bank_account as any).routing_number ? "****" : undefined,
+          },
+        }),
+        setup_intent_id: setupIntent.id,
+      });
 
       if (paymentMethod.card) {
         const last4 = String(paymentMethod.card.last4 || "****").slice(0, 4);
         const brand = paymentMethod.card.brand ? String(paymentMethod.card.brand) : null;
-        const cardExists = existingMethods.some(
+        const sameCardRow = existingMethods.find(
           (m) => m.type === "card" && m.lastFour === last4 && (brand ? m.cardBrand === brand : true)
         );
-        if (cardExists) {
-          return res.status(200).json({ success: true, alreadySaved: true, message: "This card is already saved" });
-        }
-        try {
-          await storage.createCompanyPaymentMethod({
-            profileId: profile.id,
-            type: "card",
-            lastFour: last4 || "****",
-            cardBrand: brand || null,
-            stripePaymentMethodId: paymentMethod.id,
-            isPrimary: !hasPrimary,
-            isVerified: true,
+        let createdCard;
+        if (sameCardRow) {
+          try {
+            await storage.updateCompanyPaymentMethod(sameCardRow.id, {
+              stripePaymentMethodId: paymentMethod.id,
+              stripePaymentMethodJson: stripePmJson(paymentMethod),
+              isVerified: true,
+            });
+            createdCard = { ...sameCardRow, stripePaymentMethodId: paymentMethod.id, isPrimary: sameCardRow.isPrimary };
+          } catch (dbErr: any) {
+            console.error("[Stripe] updateCompanyPaymentMethod (card) error:", dbErr?.message || dbErr);
+            return res.status(500).json({ message: dbErr?.message || "Could not save card. Please try again." });
+          }
+          for (const m of existingMethods) {
+            if (m.id !== sameCardRow.id) await storage.updateCompanyPaymentMethod(m.id, { isPrimary: false });
+          }
+          await storage.updateProfile(profile.id, {
+            primaryPaymentMethodId: sameCardRow.id,
+            primaryPaymentMethodVerified: true,
+            lastFailedPaymentMethodId: null,
           });
-        } catch (dbErr: any) {
-          console.error("[Stripe] createCompanyPaymentMethod (card) error:", dbErr?.message || dbErr);
-          return res.status(500).json({ message: dbErr?.message || "Could not save card. Please try again." });
+        } else {
+          try {
+            createdCard = await storage.createCompanyPaymentMethod({
+              profileId: profile.id,
+              type: "card",
+              lastFour: last4 || "****",
+              cardBrand: brand || null,
+              stripePaymentMethodId: paymentMethod.id,
+              isPrimary: true,
+              isVerified: true,
+              stripePaymentMethodJson: stripePmJson(paymentMethod),
+            });
+          } catch (dbErr: any) {
+            console.error("[Stripe] createCompanyPaymentMethod (card) error:", dbErr?.message || dbErr);
+            return res.status(500).json({ message: dbErr?.message || "Could not save card. Please try again." });
+          }
+          for (const m of existingMethods) {
+            if (m.id !== createdCard.id) await storage.updateCompanyPaymentMethod(m.id, { isPrimary: false });
+          }
+          await storage.updateProfile(profile.id, {
+            primaryPaymentMethodId: createdCard.id,
+            primaryPaymentMethodVerified: true,
+            lastFailedPaymentMethodId: null,
+          });
         }
-        console.log(`[Stripe] Saved card ending in ${last4} for company ${profile.id} (via SetupIntent)`);
+        if (process.env.NODE_ENV !== "production") {
+          console.log("[Stripe] confirm-setup: saved card ending " + last4 + " for profileId=" + profile.id);
+        }
         return res.json({
           success: true,
           type: "card",
           cardBrand: brand,
           lastFour: last4,
-          isPrimary: !hasPrimary,
+          isPrimary: true,
+          paymentMethodId: createdCard.id,
+          message: "Card saved successfully",
         });
       }
 
       if (paymentMethod.us_bank_account) {
         const last4 = String(paymentMethod.us_bank_account.last4 || "****").slice(0, 4);
         const bankName = paymentMethod.us_bank_account.bank_name ? String(paymentMethod.us_bank_account.bank_name) : "Bank";
-        const achExists = existingMethods.some(
-          (m) => m.type === "ach" && m.stripePaymentMethodId === paymentMethod.id
-        );
-        if (achExists) {
-          return res.status(200).json({ success: true, alreadySaved: true, message: "This bank account is already saved" });
-        }
+        let createdAch;
         try {
-          await storage.createCompanyPaymentMethod({
+          createdAch = await storage.createCompanyPaymentMethod({
             profileId: profile.id,
             type: "ach",
             lastFour: last4 || "****",
             bankName: bankName || "Bank",
             stripePaymentMethodId: paymentMethod.id,
-            isPrimary: !hasPrimary,
+            isPrimary: true,
             isVerified: false,
+            stripePaymentMethodJson: stripePmJson(paymentMethod),
           });
         } catch (dbErr: any) {
           console.error("[Stripe] createCompanyPaymentMethod (ach) error:", dbErr?.message || dbErr);
           return res.status(500).json({ message: dbErr?.message || "Could not save bank account. Please try again." });
         }
-        console.log(`[Stripe] Saved ACH ending in ${last4} for company ${profile.id} (via SetupIntent)`);
+        for (const m of existingMethods) {
+          if (m.id !== createdAch.id) await storage.updateCompanyPaymentMethod(m.id, { isPrimary: false });
+        }
+        await storage.updateProfile(profile.id, {
+          primaryPaymentMethodId: createdAch.id,
+          primaryPaymentMethodVerified: false,
+          lastFailedPaymentMethodId: null,
+        });
+        if (process.env.NODE_ENV !== "production") {
+          console.log("[Stripe] confirm-setup: saved ACH ending " + last4 + " for profileId=" + profile.id);
+        }
         return res.json({
           success: true,
           type: "ach",
           lastFour: last4,
           bankName,
-          isPrimary: !hasPrimary,
+          isPrimary: true,
+          paymentMethodId: createdAch.id,
+          message: "Bank account saved successfully",
         });
       }
 
@@ -15023,50 +16847,42 @@ Respond ONLY in this exact JSON format:
       
       const stripeService = (await import("./services/stripe")).default;
       const stripe = stripeService.getStripe();
-      
-      // Ensure company has a Stripe customer - create one if not
-      let stripeCustomerId = profile.stripeCustomerId;
-      if (!stripeCustomerId) {
-        console.log(`[Stripe] Creating Stripe customer for company ${profile.id}...`);
-        const customer = await stripe.customers.create({
-          email: profile.email || undefined,
-          name: profile.companyName || `${profile.firstName} ${profile.lastName}`.trim() || undefined,
-          metadata: {
-            profileId: profile.id.toString(),
-            userId: profile.userId,
-            role: "company",
-          },
-        });
-        stripeCustomerId = customer.id;
-        await storage.updateProfile(profile.id, { stripeCustomerId });
-        console.log(`[Stripe] Created Stripe customer ${stripeCustomerId} for company ${profile.id}`);
-      }
-      
-      // Attach payment method to customer if not already attached
-      try {
-        await stripe.paymentMethods.attach(stripePaymentMethodId, {
-          customer: stripeCustomerId,
-        });
-        console.log(`[Stripe] Attached payment method ${stripePaymentMethodId} to customer ${stripeCustomerId}`);
-      } catch (attachError: any) {
-        const errorMsg = String(attachError?.message || attachError?.raw?.body?.error?.message || "");
-        // Payment method not found on this Stripe account (e.g. wrong mode, or from Connect)
-        if (errorMsg.includes("No such PaymentMethod") || errorMsg.includes("exists on one of your connected accounts")) {
-          console.warn(`[Stripe] Payment method ${stripePaymentMethodId} not valid for this account: ${errorMsg}`);
-          return res.status(400).json({
-            message: "This saved card is no longer valid (wrong account or mode). Please remove it in Payment Methods and add your card again.",
-          });
+
+      // Use the account's Stripe customer (create once if missing; never changed)
+      const stripeCustomerId = await ensureCompanyStripeCustomer(profile);
+
+      // Attach payment method to customer only if not already attached (Stripe forbids re-attaching detached PMs)
+      let pm = await stripe.paymentMethods.retrieve(stripePaymentMethodId);
+      const pmCustomer = typeof (pm as any).customer === "string" ? (pm as any).customer : (pm as any).customer?.id ?? null;
+      if (pmCustomer !== stripeCustomerId) {
+        if (pmCustomer !== null && pmCustomer !== undefined) {
+          return res.status(400).json({ message: "This card is linked to a different account. Please remove it in Payment Methods and add your card again." });
         }
-        // Handle specific attachment errors
-        if (errorMsg.includes("already been attached to a Customer") && !errorMsg.includes(stripeCustomerId)) {
-          console.error(`[Stripe] Payment method ${stripePaymentMethodId} is attached to a different customer`);
-          return res.status(403).json({ message: "This payment method cannot be used with this account" });
-        }
-        // Log but continue if already attached to same customer
-        if (errorMsg.includes("already been attached")) {
-          console.log(`[Stripe] Payment method ${stripePaymentMethodId} already attached to customer ${stripeCustomerId}`);
-        } else {
-          console.warn(`[Stripe] Payment method attachment warning: ${errorMsg}`);
+        try {
+          await stripe.paymentMethods.attach(stripePaymentMethodId, { customer: stripeCustomerId });
+          console.log(`[Stripe] Attached payment method ${stripePaymentMethodId} to customer ${stripeCustomerId}`);
+        } catch (attachError: any) {
+          const errorMsg = String(attachError?.message || attachError?.raw?.body?.error?.message || "");
+          if (errorMsg.includes("No such PaymentMethod") || errorMsg.includes("exists on one of your connected accounts")) {
+            return res.status(400).json({ message: "This saved card is no longer valid. Please remove it in Payment Methods and add your card again." });
+          }
+          if (errorMsg.includes("may not be used again") || errorMsg.includes("detached from a Customer") || errorMsg.includes("previously used without being attached")) {
+            try {
+              if (authorizedMethod && authorizedMethod.id) await storage.deleteCompanyPaymentMethod(authorizedMethod.id);
+            } catch (_) {}
+            return res.status(400).json({
+              message: "This card can no longer be used and has been removed from your payment methods. Please add your card again.",
+              code: "PAYMENT_METHOD_REMOVED",
+            });
+          }
+          if (errorMsg.includes("already been attached to a Customer") && !errorMsg.includes(stripeCustomerId)) {
+            return res.status(403).json({ message: "This payment method cannot be used with this account" });
+          }
+          if (errorMsg.includes("already been attached")) {
+            // same customer, continue
+          } else {
+            throw attachError;
+          }
         }
       }
       
@@ -15116,6 +16932,7 @@ Respond ONLY in this exact JSON format:
             message: "Additional authentication required",
           });
         }
+        await storage.updateProfile(profile.id, { lastFailedPaymentMethodId: authorizedMethod.id });
         return res.status(400).json({ 
           message: `Payment not successful. Status: ${paymentIntent.status}`,
           status: paymentIntent.status,
@@ -15186,11 +17003,13 @@ Respond ONLY in this exact JSON format:
         fullMessageLower.includes("no such paymentmethod") ||
         fullMessageLower.includes("no such payment_method");
       if (invalidPm) {
+        if (authorizedMethod?.id) await storage.updateProfile(profile.id, { lastFailedPaymentMethodId: authorizedMethod.id });
         return res.status(400).json({
           message: "This saved card is no longer valid. Please remove it in Payment Methods and add your card again.",
         });
       }
 
+      if (authorizedMethod?.id) await storage.updateProfile(profile.id, { lastFailedPaymentMethodId: authorizedMethod.id });
       res.status(500).json({ message: fullMessage });
     }
     } catch (outerErr: any) {
@@ -15861,6 +17680,68 @@ Respond ONLY in this exact JSON format:
     }
   });
 
+  // Normalize calendar URL: if pasted multiple times (e.g. same URL concatenated), keep only the first one.
+  function normalizeCalendarUrl(input: string): string {
+    const s = input.trim();
+    if (!s) return s;
+    const re = /https?:\/\//gi;
+    const first = re.exec(s);
+    if (!first) return s;
+    const start = first.index;
+    const next = re.exec(s);
+    const end = next ? next.index : s.length;
+    return s.slice(start, end).trim();
+  }
+
+  // Add a single calendar URL to current user's imported calendars (iCal/ICS link)
+  // Per-account: only the current user's profile is updated. Admins/owner/teammates with admin see all via their own imports and availability.
+  app.post("/api/calendar/import", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    try {
+      const profile = req.profile;
+      if (!profile) return res.status(404).json({ message: "Profile not found" });
+      const { url } = req.body;
+      if (!url || typeof url !== "string" || !url.trim()) {
+        return res.status(400).json({ message: "Calendar URL is required" });
+      }
+      const trimmed = normalizeCalendarUrl(url);
+      if (!trimmed) return res.status(400).json({ message: "Calendar URL is required" });
+      let existing: string[] = [];
+      if (profile.importedCalendars) {
+        try {
+          const parsed = JSON.parse(profile.importedCalendars as string);
+          existing = Array.isArray(parsed) ? parsed.filter((u): u is string => typeof u === "string") : [];
+        } catch {
+          existing = [];
+        }
+      }
+      const normalized = existing;
+      if (normalized.includes(trimmed)) {
+        return res.json({ message: "Calendar already imported" });
+      }
+      normalized.push(trimmed);
+      await db.update(profiles)
+        .set({
+          importedCalendars: JSON.stringify(normalized),
+          updatedAt: new Date(),
+        })
+        .where(eq(profiles.id, profile.id));
+      clearProfileSnapshot(req);
+      const session = req.session as { save?: (cb: (err?: Error) => void) => void };
+      if (typeof session?.save === "function") {
+        session.save((err) => {
+          if (err) console.warn("Calendar import: session save failed", err);
+          res.json({ message: "Calendar imported" });
+        });
+      } else {
+        res.json({ message: "Calendar imported" });
+      }
+    } catch (error: any) {
+      console.error("Calendar import error:", error);
+      res.status(400).json({ message: error.message || "Import failed" });
+    }
+  });
+
   // Import calendars - scoped to current user (teammate, admin, or worker)
   // Each user can only import/export their own calendar settings
   app.post("/api/calendar/import-settings", async (req, res) => {
@@ -15874,16 +17755,26 @@ Respond ONLY in this exact JSON format:
       }
       
       // Scoped to current user's profile - teammates/admins/workers can only save their own settings
-      const { importedCalendars } = req.body;
+      const raw = req.body.importedCalendars;
+      const list = Array.isArray(raw) ? raw.filter((u): u is string => typeof u === "string") : [];
+      const normalized = [...new Set(list.map((u) => normalizeCalendarUrl(String(u))).filter(Boolean))];
       
       await db.update(profiles)
         .set({ 
-          importedCalendars: JSON.stringify(importedCalendars || []),
+          importedCalendars: JSON.stringify(normalized),
           updatedAt: new Date()
         })
         .where(eq(profiles.id, profile.id)); // Only update current user's profile
-      
-      res.json({ message: "Calendar import settings saved" });
+      clearProfileSnapshot(req);
+      const sessionSettings = req.session as { save?: (cb: (err?: Error) => void) => void };
+      if (typeof sessionSettings?.save === "function") {
+        sessionSettings.save((err) => {
+          if (err) console.warn("Calendar import-settings: session save failed", err);
+          res.json({ message: "Calendar import settings saved" });
+        });
+      } else {
+        res.json({ message: "Calendar import settings saved" });
+      }
     } catch (error: any) {
       console.error("Calendar import settings error:", error);
       res.status(400).json({ message: error.message });
@@ -15891,25 +17782,182 @@ Respond ONLY in this exact JSON format:
   });
 
   // Get imported calendar settings - scoped to current user
-  // Each user can only retrieve their own calendar import settings
+  // Each user can only retrieve their own calendar import settings. Load from DB so list is fresh after import.
   app.get("/api/calendar/import-settings", async (req, res) => {
     if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
     
     try {
-      const user = req.user as any;
-      const profile = req.profile;
+      const userId = (req.user as any)?.claims?.sub ?? (req.user as any)?.id;
+      const profile = userId ? await storage.getProfileByUserId(String(userId)) : req.profile;
       if (!profile) {
         return res.status(404).json({ message: "Profile not found" });
       }
       
-      // Scoped to current user's profile - only return their own settings
-      const importedCalendars = profile.importedCalendars 
-        ? JSON.parse(profile.importedCalendars as string) 
-        : [];
-      
+      let importedCalendars: string[] = [];
+      if (profile.importedCalendars) {
+        try {
+          const parsed = JSON.parse(profile.importedCalendars as string);
+          const list = Array.isArray(parsed) ? parsed.filter((u): u is string => typeof u === "string") : [];
+          importedCalendars = [...new Set(list.map((u) => normalizeCalendarUrl(u)).filter(Boolean))];
+        } catch {
+          importedCalendars = [];
+        }
+      }
       res.json({ importedCalendars });
     } catch (error: any) {
       res.status(400).json({ message: error.message });
+    }
+  });
+
+  // Get events from imported iCal URLs for the calendar (day/week/month). Per-account; admins see all team imports.
+  app.get("/api/calendar/imported-events", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    try {
+      const userId = (req.user as any)?.claims?.sub ?? (req.user as any)?.id;
+      const profile = userId ? await storage.getProfileByUserId(String(userId)) : req.profile;
+      if (!profile) return res.status(404).json({ message: "Profile not found" });
+      const startParam = req.query.start as string;
+      const endParam = req.query.end as string;
+      if (!startParam || !endParam) {
+        return res.status(400).json({ message: "Query start and end (ISO date) required" });
+      }
+      const rangeStart = new Date(startParam);
+      const rangeEnd = new Date(endParam);
+
+      type Source = { profileId: number; name: string };
+      const sources: { profile: typeof profile; source: Source }[] = [{ profile, source: { profileId: profile.id, name: [profile.firstName, profile.lastName].filter(Boolean).join(" ") || "You" } }];
+      // Team owner sees all teammates' iCal imports; teammates with admin role also see all.
+      const ownerTeam = await db.select().from(teams).where(eq(teams.ownerId, profile.id)).then((r) => r[0]);
+      let teamForAll: typeof ownerTeam = ownerTeam ?? null;
+      if (!ownerTeam && profile.teamId) {
+        const memberTeam = await db.select().from(teams).where(eq(teams.id, profile.teamId)).then((r) => r[0]);
+        if (memberTeam) {
+          const members = await db.select().from(workerTeamMembers)
+            .where(and(eq(workerTeamMembers.teamId, memberTeam.id), eq(workerTeamMembers.status, "active")));
+          const currentMember = members.find((m) => (m.email || "").toLowerCase() === (profile.email || "").toLowerCase());
+          if (currentMember && (currentMember as { role?: string }).role === "admin") {
+            teamForAll = memberTeam;
+          }
+        }
+      }
+      if (teamForAll) {
+        const teammateProfiles = await db.select().from(profiles).where(eq(profiles.teamId, teamForAll.id));
+        const ownerProfile = teamForAll.ownerId ? await db.select().from(profiles).where(eq(profiles.id, teamForAll.ownerId)).then((r) => r[0]) : null;
+        const seen = new Set(sources.map((s) => s.profile.id));
+        for (const p of teammateProfiles) {
+          if (seen.has(p.id)) continue;
+          seen.add(p.id);
+          sources.push({ profile: p, source: { profileId: p.id, name: [p.firstName, p.lastName].filter(Boolean).join(" ") || "Teammate" } });
+        }
+        if (ownerProfile && !seen.has(ownerProfile.id)) {
+          seen.add(ownerProfile.id);
+          sources.push({ profile: ownerProfile, source: { profileId: ownerProfile.id, name: [ownerProfile.firstName, ownerProfile.lastName].filter(Boolean).join(" ") || "Owner" } });
+        }
+      }
+
+      const events: { title: string; start: string; end: string; sourceProfileId?: number; sourceName?: string }[] = [];
+      let ical: typeof import("node-ical");
+      try {
+        ical = await import("node-ical");
+      } catch {
+        return res.json({ events });
+      }
+
+      for (const { profile: p, source } of sources) {
+        let urls: string[] = [];
+        if (p.importedCalendars) {
+          try {
+            const raw = JSON.parse(p.importedCalendars as string);
+            const list = Array.isArray(raw) ? raw.filter((u): u is string => typeof u === "string") : [];
+            urls = [...new Set(list.map((u) => normalizeCalendarUrl(u)).filter(Boolean))];
+          } catch {
+            urls = [];
+          }
+        }
+        for (const url of urls) {
+          try {
+            const fetchRes = await Promise.race([
+              fetch(url, {
+                signal: AbortSignal.timeout(15000),
+                redirect: "follow",
+                headers: {
+                  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                  Accept: "text/calendar, text/plain, */*",
+                },
+              }),
+              new Promise<never>((_, rej) => setTimeout(() => rej(new Error("timeout")), 15000)),
+            ]);
+            if (!fetchRes.ok) {
+              console.warn("Calendar import URL returned", fetchRes.status, url?.slice(0, 80));
+              continue;
+            }
+            const data = await fetchRes.text();
+            const parsed = ical.parseICS(data);
+            const toDate = (v: Date | string | undefined): Date | null => {
+              if (v == null) return null;
+              if (v instanceof Date) return Number.isNaN(v.getTime()) ? null : v;
+              const str = String(v).trim();
+              if (!str) return null;
+              if (/^\d{8}$/.test(str)) {
+                const y = parseInt(str.slice(0, 4), 10);
+                const m = parseInt(str.slice(4, 6), 10) - 1;
+                const d = parseInt(str.slice(6, 8), 10);
+                return new Date(y, m, d);
+              }
+              if (/^\d{8}T\d{6}(Z?)$/.test(str)) {
+                const d = new Date(str.replace(/(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})(Z?)/, "$1-$2-$3T$4:$5:$6$7"));
+                return Number.isNaN(d.getTime()) ? null : d;
+              }
+              const d = new Date(str);
+              return Number.isNaN(d.getTime()) ? null : d;
+            };
+            const vevents: { type?: string; start?: Date | string; end?: Date | string; summary?: string }[] = [];
+            const collectVevents = (obj: unknown): void => {
+              if (!obj || typeof obj !== "object") return;
+              const o = obj as Record<string, unknown>;
+              if (o.type === "VEVENT") {
+                vevents.push(o as { type?: string; start?: Date | string; end?: Date | string; summary?: string });
+                return;
+              }
+              for (const k of Object.keys(o)) {
+                const v = o[k];
+                if (v && typeof v === "object" && !(v instanceof Date)) collectVevents(v);
+              }
+            };
+            if (typeof parsed === "object" && parsed !== null) {
+              for (const key of Object.keys(parsed)) {
+                const item = (parsed as Record<string, unknown>)[key];
+                if (item && typeof item === "object" && (item as { type?: string }).type === "VEVENT") {
+                  vevents.push(item as { type?: string; start?: Date | string; end?: Date | string; summary?: string });
+                } else {
+                  collectVevents(item);
+                }
+              }
+            }
+            for (const ev of vevents) {
+              const start = toDate(ev.start);
+              const end = toDate(ev.end) ?? start;
+              if (!start || !end) continue;
+              if (end <= rangeStart || start >= rangeEnd) continue;
+              const title = (ev.summary && String(ev.summary)) || "Event";
+              events.push({
+                title,
+                start: start.toISOString(),
+                end: end.toISOString(),
+                sourceProfileId: source.profileId,
+                sourceName: source.name,
+              });
+            }
+          } catch (err) {
+            console.warn("Calendar import fetch/parse failed for URL:", url?.slice(0, 80), (err as Error)?.message);
+          }
+        }
+      }
+
+      res.json({ events });
+    } catch (error: any) {
+      console.error("Imported calendar events error:", error);
+      res.status(400).json({ message: error.message || "Failed to load imported events" });
     }
   });
 
@@ -16059,6 +18107,70 @@ Respond ONLY in this exact JSON format:
     res.json({ received: true });
   });
 
+  // Stripe Payment Method webhook – update company_payment_methods (e.g. ACH verification status)
+  app.post("/api/webhooks/stripe-payment-method", async (req, res) => {
+    const stripeService = (await import("./services/stripe")).default;
+    if (!stripeService.isStripeConfigured()) {
+      return res.status(500).json({ message: "Stripe is not configured" });
+    }
+    const sig = req.headers["stripe-signature"];
+    if (!sig) {
+      return res.status(400).json({ message: "Missing stripe-signature header" });
+    }
+    const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET_PAYMENT_METHOD || process.env.STRIPE_WEBHOOK_SECRET;
+    if (!webhookSecret) {
+      console.error("[Stripe Payment Method] Webhook secret not configured");
+      return res.status(500).json({ message: "Webhook secret not configured" });
+    }
+    const rawBody = (req as any).rawBody ?? (typeof req.body === "string" ? req.body : JSON.stringify(req.body));
+    let event: any;
+    try {
+      const stripe = stripeService.getStripe();
+      event = stripe.webhooks.constructEvent(rawBody, sig, webhookSecret);
+    } catch (err: any) {
+      console.error("[Stripe Payment Method] Webhook signature verification failed:", err.message);
+      return res.status(400).json({ message: `Webhook Error: ${err.message}` });
+    }
+    try {
+      if (event.type === "payment_method.updated" || event.type === "payment_method.attached") {
+        const pm = event.data.object as any;
+        const pmId = pm.id;
+        const existing = await storage.getCompanyPaymentMethodByStripePmId(pmId);
+        if (!existing) {
+          res.json({ received: true });
+          return;
+        }
+        const updates: Record<string, unknown> = {};
+        const jsonMerge = (existing.stripePaymentMethodJson as Record<string, unknown>) || {};
+        if (pm.us_bank_account) {
+          const verificationStatus = (pm.us_bank_account as any).verification_status;
+          const verified = verificationStatus === "verified";
+          updates.isVerified = verified;
+          (jsonMerge as any).us_bank_account = (jsonMerge as any).us_bank_account || {};
+          (jsonMerge as any).us_bank_account.verification_status = verificationStatus;
+          (jsonMerge as any).us_bank_account.updated = new Date().toISOString();
+        }
+        (jsonMerge as any).last_webhook_event = event.type;
+        (jsonMerge as any).last_webhook_at = new Date().toISOString();
+        updates.stripePaymentMethodJson = jsonMerge;
+        await storage.updateCompanyPaymentMethod(existing.id, updates as any);
+        if (existing.type === "ach" && updates.isVerified) {
+          const profile = await storage.getProfile(existing.profileId);
+          if (profile && (profile as any).primaryPaymentMethodId === existing.id) {
+            await storage.updateProfile(existing.profileId, { primaryPaymentMethodVerified: true });
+          }
+        }
+        if (process.env.NODE_ENV !== "production") {
+          console.log("[Stripe Payment Method] Updated pm " + pmId + " isVerified=" + (updates.isVerified ?? existing.isVerified));
+        }
+      }
+    } catch (error: any) {
+      console.error("[Stripe Payment Method] Error processing webhook:", error?.message || error);
+      return res.status(500).json({ message: "Error processing webhook" });
+    }
+    res.json({ received: true });
+  });
+
   return httpServer;
 }
 
@@ -16097,98 +18209,169 @@ export async function seedDatabase() {
     // Try to find by email or create if needed
   }
 
-  // Create demo users for seeding
+  // Demo user ids (preferred when seeding first; otherwise use existing user for that email so relog keeps data)
   const demoCompanyUserId = "demo-company-id";
   const demoCompany2UserId = "demo-company-2-id";
   const demoWorkerUserId = "demo-worker-id";
   const demoOperatorUserId = "demo-operator-id";
 
-  // Insert users first to satisfy FK constraints
-  await db.insert(users).values([
-    { 
-      id: demoCompanyUserId,
-      email: "company@demo.com",
-      firstName: "Demo",
-      lastName: "Company"
-    },
-    { 
-      id: demoCompany2UserId,
-      email: "company2@demo.com",
-      firstName: "BuildRight",
-      lastName: "Inc"
-    },
-    {
-      id: demoWorkerUserId,
-      email: "worker@demo.com",
-      firstName: "Demo",
-      lastName: "Worker"
-    },
-    {
-      id: demoOperatorUserId,
-      email: "operator@demo.com",
-      firstName: "Business",
-      lastName: "Operator"
+  async function getOrCreateDemoUser(
+    email: string,
+    preferredId: string,
+    firstName: string,
+    lastName: string
+  ): Promise<string> {
+    const existing = await authStorage.getUser(preferredId);
+    if (existing) return existing.id;
+    const byEmail = await authStorage.getUserByEmail(email);
+    if (byEmail) return byEmail.id;
+    try {
+      await db.insert(users).values({
+        id: preferredId,
+        email,
+        firstName,
+        lastName,
+      });
+    } catch (e: any) {
+      if (e?.code === "23505") {
+        const byEmail2 = await authStorage.getUserByEmail(email);
+        if (byEmail2) return byEmail2.id;
+      }
+      throw e;
     }
-  ]).onConflictDoNothing();
+    return preferredId;
+  }
 
-  // Create company profiles
-  const company = await storage.createProfile({
-    userId: demoCompanyUserId,
-    role: "company",
-    companyName: "Acme Construction",
-    city: "San Francisco",
-    state: "CA",
-    bio: "Leading construction firm in the Bay Area.",
-    depositAmount: 200000,
-  });
+  const companyUserId = await getOrCreateDemoUser("company@demo.com", demoCompanyUserId, "Demo", "Company");
+  const company2UserId = await getOrCreateDemoUser("company2@demo.com", demoCompany2UserId, "BuildRight", "Inc");
+  const workerUserId = await getOrCreateDemoUser("worker@demo.com", demoWorkerUserId, "Demo", "Worker");
+  const operatorUserId = await getOrCreateDemoUser("operator@demo.com", demoOperatorUserId, "Business", "Operator");
 
-  const company2 = await storage.createProfile({
-    userId: demoCompany2UserId,
-    role: "company",
-    companyName: "BuildRight Inc",
-    city: "Oakland",
-    state: "CA",
-    bio: "Commercial and residential construction specialists.",
-    depositAmount: 150000,
-  });
+  let company = await storage.getProfileByUserId(companyUserId);
+  if (!company) {
+    company = await storage.createProfile({
+      userId: companyUserId,
+      role: "company",
+      companyName: "Acme Construction",
+      firstName: "Demo",
+      lastName: "Company",
+      email: "company@demo.com",
+      phone: "555-000-0001",
+      city: "San Francisco",
+      state: "CA",
+      bio: "Leading construction firm in the Bay Area.",
+      depositAmount: 200000,
+    });
+  } else {
+    const needs = !company.firstName || !company.lastName || !company.email || !company.phone;
+    if (needs) {
+      company = await storage.updateProfile(company.id, {
+        firstName: company.firstName || "Demo",
+        lastName: company.lastName || "Company",
+        email: company.email || "company@demo.com",
+        phone: company.phone || "555-000-0001",
+        companyName: company.companyName || "Acme Construction",
+      });
+    }
+  }
 
-  // Create worker profile
-  const worker = await storage.createProfile({
-    userId: demoWorkerUserId,
-    role: "worker",
-    city: "Oakland",
-    state: "CA",
-    bio: "Experienced electrician with 5 years of experience.",
-    hourlyRate: 45,
-    experienceYears: 5,
-    trades: ["Electrical", "General Labor"],
-  });
+  let company2 = await storage.getProfileByUserId(company2UserId);
+  if (!company2) {
+    company2 = await storage.createProfile({
+      userId: company2UserId,
+      role: "company",
+      companyName: "BuildRight Inc",
+      firstName: "BuildRight",
+      lastName: "Inc",
+      email: "company2@demo.com",
+      phone: "555-000-0002",
+      city: "Oakland",
+      state: "CA",
+      bio: "Commercial and residential construction specialists.",
+      depositAmount: 150000,
+    });
+  } else {
+    const needs = !company2.firstName || !company2.lastName || !company2.email || !company2.phone;
+    if (needs) {
+      company2 = await storage.updateProfile(company2.id, {
+        firstName: company2.firstName || "BuildRight",
+        lastName: company2.lastName || "Inc",
+        email: company2.email || "company2@demo.com",
+        phone: company2.phone || "555-000-0002",
+        companyName: company2.companyName || "BuildRight Inc",
+      });
+    }
+  }
 
-  // Create business operator profile (Carlos Martinez / Brandon Tolstoy)
-  const operator = await storage.createProfile({
-    userId: demoOperatorUserId,
-    role: "worker",
-    firstName: "Carlos",
-    lastName: "Martinez",
-    city: "San Jose",
-    state: "CA",
-    address: "450 W Santa Clara St", // Admin's home/work address
-    zipCode: "95113",
-    latitude: "37.3398", // Admin's work location (home base)
-    longitude: "-121.8885",
-    bio: "Licensed contractor running a team of skilled tradespeople.",
-    hourlyRate: 55,
-    experienceYears: 12,
-    trades: ["Electrical", "Plumbing", "HVAC"],
-    serviceCategories: ["elite", "lite"],
-  });
+  let worker = await storage.getProfileByUserId(workerUserId);
+  if (!worker) {
+    worker = await storage.createProfile({
+      userId: workerUserId,
+      role: "worker",
+      firstName: "Demo",
+      lastName: "Worker",
+      email: "worker@demo.com",
+      phone: "555-000-0003",
+      city: "Oakland",
+      state: "CA",
+      bio: "Experienced electrician with 5 years of experience.",
+      hourlyRate: 45,
+      experienceYears: 5,
+      trades: ["Electrical", "General Labor"],
+    });
+  } else {
+    const needs = !worker.firstName || !worker.lastName || !worker.email || !worker.phone;
+    if (needs) {
+      worker = await storage.updateProfile(worker.id, {
+        firstName: worker.firstName || "Demo",
+        lastName: worker.lastName || "Worker",
+        email: worker.email || "worker@demo.com",
+        phone: worker.phone || "555-000-0003",
+      });
+    }
+  }
 
-  // Create a team for the business operator
-  const operatorTeam = await storage.createWorkerTeam({
-    name: "Martinez Crew",
-    ownerId: operator.id,
-    description: "Professional trade services team",
-  });
+  let operator = await storage.getProfileByUserId(operatorUserId);
+  if (!operator) {
+    operator = await storage.createProfile({
+      userId: operatorUserId,
+      role: "worker",
+      firstName: "Carlos",
+      lastName: "Martinez",
+      email: "operator@demo.com",
+      phone: "555-000-0004",
+      city: "San Jose",
+      state: "CA",
+      address: "450 W Santa Clara St",
+      zipCode: "95113",
+      latitude: "37.3398",
+      longitude: "-121.8885",
+      bio: "Licensed contractor running a team of skilled tradespeople.",
+      hourlyRate: 55,
+      experienceYears: 12,
+      trades: ["Electrical", "Plumbing", "HVAC"],
+      serviceCategories: ["elite", "lite"],
+    });
+  } else {
+    const needs = !operator.firstName || !operator.lastName || !operator.email || !operator.phone;
+    if (needs) {
+      operator = await storage.updateProfile(operator.id, {
+        firstName: operator.firstName || "Carlos",
+        lastName: operator.lastName || "Martinez",
+        email: operator.email || "operator@demo.com",
+        phone: operator.phone || "555-000-0004",
+      });
+    }
+  }
+
+  let operatorTeam = await storage.getWorkerTeam(operator.id);
+  if (!operatorTeam) {
+    operatorTeam = await storage.createWorkerTeam({
+      name: "Martinez Crew",
+      ownerId: operator.id,
+      description: "Professional trade services team",
+    });
+  }
 
   // Get or create team members
   const allTeamMembers = await storage.getWorkerTeamMembers(operatorTeam.id);
@@ -16494,11 +18677,39 @@ export async function seedDatabase() {
     },
   ];
 
-  for (const jobData of sampleJobs) {
+  // 24 sample jobs in Midwest: Dayton, Cleveland, Cincinnati, Kentucky, Indianapolis, Michigan
+  const midwestSampleJobs = [
+    { companyId: company.id, title: "Electrical Wiring - Retail Build-Out", description: "Run conduit and wire new retail space in downtown Cincinnati. Must have own tools.", location: "Cincinnati, OH", address: "700 Vine St", city: "Cincinnati", state: "OH", zipCode: "45202", latitude: "39.1031", longitude: "-84.5120", trade: "Electrical" as const, serviceCategory: "Electrical", skillLevel: "elite" as const, hourlyRate: 5200, estimatedHours: 8, scheduledTime: "7:00 AM - 4:00 PM", startDate: new Date(Date.now() + 86400000 * 1) },
+    { companyId: company2.id, title: "Drywall & Finishing - Office Suite", description: "Hang and finish drywall in 1,500 sqft office. 2–3 days.", location: "Cincinnati, OH", address: "2500 E Kemper Rd", city: "Cincinnati", state: "OH", zipCode: "45241", latitude: "39.2833", longitude: "-84.3583", trade: "Drywall" as const, serviceCategory: "Drywall", skillLevel: "lite" as const, hourlyRate: 3400, estimatedHours: 8, scheduledTime: "8:00 AM - 5:00 PM", maxWorkersNeeded: 2, startDate: new Date(Date.now() + 86400000 * 2) },
+    { companyId: company.id, title: "Plumbing Rough-In - New Construction", description: "Rough-in plumbing for new single-family home. Licensed plumber preferred.", location: "Cincinnati, OH", address: "1800 Race St", city: "Cincinnati", state: "OH", zipCode: "45210", latitude: "39.1150", longitude: "-84.5186", trade: "Plumbing" as const, serviceCategory: "Plumbing", skillLevel: "elite" as const, hourlyRate: 5800, estimatedHours: 8, scheduledTime: "7:30 AM - 4:30 PM", startDate: new Date(Date.now() + 86400000 * 3) },
+    { companyId: company2.id, title: "Interior Painting - Apartments", description: "Paint 8 units. Supplies provided. Must be neat and reliable.", location: "Cincinnati, OH", address: "4000 Smith Rd", city: "Cincinnati", state: "OH", zipCode: "45212", latitude: "39.1689", longitude: "-84.4286", trade: "Painting" as const, serviceCategory: "Painting", skillLevel: "lite" as const, hourlyRate: 3000, estimatedHours: 8, scheduledTime: "8:00 AM - 5:00 PM", maxWorkersNeeded: 3, startDate: new Date(Date.now() + 86400000 * 4) },
+    { companyId: company.id, title: "HVAC Duct Installation - Commercial", description: "Install ductwork for new HVAC system in office building.", location: "Dayton, OH", address: "40 W 4th St", city: "Dayton", state: "OH", zipCode: "45402", latitude: "39.7589", longitude: "-84.1916", trade: "HVAC" as const, serviceCategory: "HVAC", skillLevel: "elite" as const, hourlyRate: 5600, estimatedHours: 8, scheduledTime: "7:00 AM - 4:00 PM", startDate: new Date(Date.now() + 86400000 * 1) },
+    { companyId: company2.id, title: "General Labor - Site Cleanup", description: "Clear debris and prep site after demo. Safety gear provided.", location: "Dayton, OH", address: "1100 S Main St", city: "Dayton", state: "OH", zipCode: "45409", latitude: "39.7422", longitude: "-84.1861", trade: "General Labor" as const, serviceCategory: "Laborer", skillLevel: "any" as const, hourlyRate: 2600, estimatedHours: 6, scheduledTime: "6:00 AM - 12:00 PM", maxWorkersNeeded: 4, startDate: new Date(Date.now() + 86400000 * 2) },
+    { companyId: company.id, title: "Carpentry - Custom Cabinets", description: "Build and install custom kitchen cabinets. High-quality work required.", location: "Dayton, OH", address: "500 E 3rd St", city: "Dayton", state: "OH", zipCode: "45402", latitude: "39.7611", longitude: "-84.1858", trade: "Carpentry" as const, serviceCategory: "Carpentry", skillLevel: "elite" as const, hourlyRate: 5000, estimatedHours: 8, scheduledTime: "8:00 AM - 5:00 PM", startDate: new Date(Date.now() + 86400000 * 5) },
+    { companyId: company2.id, title: "Concrete Pour - Driveway", description: "Pour and finish concrete driveway. Experience required.", location: "Dayton, OH", address: "2200 N Gettysburg Ave", city: "Dayton", state: "OH", zipCode: "45406", latitude: "39.7822", longitude: "-84.2186", trade: "Concrete" as const, serviceCategory: "Concrete", skillLevel: "lite" as const, hourlyRate: 3800, estimatedHours: 8, scheduledTime: "6:00 AM - 3:00 PM", startDate: new Date(Date.now() + 86400000 * 6) },
+    { companyId: company.id, title: "Electrical Panel Upgrade - Industrial", description: "Upgrade 400A panel in warehouse. Licensed electrician required.", location: "Cleveland, OH", address: "1300 E 9th St", city: "Cleveland", state: "OH", zipCode: "44114", latitude: "41.4993", longitude: "-81.6944", trade: "Electrical" as const, serviceCategory: "Electrical", skillLevel: "elite" as const, hourlyRate: 6000, estimatedHours: 8, scheduledTime: "6:00 AM - 3:00 PM", startDate: new Date(Date.now() + 86400000 * 2) },
+    { companyId: company2.id, title: "Roof Repair - Residential", description: "Replace damaged shingles and fix flashing on residential roof.", location: "Cleveland, OH", address: "4500 Lorain Ave", city: "Cleveland", state: "OH", zipCode: "44113", latitude: "41.4789", longitude: "-81.7133", trade: "General Labor" as const, serviceCategory: "Laborer", skillLevel: "lite" as const, hourlyRate: 3600, estimatedHours: 6, scheduledTime: "8:00 AM - 2:00 PM", maxWorkersNeeded: 2, startDate: new Date(Date.now() + 86400000 * 3) },
+    { companyId: company.id, title: "Demolition - Interior Strip-Out", description: "Remove interior walls and ceilings for renovation. Physical work.", location: "Cleveland, OH", address: "2000 Euclid Ave", city: "Cleveland", state: "OH", zipCode: "44115", latitude: "41.5042", longitude: "-81.6853", trade: "Demolition" as const, serviceCategory: "Laborer", skillLevel: "any" as const, hourlyRate: 2800, estimatedHours: 8, scheduledTime: "6:30 AM - 3:30 PM", maxWorkersNeeded: 3, startDate: new Date(Date.now() + 86400000 * 4) },
+    { companyId: company2.id, title: "Flooring Installation - Hardwood", description: "Install hardwood flooring in 4-bedroom home. Experience preferred.", location: "Cleveland, OH", address: "5500 Detroit Ave", city: "Cleveland", state: "OH", zipCode: "44102", latitude: "41.4842", longitude: "-81.7186", trade: "Carpentry" as const, serviceCategory: "Carpentry", skillLevel: "lite" as const, hourlyRate: 4200, estimatedHours: 8, scheduledTime: "8:00 AM - 5:00 PM", startDate: new Date(Date.now() + 86400000 * 7) },
+    { companyId: company.id, title: "Plumbing - Bathroom Remodel", description: "Full plumbing for bathroom remodel. New fixtures and rough-in.", location: "Louisville, KY", address: "500 S 4th St", city: "Louisville", state: "KY", zipCode: "40202", latitude: "38.2527", longitude: "-85.7585", trade: "Plumbing" as const, serviceCategory: "Plumbing", skillLevel: "elite" as const, hourlyRate: 5400, estimatedHours: 8, scheduledTime: "8:00 AM - 5:00 PM", startDate: new Date(Date.now() + 86400000 * 1) },
+    { companyId: company2.id, title: "Painting - Commercial Interior", description: "Paint lobby and common areas. Supplies provided.", location: "Louisville, KY", address: "4000 Dupont Circle", city: "Louisville", state: "KY", zipCode: "40207", latitude: "38.2189", longitude: "-85.6436", trade: "Painting" as const, serviceCategory: "Painting", skillLevel: "lite" as const, hourlyRate: 3200, estimatedHours: 8, scheduledTime: "7:00 AM - 4:00 PM", maxWorkersNeeded: 2, startDate: new Date(Date.now() + 86400000 * 3) },
+    { companyId: company.id, title: "HVAC Service - Restaurant", description: "Install new exhaust and make-up air for kitchen. Commercial experience needed.", location: "Lexington, KY", address: "200 W Main St", city: "Lexington", state: "KY", zipCode: "40507", latitude: "38.0406", longitude: "-84.5037", trade: "HVAC" as const, serviceCategory: "HVAC", skillLevel: "elite" as const, hourlyRate: 5800, estimatedHours: 8, scheduledTime: "6:00 AM - 3:00 PM", startDate: new Date(Date.now() + 86400000 * 5) },
+    { companyId: company2.id, title: "General Labor - Warehouse Move", description: "Help move equipment and materials. Heavy lifting. Team of 4.", location: "Lexington, KY", address: "1500 Newtown Pike", city: "Lexington", state: "KY", zipCode: "40511", latitude: "38.0811", longitude: "-84.5086", trade: "General Labor" as const, serviceCategory: "Laborer", skillLevel: "any" as const, hourlyRate: 2400, estimatedHours: 6, scheduledTime: "7:00 AM - 1:00 PM", maxWorkersNeeded: 4, startDate: new Date(Date.now() + 86400000 * 6) },
+    { companyId: company.id, title: "Electrical - Tenant Finish", description: "Wire new office tenant space. Must meet code. Own tools.", location: "Indianapolis, IN", address: "50 Monument Circle", city: "Indianapolis", state: "IN", zipCode: "46204", latitude: "39.7684", longitude: "-86.1581", trade: "Electrical" as const, serviceCategory: "Electrical", skillLevel: "elite" as const, hourlyRate: 5100, estimatedHours: 8, scheduledTime: "7:00 AM - 4:00 PM", startDate: new Date(Date.now() + 86400000 * 2) },
+    { companyId: company2.id, title: "Drywall - Multi-Family", description: "Hang and finish drywall in 12-unit building. 5 days.", location: "Indianapolis, IN", address: "3500 Lafayette Rd", city: "Indianapolis", state: "IN", zipCode: "46222", latitude: "39.8011", longitude: "-86.2186", trade: "Drywall" as const, serviceCategory: "Drywall", skillLevel: "lite" as const, hourlyRate: 3300, estimatedHours: 8, scheduledTime: "8:00 AM - 5:00 PM", maxWorkersNeeded: 3, startDate: new Date(Date.now() + 86400000 * 4) },
+    { companyId: company.id, title: "Carpentry - Trim & Doors", description: "Install interior trim and hang doors in new construction.", location: "Indianapolis, IN", address: "1200 N Meridian St", city: "Indianapolis", state: "IN", zipCode: "46202", latitude: "39.7756", longitude: "-86.1614", trade: "Carpentry" as const, serviceCategory: "Carpentry", skillLevel: "lite" as const, hourlyRate: 4000, estimatedHours: 8, scheduledTime: "8:00 AM - 5:00 PM", startDate: new Date(Date.now() + 86400000 * 8) },
+    { companyId: company2.id, title: "Concrete - Sidewalk & Steps", description: "Pour sidewalk and steps. Finish and broom.", location: "Indianapolis, IN", address: "6002 E 82nd St", city: "Indianapolis", state: "IN", zipCode: "46250", latitude: "39.9011", longitude: "-86.0686", trade: "Concrete" as const, serviceCategory: "Concrete", skillLevel: "lite" as const, hourlyRate: 3600, estimatedHours: 6, scheduledTime: "6:00 AM - 12:00 PM", startDate: new Date(Date.now() + 86400000 * 9) },
+    { companyId: company.id, title: "Plumbing - Multi-Unit Repairs", description: "Repair leaks and replace fixtures in 6 units. Licensed plumber.", location: "Detroit, MI", address: "1000 Woodward Ave", city: "Detroit", state: "MI", zipCode: "48226", latitude: "42.3314", longitude: "-83.0458", trade: "Plumbing" as const, serviceCategory: "Plumbing", skillLevel: "elite" as const, hourlyRate: 5600, estimatedHours: 8, scheduledTime: "7:30 AM - 4:30 PM", startDate: new Date(Date.now() + 86400000 * 3) },
+    { companyId: company2.id, title: "Painting - Exterior Commercial", description: "Scrape, prime, and paint exterior of 2-story building.", location: "Detroit, MI", address: "6500 Michigan Ave", city: "Detroit", state: "MI", zipCode: "48210", latitude: "42.3414", longitude: "-83.1158", trade: "Painting" as const, serviceCategory: "Painting", skillLevel: "lite" as const, hourlyRate: 3400, estimatedHours: 8, scheduledTime: "7:00 AM - 4:00 PM", maxWorkersNeeded: 2, startDate: new Date(Date.now() + 86400000 * 5) },
+    { companyId: company.id, title: "HVAC - Rooftop Unit Install", description: "Install new RTU on commercial roof. Crane on site.", location: "Grand Rapids, MI", address: "50 Monroe Ave NW", city: "Grand Rapids", state: "MI", zipCode: "49503", latitude: "42.9634", longitude: "-85.6681", trade: "HVAC" as const, serviceCategory: "HVAC", skillLevel: "elite" as const, hourlyRate: 6200, estimatedHours: 10, scheduledTime: "6:00 AM - 5:00 PM", startDate: new Date(Date.now() + 86400000 * 6) },
+    { companyId: company2.id, title: "General Labor - Landscaping Prep", description: "Grade and prep site for landscaping. Shovel, rake, wheelbarrow.", location: "Grand Rapids, MI", address: "200 Ottawa Ave NW", city: "Grand Rapids", state: "MI", zipCode: "49503", latitude: "42.9686", longitude: "-85.6736", trade: "General Labor" as const, serviceCategory: "Laborer", skillLevel: "any" as const, hourlyRate: 2500, estimatedHours: 6, scheduledTime: "7:00 AM - 1:00 PM", maxWorkersNeeded: 3, startDate: new Date(Date.now() + 86400000 * 7) },
+  ];
+
+  for (const jobData of [...sampleJobs, ...midwestSampleJobs]) {
     await storage.createJob(jobData);
   }
 
-  console.log("Database seeded with", sampleJobs.length, "sample jobs!");
+  console.log("Database seeded with", sampleJobs.length + midwestSampleJobs.length, "sample jobs!");
 
   // Create sample routes for Carlos Martinez's team (for calendar map testing)
   // Jobs in San Jose area with coordinates for route testing

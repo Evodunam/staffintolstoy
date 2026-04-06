@@ -37,6 +37,7 @@ import { GooglePlacesAutocomplete } from "@/components/GooglePlacesAutocomplete"
 import { OnDemandScheduleMultiStep } from "@/components/OnDemandScheduleMultiStep";
 import { OneDayScheduleMultiStep } from "@/components/OneDayScheduleMultiStep";
 import { RecurringScheduleMultiStep } from "@/components/RecurringScheduleMultiStep";
+import { MonthlyScheduleMultiStep } from "@/components/MonthlyScheduleMultiStep";
 import { useTranslation } from "react-i18next";
 import { cn, parseLocalDate, getTimeSlots, getValidEndTimeSlots, getEarliestEndTime, formatTime12h, isValidScheduleTime } from "@/lib/utils";
 import {
@@ -92,7 +93,7 @@ const SKILLSET_KEYWORDS: Record<string, string[]> = {
 
 const TOTAL_STEPS = 4;
 
-type ShiftType = "on-demand" | "one-day" | "recurring";
+type ShiftType = "on-demand" | "one-day" | "recurring" | "monthly";
 
 const SHIFT_TYPE_INFO: Record<ShiftType, { title: string; description: string; recommended?: boolean }> = {
   "on-demand": {
@@ -107,6 +108,10 @@ const SHIFT_TYPE_INFO: Record<ShiftType, { title: string; description: string; r
   "recurring": {
     title: "Recurring Shifts",
     description: "Set up a weekly schedule for ongoing projects. Best for multi-week projects."
+  },
+  "monthly": {
+    title: "Monthly",
+    description: "Schedule repeats monthly on selected days of the week. Best for ongoing monthly needs (up to 12 months)."
   }
 };
 
@@ -157,10 +162,25 @@ export default function PostJob() {
   const searchParams = new URLSearchParams(window.location.search);
   const isDirectRequest = searchParams.get("directRequest") === "true";
   const isNewJob = searchParams.get("new") === "1";
+  const isRepostFromCancellation = searchParams.get("repost") === "1";
+  const repostSourceJobId = Number(searchParams.get("sourceJobId") || "");
   const directRequestWorkerId = searchParams.get("workerId");
   const directRequestWorkerName = searchParams.get("workerName");
   const directRequestWorkerRate = searchParams.get("workerRate");
   const fallbackToPublic = searchParams.get("fallback") !== "false"; // Default to true
+
+  const didApplyRepostPrefillRef = useRef(false);
+
+  const { data: repostSourceJob } = useQuery<any>({
+    queryKey: ["/api/jobs", repostSourceJobId, "repost-source"],
+    enabled: isRepostFromCancellation && Number.isFinite(repostSourceJobId) && repostSourceJobId > 0,
+    queryFn: async () => {
+      const res = await fetch(`/api/jobs/${repostSourceJobId}`, { credentials: "include" });
+      if (!res.ok) throw new Error("Failed to load source job for repost");
+      return res.json();
+    },
+    staleTime: 60_000,
+  });
 
   const { data: companyLocations = [], isLoading: locationsLoading } = useQuery<CompanyLocation[]>({
     queryKey: ['/api/locations'],
@@ -554,6 +574,11 @@ export default function PostJob() {
     return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
   };
 
+  const todayStr = (() => {
+    const d = new Date();
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  })();
+
   const [onDemandDate, setOnDemandDate] = useState(getTomorrowStr);
   const [onDemandDoneByDate, setOnDemandDoneByDate] = useState("");
   const [onDemandStartTime, setOnDemandStartTime] = useState("09:00");
@@ -584,14 +609,108 @@ export default function PostJob() {
     endTime: "17:00"
   }));
 
-  const [recurringSchedule, setRecurringSchedule] = useState({
+  const [recurringSchedule, setRecurringSchedule] = useState(() => ({
     days: [] as string[],
-    startDate: "",
+    startDate: getTomorrowStr(),
     endDate: "",
-    startTime: "08:00",
+    startTime: "09:00",
     endTime: "17:00",
     weeks: 1
+  }));
+
+  const [monthlyFormStep, setMonthlyFormStep] = useState(1);
+  const [monthlySchedule, setMonthlySchedule] = useState(() => {
+    const start = getTomorrowStr();
+    const startDate = parseLocalDate(start);
+    const endDate = new Date(startDate.getFullYear(), startDate.getMonth() + 1, 0);
+    return {
+      startDate: start,
+      endDate: `${endDate.getFullYear()}-${String(endDate.getMonth() + 1).padStart(2, "0")}-${String(endDate.getDate()).padStart(2, "0")}`,
+      days: [] as string[],
+      startTime: "09:00",
+      endTime: "17:00"
+    };
   });
+
+  const toDateInput = (value: string | Date | null | undefined): string => {
+    if (!value) return "";
+    const d = value instanceof Date ? value : new Date(value);
+    if (Number.isNaN(d.getTime())) return "";
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  };
+
+  const toTimeInput = (value: string | null | undefined, fallback = "09:00"): string => {
+    if (!value) return fallback;
+    const trimmed = String(value).trim();
+    if (/^\d{2}:\d{2}$/.test(trimmed)) return trimmed;
+    const m = trimmed.match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
+    if (!m) return fallback;
+    let h = Number(m[1]);
+    const mm = m[2];
+    const ampm = m[3].toUpperCase();
+    if (ampm === "PM" && h < 12) h += 12;
+    if (ampm === "AM" && h === 12) h = 0;
+    return `${String(h).padStart(2, "0")}:${mm}`;
+  };
+
+  useEffect(() => {
+    if (!isRepostFromCancellation || !repostSourceJob || didApplyRepostPrefillRef.current) return;
+
+    const source = repostSourceJob;
+    const startDate = toDateInput(source.startDate) || getTomorrowStr();
+    const endDate = toDateInput(source.endDate);
+    const startTime = toTimeInput(source.scheduledTime, "09:00");
+    const endTime = toTimeInput(source.endTime, "17:00");
+    const days = Array.isArray(source.scheduleDays) ? source.scheduleDays.map((d: string) => String(d).toLowerCase()) : [];
+    const recurringWeeks = Number(source.recurringWeeks) > 0 ? Number(source.recurringWeeks) : 1;
+    const recurringMonths = Number(source.recurringMonths) > 0 ? Number(source.recurringMonths) : 0;
+
+    setCompanyJobTitle(source.title || "");
+    setJobDescription(source.description || "");
+    setWorkersNeeded(Math.max(1, Number(source.maxWorkersNeeded) || 1));
+    if (source.companyLocationId) setSelectedLocationId(Number(source.companyLocationId));
+
+    if (source.jobType === "on_demand" || source.isOnDemand) {
+      setShiftType("on-demand");
+      setOnDemandDate(startDate);
+      setOnDemandDoneByDate(endDate || "");
+      setOnDemandStartTime(startTime);
+      setShowSchedulePopup("on-demand");
+    } else if (source.jobType === "recurring" && recurringMonths > 0) {
+      setShiftType("monthly");
+      setMonthlySchedule({
+        startDate,
+        endDate: endDate || startDate,
+        days,
+        startTime,
+        endTime,
+      });
+      setShowSchedulePopup("monthly");
+    } else if (source.jobType === "recurring") {
+      setShiftType("recurring");
+      setRecurringSchedule({
+        days,
+        startDate,
+        endDate: endDate || "",
+        startTime,
+        endTime,
+        weeks: recurringWeeks,
+      });
+      setShowSchedulePopup("recurring");
+    } else {
+      setShiftType("one-day");
+      setOneDaySchedule({
+        date: startDate,
+        startTime,
+        endTime,
+      });
+      setShowSchedulePopup("one-day");
+    }
+
+    setStep(2);
+    setScheduleSuggestionApplied(true);
+    didApplyRepostPrefillRef.current = true;
+  }, [isRepostFromCancellation, repostSourceJob]);
 
   useEffect(() => {
     if (!authLoading && !isAuthenticated) {
@@ -641,8 +760,10 @@ export default function PostJob() {
       onDemandFormStep,
       oneDayFormStep,
       recurringFormStep,
+      monthlyFormStep,
       oneDaySchedule,
       recurringSchedule,
+      monthlySchedule,
       showSchedulePopup,
       datePickerFor,
       showLocationPopup,
@@ -657,7 +778,7 @@ export default function PostJob() {
       step, selectedLocationId, locationListExpanded, jobDescription, aiCategories,
       selectedSkillsets, lastAnalyzedDescription, userModifiedSkills, aiGeneratedTitle,
       companyJobTitle, mediaPreviews, workersNeeded, shiftType, scheduleError, onDemandBudget, onDemandDate,
-      onDemandDoneByDate, onDemandStartTime, onDemandFormStep, oneDayFormStep, recurringFormStep, oneDaySchedule, recurringSchedule,
+      onDemandDoneByDate, onDemandStartTime,       onDemandFormStep, oneDayFormStep, recurringFormStep, monthlyFormStep, oneDaySchedule, recurringSchedule, monthlySchedule,
       showSchedulePopup, datePickerFor, showLocationPopup, editingLocationId, addLocationStep,
       showCustomContactPopup, showAddTeamMemberPopup, newLocation,
     ]
@@ -684,8 +805,20 @@ export default function PostJob() {
       setOnDemandFormStep(d.onDemandFormStep);
       setOneDayFormStep(d.oneDayFormStep ?? 1);
       setRecurringFormStep(d.recurringFormStep ?? 1);
+      setMonthlyFormStep(d.monthlyFormStep ?? 1);
       setOneDaySchedule(d.oneDaySchedule);
       setRecurringSchedule(d.recurringSchedule);
+      if (d.monthlySchedule) {
+        const ms = d.monthlySchedule as { startDate: string; endDate?: string; months?: number; days: string[]; startTime: string; endTime: string };
+        let endDate = ms.endDate;
+        if (!endDate && ms.startDate && typeof (ms as { months?: number }).months === "number") {
+          const start = parseLocalDate(ms.startDate);
+          const months = (ms as { months?: number }).months ?? 1;
+          const end = new Date(start.getFullYear(), start.getMonth() + months, 0);
+          endDate = `${end.getFullYear()}-${String(end.getMonth() + 1).padStart(2, "0")}-${String(end.getDate()).padStart(2, "0")}`;
+        }
+        setMonthlySchedule({ startDate: ms.startDate, endDate: endDate || ms.startDate, days: ms.days || [], startTime: ms.startTime || "09:00", endTime: ms.endTime || "17:00" });
+      }
       setScheduleSuggestionApplied(true); // Don't overwrite restored schedule with AI suggestion
       setShowSchedulePopup(d.showSchedulePopup);
       setDatePickerFor(d.datePickerFor);
@@ -742,9 +875,22 @@ export default function PostJob() {
     setOnDemandStartTime("09:00");
     setOnDemandFormStep(1);
     setOneDaySchedule({ date: getTomorrowStr(), startTime: "09:00", endTime: "17:00" });
-    setRecurringSchedule({ days: [], startDate: "", endDate: "", startTime: "09:00", endTime: "17:00", weeks: 1 });
+    setRecurringSchedule({ days: [], startDate: getTomorrowStr(), endDate: "", startTime: "09:00", endTime: "17:00", weeks: 1 });
+    setMonthlySchedule(() => {
+      const start = getTomorrowStr();
+      const startD = parseLocalDate(start);
+      const endD = new Date(startD.getFullYear(), startD.getMonth() + 1, 0);
+      return {
+        startDate: start,
+        endDate: `${endD.getFullYear()}-${String(endD.getMonth() + 1).padStart(2, "0")}-${String(endD.getDate()).padStart(2, "0")}`,
+        days: [],
+        startTime: "09:00",
+        endTime: "17:00"
+      };
+    });
     setOneDayFormStep(1);
     setRecurringFormStep(1);
+    setMonthlyFormStep(1);
     setShowSchedulePopup(null);
     setDatePickerFor(null);
     setShowLocationPopup(false);
@@ -934,7 +1080,29 @@ export default function PostJob() {
   };
 
   const recurringStartError = shiftType === "recurring" ? validateRecurringStart() : null;
-  const effectiveScheduleError = scheduleError || recurringStartError;
+  const validateMonthlyStart = () => {
+    const startDate = monthlySchedule.startDate || todayStr;
+    if (!startDate || !monthlySchedule.startTime) return null;
+    const selectedDateTime = new Date(`${startDate}T${monthlySchedule.startTime}`);
+    const now = new Date();
+    if (selectedDateTime < now) {
+      return "Start date and time cannot be in the past";
+    }
+    return null;
+  };
+  const monthlyStartError = shiftType === "monthly" ? validateMonthlyStart() : null;
+  const effectiveScheduleError = scheduleError || recurringStartError || monthlyStartError;
+
+  const monthlyMonthsCount = useMemo(() => {
+    const s = monthlySchedule.startDate || todayStr;
+    const e = monthlySchedule.endDate || s;
+    if (!s || !e) return 0;
+    const start = parseLocalDate(s);
+    const end = parseLocalDate(e);
+    if (end < start) return 0;
+    const months = (end.getFullYear() - start.getFullYear()) * 12 + (end.getMonth() - start.getMonth()) + 1;
+    return Math.max(1, Math.min(12, months));
+  }, [monthlySchedule.startDate, monthlySchedule.endDate, todayStr]);
 
   const isScheduleValid = () => {
     if (!shiftType) return false;
@@ -947,6 +1115,10 @@ export default function PostJob() {
     if (shiftType === "recurring") {
       const pastError = validateRecurringStart();
       return recurringSchedule.days.length > 0 && recurringSchedule.weeks > 0 && !pastError;
+    }
+    if (shiftType === "monthly") {
+      const pastError = validateMonthlyStart();
+      return monthlySchedule.days.length > 0 && monthlyMonthsCount >= 1 && monthlyMonthsCount <= 12 && !pastError;
     }
     return false;
   };
@@ -962,6 +1134,12 @@ export default function PostJob() {
       const end = parseInt(recurringSchedule.endTime.split(":")[0]);
       const hoursPerDay = end - start;
       return hoursPerDay * recurringSchedule.days.length * recurringSchedule.weeks * workersNeeded;
+    }
+    if (shiftType === "monthly") {
+      const start = parseInt(monthlySchedule.startTime.split(":")[0]);
+      const end = parseInt(monthlySchedule.endTime.split(":")[0]);
+      const hoursPerDay = end - start;
+      return hoursPerDay * monthlySchedule.days.length * monthlyMonthsCount * workersNeeded;
     }
     return 0;
   };
@@ -1097,7 +1275,7 @@ export default function PostJob() {
     }
   };
 
-  const handleSubmit = async () => {
+  const handleSubmit = async (saveAsDraft?: boolean) => {
     if (!selectedLocation || selectedSkillsets.length === 0) {
       toast({ title: t("error"), description: t("pleaseSelectLocationAndSkill"), variant: "destructive" });
       return;
@@ -1140,6 +1318,19 @@ export default function PostJob() {
         const startHour = parseInt(recurringSchedule.startTime.split(":")[0]);
         const endHour = parseInt(recurringSchedule.endTime.split(":")[0]);
         estimatedHours = (endHour - startHour) * recurringSchedule.days.length * recurringSchedule.weeks;
+        jobType = "recurring";
+      } else if (shiftType === "monthly") {
+        const startDateStr = monthlySchedule.startDate || todayStr;
+        const endDateStr = monthlySchedule.endDate || startDateStr;
+        const startLocal = parseLocalDate(startDateStr);
+        const endLocal = parseLocalDate(endDateStr);
+        const [sh, sm] = monthlySchedule.startTime.split(":").map(Number);
+        const [eh, em] = monthlySchedule.endTime.split(":").map(Number);
+        startDate = new Date(startLocal.getFullYear(), startLocal.getMonth(), startLocal.getDate(), sh, sm || 0, 0, 0);
+        endDate = new Date(endLocal.getFullYear(), endLocal.getMonth(), endLocal.getDate(), eh, em || 0, 0, 0);
+        const startHour = parseInt(monthlySchedule.startTime.split(":")[0]);
+        const endHour = parseInt(monthlySchedule.endTime.split(":")[0]);
+        estimatedHours = (endHour - startHour) * monthlySchedule.days.length * monthlyMonthsCount * workersNeeded;
         jobType = "recurring";
       } else {
         startDate = new Date();
@@ -1204,15 +1395,16 @@ export default function PostJob() {
         maxWorkersNeeded: workersNeeded,
         startDate: startDate.toISOString(),
         endDate: endDate?.toISOString(),
-        scheduledTime: shiftType === "on-demand" ? onDemandStartTime : (shiftType === "one-day" ? oneDaySchedule.startTime : recurringSchedule.startTime),
+        scheduledTime: shiftType === "on-demand" ? onDemandStartTime : (shiftType === "one-day" ? oneDaySchedule.startTime : shiftType === "monthly" ? monthlySchedule.startTime : recurringSchedule.startTime),
         estimatedHours,
         isOnDemand: shiftType === "on-demand",
         jobType,
         images: imageUrls.length > 0 ? imageUrls : undefined,
         videos: videoUrls.length > 0 ? videoUrls : undefined,
-        scheduleDays: shiftType === "recurring" ? recurringSchedule.days : undefined,
-        endTime: shiftType === "recurring" ? recurringSchedule.endTime : (shiftType === "one-day" ? oneDaySchedule.endTime : undefined),
-        recurringWeeks: shiftType === "recurring" ? recurringSchedule.weeks : undefined,
+        scheduleDays: shiftType === "recurring" ? recurringSchedule.days : (shiftType === "monthly" ? monthlySchedule.days : undefined),
+        endTime: shiftType === "recurring" ? recurringSchedule.endTime : (shiftType === "monthly" ? monthlySchedule.endTime : (shiftType === "one-day" ? oneDaySchedule.endTime : undefined)),
+        recurringWeeks: shiftType === "recurring" ? recurringSchedule.weeks : (shiftType === "monthly" ? undefined : undefined),
+        recurringMonths: shiftType === "monthly" ? monthlyMonthsCount : undefined,
         budgetCents: onDemandBudget ? onDemandBudget * 100 : undefined, // Convert to cents
       };
 
@@ -1237,15 +1429,16 @@ export default function PostJob() {
           maxWorkersNeeded: workersNeeded,
           startDate: startDate.toISOString(),
           endDate: endDate?.toISOString(),
-          scheduledTime: shiftType === "on-demand" ? onDemandStartTime : (shiftType === "one-day" ? oneDaySchedule.startTime : recurringSchedule.startTime),
+          scheduledTime: shiftType === "on-demand" ? onDemandStartTime : (shiftType === "one-day" ? oneDaySchedule.startTime : shiftType === "monthly" ? monthlySchedule.startTime : recurringSchedule.startTime),
           estimatedHours,
           isOnDemand: shiftType === "on-demand",
           jobType,
           images: imageUrls.length > 0 ? imageUrls : undefined,
           videos: videoUrls.length > 0 ? videoUrls : undefined,
-          scheduleDays: shiftType === "recurring" ? recurringSchedule.days : undefined,
-          endTime: shiftType === "recurring" ? recurringSchedule.endTime : (shiftType === "one-day" ? oneDaySchedule.endTime : undefined),
+          scheduleDays: shiftType === "recurring" ? recurringSchedule.days : (shiftType === "monthly" ? monthlySchedule.days : undefined),
+          endTime: shiftType === "recurring" ? recurringSchedule.endTime : (shiftType === "monthly" ? monthlySchedule.endTime : (shiftType === "one-day" ? oneDaySchedule.endTime : undefined)),
           recurringWeeks: shiftType === "recurring" ? recurringSchedule.weeks : undefined,
+          recurringMonths: shiftType === "monthly" ? monthlyMonthsCount : undefined,
           budgetCents: onDemandBudget ? onDemandBudget * 100 : undefined,
           fallbackToPublic,
         };
@@ -1270,31 +1463,26 @@ export default function PostJob() {
             : t("jobRequestSentToWorkerFallback")
         });
       } else {
-        // Regular job posting
-        const response = await apiRequest("POST", "/api/jobs", jobData);
+        // Regular job posting (or save as draft)
+        const payload = saveAsDraft ? { ...jobData, status: "draft" as const } : jobData;
+        const response = await apiRequest("POST", "/api/jobs", payload);
         const createdJob = await response.json();
-        
-        // Invalidate jobs cache
+
         queryClient.invalidateQueries({ queryKey: ['/api/jobs'] });
         queryClient.invalidateQueries({ queryKey: ['/api/jobs/find-work'] });
         queryClient.invalidateQueries({ queryKey: ['/api/company/jobs'] });
 
-        confetti({
-          particleCount: 100,
-          spread: 70,
-          origin: { y: 0.6 }
-        });
-        
-        toast({ 
-          title: t("jobPostedSuccessfully"), 
-          description: t("workersWillBeNotified")
-        });
+        if (saveAsDraft) {
+          toast({ title: t("draftSaved", "Draft saved"), description: t("draftSavedDesc", "Publish from Your Jobs when you're ready.") });
+          setTimeout(() => setLocation("/company-dashboard?tab=jobs"), 1500);
+        } else {
+          confetti({ particleCount: 100, spread: 70, origin: { y: 0.6 } });
+          toast({ title: t("jobPostedSuccessfully"), description: t("workersWillBeNotified") });
+          setTimeout(() => setLocation("/company-dashboard?tab=team"), 2000);
+        }
       }
 
       clearStoredDraft(profile?.id);
-      setTimeout(() => {
-        setLocation("/company-dashboard?tab=team");
-      }, 2000);
     } catch (error: any) {
       console.error("Failed to post job:", error);
       toast({ 
@@ -1319,10 +1507,6 @@ export default function PostJob() {
     return null;
   }
 
-  const todayStr = (() => {
-    const d = new Date();
-    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-  })();
   const hasCompleteLocation = companyLocations.length > 0;
   const estimatedCost = calculateEstimatedCost();
   const scheduleIsValid = isScheduleValid();
@@ -1885,189 +2069,7 @@ export default function PostJob() {
                   </div>
                 </div>
               )}
-              
-              {!isMobile && shiftType === "on-demand" && (
-                <div className="p-4 border rounded-lg space-y-4">
-                  <h4 className="font-medium">On-Demand Schedule</h4>
-                  <OnDemandScheduleMultiStep
-                    date={onDemandDate}
-                    onDateChange={setOnDemandDate}
-                    time={onDemandStartTime}
-                    onTimeChange={setOnDemandStartTime}
-                    doneByDate={onDemandDoneByDate}
-                    onDoneByDateChange={setOnDemandDoneByDate}
-                    budget={onDemandBudget}
-                    onBudgetChange={setOnDemandBudget}
-                    workersNeeded={workersNeeded}
-                    todayStr={todayStr}
-                    minDateForStart={parseLocalDate(todayStr)}
-                    validateTime={validateOnDemandTime}
-                    scheduleError={scheduleError}
-                    onScheduleErrorChange={setScheduleError}
-                    compact
-                  />
-                  <p className="text-sm text-muted-foreground">
-                    Workers will start immediately and continue until the task is complete.
-                  </p>
-                </div>
-              )}
-              
-              {!isMobile && shiftType === "one-day" && (
-                <div className="p-4 border rounded-lg space-y-4">
-                  <h4 className="font-medium">One-Day Schedule</h4>
-                  <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                    <div>
-                      <Label className="text-sm">Date</Label>
-                      <Input
-                        type="date"
-                        min={todayStr}
-                        value={oneDaySchedule.date}
-                        onChange={(e) => {
-                          setOneDaySchedule({ ...oneDaySchedule, date: e.target.value });
-                          const validation = isValidScheduleTime(e.target.value, oneDaySchedule.startTime);
-                          setScheduleError(validation.valid ? null : validation.error || null);
-                        }}
-                        className="mt-1"
-                        data-testid="input-oneday-date"
-                      />
-                    </div>
-                    <div>
-                      <Label className="text-sm">Start Time</Label>
-                      <Select
-                        value={oneDaySchedule.startTime || "09:00"}
-                        onValueChange={(v) => {
-                          const validEnds = getValidEndTimeSlots(v);
-                          const earliest = getEarliestEndTime(v);
-                          const newEnd = (oneDaySchedule.endTime && validEnds.includes(oneDaySchedule.endTime)) ? oneDaySchedule.endTime : earliest;
-                          setOneDaySchedule(prev => ({
-                            ...prev,
-                            startTime: v,
-                            endTime: newEnd,
-                          }));
-                          const validation = isValidScheduleTime(oneDaySchedule.date, v, newEnd);
-                          setScheduleError(validation.valid ? null : validation.error || null);
-                        }}
-                        data-testid="select-oneday-start"
-                      >
-                        <SelectTrigger className="mt-1 w-full"><SelectValue placeholder="Start" /></SelectTrigger>
-                        <SelectContent>
-                          {getTimeSlots().map((slot) => (
-                            <SelectItem key={slot} value={slot}>{formatTime12h(slot)}</SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
-                    </div>
-                    <div>
-                      <Label className="text-sm">End Time</Label>
-                      <Select
-                        value={oneDaySchedule.endTime || getEarliestEndTime(oneDaySchedule.startTime || "09:00")}
-                        onValueChange={(v) => {
-                          setOneDaySchedule(prev => ({ ...prev, endTime: v }));
-                          const validation = isValidScheduleTime(oneDaySchedule.date, oneDaySchedule.startTime, v);
-                          setScheduleError(validation.valid ? null : validation.error || null);
-                        }}
-                        data-testid="select-oneday-end"
-                      >
-                        <SelectTrigger className="mt-1 w-full"><SelectValue placeholder="End" /></SelectTrigger>
-                        <SelectContent>
-                          {getValidEndTimeSlots(oneDaySchedule.startTime || "09:00").map((slot) => (
-                            <SelectItem key={slot} value={slot}>{formatTime12h(slot)}</SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
-                    </div>
-                  </div>
-                  {scheduleError && shiftType === "one-day" && (
-                    <div className="flex items-center gap-2 text-destructive text-sm">
-                      <AlertCircle className="w-4 h-4" />
-                      {scheduleError}
-                    </div>
-                  )}
-                </div>
-              )}
-              
-              {!isMobile && shiftType === "recurring" && (
-                <div className="p-4 border rounded-lg space-y-4">
-                  <h4 className="font-medium">Recurring Schedule</h4>
-                  <div>
-                    <Label className="text-sm">Select days</Label>
-                    <div className="flex flex-wrap gap-2 mt-2">
-                      {DAYS_OF_WEEK.map(day => (
-                        <button
-                          key={day}
-                          type="button"
-                          onClick={() => {
-                            const days = recurringSchedule.days.includes(day)
-                              ? recurringSchedule.days.filter(d => d !== day)
-                              : [...recurringSchedule.days, day];
-                            setRecurringSchedule({ ...recurringSchedule, days });
-                          }}
-                          className={`px-3 py-2 rounded-md border text-sm capitalize transition-colors ${
-                            recurringSchedule.days.includes(day)
-                              ? "bg-primary text-primary-foreground border-primary"
-                              : "hover:border-primary/50"
-                          }`}
-                          data-testid={`button-day-${day}`}
-                        >
-                          {day.slice(0, 3)}
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-                  <div className="grid grid-cols-2 gap-4">
-                    <div>
-                      <Label className="text-sm">Start Time</Label>
-                      <Select
-                        value={recurringSchedule.startTime || "09:00"}
-                        onValueChange={(v) => {
-                          const validEnds = getValidEndTimeSlots(v);
-                          const earliest = getEarliestEndTime(v);
-                          setRecurringSchedule(prev => ({
-                            ...prev,
-                            startTime: v,
-                            endTime: (prev.endTime && validEnds.includes(prev.endTime)) ? prev.endTime : earliest,
-                          }));
-                        }}
-                        data-testid="select-recurring-start"
-                      >
-                        <SelectTrigger className="mt-1 w-full"><SelectValue placeholder="Start" /></SelectTrigger>
-                        <SelectContent>
-                          {getTimeSlots().map((slot) => (
-                            <SelectItem key={slot} value={slot}>{formatTime12h(slot)}</SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
-                    </div>
-                    <div>
-                      <Label className="text-sm">End Time</Label>
-                      <Select
-                        value={recurringSchedule.endTime || getEarliestEndTime(recurringSchedule.startTime || "09:00")}
-                        onValueChange={(v) => setRecurringSchedule(prev => ({ ...prev, endTime: v }))}
-                        data-testid="select-recurring-end"
-                      >
-                        <SelectTrigger className="mt-1 w-full"><SelectValue placeholder="End" /></SelectTrigger>
-                        <SelectContent>
-                          {getValidEndTimeSlots(recurringSchedule.startTime || "09:00").map((slot) => (
-                            <SelectItem key={slot} value={slot}>{formatTime12h(slot)}</SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
-                    </div>
-                  </div>
-                  <div>
-                    <Label className="text-sm">Number of weeks</Label>
-                    <Input
-                      type="number"
-                      min={1}
-                      max={52}
-                      value={recurringSchedule.weeks}
-                      onChange={(e) => setRecurringSchedule({ ...recurringSchedule, weeks: parseInt(e.target.value) || 1 })}
-                      className="mt-1"
-                      data-testid="input-recurring-weeks"
-                    />
-                  </div>
-                </div>
-              )}
+              {/* Schedule forms (On-Demand, One-Day, Recurring) are only shown in the pop-up when user clicks a shift type — not inline on this card */}
             </CardContent>
           </Card>
         )}
@@ -2080,7 +2082,12 @@ export default function PostJob() {
             description={showSchedulePopup ? SHIFT_TYPE_INFO[showSchedulePopup].description : ""}
             contentClassName="max-w-2xl"
             showBackButton
-            onBack={() => setShowSchedulePopup(null)}
+            onBack={() => {
+              if (showSchedulePopup === "on-demand" && onDemandFormStep > 1)
+                setOnDemandFormStep((s) => s - 1);
+              else
+                setShowSchedulePopup(null);
+            }}
             backLabel="Back"
             progressSteps={
               showSchedulePopup === "on-demand"
@@ -2088,24 +2095,19 @@ export default function PostJob() {
                 : showSchedulePopup === "one-day"
                   ? 0
                   : showSchedulePopup === "recurring"
-                    ? 2
-                    : 0
+                    ? 1
+                    : showSchedulePopup === "monthly"
+                      ? 1
+                      : 0
             }
             progressCurrent={
               showSchedulePopup === "on-demand"
                 ? onDemandFormStep
                 : showSchedulePopup === "one-day"
                   ? oneDayFormStep
-                  : showSchedulePopup === "recurring"
-                    ? recurringFormStep
+                  : showSchedulePopup === "monthly"
+                    ? monthlyFormStep
                     : 1
-            }
-            secondaryAction={
-              showSchedulePopup === "on-demand" && onDemandFormStep > 1
-                ? { label: "Back", onClick: () => setOnDemandFormStep((s) => s - 1) }
-                : showSchedulePopup === "recurring" && recurringFormStep > 1
-                  ? { label: "Back", onClick: () => setRecurringFormStep((s) => s - 1) }
-                  : undefined
             }
             primaryAction={
               showSchedulePopup === "on-demand"
@@ -2120,6 +2122,7 @@ export default function PostJob() {
                         setOnDemandBudget(days * 8 * 40 * workersNeeded);
                       }
                       setShowSchedulePopup(null);
+                      setStep(3);
                     },
                     disabled:
                       !(onDemandDate && onDemandStartTime && validateOnDemandTime(onDemandDate, onDemandStartTime).valid),
@@ -2127,7 +2130,10 @@ export default function PostJob() {
                 : showSchedulePopup === "one-day"
                 ? {
                     label: "Done",
-                    onClick: () => setShowSchedulePopup(null),
+                    onClick: () => {
+                      setShowSchedulePopup(null);
+                      setStep(3);
+                    },
                     disabled:
                       !oneDaySchedule.date ||
                       !oneDaySchedule.startTime ||
@@ -2136,37 +2142,47 @@ export default function PostJob() {
                   }
                 : showSchedulePopup === "recurring"
                 ? {
-                    label: recurringFormStep === 2 ? "Done" : "Next",
+                    label: "Done",
                     onClick: () => {
-                      if (recurringFormStep === 1) {
-                        if (
-                          recurringSchedule.days.length > 0 &&
-                          recurringSchedule.weeks >= 1
-                        )
-                          setRecurringFormStep(2);
-                      } else if (recurringFormStep === 2) {
-                        const hrs =
-                          recurringSchedule.startTime &&
-                          recurringSchedule.endTime
-                            ? parseInt(recurringSchedule.endTime.split(":")[0]) -
-                              parseInt(recurringSchedule.startTime.split(":")[0])
-                            : 0;
-                        if (
-                          (recurringSchedule.startDate || todayStr) &&
-                          hrs > 0
-                        )
-                          setShowSchedulePopup(null);
+                      const hrs =
+                        recurringSchedule.startTime &&
+                        recurringSchedule.endTime
+                          ? parseInt(recurringSchedule.endTime.split(":")[0]) -
+                            parseInt(recurringSchedule.startTime.split(":")[0])
+                          : 0;
+                      if (
+                        (recurringSchedule.startDate || todayStr) &&
+                        hrs > 0
+                      ) {
+                        setShowSchedulePopup(null);
+                        setStep(3);
                       }
                     },
                     disabled:
-                      recurringFormStep === 1 &&
-                      (recurringSchedule.days.length === 0 || recurringSchedule.weeks < 1) ||
-                      (recurringFormStep === 2 &&
-                        (!!recurringStartError ||
-                          !(recurringSchedule.startDate || todayStr) ||
-                          !recurringSchedule.startTime ||
-                          !recurringSchedule.endTime ||
-                          !isValidScheduleTime(recurringSchedule.startDate || todayStr, recurringSchedule.startTime, recurringSchedule.endTime).valid)),
+                      recurringSchedule.days.length === 0 ||
+                      recurringSchedule.weeks < 1 ||
+                      !!recurringStartError ||
+                      !(recurringSchedule.startDate || todayStr) ||
+                      !recurringSchedule.startTime ||
+                      !recurringSchedule.endTime ||
+                      !isValidScheduleTime(recurringSchedule.startDate || todayStr, recurringSchedule.startTime, recurringSchedule.endTime).valid,
+                  }
+                : showSchedulePopup === "monthly"
+                ? {
+                    label: "Done",
+                    onClick: () => {
+                      setShowSchedulePopup(null);
+                      setStep(3);
+                    },
+                    disabled:
+                      monthlySchedule.days.length === 0 ||
+                      monthlyMonthsCount < 1 ||
+                      monthlyMonthsCount > 12 ||
+                      !!monthlyStartError ||
+                      !(monthlySchedule.startDate || todayStr) ||
+                      !monthlySchedule.startTime ||
+                      !monthlySchedule.endTime ||
+                      !isValidScheduleTime(monthlySchedule.startDate || todayStr, monthlySchedule.startTime, monthlySchedule.endTime).valid,
                   }
                 : undefined
             }
@@ -2188,7 +2204,7 @@ export default function PostJob() {
                   validateTime={validateOnDemandTime}
                   scheduleError={scheduleError}
                   onScheduleErrorChange={setScheduleError}
-                  onComplete={() => setShowSchedulePopup(null)}
+                  onComplete={() => { setShowSchedulePopup(null); setStep(3); }}
                   step={onDemandFormStep}
                   onStepChange={setOnDemandFormStep}
                   hideFooter
@@ -2215,23 +2231,42 @@ export default function PostJob() {
               {showSchedulePopup === "recurring" && (
                 <RecurringScheduleMultiStep
                   startDate={recurringSchedule.startDate}
-                  onStartDateChange={(d) => setRecurringSchedule({ ...recurringSchedule, startDate: d })}
+                  onStartDateChange={(d) => setRecurringSchedule((prev) => ({ ...prev, startDate: d }))}
                   endDate={recurringSchedule.endDate}
-                  onEndDateChange={(d) => setRecurringSchedule({ ...recurringSchedule, endDate: d })}
+                  onEndDateChange={(d) => setRecurringSchedule((prev) => ({ ...prev, endDate: d }))}
                   days={recurringSchedule.days}
-                  onDaysChange={(days) => setRecurringSchedule({ ...recurringSchedule, days })}
+                  onDaysChange={(days) => setRecurringSchedule((prev) => ({ ...prev, days }))}
                   startTime={recurringSchedule.startTime}
-                  onStartTimeChange={(t) => setRecurringSchedule({ ...recurringSchedule, startTime: t })}
+                  onStartTimeChange={(t) => setRecurringSchedule((prev) => ({ ...prev, startTime: t }))}
                   endTime={recurringSchedule.endTime}
-                  onEndTimeChange={(t) => setRecurringSchedule({ ...recurringSchedule, endTime: t })}
+                  onEndTimeChange={(t) => setRecurringSchedule((prev) => ({ ...prev, endTime: t }))}
                   weeks={recurringSchedule.weeks}
-                  onWeeksChange={(w) => setRecurringSchedule({ ...recurringSchedule, weeks: w })}
+                  onWeeksChange={(w) => setRecurringSchedule((prev) => ({ ...prev, weeks: w }))}
                   minDate={parseLocalDate(todayStr)}
                   workersNeeded={workersNeeded}
                   todayStr={todayStr}
                   scheduleError={recurringStartError}
                   step={recurringFormStep}
                   onStepChange={setRecurringFormStep}
+                  hideFooter
+                />
+              )}
+              {showSchedulePopup === "monthly" && (
+                <MonthlyScheduleMultiStep
+                  startDate={monthlySchedule.startDate}
+                  onStartDateChange={(d) => setMonthlySchedule((prev) => ({ ...prev, startDate: d }))}
+                  endDate={monthlySchedule.endDate}
+                  onEndDateChange={(d) => setMonthlySchedule((prev) => ({ ...prev, endDate: d }))}
+                  minDate={parseLocalDate(todayStr)}
+                  todayStr={todayStr}
+                  days={monthlySchedule.days}
+                  onDaysChange={(days) => setMonthlySchedule((prev) => ({ ...prev, days }))}
+                  startTime={monthlySchedule.startTime}
+                  onStartTimeChange={(t) => setMonthlySchedule((prev) => ({ ...prev, startTime: t }))}
+                  endTime={monthlySchedule.endTime}
+                  onEndTimeChange={(t) => setMonthlySchedule((prev) => ({ ...prev, endTime: t }))}
+                  workersNeeded={workersNeeded}
+                  scheduleError={monthlyStartError}
                   hideFooter
                 />
               )}
@@ -2370,7 +2405,14 @@ export default function PostJob() {
                         <div className="mt-1 text-muted-foreground">
                           <div>Days: <strong>{recurringSchedule.days.map(formatDayName).join(", ")}</strong></div>
                           <div>Time: <strong>{formatTime(recurringSchedule.startTime)} - {formatTime(recurringSchedule.endTime)}</strong></div>
-                          <div>Duration: <strong>{recurringSchedule.weeks} week{recurringSchedule.weeks > 1 ? "s" : ""}</strong></div>
+                          <div>Weeks: <strong>{recurringSchedule.weeks}</strong></div>
+                        </div>
+                      )}
+                      {shiftType === "monthly" && (
+                        <div className="mt-1 text-muted-foreground">
+                          <div>Days: <strong>{monthlySchedule.days.map(formatDayName).join(", ")}</strong></div>
+                          <div>Time: <strong>{formatTime(monthlySchedule.startTime)} - {formatTime(monthlySchedule.endTime)}</strong></div>
+                          <div>Months: <strong>{monthlyMonthsCount} month{monthlyMonthsCount > 1 ? "s" : ""}</strong></div>
                         </div>
                       )}
                       {shiftType === "one-day" && (
@@ -2514,6 +2556,9 @@ export default function PostJob() {
                   {shiftType === "recurring" && (
                     <>Recurring • {(recurringSchedule.startDate || todayStr) ? parseLocalDate(recurringSchedule.startDate || todayStr).toLocaleDateString(undefined, { month: "short", day: "numeric" }) : "—"}–{recurringSchedule.endDate ? parseLocalDate(recurringSchedule.endDate).toLocaleDateString(undefined, { month: "short", day: "numeric" }) : "—"} • {recurringSchedule.days.length ? recurringSchedule.days.map(d => d.slice(0, 3)).join(", ") : "—"}</>
                   )}
+                  {shiftType === "monthly" && (
+                    <>Monthly • {(monthlySchedule.startDate || todayStr) ? parseLocalDate(monthlySchedule.startDate || todayStr).toLocaleDateString(undefined, { month: "short", day: "numeric" }) : "—"}–{monthlySchedule.endDate ? parseLocalDate(monthlySchedule.endDate).toLocaleDateString(undefined, { month: "short", day: "numeric" }) : "—"} • {monthlyMonthsCount} mo • {monthlySchedule.days.length ? monthlySchedule.days.map(d => d.slice(0, 3)).join(", ") : "—"}</>
+                  )}
                 </span>
               </div>
               <div className="flex items-center gap-1.5 shrink-0">
@@ -2557,8 +2602,19 @@ export default function PostJob() {
               <Button variant="outline" onClick={() => setStep(2)} disabled={isSubmitting}>
                 <ArrowLeft className="w-4 h-4 mr-2" /> Back
               </Button>
+              {!isDirectRequest && (
+                <Button
+                  variant="outline"
+                  onClick={() => handleSubmit(true)}
+                  disabled={isSubmitting}
+                  data-testid="button-save-draft"
+                >
+                  {isSubmitting ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : null}
+                  {t("saveAsDraft", "Save as draft")}
+                </Button>
+              )}
               <Button
-                onClick={handleSubmit}
+                onClick={() => handleSubmit()}
                 className="flex-1 sm:flex-none sm:min-w-[140px]"
                 disabled={isSubmitting}
                 data-testid="button-confirm-job"
@@ -2621,6 +2677,7 @@ export default function PostJob() {
                     onChange={(address, components) => setNewLocation(prev => ({ ...prev, address, city: components.city || prev.city, state: components.state || prev.state, zipCode: components.zipCode || prev.zipCode }))}
                     placeholder="Start typing an address..."
                     required
+                    containerClassName="pt-6 pb-6 px-6"
                     data-testid="input-location-address"
                   />
                   <div>
@@ -2870,6 +2927,7 @@ export default function PostJob() {
                     onChange={(address, components) => setNewLocation(prev => ({ ...prev, address, city: components.city || prev.city, state: components.state || prev.state, zipCode: components.zipCode || prev.zipCode }))}
                     placeholder="Start typing an address..."
                     required
+                    containerClassName="pt-6 pb-6 px-6"
                     data-testid="input-location-address"
                   />
                   <div>

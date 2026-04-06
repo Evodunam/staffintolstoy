@@ -41,14 +41,17 @@ SESSION_SECRET=28676252a35900692d34688d2bca4adbf196b829fa541820df1dd60d49470e0d
 
 ## Mercury Sandbox API Token
 
-Add this to `.env.development`:
+Add **one** of these to `.env.development` (same value; pick either name):
 
 ```env
-# Mercury Bank API - Sandbox (for development/testing)
-Mercury_Sandbox=<your-mercury-sandbox-token>
+# Mercury Bank API - Sandbox — paste the full string from Mercury (includes secret-token: prefix)
+Mercury_Sandbox=secret-token:mercury_sandbox_wma_YOUR_KEY_HERE
+
+# Alternative env name (also supported by server + isConfigured())
+# MERCURY_SANDBOX_API_TOKEN=secret-token:mercury_sandbox_wma_YOUR_KEY_HERE
 ```
 
-**Note**: This is a read-only key (no IP whitelist required). For write operations, use the write key with IP whitelist.
+**Note**: Basic auth username is the full `secret-token:mercury_sandbox_wma_...` string; the code normalizes/strips as needed. If this key was ever pasted in chat/CI logs, rotate it in Mercury and update `.env.development` only (never commit the real token).
 
 ---
 
@@ -74,7 +77,7 @@ When device geolocation is denied, the app tries IP-based location: **Google Geo
 
 ```env
 # Optional – ipapi.co API key (fallback when Google fails)
-IPAPI_API_KEY=your_ipapi_key
+IPAPI_API_KEY=AzZ4jUj0F5eFNjhgWgLpikGJxYdf5IzcsfBQSiOMw69RtR8JzX
 ```
 
 ---
@@ -112,6 +115,23 @@ After adding and restarting the dev server, portfolio uploads on worker onboardi
 - Ensure both `IDRIVE_E2_ACCESS_KEY_ID` and `IDRIVE_E2_SECRET_ACCESS_KEY` are in `.env.development` with no spaces around `=`.
 - Restart the dev server (env vars load only on startup).
 - Check server startup logs for `Manually parsed ... IDRIVE_E2 variables` to confirm they were loaded.
+
+---
+
+## Demo accounts (worker@demo.com, operator@demo.com)
+
+Demo data **is saved** in the database: profile, operator team, team members, applications, and jobs are all stored and keyed by the logged-in user’s **user id**.
+
+**Why it can look like everything was “deleted” after relog:**
+
+1. **Different user id** – If you signed in with Google (or magic link) *before* the seed ran, the app created a **new** user with a random id and that account has no team/jobs. The seed creates users with fixed ids (`demo-worker-id`, `demo-operator-id`). So you can end up with two “worker@demo.com” users: one from Google (random id) and one from seed (fixed id). After “relog” you might be on the empty account.
+2. **Avatar** – The UI uses **profile** `avatarUrl` (profiles table). Google login only updates **user** `profileImageUrl` (users table). If the avatar “changed,” it’s usually because you’re on a different profile (different user id).
+
+**What to do:**
+
+- **Run the seed once** (e.g. `POST /api/dev/seed` or your dev “Seed” button) so demo users with fixed ids and full data exist.
+- Use the **Dev Account Switcher** (dev only) to switch to the demo account that has data (e.g. “operator@demo.com” / “Business Operator” for the operator with team and jobs).
+- Seed is now **idempotent**: re-running it won’t duplicate or wipe demo users; it will get-or-create users and profiles so relogging keeps the same data.
 
 ---
 

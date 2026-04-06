@@ -1,6 +1,6 @@
 import { db } from "./db";
 import { 
-  profiles, jobs, applications, reviews, users, companyLocations, teamInvites, timesheets, companyTeamMembers,
+  profiles, jobs, applications, jobAssignments, reviews, users, companyLocations, teamInvites, timesheets, companyTeamMembers,
   adminStrikes, jobSuspensions, billingActions, adminActivityLog, workerStatuses, companyStatuses,
   companyPaymentMethods, companyTransactions, workerPayouts, payoutAccounts, invoices, invoiceItems, workerDismissedJobs,
   teams, workerTeamMembers, savedTeamMembers, timesheetReports, directJobInquiries, jobMessages,
@@ -167,6 +167,7 @@ export interface IStorage {
   
   // Company Payment Methods
   getCompanyPaymentMethod(id: number): Promise<CompanyPaymentMethod | undefined>;
+  getCompanyPaymentMethodByStripePmId(stripePaymentMethodId: string): Promise<CompanyPaymentMethod | undefined>;
   getCompanyPaymentMethods(profileId: number): Promise<CompanyPaymentMethod[]>;
   getPrimaryPaymentMethod(profileId: number): Promise<CompanyPaymentMethod | undefined>;
   createCompanyPaymentMethod(method: InsertCompanyPaymentMethod): Promise<CompanyPaymentMethod>;
@@ -180,6 +181,8 @@ export interface IStorage {
   // Worker Payouts
   getWorkerPayouts(workerId: number): Promise<WorkerPayout[]>;
   getWorkerPayoutsByStatus(workerId: number, status: string): Promise<WorkerPayout[]>;
+  /** Latest payout row for a timesheet (if any). */
+  getWorkerPayoutByTimesheetId(timesheetId: number): Promise<WorkerPayout | undefined>;
   createWorkerPayout(payout: InsertWorkerPayout): Promise<WorkerPayout>;
   updateWorkerPayout(id: number, updates: Partial<InsertWorkerPayout>): Promise<WorkerPayout>;
   
@@ -466,12 +469,50 @@ export class DatabaseStorage implements IStorage {
   }
 
   async updateApplicationStatus(id: number, status: string): Promise<Application> {
+    const statusTyped = status as Application["status"];
+    const shouldSetRespondedAt =
+      status === "accepted" || status === "rejected" || status === "withdrawn";
     const [app] = await db
       .update(applications)
-      .set({ status: status as any })
+      .set({
+        status: statusTyped,
+        ...(shouldSetRespondedAt ? { respondedAt: new Date() } : {}),
+      })
       .where(eq(applications.id, id))
       .returning();
+    if (status === "accepted" && app) {
+      await this.syncJobAssignmentForAcceptedApplication(app);
+    }
     return app;
+  }
+
+  /** Upsert job_assignments when an application is accepted (hire → assignment record). */
+  private async syncJobAssignmentForAcceptedApplication(application: Application): Promise<void> {
+    const job = await this.getJob(application.jobId);
+    if (!job) return;
+
+    const agreedRate =
+      application.proposedRate != null && application.proposedRate > 0
+        ? application.proposedRate
+        : job.hourlyRate ?? 0;
+
+    await db
+      .insert(jobAssignments)
+      .values({
+        jobId: application.jobId,
+        workerId: application.workerId,
+        applicationId: application.id,
+        agreedRate,
+        status: "assigned",
+      })
+      .onConflictDoUpdate({
+        target: [jobAssignments.jobId, jobAssignments.workerId],
+        set: {
+          applicationId: application.id,
+          agreedRate,
+          status: "assigned",
+        },
+      });
   }
 
   async getWorkerApplications(workerId: number): Promise<(Application & { job: Job; teamMember?: WorkerTeamMember | null; company?: { id: number; companyName: string | null; phone: string | null; avatarUrl: string | null; companyLogo: string | null; firstName: string | null; lastName: string | null } | null })[]> {
@@ -524,6 +565,17 @@ export class DatabaseStorage implements IStorage {
   }
 
   async deleteApplication(id: number): Promise<void> {
+    // Keep legacy delete path FK-safe:
+    // if an assignment references this application, unlink it first.
+    await db
+      .update(jobAssignments)
+      .set({
+        applicationId: null,
+        status: "cancelled",
+        completedAt: new Date(),
+      })
+      .where(eq(jobAssignments.applicationId, id));
+
     await db.delete(applications).where(eq(applications.id, id));
   }
   
@@ -714,6 +766,33 @@ export class DatabaseStorage implements IStorage {
       ...timesheet, 
       company, 
       job 
+    }));
+  }
+
+  /** Timesheets for all workers in a team (business operator view): owner + members (profiles with teamId). Returns worker profile for each row. */
+  async getTimesheetsByTeamOwner(ownerId: number): Promise<(Timesheet & { company: Profile; job: Job; worker: Profile })[]> {
+    const team = await this.getWorkerTeam(ownerId);
+    if (!team) return [];
+    const memberProfiles = await db.select({ id: profiles.id }).from(profiles).where(eq(profiles.teamId, team.id));
+    const workerIds = [ownerId, ...memberProfiles.map((p) => p.id)];
+    if (workerIds.length === 0) return [];
+    const result = await db.select({
+      timesheet: timesheets,
+      company: profiles,
+      job: jobs,
+    })
+    .from(timesheets)
+    .innerJoin(profiles, eq(timesheets.companyId, profiles.id))
+    .innerJoin(jobs, eq(timesheets.jobId, jobs.id))
+    .where(inArray(timesheets.workerId, workerIds))
+    .orderBy(desc(timesheets.createdAt));
+    const workerProfiles = await db.select().from(profiles).where(inArray(profiles.id, workerIds));
+    const workerProfileMap = new Map(workerProfiles.map((p) => [p.id, p]));
+    return result.map(({ timesheet, company, job }) => ({
+      ...timesheet,
+      company,
+      job,
+      worker: workerProfileMap.get(timesheet.workerId) ?? ({} as Profile),
     }));
   }
   
@@ -917,6 +996,11 @@ export class DatabaseStorage implements IStorage {
     const [method] = await db.select().from(companyPaymentMethods).where(eq(companyPaymentMethods.id, id));
     return method;
   }
+
+  async getCompanyPaymentMethodByStripePmId(stripePaymentMethodId: string): Promise<CompanyPaymentMethod | undefined> {
+    const [method] = await db.select().from(companyPaymentMethods).where(eq(companyPaymentMethods.stripePaymentMethodId, stripePaymentMethodId));
+    return method;
+  }
   
   async getCompanyPaymentMethods(profileId: number): Promise<CompanyPaymentMethod[]> {
     return await db.select().from(companyPaymentMethods).where(eq(companyPaymentMethods.profileId, profileId));
@@ -931,6 +1015,7 @@ export class DatabaseStorage implements IStorage {
     return method;
   }
   
+  // When adding a Stripe payment method (card/ACH), always pass stripePaymentMethodId so it is stored for precheck (no need to fetch from Stripe).
   async createCompanyPaymentMethod(method: InsertCompanyPaymentMethod): Promise<CompanyPaymentMethod> {
     const [newMethod] = await db.insert(companyPaymentMethods).values(method).returning();
     return newMethod;
@@ -1018,6 +1103,16 @@ export class DatabaseStorage implements IStorage {
       });
       throw err;
     }
+  }
+
+  async getWorkerPayoutByTimesheetId(timesheetId: number): Promise<WorkerPayout | undefined> {
+    const [p] = await db
+      .select()
+      .from(workerPayouts)
+      .where(eq(workerPayouts.timesheetId, timesheetId))
+      .orderBy(desc(workerPayouts.createdAt))
+      .limit(1);
+    return p;
   }
   
   async createWorkerPayout(payout: InsertWorkerPayout): Promise<WorkerPayout> {

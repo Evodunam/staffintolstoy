@@ -65,7 +65,7 @@ import { INDUSTRY_CATEGORIES } from "@shared/industries";
 import { GooglePlacesAutocomplete } from "@/components/GooglePlacesAutocomplete";
 import confetti from "canvas-confetti";
 import { SiGoogle } from "react-icons/si";
-import { loadStripe } from "@stripe/stripe-js";
+import { loadStripe } from "@/lib/stripe";
 import { Elements, PaymentElement, useStripe, useElements } from "@stripe/react-stripe-js";
 
 const TOTAL_STEPS = 5;

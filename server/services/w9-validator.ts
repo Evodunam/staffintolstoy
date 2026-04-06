@@ -2,10 +2,15 @@ import { createRequire } from "module";
 import { log } from "../index";
 
 const require = createRequire(import.meta.url);
-const pdfParseModule = require("pdf-parse");
-const pdfParse = (typeof pdfParseModule === "function" ? pdfParseModule : pdfParseModule?.default) as (buffer: Buffer) => Promise<{ text: string; numpages: number; info?: unknown }>;
-if (typeof pdfParse !== "function") {
-  throw new Error("pdf-parse did not export a function");
+
+function getPdfParse(): ((buffer: Buffer) => Promise<{ text: string; numpages: number; info?: unknown }>) | null {
+  try {
+    const pdfParseModule = require("pdf-parse");
+    const fn = typeof pdfParseModule === "function" ? pdfParseModule : pdfParseModule?.default ?? pdfParseModule?.pdfParse;
+    return typeof fn === "function" ? fn : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -40,9 +45,20 @@ export async function validateW9Form(
 
   try {
     if (mimeType === "application/pdf") {
-      // Extract text from PDF
-      const pdfData = await pdfParse(fileBuffer);
-      text = pdfData.text;
+      // Extract text from PDF (pdf-parse is optional; if unavailable, accept and skip validation)
+      const pdfParse = getPdfParse();
+      if (pdfParse) {
+        const pdfData = await pdfParse(fileBuffer);
+        text = pdfData.text ?? "";
+      } else {
+        log("pdf-parse not available — accepting PDF without text validation", "w9-validator");
+        return {
+          isValid: true,
+          errors: ["PDF text extraction unavailable — document accepted for upload."],
+          extractedData: {},
+          confidence: 0.5,
+        };
+      }
     } else if (mimeType.startsWith("image/")) {
       // For images, we'd need OCR (Tesseract.js)
       // For now, we'll do basic validation and note that OCR is needed

@@ -281,6 +281,7 @@ export function DriveTimePopup({
   if (isMobile) {
     return (
       <MobilePopup
+        elevated
         open={open}
         onOpenChange={onOpenChange}
         title={t("driveTime.title")}
@@ -306,6 +307,7 @@ export function DriveTimePopup({
 
   return (
     <MobilePopup
+      elevated
       open={open}
       onOpenChange={onOpenChange}
       title={t("driveTime.title")}

@@ -109,6 +109,22 @@ export function getIndustryByRoleId(roleId: string): IndustryCategory | undefine
   return INDUSTRY_CATEGORIES.find(cat => cat.roles.some(role => role.id === roleId));
 }
 
+/** Lite/Elite pairs: only one of each pair can be selected. Returns the other role id in the pair, or null. */
+const LITE_ELITE_PAIRS: [string, string][] = [
+  ["Carpentry Lite", "Carpentry Elite"],
+  ["Electrical Lite", "Electrical Elite"],
+  ["Plumbing Lite", "Plumbing Elite"],
+  ["HVAC Lite", "HVAC Elite"],
+];
+
+export function getLiteElitePartner(roleId: string): string | null {
+  for (const [a, b] of LITE_ELITE_PAIRS) {
+    if (roleId === a) return b;
+    if (roleId === b) return a;
+  }
+  return null;
+}
+
 export function getRolesCommaSeparated(industryId: string): string {
   const roles = getRolesByIndustry(industryId);
   return roles.map(r => r.label).join(", ");

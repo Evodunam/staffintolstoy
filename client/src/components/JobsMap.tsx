@@ -1,5 +1,13 @@
 import { useState, useCallback, useMemo, useRef, useEffect } from "react";
-import { GoogleMap, useJsApiLoader, Marker, InfoWindow, OverlayView, DirectionsRenderer, Circle } from "@react-google-maps/api";
+import {
+  GoogleMap,
+  useJsApiLoader,
+  Marker,
+  InfoWindow,
+  OverlayView,
+  DirectionsRenderer,
+  Circle,
+} from "@react-google-maps/api";
 import type { Job } from "@shared/schema";
 import { Button } from "@/components/ui/button";
 import { GOOGLE_MAPS_LOADER_ID, GOOGLE_MAPS_LIBRARIES } from "@/lib/google-maps";
@@ -40,6 +48,12 @@ interface JobsMapProps {
   workerName?: string;
   teammates?: PersonLocation[];
   activeClockIns?: PersonLocation[];
+  /** When set (e.g. find-work distance filter), draw a circle of this radius in miles around each worker/teammate pin to show coverage. */
+  referenceRadiusMiles?: number;
+  /** When provided (e.g. referenceLocations from find-work), use these points for circles and fallback pins so territory shows even when profile/teammates lack saved lat/lng. */
+  referencePoints?: Array<{ lat: number; lng: number }>;
+  /** When provided, radius in miles for each reference point (Advanced per-member radius). Same order as referencePoints. */
+  referenceRadiusMilesArray?: number[];
   selectedJobId?: number;
   onJobSelect?: (jobId: number) => void;
   onPersonSelect?: (person: PersonLocation) => void;
@@ -58,6 +72,42 @@ const mapStyles = [
     stylers: [{ visibility: "off" }],
   },
 ];
+
+function getJobPriceDisplay(job: JobPin): string {
+  return job.payout || (job.hourlyRate != null ? `$${(job.hourlyRate / 100).toFixed(0)}` : "$--");
+}
+
+function getPricePillColors(job: JobPin, isSelected: boolean, isHovered: boolean) {
+  if (isSelected) return { fill: "#6366f1", stroke: "#4338ca", arrow: "#6366f1" };
+  if (isHovered) return { fill: "#3b82f6", stroke: "#1d4ed8", arrow: "#3b82f6" };
+  if (job.status === "pending") return { fill: "#eab308", stroke: "#ca8a04", arrow: "#eab308" };
+  if (job.status === "confirmed") return { fill: "#22c55e", stroke: "#16a34a", arrow: "#22c55e" };
+  if (job.urgencyColor?.includes("red")) return { fill: "#ef4444", stroke: "#dc2626", arrow: "#ef4444" };
+  if (job.urgencyColor?.includes("orange")) return { fill: "#f97316", stroke: "#ea580c", arrow: "#f97316" };
+  if (job.urgencyColor?.includes("yellow")) return { fill: "#eab308", stroke: "#ca8a04", arrow: "#eab308" };
+  if (job.urgencyColor?.includes("green")) return { fill: "#22c55e", stroke: "#16a34a", arrow: "#22c55e" };
+  return { fill: "#6366f1", stroke: "#4f46e5", arrow: "#6366f1" };
+}
+
+function buildPricePillTagIcon(job: JobPin, isSelected: boolean, isHovered: boolean): google.maps.Icon {
+  const text = getJobPriceDisplay(job);
+  const { fill, stroke, arrow } = getPricePillColors(job, isSelected, isHovered);
+  const charWidth = 7.1;
+  const innerW = Math.max(42, 14 + text.length * charWidth);
+  const w = Math.ceil(innerW + 12);
+  const h = 38;
+  const cx = w / 2;
+  const scale = isSelected ? 1.08 : 1;
+  const sw = Math.ceil(w * scale);
+  const sh = Math.ceil(h * scale);
+
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}"><path d="M ${cx - 5} 28 L ${cx} 36 L ${cx + 5} 28 Z" fill="${arrow}"/><rect x="2.5" y="2.5" width="${w - 5}" height="25" rx="8" fill="${fill}" stroke="${stroke}" stroke-width="2"/><text x="${cx}" y="19" text-anchor="middle" font-family="Inter,Segoe UI,sans-serif" font-size="12" font-weight="700" fill="#fff">${text}</text></svg>`;
+  return {
+    url: `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(svg)}`,
+    scaledSize: new google.maps.Size(sw, sh),
+    anchor: new google.maps.Point(sw / 2, sh),
+  };
+}
 
 function AvatarPin({ person, onClick }: { person: PersonLocation; onClick?: () => void }) {
   const getBackgroundColor = () => {
@@ -118,64 +168,7 @@ function AvatarPin({ person, onClick }: { person: PersonLocation; onClick?: () =
   );
 }
 
-function PricePillMarker({ 
-  job, 
-  isSelected, 
-  onClick 
-}: { 
-  job: JobPin; 
-  isSelected?: boolean;
-  onClick?: () => void;
-}) {
-  const getStatusStyles = () => {
-    if (job.status === "pending") return "bg-yellow-500 border-yellow-600";
-    if (job.status === "confirmed") return "bg-green-500 border-green-600";
-    if (job.urgencyColor) {
-      if (job.urgencyColor.includes("red")) return "bg-red-500 border-red-600";
-      if (job.urgencyColor.includes("orange")) return "bg-orange-500 border-orange-600";
-      if (job.urgencyColor.includes("yellow")) return "bg-yellow-500 border-yellow-600";
-      if (job.urgencyColor.includes("green")) return "bg-green-500 border-green-600";
-    }
-    return "bg-primary border-primary";
-  };
-
-  const getArrowColor = () => {
-    if (job.status === "pending") return "bg-yellow-500";
-    if (job.status === "confirmed") return "bg-green-500";
-    if (job.urgencyColor?.includes("red")) return "bg-red-500";
-    if (job.urgencyColor?.includes("orange")) return "bg-orange-500";
-    if (job.urgencyColor?.includes("yellow")) return "bg-yellow-500";
-    if (job.urgencyColor?.includes("green")) return "bg-green-500";
-    return "bg-primary";
-  };
-
-  const displayPrice = job.payout || (job.hourlyRate ? `$${(job.hourlyRate / 100).toFixed(0)}` : "$--");
-
-  return (
-    <div 
-      className="flex flex-col items-center cursor-pointer transform -translate-x-1/2 -translate-y-full"
-      onClick={onClick}
-      data-testid={`price-pill-${job.id}`}
-    >
-      <div 
-        className={`
-          px-2 py-1 rounded-lg shadow-lg border-2 transition-all duration-200
-          ${isSelected 
-            ? "scale-125 z-50 ring-2 ring-white bg-primary border-primary" 
-            : getStatusStyles()
-          }
-        `}
-      >
-        <span className="text-white font-bold text-xs whitespace-nowrap">
-          {displayPrice}
-        </span>
-      </div>
-      <div 
-        className={`w-2 h-2 rotate-45 -mt-1 ${isSelected ? "bg-primary" : getArrowColor()}`} 
-      />
-    </div>
-  );
-}
+const MILES_TO_METERS = 1609.344;
 
 export function JobsMap({
   jobs,
@@ -184,6 +177,9 @@ export function JobsMap({
   workerName = "You",
   teammates = [],
   activeClockIns = [],
+  referenceRadiusMiles,
+  referencePoints,
+  referenceRadiusMilesArray,
   selectedJobId,
   onJobSelect,
   onPersonSelect,
@@ -269,6 +265,43 @@ export function JobsMap({
     return b;
   }, [jobs, workerLocation, allPersonLocations, isLoaded, showPersonMarkers]);
 
+  /** Union job/person bounds with territory box — find-work used to fit only the radius, hiding off-center pins (incl. single-job). */
+  const fitMapToJobsAndTerritory = useCallback(
+    (map: google.maps.Map) => {
+      const focusPoint = referencePoints?.[0] ?? workerLocation;
+      const focusRadiusMiles =
+        referencePoints?.length && referenceRadiusMilesArray?.[0] != null
+          ? referenceRadiusMilesArray[0]
+          : referenceRadiusMiles ?? (focusPoint ? 20 : undefined);
+
+      const next = new google.maps.LatLngBounds();
+      if (bounds && !bounds.isEmpty()) {
+        next.union(bounds);
+      }
+      if (
+        focusPoint &&
+        Number.isFinite(focusPoint.lat) &&
+        Number.isFinite(focusPoint.lng) &&
+        focusRadiusMiles != null &&
+        focusRadiusMiles > 0
+      ) {
+        const lat = focusPoint.lat;
+        const lng = focusPoint.lng;
+        const milesToDegLat = 1 / 69;
+        const milesToDegLng = 1 / (69 * Math.cos((lat * Math.PI) / 180));
+        const spanLat = focusRadiusMiles * 2.2 * milesToDegLat;
+        const spanLng = focusRadiusMiles * 2.2 * milesToDegLng;
+        next.extend({ lat: lat - spanLat / 2, lng: lng - spanLng / 2 });
+        next.extend({ lat: lat + spanLat / 2, lng: lng + spanLng / 2 });
+      }
+
+      if (!next.isEmpty()) {
+        map.fitBounds(next, { top: 50, right: 50, bottom: 50, left: 50 });
+      }
+    },
+    [bounds, referencePoints, referenceRadiusMiles, referenceRadiusMilesArray, workerLocation]
+  );
+
   // Debounced hover handlers to prevent flickering
   const handleMouseOver = useCallback((jobId: number) => {
     if (hoverTimeoutRef.current) {
@@ -333,6 +366,8 @@ export function JobsMap({
   const mapRef = useRef<google.maps.Map | null>(null);
   const boundsChangeTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const isUserInteractingRef = useRef(false);
+  /** When pins populate after load (e.g. client geocode), refit once so markers aren’t off-screen. */
+  const didFitForJobPinsRef = useRef(false);
 
   const handleBoundsChanged = useCallback(() => {
     if (!mapRef.current || !onBoundsChanged) return;
@@ -423,6 +458,19 @@ export function JobsMap({
     };
   }, []);
 
+  useEffect(() => {
+    if (jobs.length === 0) {
+      didFitForJobPinsRef.current = false;
+    }
+  }, [jobs.length]);
+
+  useEffect(() => {
+    if (!isLoaded || !mapRef.current || jobs.length === 0) return;
+    if (didFitForJobPinsRef.current) return;
+    didFitForJobPinsRef.current = true;
+    fitMapToJobsAndTerritory(mapRef.current);
+  }, [isLoaded, jobs.length, fitMapToJobsAndTerritory]);
+
   if (loadError) {
     return (
       <div className={`flex items-center justify-center bg-muted rounded-md ${className}`} style={{ height }}>
@@ -456,12 +504,14 @@ export function JobsMap({
         }}
         onLoad={(map) => {
           mapRef.current = map;
-          // Only fit bounds on initial load if map doesn't have bounds yet
           const currentBounds = map.getBounds();
-          if (bounds && jobs.length > 1 && (!currentBounds || currentBounds.isEmpty())) {
-            map.fitBounds(bounds, { top: 50, right: 50, bottom: 50, left: 50 });
+          const isEmpty = !currentBounds || currentBounds.isEmpty();
+          if (isEmpty) {
+            fitMapToJobsAndTerritory(map);
           }
-          // Initial bounds update only if callback exists
+          if (jobs.length > 0) {
+            didFitForJobPinsRef.current = true;
+          }
           if (onBoundsChanged) {
             setTimeout(() => {
               if (!isUserInteractingRef.current && mapRef.current) {
@@ -475,6 +525,51 @@ export function JobsMap({
         onZoomStart={handleZoomStart}
         onZoomChanged={handleZoomChanged}
       >
+        {/* Coverage radius circles: use referencePoints (find-work) when provided, else worker/teammate pins; per-point radius when referenceRadiusMilesArray provided */}
+        {referenceRadiusMiles != null && referenceRadiusMiles > 0 && (() => {
+          const pointsToCircle = referencePoints && referencePoints.length > 0
+            ? referencePoints
+            : allPersonLocations.map((p) => ({ lat: p.lat, lng: p.lng }));
+          return pointsToCircle.map((pt, i) => {
+            const miles = referenceRadiusMilesArray?.[i] != null ? referenceRadiusMilesArray[i] : referenceRadiusMiles;
+            if (!Number.isFinite(miles) || miles <= 0) return null;
+            return Number.isFinite(pt.lat) && Number.isFinite(pt.lng) ? (
+              <Circle
+                key={referencePoints ? `ref-${i}` : `radius-${(allPersonLocations[i] as PersonLocation)?.type}-${(allPersonLocations[i] as PersonLocation)?.id}`}
+                center={{ lat: pt.lat, lng: pt.lng }}
+                radius={miles * MILES_TO_METERS}
+                options={{
+                  fillColor: referencePoints ? (i === 0 ? "#22c55e" : "#3b82f6") : (allPersonLocations[i] as PersonLocation)?.type === "worker" ? "#22c55e" : "#3b82f6",
+                  fillOpacity: 0.08,
+                  strokeColor: referencePoints ? (i === 0 ? "#16a34a" : "#2563eb") : (allPersonLocations[i] as PersonLocation)?.type === "worker" ? "#16a34a" : "#2563eb",
+                  strokeOpacity: 0.35,
+                  strokeWeight: 2,
+                  zIndex: 0,
+                }}
+              />
+            ) : null;
+          });
+        })()}
+
+        {/* Fallback pins for reference points when we have no avatar pins (e.g. only geocode cache) */}
+        {referencePoints && referencePoints.length > 0 && showPersonMarkers && allPersonLocations.length === 0 && referencePoints.map((pt, i) =>
+          Number.isFinite(pt.lat) && Number.isFinite(pt.lng) ? (
+            <Marker
+              key={`ref-pin-${i}`}
+              position={{ lat: pt.lat, lng: pt.lng }}
+              icon={{
+                path: google.maps.SymbolPath.CIRCLE,
+                fillColor: i === 0 ? "#22c55e" : "#3b82f6",
+                fillOpacity: 1,
+                strokeWeight: 2,
+                strokeColor: "#fff",
+                scale: 10,
+              }}
+              zIndex={900}
+            />
+          ) : null
+        )}
+
         {workerLocation && !showPersonMarkers && (
           <Marker
             position={workerLocation}
@@ -489,6 +584,7 @@ export function JobsMap({
               key={`person-${person.type}-${person.id}`}
               position={{ lat: person.lat, lng: person.lng }}
               mapPaneName={OverlayView.OVERLAY_MOUSE_TARGET}
+              zIndex={500}
             >
               <AvatarPin
                 person={person}
@@ -528,33 +624,34 @@ export function JobsMap({
           </InfoWindow>
         )}
 
-        {showPricePills ? (
-          jobs.map((job) => (
-            <OverlayView
-              key={`price-${job.id}`}
-              position={{ lat: job.lat, lng: job.lng }}
-              mapPaneName={OverlayView.OVERLAY_MOUSE_TARGET}
-            >
-              <PricePillMarker
-                job={job}
-                isSelected={job.id === selectedJobId}
-                onClick={() => onJobSelect?.(job.id)}
-              />
-            </OverlayView>
-          ))
-        ) : (
-          jobs.map((job) => (
-            <Marker
-              key={job.id}
-              position={{ lat: job.lat, lng: job.lng }}
-              icon={getJobMarkerIcon(job)}
-              onClick={() => onJobSelect?.(job.id)}
-              onMouseOver={() => handleMouseOver(job.id)}
-              onMouseOut={handleMouseOut}
-              zIndex={job.id === selectedJobId ? 999 : job.id === hoveredJob ? 998 : 1}
-            />
-          ))
-        )}
+        {jobs.map((job) => (
+          <Marker
+            key={job.id}
+            position={{ lat: job.lat, lng: job.lng }}
+            icon={
+              showPricePills
+                ? buildPricePillTagIcon(job, job.id === selectedJobId, job.id === hoveredJob)
+                : getJobMarkerIcon(job)
+            }
+            onClick={() => onJobSelect?.(job.id)}
+            onMouseOver={() => handleMouseOver(job.id)}
+            onMouseOut={handleMouseOut}
+            zIndex={
+              showPricePills
+                ? job.id === selectedJobId
+                  ? 1200
+                  : job.id === hoveredJob
+                    ? 1150
+                    : 1100
+                : job.id === selectedJobId
+                  ? 999
+                  : job.id === hoveredJob
+                    ? 998
+                    : 1
+            }
+            title={showPricePills ? getJobPriceDisplay(job) : undefined}
+          />
+        ))}
 
         {showMiniInfo && hoveredJob && (() => {
           const hoveredJobData = jobs.find(j => j.id === hoveredJob);
@@ -906,6 +1003,16 @@ export function JobLocationMap({
     [personLocations]
   );
 
+  /** Stable signature so effects don't re-run when personLocations is a new array with same content (avoids "Maximum update depth exceeded"). */
+  const personsSignature = useMemo(
+    () =>
+      personsWithCoords
+        .map((p) => `${p.type}-${p.id}-${p.lat}-${p.lng}`)
+        .sort()
+        .join("|"),
+    [personsWithCoords]
+  );
+
   const center = useMemo(() => {
     if (personsWithCoords.length > 0) return { lat: job.lat, lng: job.lng };
     if (effectiveUserLocation && directions?.routes?.[0]?.bounds) {
@@ -973,7 +1080,7 @@ export function JobLocationMap({
     ).then((results) => {
       setMultiDirections(results.filter((r): r is NonNullable<typeof r> => r != null));
     });
-  }, [isLoaded, job.lat, job.lng, personsWithCoords]);
+  }, [isLoaded, job.lat, job.lng, personsSignature]);
 
   useEffect(() => {
     if (personsWithCoords.length > 0) return;
@@ -992,7 +1099,7 @@ export function JobLocationMap({
     bounds.extend({ lat: job.lat, lng: job.lng });
     personsWithCoords.forEach((p) => bounds.extend({ lat: p.lat, lng: p.lng }));
     mapRef.current.fitBounds(bounds, { top: 24, right: 24, bottom: 24, left: 24 });
-  }, [multiDirections, directions, job.lat, job.lng, personsWithCoords]);
+  }, [multiDirections, directions, job.lat, job.lng, personsSignature]);
 
   if (loadError || !isLoaded) {
     return (

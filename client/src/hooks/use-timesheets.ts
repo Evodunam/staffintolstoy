@@ -13,6 +13,7 @@ export type TimesheetWithDetails = Timesheet & {
 export function useCompanyTimesheets(companyId: number | undefined, status?: string) {
   return useQuery<TimesheetWithDetails[]>({
     queryKey: ["/api/timesheets/company", companyId, status],
+    staleTime: 30_000,
     queryFn: async () => {
       if (!companyId) return [];
       const url = status 
@@ -34,6 +35,12 @@ export type TimesheetApprovalResponse = Timesheet & {
     amount: number;
     message: string;
   };
+  /** Current company balance after approval (so UI can update in real time) */
+  companyBalanceCents?: number;
+  /** True when timesheet was already approved (idempotent replay, no new charge) */
+  alreadyApproved?: boolean;
+  /** When worker will get paid (e.g. "Standard ACH: 2-3 business days") */
+  expectedPayTiming?: string;
 };
 
 export function useApproveTimesheet() {
@@ -60,8 +67,22 @@ export function useApproveTimesheet() {
         });
       }
     },
-    onSettled: () => {
+    onSuccess: async (data) => {
       queryClient.invalidateQueries({ queryKey: ["/api/timesheets/company"] });
+      // Real-time balance update: set from response then refetch so header balance always updates
+      const cents = typeof data?.companyBalanceCents === "number" ? data.companyBalanceCents : undefined;
+      if (cents !== undefined) {
+        queryClient.setQueryData(
+          ["/api/mt/company/balance"],
+          (prev: { balanceCents?: number; hasBankLinked?: boolean } | undefined) =>
+            ({ ...prev, balanceCents: cents, hasBankLinked: prev?.hasBankLinked ?? false })
+        );
+      }
+      await queryClient.refetchQueries({ queryKey: ["/api/mt/company/balance"] });
+    },
+    onSettled: async () => {
+      queryClient.invalidateQueries({ queryKey: ["/api/timesheets/company"] });
+      await queryClient.refetchQueries({ queryKey: ["/api/mt/company/balance"] });
     },
   });
 }
@@ -101,6 +122,8 @@ export type BulkApprovalResponse = {
   failed: number;
   escrowCount: number;
   results: { id: number; success: boolean; error?: string; escrowInfo?: { workerName: string; amount: number } }[];
+  /** Company balance after last successful approve (for real-time UI update) */
+  companyBalanceCents?: number;
 };
 
 export function useBulkApproveTimesheets() {
@@ -116,12 +139,13 @@ export function useBulkApproveTimesheets() {
 
       const results: BulkApprovalResponse['results'] = [];
       let escrowCount = 0;
+      let companyBalanceCents: number | undefined;
 
       for (const id of realIds) {
         try {
           const response = await apiRequest("PUT", `/api/timesheets/${id}/approve`, {});
           const data = await response.json() as TimesheetApprovalResponse;
-          
+          if (typeof data.companyBalanceCents === "number") companyBalanceCents = data.companyBalanceCents;
           if (data.payoutStatus === 'escrow' && data.escrowInfo) {
             escrowCount++;
             results.push({
@@ -139,14 +163,14 @@ export function useBulkApproveTimesheets() {
           results.push({ id, success: false, error: err?.message || 'Unknown error' });
         }
       }
-      
       const approved = results.filter(r => r.success).length;
       return {
         success: approved > 0,
         approved,
         failed: realIds.length - approved,
         escrowCount,
-        results
+        results,
+        companyBalanceCents,
       };
     },
     onMutate: async ({ timesheetIds }) => {
@@ -167,8 +191,21 @@ export function useBulkApproveTimesheets() {
         });
       }
     },
-    onSettled: () => {
+    onSuccess: async (data) => {
       queryClient.invalidateQueries({ queryKey: ["/api/timesheets/company"] });
+      const cents = typeof data?.companyBalanceCents === "number" ? data.companyBalanceCents : undefined;
+      if (cents !== undefined) {
+        queryClient.setQueryData(
+          ["/api/mt/company/balance"],
+          (prev: { balanceCents?: number; hasBankLinked?: boolean } | undefined) =>
+            ({ ...prev, balanceCents: cents, hasBankLinked: prev?.hasBankLinked ?? false })
+        );
+      }
+      await queryClient.refetchQueries({ queryKey: ["/api/mt/company/balance"] });
+    },
+    onSettled: async () => {
+      queryClient.invalidateQueries({ queryKey: ["/api/timesheets/company"] });
+      await queryClient.refetchQueries({ queryKey: ["/api/mt/company/balance"] });
     },
   });
 }

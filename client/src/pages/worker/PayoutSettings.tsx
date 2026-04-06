@@ -1,7 +1,7 @@
-import { useState } from "react";
-import { useLocation } from "wouter";
+import { useEffect, useRef, useState } from "react";
+import { useLocation, useSearch } from "wouter";
 import { useAuth } from "@/hooks/use-auth";
-import { useProfile } from "@/hooks/use-profiles";
+import { useProfile, PROFILE_ME_QUERY_KEY_PREFIX } from "@/hooks/use-profiles";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { apiRequest } from "@/lib/queryClient";
 import { api } from "@shared/routes";
@@ -17,18 +17,23 @@ import { ArrowLeft, Loader2, Building2, Plus, Check, AlertCircle, DollarSign, Za
 import type { PayoutAccount } from "@shared/schema";
 import { useTranslation } from "react-i18next";
 import { Switch } from "@/components/ui/switch";
+import { useTimesheetApprovalInvoice } from "@/contexts/TimesheetApprovalInvoiceContext";
 
 const BACK_URL = "/dashboard/menu";
 
 /** Embeddable bank/payout content for menu right panel or standalone page. */
-export function PayoutSettingsContent({ embedded = false }: { embedded?: boolean }) {
+export function PayoutSettingsContent({ embedded = false, openBankDialogOnMount = false }: { embedded?: boolean; openBankDialogOnMount?: boolean }) {
   const { t } = useTranslation("payoutSettings");
   const { t: tCommon } = useTranslation("common");
   const { user, isLoading: authLoading } = useAuth();
   const { data: profile, isLoading: profileLoading } = useProfile(user?.id);
   const [, setLocation] = useLocation();
+  const searchParams = useSearch();
   const { toast } = useToast();
   const queryClient = useQueryClient();
+  const openedBankFromUrlRef = useRef(false);
+  const openedTimesheetFromQueryRef = useRef(false);
+  const { openTimesheetApprovalInvoice } = useTimesheetApprovalInvoice();
 
   const { data: payoutAccounts = [], isLoading: payoutAccountsLoading } = useQuery<PayoutAccount[]>({
     queryKey: ["/api/mt/worker/payout-accounts"],
@@ -36,11 +41,31 @@ export function PayoutSettingsContent({ embedded = false }: { embedded?: boolean
   });
 
   const [showBankDialog, setShowBankDialog] = useState(false);
+  const shouldOpenBankOnMount = embedded ? openBankDialogOnMount : (typeof searchParams === "string" && searchParams.includes("openBank=1"));
+  useEffect(() => {
+    if (shouldOpenBankOnMount && !openedBankFromUrlRef.current) {
+      openedBankFromUrlRef.current = true;
+      setShowBankDialog(true);
+    }
+  }, [shouldOpenBankOnMount]);
+
+  useEffect(() => {
+    if (typeof searchParams !== "string" || openedTimesheetFromQueryRef.current) return;
+    const raw = searchParams.startsWith("?") ? searchParams.slice(1) : searchParams;
+    if (!raw.includes("timesheetId=")) return;
+    const params = new URLSearchParams(raw);
+    const idStr = params.get("timesheetId");
+    const id = idStr ? parseInt(idStr, 10) : NaN;
+    if (!Number.isFinite(id) || id <= 0) return;
+    openedTimesheetFromQueryRef.current = true;
+    openTimesheetApprovalInvoice(id);
+    setLocation("/dashboard/settings/payouts");
+  }, [searchParams, openTimesheetApprovalInvoice, setLocation]);
   const [routingNumber, setRoutingNumber] = useState("");
   const [accountNumber, setAccountNumber] = useState("");
   const [confirmAccountNumber, setConfirmAccountNumber] = useState("");
   const [accountType, setAccountType] = useState<string>("checking");
-  const [recipientType, setRecipientType] = useState<string>("business"); // "person" or "business"
+  const [recipientType, setRecipientType] = useState<string>("business"); // hidden: "person" or "business", default business
   const [bankName, setBankName] = useState("");
   const [routingNumberError, setRoutingNumberError] = useState<string>("");
   const [accountNumberError, setAccountNumberError] = useState<string>("");
@@ -48,14 +73,18 @@ export function PayoutSettingsContent({ embedded = false }: { embedded?: boolean
 
   const connectBankMutation = useMutation({
     mutationFn: async (data: { routingNumber: string; accountNumber: string; accountType: string; bankName: string; recipientType: string; email?: string }) => {
+      console.log("[PayoutSettings] Submitting bank account (POST /api/mt/worker/payout-account)", { bankName: data.bankName, accountType: data.accountType, routingLast4: data.routingNumber?.slice(-4) });
       const response = await apiRequest("POST", "/api/mt/worker/payout-account", data);
-      return response.json();
+      const json = await response.json();
+      console.log("[PayoutSettings] Payout-account response", { ok: response.ok, mercuryRecipientId: json?.mercuryRecipientId ?? json?.recipientId, bankAccountLinked: json?.bankAccountLinked, profileId: json?.profileId });
+      return json;
     },
-    onSuccess: () => {
+    onSuccess: (data: { mercuryRecipientId?: string; recipientId?: string; bankAccountLinked?: boolean }) => {
+      console.log("[PayoutSettings] Bank connect success – invalidating profile, payout-accounts, w9-status. Response had mercuryRecipientId:", data?.mercuryRecipientId ?? data?.recipientId, "bankAccountLinked:", data?.bankAccountLinked);
       queryClient.invalidateQueries({
         predicate: (query) => {
           const key = query.queryKey;
-          return Array.isArray(key) && (key[0] === api.profiles.get.path || key[0] === "/api/mt/worker/payout-accounts");
+          return Array.isArray(key) && (key[0] === api.profiles.get.path || key[0] === PROFILE_ME_QUERY_KEY_PREFIX || key[0] === "/api/mt/worker/payout-accounts" || key[0] === "/api/worker/w9-status");
         },
       });
       setShowBankDialog(false);
@@ -69,6 +98,7 @@ export function PayoutSettingsContent({ embedded = false }: { embedded?: boolean
       toast({ title: t("bankAccountConnected"), description: t("bankAccountLinkedForACH") });
     },
     onError: (error: Error) => {
+      console.error("[PayoutSettings] Bank connect error", error?.message ?? error);
       toast({ title: t("connectionFailed"), description: error.message || t("failedToConnectBankAccount"), variant: "destructive" });
     },
   });
@@ -85,7 +115,7 @@ export function PayoutSettingsContent({ embedded = false }: { embedded?: boolean
       queryClient.invalidateQueries({
         predicate: (query) => {
           const key = query.queryKey;
-          return Array.isArray(key) && key[0] === api.profiles.get.path;
+          return Array.isArray(key) && (key[0] === api.profiles.get.path || key[0] === PROFILE_ME_QUERY_KEY_PREFIX);
         },
       });
       toast({ 
@@ -224,6 +254,7 @@ export function PayoutSettingsContent({ embedded = false }: { embedded?: boolean
     }
     
     // All validations passed
+    console.log("[PayoutSettings] Calling connectBankMutation.mutate (bank form submit)");
     connectBankMutation.mutate({ 
       routingNumber, 
       accountNumber, 
@@ -517,19 +548,7 @@ export function PayoutSettingsContent({ embedded = false }: { embedded?: boolean
       }}
     >
       <div className="space-y-4">
-        <div className="space-y-2">
-          <Label htmlFor="recipient-type">Account Type</Label>
-          <Select value={recipientType} onValueChange={setRecipientType}>
-            <SelectTrigger data-testid="select-recipient-type">
-              <SelectValue placeholder="Select account type" />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="business">Business</SelectItem>
-              <SelectItem value="person">Personal</SelectItem>
-            </SelectContent>
-          </Select>
-          <p className="text-xs text-muted-foreground">Select whether this is a business or personal bank account</p>
-        </div>
+        <input type="hidden" name="recipientType" value={recipientType} />
         <div className="space-y-2">
           <Label htmlFor="bank-name">{t("bankName")}</Label>
           <Input id="bank-name" placeholder={t("bankNamePlaceholder")} value={bankName} onChange={(e) => setBankName(e.target.value)} data-testid="input-bank-name" />

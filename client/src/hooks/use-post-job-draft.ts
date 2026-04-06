@@ -17,7 +17,7 @@ export interface PostJobDraft {
   companyJobTitle?: string;
   mediaPermanentUrls: { url: string; type: "image" | "video" }[];
   workersNeeded: number;
-  shiftType: "on-demand" | "one-day" | "recurring" | null;
+  shiftType: "on-demand" | "one-day" | "recurring" | "monthly" | null;
   scheduleError: string | null;
   onDemandBudget: number | null;
   onDemandDate: string;
@@ -26,9 +26,11 @@ export interface PostJobDraft {
   onDemandFormStep: number;
   oneDayFormStep?: number;
   recurringFormStep?: number;
+  monthlyFormStep?: number;
   oneDaySchedule: { date: string; startTime: string; endTime: string };
   recurringSchedule: { days: string[]; startDate?: string; endDate?: string; startTime: string; endTime: string; weeks: number };
-  showSchedulePopup: "on-demand" | "one-day" | "recurring" | null;
+  monthlySchedule?: { startDate: string; endDate: string; days: string[]; startTime: string; endTime: string };
+  showSchedulePopup: "on-demand" | "one-day" | "recurring" | "monthly" | null;
   datePickerFor: { field: "onDemandStart" | "onDemandDoneBy" | "oneDayDate"; minDate: string } | null;
   showLocationPopup: boolean;
   editingLocationId: number | null;

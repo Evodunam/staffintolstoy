@@ -394,14 +394,18 @@ export function useLocationTracking() {
     if (!location || !profile || profile.role !== "worker") return;
     
     try {
-      await fetch(`/api/profiles/${profile.id}/location`, {
+      const res = await fetch(`/api/profiles/${profile.id}/location`, {
         method: "PATCH",
+        credentials: "include",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           latitude: location.latitude.toString(),
           longitude: location.longitude.toString(),
         }),
       });
+      if (res.status === 401) {
+        queryClient.setQueryData(["/api/auth/user"], null);
+      }
     } catch {
       // Silently fail - location saving is background operation
     }

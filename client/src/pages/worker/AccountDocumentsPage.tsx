@@ -20,6 +20,7 @@ import { format } from "date-fns";
 import { useTranslation } from "react-i18next";
 import { getUrlForPath } from "@/lib/subdomain-utils";
 import { getIdentityVerificationUrl } from "@/lib/identity-verification-urls";
+import { useIsMobile } from "@/hooks/use-mobile";
 import type { DigitalSignature } from "@shared/schema";
 import { CONTRACT_TEXT } from "@/pages/WorkerOnboarding";
 
@@ -43,30 +44,74 @@ interface StrikesResponse {
 }
 
 /** Embeddable account documents content for menu right panel or standalone page. */
-export function AccountDocumentsContent({ embedded = false }: { embedded?: boolean }) {
+export function AccountDocumentsContent({ embedded = false, initialTab }: { embedded?: boolean; initialTab?: string }) {
   const { t } = useTranslation("workerDocuments");
   const { t: tStrikes } = useTranslation("strikes");
   const [, setLocation] = useLocation();
+  const isMobile = useIsMobile();
   const { user } = useAuth();
   const { data: profile, isLoading: profileLoading } = useProfile(user?.id);
-  const { mutate: updateProfile } = useUpdateProfile();
+  const { mutateAsync: updateProfile } = useUpdateProfile();
   const { toast } = useToast();
   const queryClient = useQueryClient();
-  const [activeTab, setActiveTab] = useState("account-status");
+  const [activeTab, setActiveTab] = useState(initialTab || "account-status");
   const [isExtractingInsurance, setIsExtractingInsurance] = useState(false);
   const [isUploadingW9, setIsUploadingW9] = useState(false);
   const [agreementPopupSig, setAgreementPopupSig] = useState<DigitalSignature | null>(null);
   const identityReturnPendingSuccess = useRef(false);
 
-  const { data: w9Status, isLoading: w9StatusLoading } = useQuery<{ attached: boolean; recipientId: string | null }>({
+  const {
+    data: w9Status,
+    isLoading: w9StatusLoading,
+    isError: w9StatusError,
+    refetch: refetchW9Status,
+  } = useQuery<{ attached: boolean; recipientId: string | null; recipientInvalid?: boolean }>({
     queryKey: ["/api/worker/w9-status"],
-    queryFn: async () => {
-      const res = await fetch("/api/worker/w9-status", { credentials: "include" });
+    queryFn: async ({ signal }) => {
+      const res = await fetch("/api/worker/w9-status", { credentials: "include", signal });
       if (!res.ok) return { attached: false, recipientId: null };
       return res.json();
     },
     enabled: !!user && !!profile?.id && profile?.role === "worker" && activeTab === "w9",
+    staleTime: 0,
+    retry: 1,
+    retryDelay: 2500,
   });
+
+  // When W-9 tab shows "W-9 on File", trigger server-side release of pending payouts and refresh banner data
+  const w9OnFile = !!(w9Status?.attached || (profile as { w9UploadedAt?: string })?.w9UploadedAt);
+  useEffect(() => {
+    if (activeTab !== "w9" || !profile?.id || profile?.role !== "worker" || !w9OnFile) return;
+    const run = async () => {
+      try {
+        await queryClient.fetchQuery({
+          queryKey: ["/api/worker/pending-w9-payouts"],
+          queryFn: async () => {
+            const res = await apiRequest("GET", "/api/worker/pending-w9-payouts");
+            return res.json();
+          },
+        });
+        // Invalidate again after a short delay so banner sees updated count once release progresses
+        setTimeout(() => queryClient.invalidateQueries({ queryKey: ["/api/worker/pending-w9-payouts"] }), 3000);
+      } catch (_) {
+        // ignore
+      }
+    };
+    run();
+  }, [activeTab, profile?.id, profile?.role, w9OnFile, queryClient]);
+
+  const showRecipientInvalidToast = useRef(false);
+  useEffect(() => {
+    if (w9Status?.recipientInvalid && !showRecipientInvalidToast.current) {
+      showRecipientInvalidToast.current = true;
+      toast({
+        title: "Bank connection no longer valid",
+        description: "Please reconnect your bank in Payout Settings to receive payments and attach your W-9.",
+        variant: "destructive",
+      });
+    }
+    if (!w9Status?.recipientInvalid) showRecipientInvalidToast.current = false;
+  }, [w9Status?.recipientInvalid, toast]);
 
   const { data: strikesData, isLoading: strikesLoading } = useQuery<StrikesResponse>({
     queryKey: ["/api/my-strikes"],
@@ -356,6 +401,35 @@ export function AccountDocumentsContent({ embedded = false }: { embedded?: boole
                   <Loader2 className="w-5 h-5 animate-spin text-muted-foreground" />
                   <p className="text-sm text-muted-foreground">Checking W-9 status with Mercury…</p>
                 </div>
+              ) : w9StatusError ? (
+                <div className="flex flex-col sm:flex-row sm:items-center gap-3 p-4 bg-muted/50 rounded-lg border border-border">
+                  <AlertCircle className="w-5 h-5 text-amber-600 shrink-0" />
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm font-medium">Couldn’t verify W-9 with Mercury</p>
+                    <p className="text-xs text-muted-foreground mt-1">
+                      The check timed out or the network failed. You can still upload your W-9 below; try again to refresh status.
+                    </p>
+                  </div>
+                  <Button type="button" variant="outline" size="sm" className="shrink-0" onClick={() => refetchW9Status()}>
+                    Retry
+                  </Button>
+                </div>
+              ) : w9Status?.recipientInvalid ? (
+                <div className="space-y-4">
+                  <div className="flex items-start gap-3 p-4 bg-destructive/10 border border-destructive/30 rounded-lg">
+                    <AlertCircle className="w-5 h-5 text-destructive shrink-0 mt-0.5" />
+                    <div className="flex-1">
+                      <p className="font-medium text-destructive">Bank connection no longer valid</p>
+                      <p className="text-sm text-muted-foreground mt-1">
+                        Your bank connection could not be verified. Reconnect your bank in Payout Settings to receive payments and attach your W-9.
+                      </p>
+                    </div>
+                  </div>
+                  <Button variant="default" className="w-full" onClick={() => setLocation(isMobile ? "/dashboard/settings/payouts?openBank=1" : "/dashboard/menu/bank?openBank=1")}>
+                    <ExternalLink className="w-4 h-4 mr-2" />
+                    Go to Payout Settings
+                  </Button>
+                </div>
               ) : (w9Status?.attached || (profile as { w9UploadedAt?: string })?.w9UploadedAt) ? (
                 <div className="flex items-center gap-3 p-4 bg-green-50 dark:bg-green-950/20 rounded-lg border border-green-200 dark:border-green-800">
                   <CheckCircle2 className="w-5 h-5 text-green-600" />
@@ -367,13 +441,68 @@ export function AccountDocumentsContent({ embedded = false }: { embedded?: boole
                   </div>
                 </div>
               ) : !w9Status?.recipientId ? (
-                <div className="text-center py-8">
-                  <FileText className="w-12 h-12 mx-auto text-muted-foreground mb-4" />
-                  <h3 className="font-semibold mb-2">Connect Bank Account First</h3>
-                  <p className="text-sm text-muted-foreground mb-4">
-                    To upload your W-9 for Mercury payouts, you need to connect your bank account in Payout settings.
+                <div className="space-y-4">
+                  <div className="text-center py-4">
+                    <h3 className="font-semibold mb-2">Upload W-9 for payouts</h3>
+                    <p className="text-sm text-muted-foreground mb-4">
+                      Upload your W-9 now. Once you connect your bank in Payout Settings, we’ll attach it to your Mercury account and any withheld payments will be released.
+                    </p>
+                    <input
+                      id="w9-upload-no-recipient"
+                      type="file"
+                      accept=".pdf,image/*"
+                      className="hidden"
+                      onChange={async (e) => {
+                        const file = e.target.files?.[0];
+                        if (!file || !profile?.id) return;
+                        setIsUploadingW9(true);
+                        const reader = new FileReader();
+                        reader.onload = async (ev) => {
+                          const base64Data = ev.target?.result as string;
+                          try {
+                            await updateProfile({
+                              id: profile.id,
+                              data: { w9DocumentUrl: base64Data },
+                              skipToast: true,
+                            });
+                            await queryClient.invalidateQueries({ queryKey: ["/api/profiles", user?.id] });
+                            await queryClient.invalidateQueries({ queryKey: ["/api/profiles"] });
+                            await queryClient.invalidateQueries({ queryKey: ["/api/worker/w9-status"] });
+                            toast({
+                              title: "W-9 saved",
+                              description: "We’ll attach it to your Mercury account when you connect your bank in Payout Settings.",
+                            });
+                          } catch (err: unknown) {
+                            toast({
+                              title: "Upload failed",
+                              description: err instanceof Error ? err.message : "Failed to save W-9. Please try again.",
+                              variant: "destructive",
+                            });
+                          } finally {
+                            setIsUploadingW9(false);
+                            e.target.value = "";
+                          }
+                        };
+                        reader.readAsDataURL(file);
+                      }}
+                    />
+                    <Button
+                      variant="default"
+                      disabled={isUploadingW9}
+                      onClick={() => document.getElementById("w9-upload-no-recipient")?.click()}
+                    >
+                      {isUploadingW9 ? (
+                        <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                      ) : (
+                        <Upload className="w-4 h-4 mr-2" />
+                      )}
+                      {isUploadingW9 ? "Uploading…" : "Upload W-9"}
+                    </Button>
+                  </div>
+                  <p className="text-xs text-muted-foreground text-center">
+                    Then connect your bank to receive payments.
                   </p>
-                  <Button variant="outline" onClick={() => setLocation("/dashboard/settings/payouts")}>
+                  <Button variant="outline" className="w-full" onClick={() => setLocation(isMobile ? "/dashboard/settings/payouts?openBank=1" : "/dashboard/menu/bank?openBank=1")}>
                     <ExternalLink className="w-4 h-4 mr-2" />
                     Go to Payout Settings
                   </Button>
@@ -409,16 +538,27 @@ export function AccountDocumentsContent({ embedded = false }: { embedded?: boole
                             await queryClient.invalidateQueries({ queryKey: ["/api/profiles", user?.id] });
                             await queryClient.invalidateQueries({ queryKey: ["/api/profiles"] });
                             await queryClient.invalidateQueries({ queryKey: ["/api/worker/w9-status"] });
+                            await queryClient.invalidateQueries({ queryKey: ["/api/worker/pending-w9-payouts"] });
                             toast({
                               title: "W-9 uploaded",
-                              description: "Your W-9 was attached to Mercury successfully.",
+                              description: "Your W-9 was attached to Mercury successfully. Pending payments are being released.",
                             });
                           } catch (err: unknown) {
+                            const message = err instanceof Error ? err.message : "";
+                            console.error("[AccountDocuments] W-9 upload failed:", message, err);
+                            const isReconnectBankError = /Payout Settings|reconnect|connect your bank/i.test(message);
                             toast({
                               title: "Upload failed",
-                              description: err instanceof Error ? err.message : "Failed to attach W-9 to Mercury. Please try again.",
+                              description: message || "Failed to attach W-9 to Mercury. Please try again.",
                               variant: "destructive",
                             });
+                            if (isReconnectBankError) {
+                              if (isMobile) {
+                                setLocation("/dashboard/settings/payouts?openBank=1");
+                              } else {
+                                setLocation("/dashboard/menu/bank?openBank=1");
+                              }
+                            }
                           } finally {
                             setIsUploadingW9(false);
                             e.target.value = "";
@@ -503,5 +643,11 @@ export function AccountDocumentsContent({ embedded = false }: { embedded?: boole
 }
 
 export default function AccountDocumentsPage() {
-  return <AccountDocumentsContent />;
+  const tabFromUrl = typeof window !== "undefined"
+    ? new URLSearchParams(window.location.search).get("tab")
+    : null;
+  const initialTab = tabFromUrl && ["account-status", "agreements", "insurance", "w9", "id-verification"].includes(tabFromUrl)
+    ? tabFromUrl
+    : undefined;
+  return <AccountDocumentsContent initialTab={initialTab} />;
 }

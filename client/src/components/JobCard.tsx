@@ -2,6 +2,7 @@ import { type Job, type Profile } from "@shared/schema";
 import { format } from "date-fns";
 import { MapPin, Clock, DollarSign, Calendar } from "lucide-react";
 import { Link } from "wouter";
+import { getDisplayJobTitle } from "@/lib/job-display";
 
 interface JobCardProps {
   job: Job & { companyName?: string | null; company?: Profile };
@@ -20,7 +21,7 @@ export function JobCard({ job }: JobCardProps) {
                 {job.trade}
               </span>
               <h3 className="text-xl font-bold group-hover:text-primary/80 transition-colors">
-                {job.title}
+                {getDisplayJobTitle(job)}
               </h3>
               <p className="text-sm text-muted-foreground mt-1">{companyName}</p>
             </div>

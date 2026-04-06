@@ -28,10 +28,11 @@ export function useAuth() {
     queryKey: ["/api/auth/user"],
     queryFn: fetchUser,
     retry: false,
-    staleTime: 1000 * 60 * 5, // 5 minutes
-    refetchOnWindowFocus: false, // Prevent refetch on window focus to avoid loops
-    refetchOnMount: false, // Only refetch if data is stale
-    refetchOnReconnect: false, // Don't refetch on reconnect
+    // Short stale window + remount refetch so expired sessions don't keep driving profile-scoped queries (401 spam).
+    staleTime: 60_000,
+    refetchOnWindowFocus: true,
+    refetchOnMount: true,
+    refetchOnReconnect: true,
   });
 
   const logoutMutation = useMutation({

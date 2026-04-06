@@ -44,6 +44,11 @@ export function getPublishableKey(): string | null {
   return publishableKey || null;
 }
 
+/** "test" when using sk_test_ (sandbox), "live" otherwise. Useful for API config and logging. */
+export function getStripeKeyMode(): "test" | "live" {
+  return isTestKey ? "test" : "live";
+}
+
 export function isStripeConfigured(): boolean {
   return !!stripe && !!publishableKey;
 }
@@ -303,6 +308,7 @@ export default {
   confirmPaymentIntent,
   getPaymentIntent,
   getPublishableKey,
+  getStripeKeyMode,
   isStripeConfigured,
   calculateCardFee,
   getStripe,

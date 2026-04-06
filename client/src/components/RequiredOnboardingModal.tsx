@@ -5,7 +5,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { MapPin, User, CheckCircle, Loader2, Upload, X, DollarSign, Wrench, ChevronDown, ChevronUp } from "lucide-react";
-import { useProfile, useUpdateProfile } from "@/hooks/use-profiles";
+import { useProfile, useUpdateProfile, invalidateSessionProfileQueries } from "@/hooks/use-profiles";
 import { useAuth } from "@/hooks/use-auth";
 import { useToast } from "@/hooks/use-toast";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -13,7 +13,6 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useUpload } from "@/hooks/use-upload";
 import { GooglePlacesAutocomplete } from "@/components/GooglePlacesAutocomplete";
 import { checkLocationPermission, checkNativePermissions, requestLocationPermissions, openAppSettings, getCurrentPosition } from "@/lib/nativeLocationTracking";
-import { api } from "@shared/routes";
 import { INDUSTRY_CATEGORIES } from "@shared/industries";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
@@ -535,7 +534,7 @@ export function RequiredOnboardingModal({ profile, onComplete }: RequiredOnboard
       
       // Invalidate all profile-related queries to update avatars everywhere (non-blocking)
       queryClient.invalidateQueries({ queryKey: ["/api/profiles"] });
-      queryClient.invalidateQueries({ queryKey: [api.profiles.get.path] });
+      invalidateSessionProfileQueries(queryClient);
       queryClient.invalidateQueries({ queryKey: ["/api/today/assignments"] });
       queryClient.invalidateQueries({ queryKey: ["/api/jobs"] });
       queryClient.invalidateQueries({ queryKey: ["/api/jobs/find-work"] });
@@ -561,7 +560,7 @@ export function RequiredOnboardingModal({ profile, onComplete }: RequiredOnboard
   };
   
   const handleRateSubmit = async () => {
-    if (rateValue === undefined || rateValue === null || rateValue < 0 || rateValue > 60) {
+    if (rateValue === undefined || rateValue === null || rateValue < 0 || rateValue > 200) {
       toast({
         title: t("invalidRate"),
         description: t("rateBetween0And60"),
@@ -992,8 +991,8 @@ export function RequiredOnboardingModal({ profile, onComplete }: RequiredOnboard
                 <Input
                   id="hourlyRate"
                   type="number"
-                  min="0"
-                  max="60"
+                  min={1}
+                  max={200}
                   value={rateValue}
                   onChange={(e) => setRateValue(Number(e.target.value))}
                   placeholder={t("hourlyRatePlaceholder")}
@@ -1008,7 +1007,7 @@ export function RequiredOnboardingModal({ profile, onComplete }: RequiredOnboard
               <Button
                 onClick={handleRateSubmit}
                 className="w-full"
-                disabled={rateValue === undefined || rateValue === null || rateValue < 0 || rateValue > 60 || submittingRate}
+                disabled={rateValue === undefined || rateValue === null || rateValue < 1 || rateValue > 200 || submittingRate}
               >
                 {submittingRate ? (
                   <div className="flex items-center gap-2">

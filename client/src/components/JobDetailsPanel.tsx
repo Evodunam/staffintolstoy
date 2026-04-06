@@ -6,6 +6,7 @@ import { apiRequest } from "@/lib/queryClient";
 import { useAuth } from "@/hooks/use-auth";
 import { useProfile } from "@/hooks/use-profiles";
 import { useToast } from "@/hooks/use-toast";
+import { useOfflineWorker } from "@/hooks/use-offline-worker";
 
 import { Card } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -16,10 +17,16 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } f
 import { ResponsiveDialog } from "@/components/ui/responsive-dialog";
 import { 
   MapPin, Clock, Star, Phone, Mail, User, Users, DollarSign, 
-  Calendar, Briefcase, X, FileText, CheckCircle, AlertCircle, Navigation, Loader2, LogIn, LogOut, Apple, Video
+  Calendar, Briefcase, X, FileText, CheckCircle, AlertCircle, Navigation, Loader2, LogIn, LogOut, Apple, Video, ChevronRight, Info, Play, Square, Receipt
 } from "lucide-react";
 import { SiGooglemaps, SiWaze } from "react-icons/si";
 import { JobDetailsContent } from "@/components/JobDetailsContent";
+import { MaterialInvoiceDialog } from "@/components/MaterialInvoiceDialog";
+import { Sheet, SheetContent, SheetTitle } from "@/components/ui/sheet";
+import { useTranslation } from "react-i18next";
+import { cn } from "@/lib/utils";
+import { getDisplayJobTitle } from "@/lib/job-display";
+import { ErrorBoundary } from "@/components/ErrorBoundary";
 
 interface JobDetailsPanelProps {
   job: Job | null;
@@ -41,12 +48,17 @@ interface TimesheetData {
   clockInTime: string;
   clockOutTime: string | null;
   status: string;
-  adjustedHours: number;
+  /** API often returns decimal hours as string */
+  adjustedHours: number | string;
+  totalHours?: number | string | null;
   hourlyRate: number;
+  totalPay?: number | null;
   workerNotes: string | null;
   workerName: string;
   workerAvatarUrl: string | null;
   workerInitials: string;
+  timesheetType?: string | null;
+  receiptUrl?: string | null;
 }
 
 interface ApplicationData {
@@ -67,26 +79,40 @@ interface ApplicationData {
   };
 }
 
+interface WorkerTeamMemberBasic {
+  id: number;
+  firstName: string | null;
+  lastName: string | null;
+  email: string | null;
+  avatarUrl: string | null;
+  status: string;
+}
+
 export function JobDetailsPanel({ job, participants, isOpen, onClose, isMobile, isCompany, onMarkComplete, onStartCallForParticipant }: JobDetailsPanelProps) {
   const markupMultiplier = 1.52;
   const { toast } = useToast();
   const { user } = useAuth();
   const { data: profile } = useProfile(user?.id);
   const queryClient = useQueryClient();
+  const { t } = useTranslation("enhancedJobDialog");
+  const { t: tCommon } = useTranslation("common");
+  const { t: tToday } = useTranslation("today");
   const [directionsDialogOpen, setDirectionsDialogOpen] = useState(false);
+  const [materialInvoiceOpen, setMaterialInvoiceOpen] = useState(false);
   const [clockingIn, setClockingIn] = useState(false);
   const [clockingOut, setClockingOut] = useState(false);
   const [locationError, setLocationError] = useState<{ title: string; description: string } | null>(null);
+  const [appToReassign, setAppToReassign] = useState<ApplicationData | null>(null);
   
   // Location fallback: try browser geolocation first; if it fails (e.g. Chrome's network location provider returns 403),
   // try server-side IP geolocation so clock in/out still works.
-  const tryIpGeolocation = async (onSuccess: (coords: { lat: number; lng: number }) => void, onError: () => void) => {
+  const tryIpGeolocation = async (onSuccess: (coords: { lat: number; lng: number; isIpBased?: boolean }) => void, onError: () => void) => {
     try {
       const res = await fetch("/api/geolocation/ip", { method: "POST" });
       if (res.ok) {
         const data = await res.json();
         if (data.latitude != null && data.longitude != null) {
-          onSuccess({ lat: data.latitude, lng: data.longitude });
+          onSuccess({ lat: data.latitude, lng: data.longitude, isIpBased: true });
           return;
         }
       }
@@ -101,15 +127,12 @@ export function JobDetailsPanel({ job, participants, isOpen, onClose, isMobile, 
   };
 
   const getLocationWithFallback = (
-    onSuccess: (coords: { lat: number; lng: number }) => void,
+    onSuccess: (coords: { lat: number; lng: number; isIpBased?: boolean }) => void,
     onError: () => void
   ) => {
     if (!navigator.geolocation) {
-      setLocationError({
-        title: "Location Not Available",
-        description: "Your browser doesn't support location services. Please use a different browser."
-      });
-      onError();
+      // No geolocation API - try IP immediately
+      tryIpGeolocation(onSuccess, onError);
       return;
     }
 
@@ -122,14 +145,21 @@ export function JobDetailsPanel({ job, participants, isOpen, onClose, isMobile, 
     // Try high accuracy first, fall back to low accuracy, then IP geolocation
     navigator.geolocation.getCurrentPosition(
       (position) => {
-        onSuccess({ lat: position.coords.latitude, lng: position.coords.longitude });
+        onSuccess({ lat: position.coords.latitude, lng: position.coords.longitude, isIpBased: false });
       },
-      () => {
+      (error1) => {
         navigator.geolocation.getCurrentPosition(
           (position) => {
-            onSuccess({ lat: position.coords.latitude, lng: position.coords.longitude });
+            onSuccess({ lat: position.coords.latitude, lng: position.coords.longitude, isIpBased: false });
           },
-          showBrowserErrorAndTryIp,
+          (error2) => {
+            // If permission denied or unavailable, try IP geolocation
+            if (error2.code === error2.PERMISSION_DENIED || error2.code === error2.POSITION_UNAVAILABLE) {
+              showBrowserErrorAndTryIp();
+            } else {
+              showBrowserErrorAndTryIp();
+            }
+          },
           { enableHighAccuracy: false, timeout: 10000, maximumAge: 60000 }
         );
       },
@@ -150,21 +180,108 @@ export function JobDetailsPanel({ job, participants, isOpen, onClose, isMobile, 
 
   const { data: applicationsData } = useQuery<ApplicationData[]>({
     queryKey: ["/api/jobs", job?.id, "applications"],
-    enabled: !!job && isCompany,
+    enabled: !!job,
   });
   
-  // Worker's active timesheet for this job
+  // Worker's active timesheet (any job) — same query key as WorkerDashboard so panel and calendar stay in sync
+  const { data: globalActiveTimesheet } = useQuery<Timesheet | null>({
+    queryKey: ["/api/timesheets/active", profile?.id],
+    queryFn: async () => {
+      if (!profile?.id) return null;
+      try {
+        const res = await fetch(`/api/timesheets/active/${profile.id}`, { credentials: "include" });
+        if (res.status === 404) return null;
+        if (!res.ok) throw new Error("Failed to fetch active timesheet");
+        return res.json();
+      } catch {
+        return null;
+      }
+    },
+    enabled: !!profile?.id && !isCompany,
+    refetchInterval: 60000,
+    staleTime: 30000,
+  });
+
+  // Worker's timesheets for this job (same API as calendar/job details; not /api/worker/timesheets — that path does not exist)
   const { data: workerTimesheets } = useQuery<Timesheet[]>({
-    queryKey: ["/api/worker/timesheets", job?.id],
+    queryKey: ["/api/timesheets/job", job?.id],
+    queryFn: async () => {
+      const res = await fetch(`/api/timesheets/job/${job!.id}`, { credentials: "include" });
+      if (res.status === 403) return [];
+      if (!res.ok) throw new Error(await res.text().catch(() => res.statusText));
+      return res.json();
+    },
     enabled: !!job && !isCompany && !!profile,
   });
-  
-  const activeTimesheet = workerTimesheets?.find(ts => ts.jobId === job?.id && !ts.clockOutTime);
-  const isClockedIn = !!activeTimesheet;
+
+  // Offline: pending clock-in/out so worker can clock in from Chats when offline
+  const {
+    isOnline,
+    hasPendingClockedIn,
+    pendingClockedInJobId,
+    pendingClockInTime,
+    lastPendingClockInLocalId,
+    addPendingClockIn,
+    addPendingClockOut,
+    refreshPending,
+  } = useOfflineWorker(profile?.id);
+
+  const offlinePendingForThisJob = !isCompany && !isOnline && hasPendingClockedIn && job != null && pendingClockedInJobId === job.id;
+  const syntheticOfflineTimesheet: Timesheet | null = offlinePendingForThisJob && pendingClockInTime
+    ? { id: -1, jobId: job!.id, clockInTime: pendingClockInTime, clockOutTime: null } as Timesheet
+    : null;
+
+  const activeTimesheet = globalActiveTimesheet?.jobId === job?.id
+    ? globalActiveTimesheet
+    : (workerTimesheets?.find(ts => ts.jobId === job?.id && !ts.clockOutTime) ?? null) || syntheticOfflineTimesheet;
+  const isClockedInToThisJob = !!activeTimesheet;
+  const isClockedIn = !!globalActiveTimesheet || (!isCompany && !isOnline && hasPendingClockedIn);
+  const jobStartDate = job?.startDate ? new Date(job.startDate) : null;
+  const isFutureJob = !!jobStartDate && new Date() < jobStartDate;
+  const isJobToday = !!jobStartDate && new Date().toDateString() === jobStartDate.toDateString();
+  const canClockIn = !isCompany && !!job && !!profile && isJobToday && !isClockedIn;
 
   const timesheets = timesheetsData?.filter(t => t.jobId === job?.id) || [];
   const applications = applicationsData || [];
   const acceptedWorkers = applications.filter(a => a.status === "accepted");
+  /** Worker view: current user's accepted application (for rate display). */
+  const myApplication = !isCompany && profile ? acceptedWorkers.find((a: ApplicationData) => a.workerId === profile.id) : null;
+
+  // Worker (business operator) team for reassign: only when not company and profile has no teamId (owner)
+  const { data: workerTeam } = useQuery<{ id: number; ownerId: number; name?: string }>({
+    queryKey: ["/api/worker-team"],
+    enabled: !!profile && !isCompany && profile.teamId == null,
+  });
+  const { data: workerTeamMembers } = useQuery<WorkerTeamMemberBasic[]>({
+    queryKey: ["/api/worker-team", workerTeam?.id, "members"],
+    enabled: !!workerTeam?.id,
+    queryFn: async () => {
+      const res = await apiRequest("GET", `/api/worker-team/${workerTeam!.id}/members`);
+      if (!res.ok) throw new Error(await res.text());
+      return res.json();
+    },
+  });
+  const activeTeamMembers = workerTeamMembers?.filter(m => m.status === "active") ?? [];
+  const reassignMutation = useMutation({
+    mutationFn: async ({ applicationId, teamMemberId }: { applicationId: number; teamMemberId: number | null }) => {
+      const res = await apiRequest("PATCH", `/api/applications/${applicationId}/team-member`, { teamMemberId });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error((data as { message?: string }).message || "Failed to reassign");
+      }
+      return res.json();
+    },
+    onSuccess: (_data, { applicationId }) => {
+      queryClient.invalidateQueries({ queryKey: ["/api/jobs", job?.id, "applications"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/chats/jobs"] });
+      setAppToReassign(null);
+      toast({ title: t("jobReassignedSuccessfully") ?? "Worker reassigned. Chat will update." });
+    },
+    onError: (err) => {
+      toast({ title: t("couldNotReassignWorker") ?? "Could not reassign worker", description: err.message, variant: "destructive" });
+    },
+  });
+  const isWorkerAdmin = !isCompany && profile?.teamId == null && !!workerTeam;
   
   // Clock in mutation
   const clockInMutation = useMutation({
@@ -173,7 +290,8 @@ export function JobDetailsPanel({ job, participants, isOpen, onClose, isMobile, 
     },
     onSuccess: () => {
       toast({ title: "Clocked In", description: "You are now clocked in for this job." });
-      queryClient.invalidateQueries({ queryKey: ["/api/worker/timesheets"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/timesheets/job", job?.id] });
+      queryClient.invalidateQueries({ queryKey: ["/api/timesheets/active", profile?.id] });
       queryClient.invalidateQueries({ queryKey: ["/api/chats/jobs"] });
     },
     onError: (error: any) => {
@@ -191,7 +309,8 @@ export function JobDetailsPanel({ job, participants, isOpen, onClose, isMobile, 
     },
     onSuccess: () => {
       toast({ title: "Clocked Out", description: "You have clocked out successfully." });
-      queryClient.invalidateQueries({ queryKey: ["/api/worker/timesheets"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/timesheets/job", job?.id] });
+      queryClient.invalidateQueries({ queryKey: ["/api/timesheets/active", profile?.id] });
       queryClient.invalidateQueries({ queryKey: ["/api/chats/jobs"] });
     },
     onError: (error: any) => {
@@ -205,9 +324,52 @@ export function JobDetailsPanel({ job, participants, isOpen, onClose, isMobile, 
   const handleClockIn = () => {
     if (!job || !profile) return;
     setClockingIn(true);
-    
+
+    // Offline: queue clock-in (with or without location). If GPS doesn't respond in 4s, clock in without location so user isn't stuck.
+    if (!isOnline) {
+      let resolved = false;
+      const finish = (lat: number | null, lng: number | null) => {
+        if (resolved) return;
+        resolved = true;
+        addPendingClockIn({
+          jobId: job.id,
+          workerId: profile.id,
+          latitude: lat,
+          longitude: lng,
+          teamMemberId: myApplication?.teamMemberId ?? undefined,
+        });
+        refreshPending();
+        toast({
+          title: tToday("clockedInOffline"),
+          description: lat != null && lng != null ? tToday("clockedInOfflineDescription") : (tToday("clockedInOfflineNoLocation") || "Location will be required when you're back online to approve this timesheet."),
+        });
+        queryClient.invalidateQueries({ queryKey: ["/api/timesheets/active", profile.id] });
+        queryClient.invalidateQueries({ queryKey: ["/api/chats/jobs"] });
+        setClockingIn(false);
+      };
+      const timeoutId = window.setTimeout(() => finish(null, null), 4000);
+      getLocationWithFallback(
+        (coords) => {
+          window.clearTimeout(timeoutId);
+          finish(coords.lat, coords.lng);
+        },
+        () => {
+          window.clearTimeout(timeoutId);
+          finish(null, null);
+        }
+      );
+      return;
+    }
+
     getLocationWithFallback(
       (coords) => {
+        if (coords.isIpBased) {
+          toast({
+            title: tToday("clockedInWithIpLocationTitle") || "Clocked in with approximate location",
+            description: tToday("clockedInWithIpLocation") || "Using approximate location. Approval may be delayed until location is verified.",
+            variant: "default",
+          });
+        }
         clockInMutation.mutate({
           jobId: job.id,
           workerId: profile.id,
@@ -220,12 +382,22 @@ export function JobDetailsPanel({ job, participants, isOpen, onClose, isMobile, 
       }
     );
   };
-  
+
   const handleClockOut = () => {
     if (!activeTimesheet) return;
+
+    // Offline or synthetic (pending) timesheet: queue clock-out by pending clock-in localId
+    if ((!isOnline || activeTimesheet.id === -1) && lastPendingClockInLocalId) {
+      addPendingClockOut(lastPendingClockInLocalId);
+      refreshPending();
+      toast({ title: tToday("clockedOutOffline"), description: tToday("clockedOutOfflineDescription") });
+      queryClient.invalidateQueries({ queryKey: ["/api/timesheets/active", profile?.id] });
+      queryClient.invalidateQueries({ queryKey: ["/api/chats/jobs"] });
+      setClockingOut(false);
+      return;
+    }
+
     setClockingOut(true);
-    
-    // Use getLocationWithFallback - location is REQUIRED for clock out
     getLocationWithFallback(
       (coords) => {
         clockOutMutation.mutate({
@@ -235,9 +407,7 @@ export function JobDetailsPanel({ job, participants, isOpen, onClose, isMobile, 
         });
       },
       () => {
-        // Location is required - block clock out if location fails
         setClockingOut(false);
-        // LocationError dialog will be shown by getLocationWithFallback
       }
     );
   };
@@ -290,14 +460,37 @@ export function JobDetailsPanel({ job, participants, isOpen, onClose, isMobile, 
     return `$${displayRate.toFixed(0)}/hr`;
   };
 
-  const hoursClocked = timesheets.reduce((sum, ts) => sum + ts.adjustedHours, 0);
+  const hoursClocked = timesheets.reduce(
+    (sum, ts) => sum + (parseFloat(String(ts.adjustedHours ?? 0)) || 0),
+    0
+  );
   const estimatedHours = job?.estimatedHours || 8;
   const maxWorkers = job?.maxWorkersNeeded || 1;
   const hoursRemaining = Math.max(0, (estimatedHours * Math.max(1, acceptedWorkers.length)) - hoursClocked);
   
   const estimatedTotalCost = Math.round((job?.hourlyRate || 0) * markupMultiplier * estimatedHours * maxWorkers) / 100;
-  const amountSpent = timesheets.filter(ts => ts.status === "approved").reduce((sum, ts) => sum + Math.round(ts.adjustedHours * ts.hourlyRate * markupMultiplier), 0) / 100;
-  const amountPending = timesheets.filter(ts => ts.status === "pending").reduce((sum, ts) => sum + Math.round(ts.adjustedHours * ts.hourlyRate * markupMultiplier), 0) / 100;
+  const amountSpent =
+    timesheets
+      .filter((ts) => ts.status === "approved")
+      .reduce(
+        (sum, ts) =>
+          sum +
+          Math.round(
+            (parseFloat(String(ts.adjustedHours ?? 0)) || 0) * ts.hourlyRate * markupMultiplier
+          ),
+        0
+      ) / 100;
+  const amountPending =
+    timesheets
+      .filter((ts) => ts.status === "pending")
+      .reduce(
+        (sum, ts) =>
+          sum +
+          Math.round(
+            (parseFloat(String(ts.adjustedHours ?? 0)) || 0) * ts.hourlyRate * markupMultiplier
+          ),
+        0
+      ) / 100;
   const pendingCount = timesheets.filter(ts => ts.status === "pending").length;
   const approvedCount = timesheets.filter(ts => ts.status === "approved").length;
 
@@ -319,13 +512,17 @@ export function JobDetailsPanel({ job, participants, isOpen, onClose, isMobile, 
         addressLine={[job?.address, job?.city, job?.state].filter(Boolean).join(", ") || ""}
         trade={job?.trade ?? ""}
         rateDisplay={
-          acceptedWorkers.length > 0
-            ? (() => {
-                const rates = acceptedWorkers.map((a: any) => (a.proposedRate ?? a.worker?.hourlyRate ?? job?.hourlyRate) ?? 0).filter((r: number) => r > 0);
-                const avg = rates.length ? Math.round(rates.reduce((s: number, r: number) => s + r, 0) / rates.length) : (job?.hourlyRate || 0);
-                return formatRateWithMarkup(avg);
-              })()
-            : formatRateWithMarkup(job?.hourlyRate || 0)
+          isCompany
+            ? (acceptedWorkers.length > 0
+                ? (() => {
+                    const ratesCents = acceptedWorkers.map((a: any) => (a.proposedRate ?? a.worker?.hourlyRate ?? job?.hourlyRate) ?? 0).filter((r: number) => r > 0);
+                    const avgCents = ratesCents.length ? Math.round(ratesCents.reduce((s: number, r: number) => s + r, 0) / ratesCents.length) : 0;
+                    return avgCents > 0 ? formatRateWithMarkup(avgCents) : (t("rateUndetermined") || "Undetermined");
+                  })()
+                : (t("rateUndetermined") || "Undetermined"))
+            : (myApplication
+                ? `$${Math.round((myApplication.proposedRate ?? job?.hourlyRate ?? 0) / 100)}/hr`
+                : (t("rateUndetermined") || "Undetermined"))
         }
         estimatedHoursDisplay={`${estimatedHours}h`}
         workersDisplay={`${acceptedWorkers.length}/${maxWorkers}`}
@@ -370,8 +567,8 @@ export function JobDetailsPanel({ job, participants, isOpen, onClose, isMobile, 
             <div className="space-y-1">
               {acceptedWorkers.map(app => {
                 const workerTimesheets = timesheets.filter(ts => ts.workerId === app.worker.id);
-                const workerHours = workerTimesheets.reduce((sum, ts) => sum + ts.adjustedHours, 0);
-                const workerEarnings = workerTimesheets.reduce((sum, ts) => sum + Math.round(ts.adjustedHours * ts.hourlyRate * markupMultiplier), 0) / 100;
+                const workerHours = workerTimesheets.reduce((sum, ts) => sum + (Number(ts.adjustedHours) || 0), 0);
+                const workerEarnings = workerTimesheets.reduce((sum, ts) => sum + Math.round((Number(ts.adjustedHours) || 0) * (Number(ts.hourlyRate) || 0) * markupMultiplier), 0) / 100;
                 const isEmployee = !!(app as ApplicationData).teamMemberId;
                 const showPhone = app.worker.phone && !isEmployee && !onStartCallForParticipant;
                 // For employees: call business operator (manager). For direct workers: call the worker.
@@ -382,7 +579,7 @@ export function JobDetailsPanel({ job, participants, isOpen, onClose, isMobile, 
                   <div key={app.id} className="flex items-center gap-3 p-2 rounded-lg hover:bg-muted/50 transition-colors">
                     <Avatar className="w-9 h-9 flex-shrink-0">
                       <AvatarImage src={app.worker.avatarUrl || undefined} />
-                      <AvatarFallback className="text-xs">{app.worker.firstName[0]}{app.worker.lastName[0]}</AvatarFallback>
+                      <AvatarFallback className="text-xs">{app.worker.firstName?.[0]}{app.worker.lastName?.[0]}</AvatarFallback>
                     </Avatar>
                     <div className="flex-1 min-w-0">
                       <p className="text-sm font-medium truncate">{app.worker.firstName} {app.worker.lastName}</p>
@@ -461,7 +658,49 @@ export function JobDetailsPanel({ job, participants, isOpen, onClose, isMobile, 
         )}
       </section>
 
-      {/* Job actions — Directions, Clock In/Out (reference: Conversation actions) */}
+      {/* Team (worker only): workers on this job; business operator can swap */}
+      {!isCompany && (
+        <section>
+          <h4 className="font-semibold text-sm text-foreground mb-2 flex items-center gap-2">
+            <Users className="w-4 h-4 text-muted-foreground" />
+            Team
+          </h4>
+          {acceptedWorkers.length === 0 ? (
+            <p className="text-xs text-muted-foreground py-2">No workers on this job yet</p>
+          ) : (
+            <div className="space-y-1">
+              {acceptedWorkers.map(app => (
+                <div key={app.id} className="flex items-center gap-3 p-2 rounded-lg hover:bg-muted/50 transition-colors">
+                  <Avatar className="w-9 h-9 flex-shrink-0">
+                    <AvatarImage src={app.worker.avatarUrl || undefined} />
+                    <AvatarFallback className="text-xs">{app.worker.firstName?.[0]}{app.worker.lastName?.[0]}</AvatarFallback>
+                  </Avatar>
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm font-medium truncate">{app.worker.firstName} {app.worker.lastName}</p>
+                    <p className="text-xs text-muted-foreground">
+                      ${Math.round((app.proposedRate ?? 0) / 100)}/hr
+                    </p>
+                  </div>
+                  {isWorkerAdmin && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="flex-shrink-0 gap-1"
+                      onClick={() => setAppToReassign(app)}
+                      data-testid={`reassign-worker-${app.id}`}
+                    >
+                      {t("reassign") ?? "Swap"}
+                      <ChevronRight className="w-4 h-4" />
+                    </Button>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </section>
+      )}
+
+      {/* Job actions — Directions, Clock In/Out (1:1 with WorkerCalendar accepted-job dialog) */}
       {!isCompany && (
         <section>
           <h4 className="font-semibold text-sm text-foreground mb-2">Job actions</h4>
@@ -475,18 +714,28 @@ export function JobDetailsPanel({ job, participants, isOpen, onClose, isMobile, 
               <Navigation className="w-4 h-4 text-muted-foreground flex-shrink-0" />
               Get directions
             </button>
-            {isClockedIn ? (
+            {isFutureJob ? (
               <button
                 type="button"
-                onClick={handleClockOut}
+                disabled
+                className="w-full flex items-center gap-3 px-3 py-2.5 text-left text-sm bg-secondary text-secondary-foreground border-border opacity-60 cursor-not-allowed"
+                data-testid="button-clock-in"
+              >
+                <Clock className="w-4 h-4 flex-shrink-0" />
+                Job Has Not Begun
+              </button>
+            ) : isClockedInToThisJob ? (
+              <button
+                type="button"
+                onClick={() => activeTimesheet && handleClockOut()}
                 disabled={clockingOut}
                 className="w-full flex items-center gap-3 px-3 py-2.5 text-left text-sm text-destructive hover:bg-destructive/10 transition-colors disabled:opacity-50"
                 data-testid="button-clock-out"
               >
-                {clockingOut ? <Loader2 className="w-4 h-4 animate-spin flex-shrink-0" /> : <LogOut className="w-4 h-4 flex-shrink-0" />}
+                {clockingOut ? <Loader2 className="w-4 h-4 animate-spin flex-shrink-0" /> : <Square className="w-4 h-4 flex-shrink-0" />}
                 Clock out
               </button>
-            ) : (
+            ) : canClockIn ? (
               <button
                 type="button"
                 onClick={handleClockIn}
@@ -494,12 +743,40 @@ export function JobDetailsPanel({ job, participants, isOpen, onClose, isMobile, 
                 className="w-full flex items-center gap-3 px-3 py-2.5 text-left text-sm hover:bg-muted/50 transition-colors disabled:opacity-50"
                 data-testid="button-clock-in"
               >
-                {clockingIn ? <Loader2 className="w-4 h-4 animate-spin flex-shrink-0" /> : <LogIn className="w-4 h-4 flex-shrink-0" />}
+                {clockingIn ? <Loader2 className="w-4 h-4 animate-spin flex-shrink-0" /> : <Play className="w-4 h-4 flex-shrink-0" />}
+                Clock in
+              </button>
+            ) : (
+              <button
+                type="button"
+                disabled
+                className="w-full flex items-center gap-3 px-3 py-2.5 text-left text-sm bg-secondary text-secondary-foreground border-border opacity-40 cursor-not-allowed"
+                data-testid="button-clock-in-disabled"
+              >
+                <Play className="w-4 h-4 flex-shrink-0" />
                 Clock in
               </button>
             )}
+            <button
+              type="button"
+              onClick={() => setMaterialInvoiceOpen(true)}
+              className="w-full flex items-center gap-3 px-3 py-2.5 text-left text-sm hover:bg-muted/50 transition-colors border-t border-border"
+              data-testid="button-material-invoice"
+            >
+              <Receipt className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+              Material Invoice
+            </button>
           </div>
         </section>
+      )}
+
+      {job && !isCompany && (
+        <MaterialInvoiceDialog
+          open={materialInvoiceOpen}
+          onOpenChange={setMaterialInvoiceOpen}
+          jobId={job.id}
+          jobTitle={job.title ?? "Job"}
+        />
       )}
 
       {/* Timesheets (company only) */}
@@ -510,33 +787,48 @@ export function JobDetailsPanel({ job, participants, isOpen, onClose, isMobile, 
             Timesheets ({timesheets.length})
           </h4>
           <div className="space-y-1 rounded-lg border border-border overflow-hidden">
-            {timesheets.map(ts => (
-              <div key={ts.id} className="flex items-center justify-between px-3 py-2 bg-muted/30 text-xs hover:bg-muted/50 transition-colors">
-                <div className="flex items-center gap-2 min-w-0">
-                  <Avatar className="w-6 h-6 flex-shrink-0">
-                    <AvatarImage src={ts.workerAvatarUrl || undefined} />
-                    <AvatarFallback className="text-[8px]">{ts.workerInitials}</AvatarFallback>
-                  </Avatar>
-                  <div className="min-w-0">
-                    <p className="font-medium truncate">{ts.workerName}</p>
-                    <p className="text-[10px] text-muted-foreground">
-                      {format(new Date(ts.clockInTime), "MMM d")} · {ts.adjustedHours.toFixed(1)}h
-                    </p>
+            {timesheets.map(ts => {
+              const isMaterialInvoice = ts.timesheetType === "material_invoice";
+              const hoursForDisplay =
+                parseFloat(String(ts.adjustedHours ?? ts.totalHours ?? 0)) || 0;
+              const amount = isMaterialInvoice && ts.totalPay != null
+                ? (ts.totalPay / 100).toFixed(2)
+                : (Math.round(hoursForDisplay * ts.hourlyRate * markupMultiplier) / 100).toFixed(2);
+              return (
+                <div key={ts.id} className="flex items-center justify-between px-3 py-2 bg-muted/30 text-xs hover:bg-muted/50 transition-colors">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <Avatar className="w-6 h-6 flex-shrink-0">
+                      <AvatarImage src={ts.workerAvatarUrl || undefined} />
+                      <AvatarFallback className="text-[8px]">{ts.workerInitials}</AvatarFallback>
+                    </Avatar>
+                    <div className="min-w-0">
+                      <p className="font-medium truncate">{ts.workerName}</p>
+                      <p className="text-[10px] text-muted-foreground">
+                        {format(new Date(ts.clockInTime), "MMM d")}
+                        {isMaterialInvoice ? (
+                          <> · <span className="inline-flex items-center gap-0.5"><Receipt className="w-2.5 h-2.5" /> Invoice</span>{ts.receiptUrl && (
+                            <a href={ts.receiptUrl.startsWith("http") ? ts.receiptUrl : `${window.location.origin}${ts.receiptUrl}`} target="_blank" rel="noopener noreferrer" className="ml-1 text-primary hover:underline">Receipt</a>
+                          )}</>
+                        ) : (
+                          <> · {hoursForDisplay.toFixed(1)}h</>
+                        )}
+                      </p>
+                    </div>
+                  </div>
+                  <div className="text-right flex-shrink-0">
+                    <p className="font-medium">${amount}</p>
+                    <Badge
+                      variant={ts.status === "approved" ? "default" : ts.status === "pending" ? "secondary" : "outline"}
+                      className="text-[8px] px-1 py-0"
+                    >
+                      {ts.status === "approved" && <CheckCircle className="w-2 h-2 mr-0.5" />}
+                      {ts.status === "pending" && <AlertCircle className="w-2 h-2 mr-0.5" />}
+                      {ts.status}
+                    </Badge>
                   </div>
                 </div>
-                <div className="text-right flex-shrink-0">
-                  <p className="font-medium">${(Math.round(ts.adjustedHours * ts.hourlyRate * markupMultiplier) / 100).toFixed(2)}</p>
-                  <Badge
-                    variant={ts.status === "approved" ? "default" : ts.status === "pending" ? "secondary" : "outline"}
-                    className="text-[8px] px-1 py-0"
-                  >
-                    {ts.status === "approved" && <CheckCircle className="w-2 h-2 mr-0.5" />}
-                    {ts.status === "pending" && <AlertCircle className="w-2 h-2 mr-0.5" />}
-                    {ts.status}
-                  </Badge>
-                </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         </section>
       )}
@@ -595,15 +887,110 @@ export function JobDetailsPanel({ job, participants, isOpen, onClose, isMobile, 
     <Dialog open={!!locationError} onOpenChange={(open) => !open && setLocationError(null)}>
       <DialogContent className="max-w-sm">
         <DialogHeader>
-          <DialogTitle>{locationError?.title}</DialogTitle>
-          <DialogDescription>{locationError?.description}</DialogDescription>
+          <DialogTitle className="flex items-center gap-2">
+            <Navigation className="w-4 h-4 text-amber-500" />
+            {locationError?.title}
+          </DialogTitle>
+          <DialogDescription className="pt-1">{locationError?.description}</DialogDescription>
         </DialogHeader>
-        <Button onClick={() => setLocationError(null)} data-testid="button-close-location-error">
-          OK
-        </Button>
+        <div className="rounded-lg bg-muted p-3 text-xs text-muted-foreground space-y-1">
+          <p className="font-medium text-foreground text-xs">To enable location:</p>
+          <p>• <strong>iOS:</strong> Settings → Privacy → Location Services → Browser → While Using</p>
+          <p>• <strong>Android:</strong> Settings → Apps → Browser → Permissions → Location → Allow</p>
+          <p>• <strong>Desktop:</strong> Click the lock icon in your address bar → Location → Allow</p>
+        </div>
+        <div className="flex gap-2">
+          <Button variant="outline" className="flex-1" onClick={() => setLocationError(null)} data-testid="button-close-location-error">
+            Dismiss
+          </Button>
+          <Button className="flex-1" onClick={() => {
+            setLocationError(null);
+            toast({ title: "Check-in requested", description: "Your manager will be notified to approve your check-in manually." });
+          }} data-testid="button-manual-checkin-request">
+            Request manual check-in
+          </Button>
+        </div>
       </DialogContent>
     </Dialog>
   );
+
+  // Reassign worker sheet (same copy as JobContent): applied rate unchanged + pick self or teammate
+  const ReassignSheet = () => {
+    if (!appToReassign || !job) return null;
+    const rateDollars = Math.round((appToReassign.proposedRate ?? 0) / 100);
+    const assignedIds = new Set(acceptedWorkers.filter(a => a.id !== appToReassign.id).map(a => a.teamMemberId ?? "self"));
+    return (
+      <Sheet open={!!appToReassign} onOpenChange={(open) => !open && setAppToReassign(null)}>
+        <SheetContent side="bottom" className="rounded-t-2xl max-h-[85vh] flex flex-col">
+          <SheetTitle className="sr-only">{t("reassignWorker") ?? "Reassign worker"}</SheetTitle>
+          <div className="flex-1 min-h-0 overflow-y-auto p-4">
+            <div className="bg-blue-50 dark:bg-blue-950/30 border border-blue-200 dark:border-blue-800/50 rounded-lg p-3 mb-4">
+              <div className="flex items-start gap-2">
+                <Info className="w-4 h-4 text-blue-600 dark:text-blue-400 mt-0.5 flex-shrink-0" />
+                <p className="text-sm text-blue-700 dark:text-blue-300">
+                  {t("appliedRateWillRemainUnchanged", { rate: rateDollars }) ?? `The applied rate of $${rateDollars}/hr will remain unchanged when reassigning.`}
+                </p>
+              </div>
+            </div>
+            <p className="text-sm font-medium text-muted-foreground mb-2">{t("selectTeamMember") ?? "Select who will work this job"}</p>
+            <div className="space-y-2">
+              {(!assignedIds.has("self") || appToReassign.teamMemberId == null) && (
+                <button
+                  type="button"
+                  onClick={() => reassignMutation.mutate({ applicationId: appToReassign.id, teamMemberId: null })}
+                  disabled={reassignMutation.isPending}
+                  className={cn(
+                    "w-full rounded-xl p-3 border flex items-center gap-3 text-left",
+                    appToReassign.teamMemberId == null ? "bg-primary/10 border-primary/30" : "bg-green-50 dark:bg-green-950/30 border-green-200 dark:border-green-800 hover:ring-2 hover:ring-primary/30"
+                  )}
+                  data-testid="select-team-member-self"
+                >
+                  <Avatar className="w-10 h-10">
+                    <AvatarImage src={profile?.avatarUrl || undefined} />
+                    <AvatarFallback className="text-xs">{profile?.firstName?.[0]}{profile?.lastName?.[0]}</AvatarFallback>
+                  </Avatar>
+                  <div className="flex-1 min-w-0">
+                    <p className="font-medium text-sm">{profile?.firstName} {profile?.lastName} (You)</p>
+                  </div>
+                  {appToReassign.teamMemberId == null && (
+                    <Badge variant="secondary" className="text-xs">{t("current") ?? "Current"}</Badge>
+                  )}
+                </button>
+              )}
+              {activeTeamMembers.map(m => {
+                const isAssigned = assignedIds.has(m.id);
+                if (isAssigned && appToReassign.teamMemberId !== m.id) return null;
+                return (
+                  <button
+                    key={m.id}
+                    type="button"
+                    onClick={() => reassignMutation.mutate({ applicationId: appToReassign.id, teamMemberId: m.id })}
+                    disabled={reassignMutation.isPending}
+                    className={cn(
+                      "w-full rounded-xl p-3 border flex items-center gap-3 text-left transition-colors",
+                      appToReassign.teamMemberId === m.id ? "bg-primary/10 border-primary/30" : "bg-green-50 dark:bg-green-950/30 border-green-200 dark:border-green-800 hover:ring-2 hover:ring-primary/30"
+                    )}
+                    data-testid={`select-team-member-${m.id}`}
+                  >
+                    <Avatar className="w-10 h-10">
+                      <AvatarImage src={m.avatarUrl || undefined} />
+                      <AvatarFallback className="text-xs">{m.firstName?.[0]}{m.lastName?.[0]}</AvatarFallback>
+                    </Avatar>
+                    <div className="flex-1 min-w-0">
+                      <p className="font-medium text-sm">{m.firstName} {m.lastName}</p>
+                    </div>
+                    {appToReassign.teamMemberId === m.id && (
+                      <Badge variant="secondary" className="text-xs">{t("current") ?? "Current"}</Badge>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        </SheetContent>
+      </Sheet>
+    );
+  };
 
   if (isMobile) {
     // Allow click when job is in a completable state (open/in_progress) and filled; if pending timesheets, dashboard will show approval pop-up
@@ -615,7 +1002,7 @@ export function JobDetailsPanel({ job, participants, isOpen, onClose, isMobile, 
           onOpenChange={(open) => !open && onClose()}
           title={
             <div className="flex items-center gap-2 pr-2">
-              <span className="truncate">{job.title}</span>
+              <span className="truncate">{getDisplayJobTitle(job)}</span>
               <Badge variant={((job.status === "open" || job.status === "in_progress") && ((job as any).workersHired > 0 || (job as any).applications?.some((a: any) => a.status === "accepted"))) ? "secondary" : job.status === "open" ? "default" : job.status === "in_progress" ? "secondary" : "outline"} className="flex-shrink-0">
                 {((job.status === "open" || job.status === "in_progress") && ((job as any).workersHired > 0 || (job as any).applications?.some((a: any) => a.status === "accepted"))) ? "In Progress" : job.status === "in_progress" ? "In Progress" : (job.status === "open" ? "Open" : job.status.charAt(0).toUpperCase() + job.status.slice(1))}
               </Badge>
@@ -624,16 +1011,19 @@ export function JobDetailsPanel({ job, participants, isOpen, onClose, isMobile, 
           description={`${job.city}, ${job.state}`}
           primaryAction={isCompany && onMarkComplete ? {
             label: "Mark as Complete",
-            onClick: () => job && onMarkComplete(job.id, job.title),
+            onClick: () => job && onMarkComplete(job.id, getDisplayJobTitle(job)),
             disabled: !mobileCanTapMarkComplete,
             icon: <CheckCircle className="w-4 h-4 mr-2" />,
             testId: "button-mark-complete-job-details-mobile",
           } : undefined}
         >
-          <PanelContent />
+          <ErrorBoundary section="Job details">
+            <PanelContent />
+          </ErrorBoundary>
         </ResponsiveDialog>
         <DirectionsDialog />
         <LocationErrorDialogComponent />
+        <ReassignSheet />
       </>
     );
   }
@@ -645,7 +1035,7 @@ export function JobDetailsPanel({ job, participants, isOpen, onClose, isMobile, 
       <div className="w-80 border-l border-border flex flex-col bg-background">
         <div className="flex items-center justify-between p-3 border-b border-border">
           <div className="flex-1 min-w-0">
-            <h3 className="font-semibold text-sm truncate">{job.title}</h3>
+            <h3 className="font-semibold text-sm truncate">{getDisplayJobTitle(job)}</h3>
             <p className="text-[10px] text-muted-foreground flex items-center gap-1">
               <MapPin className="w-2.5 h-2.5" />
               {job.city}, {job.state}
@@ -656,13 +1046,15 @@ export function JobDetailsPanel({ job, participants, isOpen, onClose, isMobile, 
           </Button>
         </div>
         <ScrollArea className="flex-1 min-h-0 p-3">
-          <PanelContent />
+          <ErrorBoundary section="Job details">
+            <PanelContent />
+          </ErrorBoundary>
         </ScrollArea>
         {isCompany && onMarkComplete && (
           <div className="flex-shrink-0 border-t border-border p-3 bg-background">
             <Button
               className="w-full bg-gradient-to-r from-[#00A86B] to-[#008A57] hover:from-[#008A57] hover:to-[#006B44] text-white border-0"
-              onClick={() => job && onMarkComplete(job.id, job.title)}
+              onClick={() => job && onMarkComplete(job.id, getDisplayJobTitle(job))}
               disabled={!canMarkComplete}
               data-testid="button-mark-complete-job-details"
             >
@@ -677,6 +1069,7 @@ export function JobDetailsPanel({ job, participants, isOpen, onClose, isMobile, 
       </div>
       <DirectionsDialog />
       <LocationErrorDialogComponent />
+      <ReassignSheet />
     </>
   );
 }

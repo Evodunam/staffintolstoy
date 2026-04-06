@@ -1,6 +1,7 @@
-import { useState, useMemo, useEffect, useImperativeHandle, forwardRef, useCallback } from "react";
+import { useState, useMemo, useEffect, useRef, useImperativeHandle, forwardRef, useCallback } from "react";
+import { createPortal } from "react-dom";
 import { format, addDays, subDays, addWeeks, subWeeks, addMonths, subMonths, startOfWeek, endOfWeek, startOfMonth, endOfMonth, eachDayOfInterval, isSameDay, isToday, isTomorrow, isSameMonth, getDay, differenceInDays, isBefore, isAfter, startOfDay } from "date-fns";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { usePersistentFilter, usePersistentSetFilter } from "@/hooks/use-persistent-filter";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -9,13 +10,15 @@ import { Switch } from "@/components/ui/switch";
 import { Label } from "@/components/ui/label";
 import { Input } from "@/components/ui/input";
 import { MobilePopup } from "@/components/ui/mobile-popup";
-import { Drawer, DrawerContent, DrawerTitle, DrawerDescription } from "@/components/ui/drawer";
+import { Drawer, DrawerContent, DrawerTitle, DrawerDescription, DrawerHeader } from "@/components/ui/drawer";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from "@/components/ui/dialog";
 import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetDescription } from "@/components/ui/sheet";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Accordion, AccordionContent, AccordionItem, AccordionTrigger } from "@/components/ui/accordion";
-import { ChevronLeft, ChevronRight, Settings, Download, Copy, Link, Check, Loader2, Calendar as CalendarIcon, MapPin, Clock, Play, Square, Car, MessageSquare, Building2, Star, CheckCircle2, Image as ImageIcon, User, Calendar, Repeat, Briefcase, AlertCircle, Zap, CalendarDays, Navigation, Map as MapIcon } from "lucide-react";
-import { useIsMobile } from "@/hooks/use-mobile";
+import { ChevronLeft, ChevronRight, Settings, Download, Copy, Link, Check, Loader2, Calendar as CalendarIcon, MapPin, Clock, Play, Square, Car, MessageSquare, Building2, Star, CheckCircle2, Image as ImageIcon, User, Users, Calendar, Repeat, Briefcase, AlertCircle, Zap, CalendarDays, Navigation, Map as MapIcon, X, Trash2, Pencil } from "lucide-react";
+import { useIsMobile, useIsDesktop } from "@/hooks/use-mobile";
+import { getDisplayJobTitle } from "@/lib/job-display";
 import { useToast } from "@/hooks/use-toast";
 import { useLocation } from "wouter";
 import type { Job, Application, WorkerTeamMember, Profile, Timesheet } from "@shared/schema";
@@ -23,8 +26,9 @@ import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { JobDetailsSheet } from "./JobDetailsSheet";
 import { EnhancedJobDialog } from "./EnhancedJobDialog";
-import { MiniJobMap } from "./JobsMap";
+import { JobLocationMap, MiniJobMap, type PersonLocation } from "./JobsMap";
 import { CalendarMapView } from "./CalendarMapView";
+import { cn, formatTime12h, normalizeAvatarUrl } from "@/lib/utils";
 
 type CalendarView = "day" | "week" | "month" | "map";
 
@@ -58,10 +62,13 @@ interface WorkerCalendarProps {
   profile: Profile | null;
   activeTeamMembers: WorkerTeamMember[];
   onApplyToJob: (job: Job) => void;
-  onViewJob: (job: Job) => void;
+  /** When opening a pending application from calendar, pass application so dialog shows Pending Review, withdraw, masked address, no chat/clock in. */
+  onViewJob: (job: Job, application?: { id: number; status: "pending" | "accepted" | "rejected"; proposedRate?: number | null; teamMember?: { id: number; firstName: string | null; lastName: string | null; avatarUrl: string | null; hourlyRate: number | null } | null } | null) => void;
   onWithdrawApplication: (applicationId: number) => void;
   onUpdateTeamMember: (applicationId: number, teamMemberId: number | null) => void;
   onGetDirections: (job: Job) => void;
+  /** When user clicks "Add to route" for an available job, open apply dialog at step 3 (message). */
+  onApplyToJobAtStep3?: (job: Job) => void;
   isWithdrawing?: boolean;
   clockInStatus?: ClockInStatus;
   clockInError?: string | null;
@@ -71,6 +78,18 @@ interface WorkerCalendarProps {
   isClockingOut?: boolean;
   isEmployee?: boolean;
   impersonatedTeamMemberId?: number | null;
+  /** When set (mobile), calendar toolbar is rendered into this slot instead of local banner. */
+  calendarHeaderSlotRef?: React.RefObject<HTMLDivElement | null>;
+  /** True when the slot DOM node is mounted (so we can portal). */
+  calendarHeaderSlotReady?: boolean;
+  /** Same as Find Work map: draw radius circles (worker + teammates). */
+  referencePoints?: Array<{ lat: number; lng: number }>;
+  referenceRadiusMiles?: number;
+  referenceRadiusMilesArray?: number[];
+  workerTeamId?: number | null;
+  /** One-shot deep link from URL: open accepted-event details for this job id. */
+  calendarDeepLinkJobId?: number | null;
+  onCalendarDeepLinkHandled?: () => void;
 }
 
 interface CalendarEvent {
@@ -84,10 +103,13 @@ interface CalendarEvent {
   estimatedHours?: number;
   location?: string;
   hourlyRate?: number;
-  type: "accepted" | "pending" | "opportunity";
+  type: "accepted" | "pending" | "opportunity" | "imported";
   job: Job;
   teamMember?: WorkerTeamMember | null;
   company?: { id: number; companyName: string | null; phone: string | null; avatarUrl?: string | null; companyLogo?: string | null; firstName?: string | null; lastName?: string | null } | null;
+  /** For type "imported": external calendar event source (e.g. "John" or "You") */
+  sourceName?: string;
+  sourceProfileId?: number;
 }
 
 const HOUR_HEIGHT = 48;
@@ -105,34 +127,49 @@ const DAY_MAP: Record<string, number> = {
   "sat": 6, "saturday": 6,
 };
 
-function getRecurringDates(job: Job): Date[] {
+/**
+ * Get all occurrence dates for a recurring job. If rangeStart/rangeEnd are provided,
+ * returns dates within that range (for calendar display). Otherwise returns dates
+ * from job start for recurringWeeks (legacy).
+ */
+function getRecurringDates(job: Job, rangeStart?: Date, rangeEnd?: Date): Date[] {
   const days = job.scheduleDays || (job as any).recurringDays || [];
   if (days.length === 0 || job.jobType !== "recurring") {
     return [];
   }
-  
-  const weeks = (job as any).recurringWeeks || 1;
-  const startDate = new Date(job.startDate);
-  startDate.setHours(0, 0, 0, 0);
-  
+
   const scheduleDayNumbers = days
-    .map((d: string) => DAY_MAP[d.toLowerCase()])
+    .map((d: string) => DAY_MAP[(d || "").toString().toLowerCase()])
     .filter((n: number | undefined): n is number => n !== undefined);
-  
+
   if (scheduleDayNumbers.length === 0) return [];
-  
-  const dates: Date[] = [];
-  const endDate = addDays(startDate, weeks * 7);
-  
-  let currentDate = new Date(startDate);
-  while (currentDate <= endDate) {
-    const dayOfWeek = getDay(currentDate);
-    if (scheduleDayNumbers.includes(dayOfWeek)) {
-      dates.push(new Date(currentDate));
-    }
-    currentDate = addDays(currentDate, 1);
+
+  const jobStart = new Date(job.startDate);
+  jobStart.setHours(0, 0, 0, 0);
+
+  let start: Date;
+  let end: Date;
+  if (rangeStart && rangeEnd) {
+    start = startOfDay(rangeStart);
+    end = startOfDay(rangeEnd);
+    // Don't include dates before the job's start
+    if (end <= jobStart) return [];
+    if (start < jobStart) start = new Date(jobStart);
+  } else {
+    const weeks = (job as any).recurringWeeks || 52;
+    start = new Date(jobStart);
+    end = addDays(jobStart, weeks * 7);
   }
-  
+
+  const dates: Date[] = [];
+  let current = new Date(start);
+  while (current < end) {
+    const dayOfWeek = getDay(current);
+    if (scheduleDayNumbers.includes(dayOfWeek)) {
+      dates.push(new Date(current));
+    }
+    current = addDays(current, 1);
+  }
   return dates;
 }
 
@@ -147,33 +184,76 @@ function parseTime(timeStr: string): { hours: number; minutes: number } {
   return { hours, minutes };
 }
 
+/** Apply job scheduledTime to a given day so start/end have correct times for timeline height. */
+function applyScheduledTimeToDay(day: Date, scheduledTime: string | undefined, estimatedHours?: number): { start: Date; end: Date } {
+  const start = new Date(day);
+  if (Number.isNaN(start.getTime())) {
+    start.setTime(0);
+  }
+  start.setHours(0, 0, 0, 0);
+  if (scheduledTime?.trim()) {
+    const rangeParts = scheduledTime.split(/\s+[\-–—]\s+/).map((s) => s.trim()).filter(Boolean);
+    const startPart = parseTime(rangeParts[0] ?? "");
+    start.setHours(startPart.hours, startPart.minutes, 0, 0);
+    if (rangeParts.length >= 2) {
+      const endPart = parseTime(rangeParts[1] ?? "");
+      const end = new Date(day);
+      end.setHours(endPart.hours, endPart.minutes, 0, 0);
+      return { start, end };
+    }
+  }
+  const end = new Date(start);
+  end.setHours(end.getHours() + (estimatedHours ?? 4), end.getMinutes(), 0, 0);
+  return { start, end };
+}
+
 function getEventPosition(event: CalendarEvent): { top: number; height: number; isAllDay: boolean } {
   let startHour = 9;
   let startMinute = 0;
   let isAllDay = false;
-  
-  if (event.scheduledTime) {
-    const { hours, minutes } = parseTime(event.scheduledTime);
-    startHour = hours;
-    startMinute = minutes;
-  } else if (event.startDate) {
+
+  const startDateValid = event.startDate && !Number.isNaN(event.startDate.getTime());
+  const endDateValid = event.endDate && !Number.isNaN(event.endDate.getTime());
+
+  // Prefer startDate when we have it so the block aligns with actual job times (e.g. 6am–5pm on timeline)
+  if (startDateValid && event.startDate) {
     const hours = event.startDate.getHours();
     const minutes = event.startDate.getMinutes();
-    if (hours === 0 && minutes === 0) {
+    if (hours === 0 && minutes === 0 && !endDateValid) {
       isAllDay = true;
       startHour = 8;
     } else {
       startHour = hours;
       startMinute = minutes;
     }
+  } else if (event.scheduledTime) {
+    const { hours, minutes } = parseTime(event.scheduledTime);
+    startHour = hours;
+    startMinute = minutes;
   } else {
     isAllDay = true;
     startHour = 8;
   }
   
-  // Calculate duration from estimatedHours (job shift duration)
-  // This is more reliable than using endDate which may be the job's end date span
-  const durationMinutes = (event.estimatedHours || 4) * 60;
+  // Duration: use actual start/end when available so blocks match the timeline (e.g. 6am–5pm = full height)
+  let durationMinutes: number;
+  if (endDateValid && startDateValid && event.endDate && event.startDate) {
+    const mins = (event.endDate.getTime() - event.startDate.getTime()) / (60 * 1000);
+    durationMinutes = Math.max(0, mins);
+  } else if (event.scheduledTime) {
+    const rangeParts = event.scheduledTime.split(/\s+[\-–—]\s+/).map((s) => s.trim()).filter(Boolean);
+    if (rangeParts.length >= 2) {
+      const startPart = parseTime(rangeParts[0] ?? "");
+      const endPart = parseTime(rangeParts[1] ?? "");
+      const startMins = startPart.hours * 60 + startPart.minutes;
+      const endMins = endPart.hours * 60 + endPart.minutes;
+      durationMinutes = endMins > startMins ? endMins - startMins : (event.estimatedHours || 4) * 60;
+    } else {
+      durationMinutes = (event.estimatedHours || 4) * 60;
+    }
+  } else {
+    durationMinutes = (event.estimatedHours || 4) * 60;
+  }
   
   const startOffset = (startHour - START_HOUR) * HOUR_HEIGHT + (startMinute / 60) * HOUR_HEIGHT;
   const height = (durationMinutes / 60) * HOUR_HEIGHT;
@@ -181,10 +261,43 @@ function getEventPosition(event: CalendarEvent): { top: number; height: number; 
   return { top: Math.max(0, startOffset), height: Math.max(HOUR_HEIGHT / 2, height), isAllDay };
 }
 
+/** Day view: assign column index to each event so overlapping events sit side-by-side. Returns layout with columnIndex and totalColumns. */
+function getDayViewEventLayout(events: CalendarEvent[]): { event: CalendarEvent; top: number; height: number; columnIndex: number; totalColumns: number }[] {
+  const withPos = events.map((event) => {
+    const { top, height } = getEventPosition(event);
+    return { event, top, height, endOffset: top + height };
+  });
+  withPos.sort((a, b) => a.top - b.top || b.height - a.height);
+  const columnEnds: number[] = [];
+  const result: { event: CalendarEvent; top: number; height: number; columnIndex: number; totalColumns: number }[] = [];
+  for (const { event, top, height, endOffset } of withPos) {
+    let col = 0;
+    while (col < columnEnds.length && columnEnds[col] > top) col++;
+    if (col === columnEnds.length) columnEnds.push(0);
+    columnEnds[col] = endOffset;
+    result.push({ event, top, height, columnIndex: col, totalColumns: columnEnds.length });
+  }
+  const maxCols = columnEnds.length;
+  result.forEach((r) => { r.totalColumns = maxCols; });
+  return result;
+}
+
 function formatHour(hour: number): string {
   if (hour === 0) return "12 AM";
   if (hour === 12) return "12 PM";
   return hour < 12 ? `${hour} AM` : `${hour - 12} PM`;
+}
+
+/** Format event time range to 12-hour (e.g. "08:00 - 17:00" -> "8:00 AM - 5:00 PM"). Already-12h strings pass through. */
+function formatEventTimeTo12h(scheduledTime: string | undefined): string {
+  if (!scheduledTime?.trim()) return "";
+  const s = scheduledTime.trim();
+  if (/AM|PM/i.test(s)) return s;
+  if (s.includes(" - ")) {
+    const parts = s.split(" - ").map((p) => formatTime12h(p.trim()));
+    return parts.join(" – ");
+  }
+  return formatTime12h(s);
 }
 
 export const WorkerCalendar = forwardRef<WorkerCalendarRef, WorkerCalendarProps>(({ 
@@ -198,6 +311,7 @@ export const WorkerCalendar = forwardRef<WorkerCalendarRef, WorkerCalendarProps>
   onWithdrawApplication,
   onUpdateTeamMember,
   onGetDirections,
+  onApplyToJobAtStep3,
   isWithdrawing,
   clockInStatus,
   clockInError,
@@ -207,6 +321,14 @@ export const WorkerCalendar = forwardRef<WorkerCalendarRef, WorkerCalendarProps>
   isClockingOut,
   isEmployee = false,
   impersonatedTeamMemberId,
+  calendarHeaderSlotRef,
+  calendarHeaderSlotReady,
+  referencePoints,
+  referenceRadiusMiles,
+  referenceRadiusMilesArray,
+  workerTeamId = null,
+  calendarDeepLinkJobId,
+  onCalendarDeepLinkHandled,
 }, ref) => {
   // Persistent filters - these will be remembered across sessions
   const [view, setView] = usePersistentFilter<CalendarView>("calendar_view", "week");
@@ -214,6 +336,7 @@ export const WorkerCalendar = forwardRef<WorkerCalendarRef, WorkerCalendarProps>
   const [showOpportunities, setShowOpportunities] = usePersistentFilter<boolean>("calendar_show_opportunities", true);
   const [selectedPersonFilter, setSelectedPersonFilter] = usePersistentFilter<"all" | number>("calendar_person_filter", "all");
   const [enabledTeammates, setEnabledTeammates] = usePersistentSetFilter("calendar_enabled_teammates", new Set<number>());
+  const [showBusinessOperator, setShowBusinessOperator] = usePersistentFilter<boolean>("calendar_show_business_operator", true);
   
   // Job type visibility toggles for map view - all on by default
   const [showAcceptedJobs, setShowAcceptedJobs] = usePersistentFilter<boolean>("calendar_show_accepted_jobs", true);
@@ -228,6 +351,9 @@ export const WorkerCalendar = forwardRef<WorkerCalendarRef, WorkerCalendarProps>
   const [showSettings, setShowSettings] = useState(false);
   const [importCalendarUrl, setImportCalendarUrl] = useState("");
   const [isImporting, setIsImporting] = useState(false);
+  const [editingCalendarUrl, setEditingCalendarUrl] = useState<string | null>(null);
+  const [editingCalendarValue, setEditingCalendarValue] = useState("");
+  const [isSavingImportSettings, setIsSavingImportSettings] = useState(false);
   const [copiedExportUrl, setCopiedExportUrl] = useState(false);
   const [currentMediaIndex, setCurrentMediaIndex] = useState(0);
   const [mediaLoaded, setMediaLoaded] = useState(false);
@@ -240,7 +366,16 @@ export const WorkerCalendar = forwardRef<WorkerCalendarRef, WorkerCalendarProps>
   const [showSettingsMenu, setShowSettingsMenu] = useState(false);
   const [settingsSubMenu, setSettingsSubMenu] = useState<"main" | "import" | "export" | "opportunities">("main");
   const [showViewSelector, setShowViewSelector] = useState(false);
-  
+  const [showWorkerFilterSheet, setShowWorkerFilterSheet] = useState(false);
+  const importUrlInputRef = useRef<HTMLInputElement>(null);
+
+  // Focus Import URL input when settings dialog opens so user can paste immediately
+  useEffect(() => {
+    if (!showSettings) return;
+    const t = setTimeout(() => importUrlInputRef.current?.focus(), 100);
+    return () => clearTimeout(t);
+  }, [showSettings]);
+
   // Expose method to open settings menu from parent via ref
   useImperativeHandle(ref, () => ({
     openSettingsMenu: () => {
@@ -248,6 +383,13 @@ export const WorkerCalendar = forwardRef<WorkerCalendarRef, WorkerCalendarProps>
       setSettingsSubMenu("main");
     },
   }));
+
+  // Employees cannot access Export; reset to main if they had export submenu open
+  useEffect(() => {
+    if (showSettingsMenu && isEmployee && settingsSubMenu === "export") {
+      setSettingsSubMenu("main");
+    }
+  }, [showSettingsMenu, isEmployee, settingsSubMenu]);
 
   // Convert currentDateStr from string to Date object for use in components
   const currentDate = useMemo(() => {
@@ -263,41 +405,52 @@ export const WorkerCalendar = forwardRef<WorkerCalendarRef, WorkerCalendarProps>
     setCurrentDateStr(date.toISOString());
   }, [setCurrentDateStr]);
 
-  // Enable all teammates by default when they load (for map view to show all routes)
-  // Only if no saved filter exists
+  // When not on map: enable all teammates by default when they load (only if no saved filter).
+  // When user has deselected all (showBusinessOperator false + size 0), don't override.
+  // When on map: routes are per-person; show one route (auto-select first if none or multiple selected); selection is persisted
   useEffect(() => {
-    if (!isEmployee && activeTeamMembers.length > 0 && enabledTeammates.size === 0) {
-      const allTeammateIds = new Set(activeTeamMembers.map(m => m.id));
-      setEnabledTeammates(allTeammateIds);
+    if (isEmployee || activeTeamMembers.length === 0) return;
+    if (view === "map") {
+      if (enabledTeammates.size !== 1 && activeTeamMembers.length > 0) {
+        const firstId = activeTeamMembers[0].id;
+        setEnabledTeammates(new Set([firstId]));
+      }
+    } else {
+      if (enabledTeammates.size === 0 && showBusinessOperator) {
+        setEnabledTeammates(new Set(activeTeamMembers.map(m => m.id)));
+      }
     }
-  }, [activeTeamMembers, isEmployee, enabledTeammates.size, setEnabledTeammates]);
+  }, [view, activeTeamMembers, isEmployee, enabledTeammates.size, showBusinessOperator, setEnabledTeammates]);
 
   // Filter applications based on role - EXACTLY matching Today tab's filterByRole logic
   const filteredApplications = useMemo(() => {
     let filtered = applications;
     
-    // Admins (business operators) see all jobs by default
+    // Admins (business operators): apply worker filter (Me + enabled teammates)
     if (!isEmployee) {
-      // Apply person filter if set
       if (selectedPersonFilter !== "all") {
         if (selectedPersonFilter === 0) {
-          // "Me" filter - admin's own jobs (no teamMemberId assigned)
           filtered = filtered.filter(a => !a.teamMemberId);
         } else {
-          // Specific team member filter
           filtered = filtered.filter(a => a.teamMemberId === selectedPersonFilter);
         }
+      } else {
+        // selectedPersonFilter === "all" → show Me (if enabled) + enabled teammates
+        filtered = filtered.filter(
+          (a) =>
+            (showBusinessOperator && !a.teamMemberId) ||
+            (a.teamMemberId != null && enabledTeammates.has(a.teamMemberId))
+        );
       }
     } else {
-      // Employees only see jobs assigned specifically to them
-      // If impersonating, check if the application's teamMemberId matches the impersonated team member
+      // Employees only see accepted jobs assigned to them (no pending, no other workers' jobs)
       if (impersonatedTeamMemberId) {
         filtered = filtered.filter(a => a.teamMemberId === impersonatedTeamMemberId);
       } else if (profile?.teamId) {
-        // If the employee has a teamId (direct employee), filter to applications with teamMemberId set
-        // This matches Today tab's exact logic for employees
         filtered = filtered.filter(a => a.teamMemberId !== null && a.teamMemberId !== undefined);
       }
+      // Restrict to accepted only: employee workers cannot see pending on calendar
+      filtered = filtered.filter(a => a.status === "accepted");
     }
     
     // Apply legend filters for accepted and pending jobs
@@ -310,10 +463,15 @@ export const WorkerCalendar = forwardRef<WorkerCalendarRef, WorkerCalendarProps>
     }
     
     return filtered;
-  }, [applications, isEmployee, impersonatedTeamMemberId, selectedPersonFilter, profile?.teamId, showAcceptedJobs, showPendingJobs]);
+  }, [applications, isEmployee, impersonatedTeamMemberId, selectedPersonFilter, profile?.teamId, showAcceptedJobs, showPendingJobs, showBusinessOperator, enabledTeammates]);
   
   const isMobile = useIsMobile();
+  const isDesktop = useIsDesktop();
+  /** View + date nav + settings are portaled into WorkerDashboard header — don't repeat them in the sticky worker row */
+  const mobileCalendarToolbarPortaled =
+    isMobile && !!calendarHeaderSlotRef && !!calendarHeaderSlotReady && !!calendarHeaderSlotRef.current;
   const { toast } = useToast();
+  const queryClient = useQueryClient();
   
   // Fetch timesheets for selected accepted job
   const { data: jobTimesheets = [] } = useQuery<Timesheet[]>({
@@ -332,6 +490,97 @@ export const WorkerCalendar = forwardRef<WorkerCalendarRef, WorkerCalendarProps>
     queryKey: ['/api/profiles', selectedAcceptedEvent?.job?.companyId],
     enabled: !!selectedAcceptedEvent?.job?.companyId,
   });
+
+  // Date range for calendar view (day/week/month) — used for recurring job occurrences and imported events
+  const calendarViewRange = useMemo((): { start: Date; end: Date } | null => {
+    if (view === "day") {
+      const start = startOfDay(currentDate);
+      return { start, end: addDays(start, 1) };
+    }
+    if (view === "week") {
+      const start = startOfWeek(currentDate, { weekStartsOn: 0 });
+      const end = endOfWeek(currentDate, { weekStartsOn: 0 });
+      return { start, end: addDays(end, 1) };
+    }
+    if (view === "month") {
+      const start = startOfMonth(currentDate);
+      const end = endOfMonth(currentDate);
+      return { start, end: addDays(end, 1) };
+    }
+    return null;
+  }, [view, currentDate]);
+
+  // Date range for imported iCal events (day/week/month only; not used on map)
+  const importedEventsRange = useMemo(() => {
+    if (!calendarViewRange) return null;
+    return { start: calendarViewRange.start.toISOString(), end: calendarViewRange.end.toISOString() };
+  }, [calendarViewRange]);
+
+  const { data: importedEventsData } = useQuery<{ events: { title: string; start: string; end: string; sourceProfileId?: number; sourceName?: string }[] }>({
+    queryKey: ["/api/calendar/imported-events", importedEventsRange?.start, importedEventsRange?.end],
+    queryFn: async () => {
+      if (!importedEventsRange) return { events: [] };
+      const res = await fetch(
+        `/api/calendar/imported-events?start=${encodeURIComponent(importedEventsRange.start)}&end=${encodeURIComponent(importedEventsRange.end)}`,
+        { credentials: "include" }
+      );
+      if (!res.ok) return { events: [] };
+      const data = await res.json();
+      const events = Array.isArray(data?.events) ? data.events : Array.isArray(data) ? data : [];
+      return { events };
+    },
+    enabled: !!profile && view !== "map" && !!importedEventsRange,
+    refetchOnWindowFocus: true,
+  });
+
+  const importedEvents = importedEventsData?.events ?? [];
+
+  const { data: importSettingsData } = useQuery<{ importedCalendars: string[] }>({
+    queryKey: ["/api/calendar/import-settings"],
+    queryFn: async () => {
+      const res = await fetch("/api/calendar/import-settings", { credentials: "include" });
+      if (!res.ok) return { importedCalendars: [] };
+      const data = await res.json();
+      return Array.isArray(data?.importedCalendars) ? data : { importedCalendars: [] };
+    },
+    enabled: !!profile,
+  });
+  const importedCalendarList = Array.isArray(importSettingsData?.importedCalendars) ? importSettingsData.importedCalendars : [];
+  
+  const saveImportSettings = useCallback(async (urls: string[]) => {
+    setIsSavingImportSettings(true);
+    try {
+      const res = await fetch("/api/calendar/import-settings", {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ importedCalendars: urls }),
+      });
+      if (res.ok) {
+        queryClient.invalidateQueries({ queryKey: ["/api/calendar/import-settings"] });
+        queryClient.invalidateQueries({ queryKey: ["/api/calendar/imported-events"] });
+        setEditingCalendarUrl(null);
+        setEditingCalendarValue("");
+      } else {
+        toast({ title: "Failed to update", description: "Could not save calendar list.", variant: "destructive" });
+      }
+    } catch {
+      toast({ title: "Failed to update", description: "Please try again.", variant: "destructive" });
+    } finally {
+      setIsSavingImportSettings(false);
+    }
+  }, [queryClient, toast]);
+
+  const handleRemoveImportedCalendar = useCallback((url: string) => {
+    const next = importedCalendarList.filter((u) => u !== url);
+    saveImportSettings(next);
+  }, [importedCalendarList, saveImportSettings]);
+
+  const handleSaveEditCalendar = useCallback((oldUrl: string, newUrl: string) => {
+    if (!newUrl.trim()) return;
+    const next = importedCalendarList.map((u) => (u === oldUrl ? newUrl.trim() : u));
+    saveImportSettings(next);
+  }, [importedCalendarList, saveImportSettings]);
   
   const exportCalendarUrl = typeof window !== "undefined" 
     ? `${window.location.origin}/api/calendar/feed/${profile?.id || "worker"}.ics`
@@ -348,24 +597,49 @@ export const WorkerCalendar = forwardRef<WorkerCalendarRef, WorkerCalendarProps>
     }
   };
   
+  const normalizeCalendarUrl = (input: string): string => {
+    const s = input.trim();
+    if (!s) return s;
+    const re = /https?:\/\//gi;
+    const first = re.exec(s);
+    if (!first) return s;
+    const start = first.index;
+    const next = re.exec(s);
+    const end = next ? next.index : s.length;
+    return s.slice(start, end).trim();
+  };
+
   const handleImportCalendar = async () => {
     if (!importCalendarUrl.trim()) {
       toast({ title: "Enter a URL", description: "Please paste a calendar URL to import.", variant: "destructive" });
+      return;
+    }
+    const urlToAdd = normalizeCalendarUrl(importCalendarUrl);
+    if (!urlToAdd) {
+      toast({ title: "Invalid URL", description: "Please paste a valid calendar URL.", variant: "destructive" });
       return;
     }
     setIsImporting(true);
     try {
       const response = await fetch("/api/calendar/import", {
         method: "POST",
+        credentials: "include",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ url: importCalendarUrl }),
+        body: JSON.stringify({ url: urlToAdd }),
       });
       if (response.ok) {
         toast({ title: "Calendar imported!", description: "Your external events have been added." });
         setImportCalendarUrl("");
-        setShowSettings(false);
+        queryClient.invalidateQueries({ queryKey: ["/api/calendar/import-settings"] });
+        queryClient.invalidateQueries({ queryKey: ["/api/calendar/imported-events"] });
+        await queryClient.refetchQueries({ queryKey: ["/api/calendar/import-settings"] });
+        // Refetch imported events after a short delay so server session is saved and next request sees new URLs
+        setTimeout(() => {
+          queryClient.refetchQueries({ queryKey: ["/api/calendar/imported-events"] });
+        }, 300);
       } else {
-        toast({ title: "Import failed", description: "Could not import from this URL.", variant: "destructive" });
+        const data = await response.json().catch(() => ({}));
+        toast({ title: "Import failed", description: (data as { message?: string })?.message || "Could not import from this URL.", variant: "destructive" });
       }
     } catch {
       toast({ title: "Import failed", description: "Please check the URL and try again.", variant: "destructive" });
@@ -420,15 +694,15 @@ export const WorkerCalendar = forwardRef<WorkerCalendarRef, WorkerCalendarProps>
     }
   };
   
-  // Get relative day label - matches TodayPage/EnhancedJobDialog
+  // Get relative day label - matches WorkerDashboard accepted card (lowercase: today, tomorrow, in N days)
   const getRelativeDay = (date: Date): string => {
-    if (isToday(date)) return "Today";
-    if (isTomorrow(date)) return "Tomorrow";
+    if (isToday(date)) return "today";
+    if (isTomorrow(date)) return "tomorrow";
     
     const daysFromNow = differenceInDays(date, new Date());
     if (daysFromNow < 0) return "Past";
-    if (daysFromNow <= 6) return `In ${daysFromNow} days`;
-    if (daysFromNow <= 13) return "Next week";
+    if (daysFromNow <= 6) return `in ${daysFromNow} days`;
+    if (daysFromNow <= 13) return "next week";
     
     return format(date, "EEE, MMM d");
   };
@@ -447,62 +721,56 @@ export const WorkerCalendar = forwardRef<WorkerCalendarRef, WorkerCalendarProps>
     return sorted.map(d => dayAbbrev[d.toLowerCase()] || d).join(", ");
   };
 
-  // Get time range for job - handles both "HH:MM" (24h) and "h:mm AM/PM" (12h) formats
+  // Get time range for job - 12h format with " AM" / " PM" (e.g. "8:00 AM - 5:00 PM"). If scheduledTime contains " - ", use only the start part to avoid duplicating end time.
   const getTimeRange = (job: Job): { startTime: string | null; endTime: string | null } => {
     let startTime: string | null = null;
     let endTime: string | null = null;
-    
+
     const parseAndFormatTime = (t: string): string => {
-      // Check if already in AM/PM format
-      const ampmMatch = t.match(/(\d+):?(\d*)?\s*(AM|PM)/i);
-      if (ampmMatch) {
-        const hr = parseInt(ampmMatch[1]);
-        const min = ampmMatch[2] || "00";
-        const period = ampmMatch[3].toLowerCase();
-        return min === "00" || !ampmMatch[2] ? `${hr}${period}` : `${hr}:${min}${period}`;
-      }
-      
-      // Parse 24-hour format "HH:MM"
-      const parts = t.split(":");
-      const hr = parseInt(parts[0]);
-      const minStr = parts[1]?.replace(/\D/g, '') || "00";
-      const ampm = hr >= 12 ? "pm" : "am";
-      const h12 = hr > 12 ? hr - 12 : hr === 0 ? 12 : hr;
-      return minStr === "00" ? `${h12}${ampm}` : `${h12}:${minStr}${ampm}`;
+      const trimmed = t.trim();
+      if (trimmed.toLowerCase().includes("am") || trimmed.toLowerCase().includes("pm")) return trimmed;
+      return formatTime12h(trimmed);
     };
-    
+
     if (job.scheduledTime) {
-      startTime = parseAndFormatTime(job.scheduledTime);
-      if (job.endTime) {
-        endTime = parseAndFormatTime(job.endTime);
-      }
+      const raw = parseAndFormatTime(job.scheduledTime);
+      startTime = raw.includes(" - ") ? raw.split(" - ").map((s) => s.trim())[0] || raw : raw;
+      if (job.endTime) endTime = parseAndFormatTime(job.endTime);
     }
-    
     return { startTime, endTime };
   };
 
-  // Format job time info matching TodayPage/EnhancedJobDialog style
-  const formatJobTime = (job: Job): { relative: string; timeRange: string; fullDate: string; scheduleDaysDisplay?: string } => {
+  // Format job time info - matches WorkerDashboard accepted card: "Feb 12 (in 6 days) Start 8am - 5pm"
+  const formatJobTime = (job: Job): { relative: string; timeRange: string; fullDate: string; scheduleDaysDisplay?: string; dateTimeLine?: string } => {
     if (!job.startDate) {
-      return { relative: "On Demand", timeRange: "Flexible hours", fullDate: "Flexible schedule" };
+      return { relative: "On Demand", timeRange: "Flexible hours", fullDate: "Flexible schedule", dateTimeLine: "On Demand" };
     }
     
     const startDate = new Date(job.startDate);
     const relativeDay = getRelativeDay(startDate);
     const fullDate = format(startDate, "EEEE, MMMM d, yyyy");
+    const dateStr = format(startDate, "MMM d");
+    const datePart = relativeDay ? `${dateStr} (${relativeDay})` : dateStr;
     
     const { startTime, endTime } = getTimeRange(job);
     let timeRange = startTime && endTime ? `${startTime} - ${endTime}` : (startTime || "Flexible");
+    let dateTimeLine = startTime
+      ? (endTime ? `${datePart} Start ${startTime} - ${endTime}` : `${datePart} Start ${startTime}`)
+      : datePart;
     
     if (job.jobType === "recurring") {
-      const scheduleDaysDisplay = formatScheduleDays(job.scheduleDays);
-      return { relative: relativeDay, timeRange, fullDate, scheduleDaysDisplay };
+      const scheduleDaysDisplay = formatScheduleDays(job.scheduleDays || (job as { recurringDays?: string[] }).recurringDays);
+      if (scheduleDaysDisplay) {
+        const relPart = relativeDay ? ` (${relativeDay})` : "";
+        dateTimeLine = `${scheduleDaysDisplay}${relPart} Start ${timeRange}`;
+      }
+      return { relative: relativeDay, timeRange, fullDate, scheduleDaysDisplay, dateTimeLine };
     }
     
-    return { relative: relativeDay, timeRange, fullDate };
+    return { relative: relativeDay, timeRange, fullDate, dateTimeLine };
   };
 
-  // Format job time for display - matches TodayPage style exactly
+  // Format job time for display - matches WorkerDashboard accepted job card: "Feb 12 (in 6 days) Start 8am - 5pm"
   const JobTimeDisplay = ({ job, showFullDate = false }: { job: Job; showFullDate?: boolean }) => {
     const timeInfo = formatJobTime(job);
     const isRecurring = job.jobType === "recurring";
@@ -565,8 +833,8 @@ export const WorkerCalendar = forwardRef<WorkerCalendarRef, WorkerCalendarProps>
     return (
       <div className="space-y-0.5">
         <p className="font-semibold text-sm">
-          {timeInfo.relative}
-          {timeInfo.timeRange && (
+          {timeInfo.dateTimeLine ?? timeInfo.relative}
+          {!timeInfo.dateTimeLine && timeInfo.timeRange && (
             <span className="text-sm font-medium text-muted-foreground ml-1">
               ({timeInfo.timeRange})
             </span>
@@ -650,15 +918,18 @@ export const WorkerCalendar = forwardRef<WorkerCalendarRef, WorkerCalendarProps>
         const isRecurring = job.jobType === "recurring" && job.scheduleDays && job.scheduleDays.length > 0;
         
         if (isAccepted && isRecurring) {
-          const recurringDates = getRecurringDates(job);
+          const rangeStart = calendarViewRange?.start;
+          const rangeEnd = calendarViewRange?.end;
+          const recurringDates = getRecurringDates(job, rangeStart, rangeEnd);
           recurringDates.forEach((date, index) => {
+            const { start, end } = applyScheduledTimeToDay(date, job.scheduledTime ?? undefined, job.estimatedHours ?? undefined);
             result.push({
               id: job.id * 1000 + index,
               applicationId: app.id,
               proposedRate: app.proposedRate || undefined,
               title: job.title,
-              startDate: date,
-              endDate: job.endDate ? new Date(job.endDate) : undefined,
+              startDate: start,
+              endDate: end,
               scheduledTime: job.scheduledTime || undefined,
               estimatedHours: job.estimatedHours || undefined,
               location: job.city || job.location || undefined,
@@ -670,13 +941,18 @@ export const WorkerCalendar = forwardRef<WorkerCalendarRef, WorkerCalendarProps>
             });
           });
         } else {
+          const jobStart = new Date(job.startDate);
+          const hasTimeRange = job.scheduledTime?.trim();
+          const { start, end } = hasTimeRange
+            ? applyScheduledTimeToDay(jobStart, job.scheduledTime ?? undefined, job.estimatedHours ?? undefined)
+            : { start: jobStart, end: job.endDate ? new Date(job.endDate) : new Date(jobStart.getTime() + (job.estimatedHours ?? 4) * 60 * 60 * 1000) };
           result.push({
             id: job.id,
             applicationId: app.id,
             proposedRate: app.proposedRate || undefined,
             title: job.title,
-            startDate: new Date(job.startDate),
-            endDate: job.endDate ? new Date(job.endDate) : undefined,
+            startDate: start,
+            endDate: end,
             scheduledTime: job.scheduledTime || undefined,
             estimatedHours: job.estimatedHours || undefined,
             location: job.city || job.location || undefined,
@@ -696,11 +972,16 @@ export const WorkerCalendar = forwardRef<WorkerCalendarRef, WorkerCalendarProps>
       const appliedJobIds = new Set(applications.map(a => a.jobId));
       availableJobs.forEach(job => {
         if (!appliedJobIds.has(job.id)) {
+          const jobStart = new Date(job.startDate);
+          const hasTimeRange = job.scheduledTime?.trim();
+          const { start, end } = hasTimeRange
+            ? applyScheduledTimeToDay(jobStart, job.scheduledTime ?? undefined, job.estimatedHours ?? undefined)
+            : { start: jobStart, end: job.endDate ? new Date(job.endDate) : new Date(jobStart.getTime() + (job.estimatedHours ?? 4) * 60 * 60 * 1000) };
           result.push({
             id: job.id,
             title: job.title,
-            startDate: new Date(job.startDate),
-            endDate: job.endDate ? new Date(job.endDate) : undefined,
+            startDate: start,
+            endDate: end,
             scheduledTime: job.scheduledTime || undefined,
             estimatedHours: job.estimatedHours || undefined,
             location: job.city || job.location || undefined,
@@ -713,12 +994,57 @@ export const WorkerCalendar = forwardRef<WorkerCalendarRef, WorkerCalendarProps>
     }
     
     return result;
-  }, [filteredApplications, availableJobs, showOpportunities, isEmployee, showAvailableJobs, applications]);
+  }, [filteredApplications, availableJobs, showOpportunities, isEmployee, showAvailableJobs, applications, calendarViewRange]);
 
-  // Transform data for CalendarMapView (only when admin and view is map)
+  // One-shot deep link: open the same accepted-event details popup used by calendar clicks.
+  useEffect(() => {
+    if (!calendarDeepLinkJobId) return;
+    const targetEvent = events.find((event) => event.type === "accepted" && event.job.id === calendarDeepLinkJobId);
+    if (!targetEvent) return;
+    setCurrentMediaIndex(0);
+    setMediaLoaded(false);
+    setSelectedAcceptedEvent(targetEvent);
+    onCalendarDeepLinkHandled?.();
+  }, [calendarDeepLinkJobId, events, onCalendarDeepLinkHandled]);
+
+  const mapDateKey = format(currentDate, "yyyy-MM-dd");
+  const { data: historicalTeamMembers = [] } = useQuery<WorkerTeamMember[]>({
+    queryKey: ["/api/worker-team", workerTeamId, "members", "historical", mapDateKey],
+    enabled: !isEmployee && view === "map" && !!workerTeamId,
+    queryFn: async () => {
+      if (!workerTeamId) return [];
+      const res = await fetch(`/api/worker-team/${workerTeamId}/members?date=${encodeURIComponent(mapDateKey)}`, {
+        credentials: "include",
+      });
+      if (!res.ok) return [];
+      return res.json();
+    },
+    staleTime: 60 * 1000,
+  });
+
+  // Transform data for CalendarMapView. For employees: single "self" teammate; for admin: all active team members.
   const mapTeammates = useMemo(() => {
-    if (isEmployee) return [];
-    return activeTeamMembers.map(member => {
+    if (isEmployee) {
+        // Employee: one teammate = self (profile). Use first application's teamMemberId so assignments group correctly.
+        const firstApp = applications.find(a => a.status === "accepted" && a.teamMemberId != null);
+        const selfId = firstApp?.teamMemberId ?? profile?.id ?? 0;
+        const lat = profile?.latitude ? parseFloat(profile.latitude) : null;
+        const lng = profile?.longitude ? parseFloat(profile.longitude) : null;
+        return [{
+          id: selfId,
+          firstName: profile?.firstName ?? "",
+          lastName: profile?.lastName ?? "",
+          avatarUrl: profile?.avatarUrl ?? null,
+          workLocationAddress: profile?.address ?? null,
+          workLocationLat: lat,
+          workLocationLng: lng,
+          liveLocationLat: lat,
+          liveLocationLng: lng,
+          liveLocationTimestamp: new Date(),
+        }];
+    }
+    const mapLocationMembers = historicalTeamMembers.length > 0 ? historicalTeamMembers : activeTeamMembers;
+    return mapLocationMembers.map(member => {
       // Work location = home/start address coordinates (home base)
       // Use latitude/longitude from workerTeamMembers table as work location
       let workLocationLat: number | null = null;
@@ -751,6 +1077,15 @@ export const WorkerCalendar = forwardRef<WorkerCalendarRef, WorkerCalendarProps>
         ? memberAny.liveLocationLng
         : workLocationLng; // Fallback to work location if no live location
       const liveLocationTimestamp = memberAny.liveLocationTimestamp || new Date();
+      const liveLocationPath = Array.isArray(memberAny.liveLocationPath)
+        ? memberAny.liveLocationPath
+            .map((pt: any) => ({
+              lat: Number(pt?.lat),
+              lng: Number(pt?.lng),
+              createdAt: pt?.createdAt ?? null,
+            }))
+            .filter((pt: any) => Number.isFinite(pt.lat) && Number.isFinite(pt.lng))
+        : [];
       
       return {
         id: member.id,
@@ -763,20 +1098,14 @@ export const WorkerCalendar = forwardRef<WorkerCalendarRef, WorkerCalendarProps>
         liveLocationLat, // From location pings API, falls back to work location
         liveLocationLng, // From location pings API, falls back to work location
         liveLocationTimestamp, // From location pings API
+        liveLocationPath,
       };
     });
-  }, [activeTeamMembers, isEmployee]);
+  }, [activeTeamMembers, historicalTeamMembers, isEmployee, applications, profile]);
 
   const mapJobAssignments = useMemo(() => {
-    if (isEmployee) return [];
-    
-    console.log(`🔍 Debugging map job assignments:`);
-    console.log(`  📅 Selected date: ${format(currentDate, "yyyy-MM-dd")}`);
-    console.log(`  📦 Total applications: ${applications.length}`);
-    console.log(`  📦 Filtered applications (by person): ${filteredApplications.length}`);
-    
-    // Filter by date only - include all applications with jobs, regardless of status or teamMemberId
-    const jobsWithTeamMember = filteredApplications.filter(app => {
+    // Filter by date - jobs on selected date (±1 day)
+    const filterByDate = (app: (typeof filteredApplications)[0]) => {
       // Only require that the application has a job
       if (!app.job) {
         return false;
@@ -785,7 +1114,6 @@ export const WorkerCalendar = forwardRef<WorkerCalendarRef, WorkerCalendarProps>
       // Filter by date - check if job startDate matches currentDate (allow ±1 day for flexibility)
       const jobDate = app.job.startDate ? new Date(app.job.startDate) : null;
       if (!jobDate) {
-        console.log(`  ⚠️ Job ${app.job.id} has no startDate`);
         return false;
       }
       
@@ -802,22 +1130,20 @@ export const WorkerCalendar = forwardRef<WorkerCalendarRef, WorkerCalendarProps>
         jobDateNormalized.getTime() === dayAfter.getTime();
       
       if (!isWithinRange) {
-        console.log(`  📅 Job ${app.job.id} date mismatch: ${format(jobDate, "yyyy-MM-dd")} vs ${format(currentDate, "yyyy-MM-dd")} (showing ±1 day)`);
         return false;
       }
       
       return true;
-    });
+    };
     
-    console.log(`🗺️ Map job assignments: ${jobsWithTeamMember.length} jobs for ${format(currentDate, "yyyy-MM-dd")}`);
-    jobsWithTeamMember.forEach(app => {
-      const job = app.job!;
-      console.log(`  ✅ Job ${job.id}: ${job.title} - Status: ${app.status} - Team Member ${app.teamMemberId} - Date: ${format(new Date(job.startDate), "yyyy-MM-dd")} - Coords: ${job.latitude || "NO LAT"}, ${job.longitude || "NO LNG"}`);
-    });
+    const jobsWithTeamMember = filteredApplications.filter(filterByDate);
     
     return jobsWithTeamMember.map(app => {
       const job = app.job!;
       const fullAddress = `${job.address || ""}, ${job.city || ""}, ${job.state || ""} ${job.zipCode || ""}`.replace(/^, |, $/g, "") || job.location || "Address not provided";
+      const selfId = isEmployee
+        ? applications.find((a) => a.status === "accepted" && a.teamMemberId != null)?.teamMemberId
+        : undefined;
       return {
         jobId: job.id,
         jobTitle: job.title,
@@ -826,11 +1152,15 @@ export const WorkerCalendar = forwardRef<WorkerCalendarRef, WorkerCalendarProps>
         longitude: job.longitude,
         scheduledStart: job.startDate,
         scheduledEnd: job.endDate || job.startDate,
-        status: "scheduled",
-        teamMemberId: app.teamMemberId || null, // Allow null teamMemberId
+        status: app.status ?? "pending",
+        teamMemberId: app.teamMemberId ?? selfId ?? (profile?.id ?? 0),
       };
     });
-  }, [filteredApplications, isEmployee, currentDate]);
+  }, [filteredApplications, isEmployee, currentDate, applications, profile?.id]);
+  const mapEnabledTeammates = useMemo(
+    () => (isEmployee ? new Set(mapTeammates.map((t) => t.id)) : enabledTeammates),
+    [isEmployee, mapTeammates, enabledTeammates]
+  );
 
   const [focusedTeammateId, setFocusedTeammateId] = useState<number | null>(null);
   
@@ -886,9 +1216,44 @@ export const WorkerCalendar = forwardRef<WorkerCalendarRef, WorkerCalendarProps>
     return eachDayOfInterval({ start: monthStart, end: monthEnd });
   }, [currentDate]);
 
-  const getEventsForDate = (date: Date) => {
-    return events.filter(event => isSameDay(event.startDate, date));
-  };
+  // Convert API imported events to CalendarEvent[] (only for day/week/month; not shown on map)
+  const importedCalendarEvents = useMemo((): CalendarEvent[] => {
+    return importedEvents.reduce<CalendarEvent[]>((acc, ev, idx) => {
+      if (!ev?.start || !ev?.end) return acc;
+      const start = new Date(ev.start);
+      const end = new Date(ev.end);
+      if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return acc;
+      const eventId = -10000 - idx;
+      const scheduledTime =
+        format(start, "h:mm a") + (end.getTime() !== start.getTime() ? ` - ${format(end, "h:mm a")}` : "");
+      const syntheticJob = { id: eventId, title: ev.title || "Event", startDate: start, companyId: null } as unknown as Job;
+      acc.push({
+        id: eventId,
+        title: ev.title || "Event",
+        startDate: start,
+        endDate: end,
+        scheduledTime,
+        type: "imported",
+        job: syntheticJob,
+        sourceName: ev.sourceName,
+        sourceProfileId: ev.sourceProfileId,
+      });
+      return acc;
+    }, []);
+  }, [importedEvents]);
+
+  // Day/week/month: merge job events with imported calendar events for the given date. Map view shows only jobs.
+  const getEventsForDate = useCallback((date: Date) => {
+    const jobEvents = events.filter(event => isSameDay(event.startDate, date));
+    if (view === "map") return jobEvents;
+    const dayStart = startOfDay(date);
+    const dayEnd = addDays(dayStart, 1);
+    const importedForDay = importedCalendarEvents.filter(ev => {
+      const evEnd = ev.endDate ? ev.endDate.getTime() : ev.startDate.getTime();
+      return ev.startDate.getTime() < dayEnd.getTime() && evEnd > dayStart.getTime();
+    });
+    return [...jobEvents, ...importedForDay];
+  }, [events, view, importedCalendarEvents]);
 
   // Helper function to add ordinal suffix (1st, 2nd, 3rd, etc.)
   const getOrdinalSuffix = (day: number): string => {
@@ -998,34 +1363,49 @@ export const WorkerCalendar = forwardRef<WorkerCalendarRef, WorkerCalendarProps>
     return `$${(workerHourlyRate * hours).toFixed(0)}`;
   };
 
-  const renderEventBlock = (event: CalendarEvent, compact = false) => {
+  const renderEventBlock = (event: CalendarEvent, compact = false, fillHeight = false) => {
+    const isImported = event.type === "imported";
     const isOpportunity = event.type === "opportunity";
     const isAccepted = event.type === "accepted";
     const hasNoTime = !event.scheduledTime;
     
-    // Determine which avatar to show:
-    // - For accepted jobs: show the company (job owner) avatar
-    // - For pending jobs with team member: show team member's avatar  
-    // - For pending jobs without team member: show admin's avatar (profile)
+    // Imported (iCal) events: light gray, read-only, no job dialog
+    if (isImported) {
+      return (
+        <div
+          key={event.id}
+          className="relative z-10 rounded px-1.5 py-0.5 text-xs cursor-default overflow-hidden bg-gray-200 text-gray-600 dark:bg-gray-700 dark:text-gray-400 border border-gray-300 dark:border-gray-600"
+          title={event.sourceName ? `${event.title} (${event.sourceName})` : event.title}
+          onClick={(e) => e.stopPropagation()}
+          data-testid={`calendar-event-${event.id}`}
+        >
+          <div className="font-medium truncate text-[11px]">{event.title}</div>
+          {!compact && event.sourceName && (
+            <div className="text-[10px] opacity-80 truncate">{event.sourceName}</div>
+          )}
+          {!compact && event.scheduledTime && (
+            <div className="text-[10px] opacity-70">{formatEventTimeTo12h(event.scheduledTime)}</div>
+          )}
+        </div>
+      );
+    }
+    
+    // Determine which avatar to show (workers on the job, like job details popup):
+    // - Team member avatar when assigned, else profile (admin/self)
     const showAvatar = !isOpportunity && !compact;
     
     let avatarUrl: string | null | undefined;
     let avatarInitials: string;
     let personName: string;
     
-    if (isAccepted) {
-      // For accepted jobs, show the company (job owner) avatar
-      avatarUrl = event.company?.companyLogo || event.company?.avatarUrl;
-      avatarInitials = event.company?.companyName?.[0] || event.company?.firstName?.[0] || 'C';
-      personName = event.company?.companyName || `${event.company?.firstName || ''} ${event.company?.lastName || ''}`.trim() || 'Company';
-    } else if (event.teamMember) {
+    if (event.teamMember) {
       avatarUrl = event.teamMember.avatarUrl;
-      avatarInitials = `${event.teamMember.firstName?.[0] || ''}${event.teamMember.lastName?.[0] || ''}`;
-      personName = `${event.teamMember.firstName} ${event.teamMember.lastName?.[0]}.`;
+      avatarInitials = `${event.teamMember.firstName?.[0] || ''}${event.teamMember.lastName?.[0] || ''}`.trim() || "?";
+      personName = `${event.teamMember.firstName || ''} ${event.teamMember.lastName || ''}`.trim() || 'Worker';
     } else {
       avatarUrl = profile?.avatarUrl;
-      avatarInitials = `${profile?.firstName?.[0] || ''}${profile?.lastName?.[0] || ''}`;
-      personName = `${profile?.firstName || ''} (Me)`;
+      avatarInitials = `${profile?.firstName?.[0] || ''}${profile?.lastName?.[0] || ''}`.trim() || "?";
+      personName = `${profile?.firstName || ''} ${profile?.lastName || ''}`.trim() || '(Me)';
     }
     
     const baseClasses = "relative z-10 rounded px-1.5 py-0.5 text-xs cursor-pointer transition-all overflow-hidden";
@@ -1038,7 +1418,7 @@ export const WorkerCalendar = forwardRef<WorkerCalendarRef, WorkerCalendarProps>
     return (
       <div
         key={event.id}
-        className={`${baseClasses} ${typeClasses}`}
+        className={`${baseClasses} ${typeClasses}${fillHeight ? " h-full flex flex-col min-h-0" : ""}`}
         onClick={(e) => {
           e.stopPropagation();
           if (isOpportunity) {
@@ -1047,6 +1427,20 @@ export const WorkerCalendar = forwardRef<WorkerCalendarRef, WorkerCalendarProps>
             setCurrentMediaIndex(0);
             setMediaLoaded(false);
             setSelectedAcceptedEvent(event);
+          } else if (event.type === "pending") {
+            const app = event.applicationId != null ? {
+              id: event.applicationId,
+              status: "pending" as const,
+              proposedRate: event.proposedRate ?? null,
+              teamMember: event.teamMember ? {
+                id: event.teamMember.id,
+                firstName: event.teamMember.firstName ?? null,
+                lastName: event.teamMember.lastName ?? null,
+                avatarUrl: event.teamMember.avatarUrl ?? null,
+                hourlyRate: (event.teamMember as { hourlyRate?: number | null }).hourlyRate ?? null,
+              } : null,
+            } : undefined;
+            onViewJob(event.job, app ?? undefined);
           } else {
             setSelectedEvent(event);
           }
@@ -1055,10 +1449,21 @@ export const WorkerCalendar = forwardRef<WorkerCalendarRef, WorkerCalendarProps>
       >
         <div className="flex items-center gap-1">
           {showAvatar && (
-            <Avatar className="w-4 h-4 flex-shrink-0 border border-white/50">
-              <AvatarImage src={avatarUrl || undefined} />
-              <AvatarFallback className="text-[6px]">
-                {avatarInitials}
+            <Avatar className="h-4 w-4 min-w-4 flex-shrink-0 overflow-hidden rounded-full border border-white/50 ring-0">
+              <AvatarImage
+                src={(() => {
+                  const raw = avatarUrl ?? undefined;
+                  if (!raw) return undefined;
+                  const normalized = normalizeAvatarUrl(raw);
+                  if (!normalized) return undefined;
+                  if (normalized.startsWith("http") || normalized.startsWith("data:")) return normalized;
+                  return typeof window !== "undefined" ? `${window.location.origin}${normalized.startsWith("/") ? normalized : `/${normalized}`}` : normalized;
+                })()}
+                className="aspect-square h-full w-full object-cover"
+                referrerPolicy="no-referrer"
+              />
+              <AvatarFallback className="flex h-full w-full items-center justify-center rounded-full bg-muted text-[10px] font-medium">
+                {avatarInitials || "?"}
               </AvatarFallback>
             </Avatar>
           )}
@@ -1070,7 +1475,7 @@ export const WorkerCalendar = forwardRef<WorkerCalendarRef, WorkerCalendarProps>
           </div>
         )}
         {!compact && event.scheduledTime && (
-          <div className="text-[10px] opacity-80">{event.scheduledTime}</div>
+          <div className="text-[10px] opacity-80">{formatEventTimeTo12h(event.scheduledTime)}</div>
         )}
         {!compact && hasNoTime && isOpportunity && (
           <div className="text-[10px] opacity-70 italic">Flexible</div>
@@ -1080,7 +1485,13 @@ export const WorkerCalendar = forwardRef<WorkerCalendarRef, WorkerCalendarProps>
   };
 
   const renderMiniCalendar = () => (
-    <div className="hidden lg:block w-56 flex-shrink-0 border-r p-3 bg-background">
+    <div
+      className={cn(
+        "hidden lg:block w-56 flex-shrink-0 border-r bg-background p-3",
+        /* Sticky in the dashboard scroll area; self-start avoids stretching to main column height */
+        "sticky top-0 z-20 self-start min-h-0 max-h-[100dvh] overflow-y-auto overflow-x-hidden overscroll-y-contain"
+      )}
+    >
       <div className="mb-3">
         <div className="flex items-center justify-between mb-2">
           <span className="text-sm font-medium">{format(currentDate, "MMMM yyyy")}</span>
@@ -1131,8 +1542,8 @@ export const WorkerCalendar = forwardRef<WorkerCalendarRef, WorkerCalendarProps>
       </div>
 
       <div className="space-y-3 mt-4 pt-4 border-t">
-        {/* Person Filter for Admins - Only show if not employee and has team members */}
-        {!isEmployee && activeTeamMembers.length > 0 && (
+        {/* Person Filter for Admins - hide on Routes view (routes are per-person, use "Show route for" below) */}
+        {!isEmployee && activeTeamMembers.length > 0 && view !== "map" && (
           <div className="space-y-2">
             <p className="text-xs text-muted-foreground font-medium">Filter by Person</p>
             <div className="space-y-1.5">
@@ -1192,6 +1603,35 @@ export const WorkerCalendar = forwardRef<WorkerCalendarRef, WorkerCalendarProps>
                   <span className="truncate">{member.firstName} {member.lastName}</span>
                 </button>
               ))}
+            </div>
+          </div>
+        )}
+
+        {/* Routes view only: show one person's route at a time (per-person); selection remembered */}
+        {!isEmployee && view === "map" && activeTeamMembers.length > 0 && (
+          <div className="space-y-2">
+            <p className="text-xs text-muted-foreground font-medium">Show route for</p>
+            <div className="space-y-1.5">
+              {activeTeamMembers.map((member) => {
+                const isSelected = enabledTeammates.size === 1 && enabledTeammates.has(member.id);
+                return (
+                  <button
+                    key={member.id}
+                    onClick={() => setEnabledTeammates(new Set([member.id]))}
+                    className={`w-full flex items-center gap-2 px-2 py-1.5 rounded text-xs transition-colors ${
+                      isSelected ? "bg-primary/10 text-primary" : "hover:bg-muted"
+                    }`}
+                  >
+                    <Avatar className="w-5 h-5">
+                      <AvatarImage src={member.avatarUrl || undefined} />
+                      <AvatarFallback className="text-[8px]">
+                        {member.firstName?.[0]}{member.lastName?.[0]}
+                      </AvatarFallback>
+                    </Avatar>
+                    <span className="truncate">{member.firstName} {member.lastName}</span>
+                  </button>
+                );
+              })}
             </div>
           </div>
         )}
@@ -1277,52 +1717,77 @@ export const WorkerCalendar = forwardRef<WorkerCalendarRef, WorkerCalendarProps>
 
   const renderDayView = () => (
     <div className="flex flex-col h-full overflow-hidden">
-      <div className="flex border-b sticky top-0 bg-background z-10">
-        <div className="w-16 flex-shrink-0 border-r py-2 text-center text-[10px] text-muted-foreground">
-          GMT-05
-        </div>
-        <div className="flex-1 py-2 text-center">
-          <div className="text-[10px] text-muted-foreground uppercase tracking-wider">{format(currentDate, "EEE")}</div>
-          <div className={`text-2xl font-medium mt-0.5 ${isToday(currentDate) ? "bg-primary text-primary-foreground rounded-full w-10 h-10 flex items-center justify-center mx-auto" : ""}`}>
-            {format(currentDate, "d")}
-          </div>
-        </div>
-      </div>
-      
-      <div className="flex-1 overflow-y-auto">
-        <div className="flex">
-          <div className="w-16 flex-shrink-0 border-r">
-            {HOURS.map(hour => (
-              <div 
-                key={hour} 
-                className="border-b text-[10px] text-muted-foreground text-right pr-2 flex items-start pt-0.5"
-                style={{ height: `${HOUR_HEIGHT}px` }}
-              >
-                {formatHour(hour)}
+      {/* Single scroll container so header and body share width and columns align */}
+      <div className="flex-1 min-h-0 overflow-y-auto">
+        <div className="flex flex-col min-h-min">
+          <div className="flex border-b sticky top-0 bg-background z-10 shrink-0">
+            <div className="w-16 flex-shrink-0 border-r py-2 text-center text-[10px] text-muted-foreground">
+              Time
+            </div>
+            <div className="flex-1 min-w-0 py-2 text-center">
+              <div className="text-[10px] text-muted-foreground uppercase tracking-wider">{format(currentDate, "EEE")}</div>
+              <div className={`text-2xl font-medium mt-0.5 ${isToday(currentDate) ? "bg-primary text-primary-foreground rounded-full w-10 h-10 flex items-center justify-center mx-auto" : ""}`}>
+                {format(currentDate, "d")}
               </div>
-            ))}
+            </div>
           </div>
-          <div className="flex-1 relative">
-            {HOURS.map(hour => (
-              <div key={hour} className="border-b border-l border-border/50" style={{ height: `${HOUR_HEIGHT}px` }} />
-            ))}
-            {getEventsForDate(currentDate).map(event => {
-              const { top, height } = getEventPosition(event);
-              return (
-                <div
-                  key={event.id}
-                  className="absolute left-1 right-1 z-10"
-                  style={{ top: `${top}px`, height: `${Math.max(24, height)}px` }}
+          <div className="flex shrink-0">
+            <div className="w-16 flex-shrink-0 border-r">
+              {HOURS.map(hour => (
+                <div 
+                  key={hour} 
+                  className="border-b border-border/50 text-[10px] text-muted-foreground flex items-center justify-center"
+                  style={{ height: `${HOUR_HEIGHT}px` }}
                 >
-                  {renderEventBlock(event)}
+                  {formatHour(hour)}
                 </div>
-              );
-            })}
-            <div 
-              className="absolute left-0 right-0 border-t-2 border-red-500 pointer-events-none z-10"
-              style={{ top: `${(new Date().getHours() - START_HOUR) * HOUR_HEIGHT + (new Date().getMinutes() / 60) * HOUR_HEIGHT}px` }}
-            >
-              <div className="w-2.5 h-2.5 rounded-full bg-red-500 -mt-1.5 -ml-1" />
+              ))}
+            </div>
+            <div className="flex-1 min-w-0 overflow-x-auto border-l">
+              {(() => {
+                const dayEvents = getEventsForDate(currentDate);
+                const layout = getDayViewEventLayout(dayEvents);
+                const totalColumns = layout.length > 0 ? layout[0].totalColumns : 1;
+                const minColWidth = 260;
+                const contentMinWidth = totalColumns > 1 ? totalColumns * minColWidth : undefined;
+                return (
+                  <div
+                    className="relative min-h-full w-full"
+                    style={contentMinWidth != null ? { minWidth: contentMinWidth } : undefined}
+                  >
+                    {HOURS.map(hour => (
+                      <div key={hour} className="border-b border-border/50" style={{ height: `${HOUR_HEIGHT}px` }} />
+                    ))}
+                    {layout.map(({ event, top, height, columnIndex, totalColumns: cols }) => {
+                      const h = Math.max(24, height);
+                      if (!Number.isFinite(top) || !Number.isFinite(h) || cols < 1) return null;
+                      return (
+                        <div
+                          key={event.id}
+                          className="absolute z-10 mx-0.5 box-border overflow-hidden flex flex-col min-h-0"
+                          style={{
+                            top: `${top}px`,
+                            height: `${h}px`,
+                            left: `${(columnIndex / cols) * 100}%`,
+                            width: `calc(${100 / cols}% - 4px)`,
+                            ...(cols > 1 ? { minWidth: `${minColWidth - 4}px` } : {}),
+                          }}
+                        >
+                          <div className="h-full min-h-0 flex flex-col">
+                            {renderEventBlock(event, false, true)}
+                          </div>
+                        </div>
+                      );
+                    })}
+                    <div 
+                      className="absolute left-0 right-0 border-t-2 border-red-500 pointer-events-none z-10"
+                      style={{ top: `${(new Date().getHours() - START_HOUR) * HOUR_HEIGHT + (new Date().getMinutes() / 60) * HOUR_HEIGHT}px` }}
+                    >
+                      <div className="w-2.5 h-2.5 rounded-full bg-red-500 -mt-1.5 -ml-1" />
+                    </div>
+                  </div>
+                );
+              })()}
             </div>
           </div>
         </div>
@@ -1332,67 +1797,100 @@ export const WorkerCalendar = forwardRef<WorkerCalendarRef, WorkerCalendarProps>
 
   const renderWeekView = () => (
     <div className="flex flex-col h-full overflow-hidden">
-      <div className="flex border-b sticky top-0 bg-background z-10">
-        <div className="w-16 flex-shrink-0 border-r py-2 text-center text-[10px] text-muted-foreground">
-          GMT-05
-        </div>
-        {weekDays.map(day => (
-          <div key={day.toISOString()} className="flex-1 py-2 text-center border-l">
-            <div className="text-[10px] text-muted-foreground uppercase tracking-wider">{format(day, "EEE")}</div>
-            <div 
-              className={`text-lg font-medium mt-0.5 cursor-pointer hover:bg-muted/50 rounded-full w-8 h-8 flex items-center justify-center mx-auto transition-colors
-                ${isToday(day) ? "bg-primary text-primary-foreground hover:bg-primary" : ""}`}
-                onClick={() => {
-                handleDateChange(day);
-                setView("day");
-              }}
-            >
-              {format(day, "d")}
+      {/* Single scroll container; overflow-x when day columns expand for overlapping events */}
+      <div className="flex-1 min-h-0 overflow-y-auto overflow-x-auto">
+        <div className="flex flex-col min-h-min min-w-0">
+          <div className="flex border-b sticky top-0 bg-background z-10 shrink-0">
+            <div className="w-16 flex-shrink-0 border-r py-2 text-center text-[10px] text-muted-foreground">
+              Time
             </div>
-          </div>
-        ))}
-      </div>
-      
-      <div className="flex-1 overflow-y-auto">
-        <div className="flex">
-          <div className="w-16 flex-shrink-0 border-r">
-            {HOURS.map(hour => (
-              <div 
-                key={hour} 
-                className="border-b text-[10px] text-muted-foreground text-right pr-2 flex items-start pt-0.5"
-                style={{ height: `${HOUR_HEIGHT}px` }}
-              >
-                {formatHour(hour)}
-              </div>
-            ))}
-          </div>
-          {weekDays.map(day => (
-            <div key={day.toISOString()} className="flex-1 relative border-l">
-              {HOURS.map(hour => (
-                <div key={hour} className="border-b border-border/50" style={{ height: `${HOUR_HEIGHT}px` }} />
-              ))}
-              {getEventsForDate(day).map(event => {
-                const { top, height } = getEventPosition(event);
-                return (
-                  <div
-                    key={event.id}
-                    className="absolute left-0.5 right-0.5 z-10"
-                    style={{ top: `${top}px`, height: `${Math.max(20, height)}px` }}
-                  >
-                    {renderEventBlock(event, true)}
-                  </div>
-                );
-              })}
-              {isToday(day) && (
-                <div 
-                  className="absolute left-0 right-0 border-t-2 border-red-500 pointer-events-none z-10"
-                  style={{ top: `${(new Date().getHours() - START_HOUR) * HOUR_HEIGHT + (new Date().getMinutes() / 60) * HOUR_HEIGHT}px` }}
+            {weekDays.map(day => {
+              const dayLayout = getDayViewEventLayout(getEventsForDate(day));
+              const dayCols = dayLayout.length > 0 ? dayLayout[0].totalColumns : 1;
+              const WEEK_COL_BASE_MIN = 140;
+              const WEEK_COL_LANE = 120;
+              const headerMinWidth = Math.max(WEEK_COL_BASE_MIN, dayCols * WEEK_COL_LANE);
+              return (
+                <div
+                  key={day.toISOString()}
+                  className="flex-none py-2 text-center border border-border first:border-l-0 shrink-0"
+                  style={{ minWidth: headerMinWidth }}
                 >
-                  <div className="w-2 h-2 rounded-full bg-red-500 -mt-1 -ml-0.5" />
+                  <div className="text-[10px] text-muted-foreground uppercase tracking-wider">{format(day, "EEE")}</div>
+                  <div
+                    className={`text-lg font-medium mt-0.5 cursor-pointer hover:bg-muted/50 rounded-full w-8 h-8 flex items-center justify-center mx-auto transition-colors
+                      ${isToday(day) ? "bg-primary text-primary-foreground hover:bg-primary" : ""}`}
+                    onClick={() => {
+                      handleDateChange(day);
+                      setView("day");
+                    }}
+                  >
+                    {format(day, "d")}
+                  </div>
                 </div>
-              )}
+              );
+            })}
+          </div>
+          <div className="flex shrink-0">
+            <div className="w-16 flex-shrink-0 border-r">
+              {HOURS.map(hour => (
+                <div 
+                  key={hour} 
+                  className="border-b border-border/50 text-[10px] text-muted-foreground flex items-center justify-center"
+                  style={{ height: `${HOUR_HEIGHT}px` }}
+                >
+                  {formatHour(hour)}
+                </div>
+              ))}
             </div>
-          ))}
+            {weekDays.map(day => {
+              const dayEvents = getEventsForDate(day);
+              const layout = getDayViewEventLayout(dayEvents);
+              const totalColumns = layout.length > 0 ? layout[0].totalColumns : 1;
+              const WEEK_COL_BASE_MIN = 140;
+              const WEEK_COL_LANE = 120;
+              const dayMinWidth = Math.max(WEEK_COL_BASE_MIN, totalColumns * WEEK_COL_LANE);
+              return (
+                <div
+                  key={day.toISOString()}
+                  className="flex-none relative border border-border first:border-l-0 shrink-0"
+                  style={{ minWidth: dayMinWidth }}
+                >
+                  {HOURS.map(hour => (
+                    <div key={hour} className="border-b border-border/50" style={{ height: `${HOUR_HEIGHT}px` }} />
+                  ))}
+                  {layout.map(({ event, top, height, columnIndex, totalColumns: cols }) => {
+                    const h = Math.max(20, height);
+                    if (!Number.isFinite(top) || !Number.isFinite(h) || cols < 1) return null;
+                    return (
+                      <div
+                        key={event.id}
+                        className="absolute z-10 flex flex-col min-h-0 mx-0.5"
+                        style={{
+                          top: `${top}px`,
+                          height: `${h}px`,
+                          left: `${(columnIndex / cols) * 100}%`,
+                          width: `calc(${100 / cols}% - 4px)`,
+                        }}
+                      >
+                        <div className="h-full min-h-0 flex flex-col">
+                          {renderEventBlock(event, false, true)}
+                        </div>
+                      </div>
+                    );
+                  })}
+                    {isToday(day) && (
+                    <div
+                      className="absolute left-0 right-0 border-t-2 border-red-500 pointer-events-none z-10"
+                      style={{ top: `${(new Date().getHours() - START_HOUR) * HOUR_HEIGHT + (new Date().getMinutes() / 60) * HOUR_HEIGHT}px` }}
+                    >
+                      <div className="w-2 h-2 rounded-full bg-red-500 -mt-1 -ml-0.5" />
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
         </div>
       </div>
     </div>
@@ -1459,43 +1957,49 @@ export const WorkerCalendar = forwardRef<WorkerCalendarRef, WorkerCalendarProps>
   );
 
   return (
-    <div className="flex h-full w-full bg-background">
+    <div className="flex h-full min-h-0 w-full bg-background">
       {renderMiniCalendar()}
       
       <div className="flex-1 flex flex-col min-w-0">
+        {!(isMobile && calendarHeaderSlotRef && calendarHeaderSlotReady && calendarHeaderSlotRef.current) && (
         <div className="flex items-center justify-between gap-2 px-2 py-2 border-b flex-wrap">
-          {/* Mobile Header — Settings + view type (tap = bottom sheet) in header; Today between chevrons */}
+          {/* Mobile Header — View label left, nav (chevrons + Today) center, Settings right; or portal into dashboard header */}
           {isMobile ? (
             <div className="flex items-center justify-between gap-2 w-full">
-              {/* Left: Settings (calendar header) + View type (tap = bottom-up popup) */}
+              {/* Left: View type (employee = button; !isEmployee = label only, actions are in filter row below) */}
               <div className="flex items-center gap-2 min-w-0 flex-1">
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  className="h-8 w-8 flex-shrink-0"
-                  onClick={() => {
-                    setShowSettingsMenu(true);
-                    setSettingsSubMenu("main");
-                  }}
-                  data-testid="calendar-settings-button-mobile"
-                  aria-label="Calendar settings"
-                >
-                  <Settings className="w-4 h-4" />
-                </Button>
-                <button
-                  onClick={() => setShowViewSelector(true)}
-                  className="flex items-center gap-2 text-base font-medium whitespace-nowrap min-w-0"
-                >
-                  {view === "day" && <CalendarIcon className="w-4 h-4 flex-shrink-0" />}
-                  {view === "week" && <CalendarDays className="w-4 h-4 flex-shrink-0" />}
-                  {view === "month" && <Calendar className="w-4 h-4 flex-shrink-0" />}
-                  {view === "map" && <MapIcon className="w-4 h-4 flex-shrink-0" />}
-                  <span className="truncate">
-                    {view === "day" ? "Today" : view === "week" ? "Week" : view === "month" ? "Month" : "Map"}
-                  </span>
-                </button>
+                {isEmployee ? (
+                  <button
+                    onClick={() => setShowViewSelector(true)}
+                    className="flex items-center gap-2 text-base font-medium whitespace-nowrap min-w-0"
+                  >
+                    {view === "day" && <CalendarIcon className="w-4 h-4 flex-shrink-0" />}
+                    {view === "week" && <CalendarDays className="w-4 h-4 flex-shrink-0" />}
+                    {view === "month" && <Calendar className="w-4 h-4 flex-shrink-0" />}
+                    {view === "map" && <MapIcon className="w-4 h-4 flex-shrink-0" />}
+                    <span className="truncate">
+                      {view === "day" ? "Today" : view === "week" ? "Week" : view === "month" ? "Month" : "Routes"}
+                    </span>
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => setShowViewSelector(true)}
+                    className="flex items-center gap-2 text-base font-medium whitespace-nowrap min-w-0 text-foreground hover:opacity-80 active:opacity-70 transition-opacity"
+                    data-testid="calendar-view-type-button-mobile"
+                    aria-label="Calendar view"
+                  >
+                    {view === "day" && <CalendarIcon className="w-4 h-4 flex-shrink-0 text-muted-foreground" />}
+                    {view === "week" && <CalendarDays className="w-4 h-4 flex-shrink-0 text-muted-foreground" />}
+                    {view === "month" && <Calendar className="w-4 h-4 flex-shrink-0 text-muted-foreground" />}
+                    {view === "map" && <MapIcon className="w-4 h-4 flex-shrink-0 text-muted-foreground" />}
+                    <span className="truncate">
+                      {view === "day" ? "Today" : view === "week" ? "Week" : view === "month" ? "Month" : "Routes"}
+                    </span>
+                  </button>
+                )}
               </div>
-              {/* Center–right: Chevrons with "Today" between */}
+              {/* Center: Chevrons with "Today" between */}
               <div className="flex items-center gap-0.5 flex-shrink-0">
                 <Button
                   variant="ghost"
@@ -1525,11 +2029,86 @@ export const WorkerCalendar = forwardRef<WorkerCalendarRef, WorkerCalendarProps>
                   <ChevronRight className="w-4 h-4" />
                 </Button>
               </div>
+              {/* Right: Settings (only when employee; when !isEmployee it's in the filter row below) */}
+              {isEmployee && (
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="h-8 w-8 flex-shrink-0"
+                  onClick={() => {
+                    setShowSettingsMenu(true);
+                    setSettingsSubMenu("main");
+                  }}
+                  data-testid="calendar-settings-button-mobile"
+                  aria-label="Calendar settings"
+                >
+                  <Settings className="w-4 h-4" />
+                </Button>
+              )}
             </div>
           ) : (
             <>
               {/* Desktop Header */}
               <div className="flex items-center gap-1">
+                {/* Tablet: workers filter at left of toolbar (not on map; map has it in bottom bar) */}
+                {!isEmployee && !isDesktop && view !== "map" && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-8 pl-1.5 pr-3 text-xs whitespace-nowrap flex-shrink-0 rounded-lg border bg-muted/50 border-border hover:bg-muted inline-flex items-center gap-2"
+                    onClick={() => setShowWorkerFilterSheet(true)}
+                    data-testid="calendar-workers-filter-button"
+                  >
+                    {(() => {
+                      const selectedCount = (showBusinessOperator ? 1 : 0) + activeTeamMembers.filter(m => enabledTeammates.has(m.id)).length;
+                      const allSelected = showBusinessOperator && activeTeamMembers.length > 0 && activeTeamMembers.every(m => enabledTeammates.has(m.id));
+                      const avatarPeople: { id: number; avatarUrl: string | null; firstName: string | null; lastName: string | null }[] = [];
+                      if (showBusinessOperator && profile) {
+                        avatarPeople.push({
+                          id: profile.id,
+                          avatarUrl: profile.avatarUrl ?? null,
+                          firstName: profile.firstName ?? null,
+                          lastName: profile.lastName ?? null,
+                        });
+                      }
+                      activeTeamMembers.filter(m => enabledTeammates.has(m.id)).forEach(m => {
+                        avatarPeople.push({
+                          id: m.id,
+                          avatarUrl: m.avatarUrl ?? null,
+                          firstName: m.firstName ?? null,
+                          lastName: m.lastName ?? null,
+                        });
+                      });
+                      const maxStack = 4;
+                      const showCount = avatarPeople.length;
+                      if (showCount === 0) {
+                        return (
+                          <>
+                            <Users className="w-4 h-4 flex-shrink-0" />
+                            <span>Workers</span>
+                          </>
+                        );
+                      }
+                      return (
+                        <>
+                          <span className="flex -space-x-2 flex-shrink-0">
+                            {avatarPeople.slice(0, maxStack).map((p) => (
+                              <Avatar key={p.id} className="h-6 w-6 border-2 border-background rounded-full ring-0">
+                                <AvatarImage src={p.avatarUrl || undefined} className="object-cover" />
+                                <AvatarFallback className="text-[10px] bg-muted">
+                                  {p.firstName?.[0]}{p.lastName?.[0]}
+                                </AvatarFallback>
+                              </Avatar>
+                            ))}
+                          </span>
+                          <span>
+                            {allSelected ? "All Workers" : showCount > maxStack ? `${maxStack}+ selected` : selectedCount === 1 ? "1 selected" : `${selectedCount} selected`}
+                          </span>
+                        </>
+                      );
+                    })()}
+                  </Button>
+                )}
                 <Button 
                   variant="outline" 
                   size="sm" 
@@ -1587,115 +2166,336 @@ export const WorkerCalendar = forwardRef<WorkerCalendarRef, WorkerCalendarProps>
                   >
                     Month
                   </Button>
-                  {!isEmployee && (
-                    <Button
-                      variant={view === "map" ? "default" : "ghost"}
-                      size="sm"
-                      className="h-7 px-3 text-xs"
-                      onClick={() => setView("map")}
-                    >
-                      <MapIcon className="w-3.5 h-3.5 mr-1" />
-                      Map
-                    </Button>
-                  )}
+                  <Button
+                    variant={view === "map" ? "default" : "ghost"}
+                    size="sm"
+                    className="h-7 px-3 text-xs"
+                    onClick={() => setView("map")}
+                  >
+                    <MapIcon className="w-3.5 h-3.5 mr-1" />
+                    Map
+                  </Button>
                 </div>
+                {/* Tablet/mobile (no sidebar): show gear-only settings button like desktop sidebar */}
+                {!isDesktop && (
+                  <Button
+                    variant="outline"
+                    size="icon"
+                    className="h-8 w-8 flex-shrink-0"
+                    onClick={() => setShowSettings(true)}
+                    data-testid="calendar-settings-btn"
+                    aria-label="Calendar settings"
+                  >
+                    <Settings className="w-4 h-4" />
+                  </Button>
+                )}
               </div>
             </>
           )}
         </div>
+        )}
 
-        {/* Mobile Worker Filter - Sticky top container (admin only, shown on all views including map on mobile) */}
-        {!isEmployee && isMobile && (
-          <div className="lg:hidden sticky top-0 z-20 bg-background border-b overflow-x-auto">
-            <div className="flex items-center gap-2 px-3 py-2 min-w-max">
-                <Button
-                  variant={activeTeamMembers.length > 0 && activeTeamMembers.every(member => enabledTeammates.has(member.id)) ? "default" : "outline"}
-                  size="sm"
-                  className={`h-8 px-3 text-xs whitespace-nowrap flex-shrink-0 ${
-                    activeTeamMembers.length > 0 && activeTeamMembers.every(member => enabledTeammates.has(member.id))
-                      ? "bg-green-500 hover:bg-green-600 text-white border-green-500"
-                      : ""
-                  }`}
-                  onClick={() => {
-                    // Toggle all workers on/off
-                    // Check if ALL teammates are enabled (not just if sizes match)
-                    const allEnabled = activeTeamMembers.length > 0 && 
-                      activeTeamMembers.every(member => enabledTeammates.has(member.id));
-                    
-                    if (allEnabled) {
-                      // Turn all off
-                      setEnabledTeammates(new Set());
-                    } else {
-                      // Turn all on
-                      const allIds = new Set(activeTeamMembers.map(m => m.id));
-                      setEnabledTeammates(allIds);
-                    }
-                  }}
+        {/* Portal mobile toolbar into dashboard header (view + date nav + settings). Sticky worker row below omits duplicate controls when this is active. */}
+        {isMobile && calendarHeaderSlotRef?.current && calendarHeaderSlotReady && createPortal(
+          <div className="flex items-center justify-between gap-2 w-full min-w-0">
+            <div className="flex items-center gap-2 min-w-0 flex-1">
+              {isEmployee ? (
+                <button
+                  onClick={() => setShowViewSelector(true)}
+                  className="flex items-center gap-2 text-base font-medium whitespace-nowrap min-w-0"
                 >
-                  All Workers
-                </Button>
-                {activeTeamMembers.map((member) => {
-                  const isEnabled = enabledTeammates.has(member.id);
-                  const jobCount = filteredApplications.filter(
-                    (app) => app.teamMemberId === member.id && app.status === "accepted"
-                  ).length;
+                  {view === "day" && <CalendarIcon className="w-4 h-4 flex-shrink-0" />}
+                  {view === "week" && <CalendarDays className="w-4 h-4 flex-shrink-0" />}
+                  {view === "month" && <Calendar className="w-4 h-4 flex-shrink-0" />}
+                  {view === "map" && <MapIcon className="w-4 h-4 flex-shrink-0" />}
+                  <span className="truncate">
+                    {view === "day" ? "Today" : view === "week" ? "Week" : view === "month" ? "Month" : "Routes"}
+                  </span>
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => setShowViewSelector(true)}
+                  className="inline-flex items-center justify-center gap-1.5 h-8 px-2.5 rounded-lg text-sm font-medium bg-muted/50 border border-border hover:bg-muted transition-colors min-w-0"
+                  data-testid="calendar-view-type-button-mobile"
+                  aria-label="Calendar view"
+                >
+                  {view === "day" && <CalendarIcon className="w-4 h-4 flex-shrink-0 text-muted-foreground" />}
+                  {view === "week" && <CalendarDays className="w-4 h-4 flex-shrink-0 text-muted-foreground" />}
+                  {view === "month" && <Calendar className="w-4 h-4 flex-shrink-0 text-muted-foreground" />}
+                  {view === "map" && <MapIcon className="w-4 h-4 flex-shrink-0 text-muted-foreground" />}
+                  <span className="truncate max-w-[4rem]">
+                    {view === "day" ? "Today" : view === "week" ? "Week" : view === "month" ? "Month" : "Routes"}
+                  </span>
+                </button>
+              )}
+            </div>
+            <div className="flex items-center gap-0.5 flex-shrink-0">
+              <Button variant="ghost" size="icon" className="h-8 w-8" onClick={() => navigateDate("prev")} data-testid="calendar-prev-btn">
+                <ChevronLeft className="w-4 h-4" />
+              </Button>
+              <Button variant="ghost" size="sm" className="h-8 px-2 font-medium min-w-[4rem]" onClick={goToToday} data-testid="calendar-today-btn">
+                Today
+              </Button>
+              <Button variant="ghost" size="icon" className="h-8 w-8" onClick={() => navigateDate("next")} data-testid="calendar-next-btn">
+                <ChevronRight className="w-4 h-4" />
+              </Button>
+            </div>
+            <Button
+              variant="ghost"
+              size="icon"
+              className="h-8 w-8 flex-shrink-0"
+              onClick={() => { setShowSettingsMenu(true); setSettingsSubMenu("main"); }}
+              data-testid="calendar-settings-button-mobile"
+              aria-label="Calendar settings"
+            >
+              <Settings className="w-4 h-4" />
+            </Button>
+          </div>,
+          calendarHeaderSlotRef.current
+        )}
 
-                  return (
-                    <Button
-                      key={member.id}
-                      variant="outline"
-                      size="sm"
-                      className={`h-8 px-3 text-xs whitespace-nowrap flex-shrink-0 flex items-center gap-1.5 ${
-                        isEnabled 
-                          ? "bg-green-500 hover:bg-green-600 text-white border-green-500" 
-                          : "bg-background hover:bg-muted"
-                      }`}
-                      onClick={() => handleToggleTeammate(member.id)}
-                    >
-                      <Avatar className="w-4 h-4">
-                        <AvatarImage src={member.avatarUrl || undefined} />
-                        <AvatarFallback className="text-[8px]">
-                          {member.firstName[0]}{member.lastName[0]}
-                        </AvatarFallback>
-                      </Avatar>
-                      <span>{member.firstName}</span>
-                      {jobCount > 0 && (
-                        <Badge 
-                          variant="secondary" 
-                          className={`text-[10px] px-1 py-0 h-4 ${
-                            isEnabled 
-                              ? "bg-green-600 text-white" 
-                              : ""
-                          }`}
-                        >
-                          {jobCount}
-                        </Badge>
-                      )}
-                    </Button>
-                  );
-                })}
+        {/* Mobile & Tablet: Worker filter row. View + nav + settings live in dashboard header when portaled (mobileCalendarToolbarPortaled). */}
+        {!isEmployee && !isDesktop && view !== "map" && (
+          <div className="lg:hidden sticky top-0 z-20 bg-background border-b">
+            <div className="flex items-center gap-2 px-3 py-2">
+                <Button
+                    variant="outline"
+                    size="sm"
+                    className={`h-8 pl-1.5 pr-3 text-xs whitespace-nowrap rounded-lg border bg-muted/50 border-border hover:bg-muted inline-flex items-center gap-2 ${mobileCalendarToolbarPortaled ? "flex-1 min-w-0 justify-start" : "flex-shrink-0"}`}
+                    onClick={() => setShowWorkerFilterSheet(true)}
+                    data-testid="calendar-workers-filter-button"
+                  >
+                    {(() => {
+                      const selectedCount = (showBusinessOperator ? 1 : 0) + activeTeamMembers.filter(m => enabledTeammates.has(m.id)).length;
+                      const allSelected = showBusinessOperator && activeTeamMembers.length > 0 && activeTeamMembers.every(m => enabledTeammates.has(m.id));
+                      const avatarPeople: { id: number; avatarUrl: string | null; firstName: string | null; lastName: string | null }[] = [];
+                      if (showBusinessOperator && profile) {
+                        avatarPeople.push({
+                          id: profile.id,
+                          avatarUrl: profile.avatarUrl ?? null,
+                          firstName: profile.firstName ?? null,
+                          lastName: profile.lastName ?? null,
+                        });
+                      }
+                      activeTeamMembers.filter(m => enabledTeammates.has(m.id)).forEach(m => {
+                        avatarPeople.push({
+                          id: m.id,
+                          avatarUrl: m.avatarUrl ?? null,
+                          firstName: m.firstName ?? null,
+                          lastName: m.lastName ?? null,
+                        });
+                      });
+                      const maxStack = 4;
+                      const showCount = avatarPeople.length;
+                      if (showCount === 0) {
+                        return (
+                          <>
+                            <Users className="w-4 h-4 flex-shrink-0" />
+                            <span>Workers</span>
+                          </>
+                        );
+                      }
+                      return (
+                        <>
+                          <span className="flex -space-x-2 flex-shrink-0">
+                            {avatarPeople.slice(0, maxStack).map((p) => (
+                              <Avatar key={p.id} className="h-6 w-6 border-2 border-background rounded-full ring-0">
+                                <AvatarImage src={p.avatarUrl || undefined} className="object-cover" />
+                                <AvatarFallback className="text-[10px] bg-muted">
+                                  {p.firstName?.[0]}{p.lastName?.[0]}
+                                </AvatarFallback>
+                              </Avatar>
+                            ))}
+                          </span>
+                          <span>
+                            {allSelected ? "All Workers" : showCount > maxStack ? `${maxStack}+ selected` : selectedCount === 1 ? "1 selected" : `${selectedCount} selected`}
+                          </span>
+                        </>
+                      );
+                    })()}
+                  </Button>
+                {!mobileCalendarToolbarPortaled && (
+                <div className="flex items-center gap-1.5 flex-shrink-0 ml-auto">
+                  <button
+                    type="button"
+                    onClick={() => setShowViewSelector(true)}
+                    className="inline-flex items-center justify-center gap-1.5 h-8 px-2.5 rounded-lg text-sm font-medium bg-muted/50 border border-border hover:bg-muted transition-colors min-w-0"
+                    data-testid="calendar-view-type-button-mobile"
+                    aria-label="Calendar view"
+                  >
+                    {view === "day" && <CalendarIcon className="w-4 h-4 flex-shrink-0" />}
+                    {view === "week" && <CalendarDays className="w-4 h-4 flex-shrink-0" />}
+                    {view === "month" && <Calendar className="w-4 h-4 flex-shrink-0" />}
+                    <span className="truncate max-w-[4rem]">
+                      {view === "day" ? "Today" : view === "week" ? "Week" : "Month"}
+                    </span>
+                  </button>
+                  <Button
+                    variant="outline"
+                    size="icon"
+                    className="h-8 w-8 flex-shrink-0 rounded-lg bg-muted/50 border border-border hover:bg-muted"
+                    onClick={() => { setShowSettingsMenu(true); setSettingsSubMenu("main"); }}
+                    data-testid="calendar-settings-button-mobile"
+                    aria-label="Calendar settings"
+                  >
+                    <Settings className="w-4 h-4" />
+                  </Button>
+                </div>
+                )}
             </div>
           </div>
         )}
 
-        {/* Hide mobile legend for employees - they only see accepted jobs */}
-        {/* Also hide legend on map view */}
-        {!isEmployee && view !== "map" && (
-          <div className="lg:hidden flex items-center gap-4 px-2 py-2 border-b text-xs bg-muted/30">
-            <div className="flex items-center gap-1.5">
-              <div className="w-2.5 h-2.5 rounded bg-green-500" />
-              <span>Accepted</span>
-            </div>
-            <div className="flex items-center gap-1.5">
-              <div className="w-2.5 h-2.5 rounded bg-amber-500" />
-              <span>Pending</span>
-            </div>
-            {showOpportunities && (
-              <div className="flex items-center gap-1.5">
-                <div className="w-2.5 h-2.5 rounded border-2 border-dashed border-blue-400 bg-blue-50 dark:bg-blue-950" />
-                <span>Available</span>
+        {/* Mobile & Tablet Worker Filter - Bottom sheet (business operator + teammates) */}
+        {!isEmployee && !isDesktop && (
+          <Drawer open={showWorkerFilterSheet} onOpenChange={setShowWorkerFilterSheet}>
+            <DrawerContent className="rounded-t-2xl">
+              <DrawerHeader className="flex flex-row items-center justify-between gap-2 px-4 pb-2 pt-0 text-left">
+                <DrawerTitle className="text-base font-semibold">Filter by worker</DrawerTitle>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="h-8 w-8 shrink-0 rounded-full"
+                  onClick={() => setShowWorkerFilterSheet(false)}
+                  aria-label="Close"
+                >
+                  <X className="h-4 w-4" />
+                </Button>
+              </DrawerHeader>
+              <DrawerDescription className="sr-only">Select which workers to show on the calendar</DrawerDescription>
+              <div className="px-4 pb-6">
+                <div className="space-y-1">
+                  <label className="flex items-center justify-between gap-3 py-2.5 px-3 rounded-lg border border-border bg-muted/30 hover:bg-muted/50 transition-colors cursor-pointer">
+                    <span className="text-sm font-medium">All Workers</span>
+                    <Switch
+                      checked={
+                        showBusinessOperator &&
+                        activeTeamMembers.length > 0 &&
+                        activeTeamMembers.every((m) => enabledTeammates.has(m.id))
+                      }
+                      onCheckedChange={(checked) => {
+                        if (checked) {
+                          setShowBusinessOperator(true);
+                          setEnabledTeammates(new Set(activeTeamMembers.map((m) => m.id)));
+                        } else {
+                          setShowBusinessOperator(false);
+                          setEnabledTeammates(new Set());
+                        }
+                      }}
+                      data-testid="worker-filter-all"
+                    />
+                  </label>
+                  <label className="flex items-center justify-between gap-3 py-2.5 px-3 rounded-lg border border-border bg-muted/30 hover:bg-muted/50 transition-colors cursor-pointer">
+                    <span className="flex items-center gap-2 text-sm min-w-0">
+                      <Avatar className="w-8 h-8 flex-shrink-0">
+                        <AvatarImage src={profile?.avatarUrl || undefined} />
+                        <AvatarFallback className="text-xs">
+                          {profile?.firstName?.[0]}
+                          {profile?.lastName?.[0]}
+                        </AvatarFallback>
+                      </Avatar>
+                      <span className="font-medium truncate">
+                        {profile?.firstName || profile?.lastName
+                          ? `${profile?.firstName ?? ""} ${profile?.lastName ?? ""}`.trim()
+                          : "Me"}
+                      </span>
+                      {(() => {
+                        const myJobCount = applications.filter((app) => !app.teamMemberId && app.status === "accepted").length;
+                        return myJobCount > 0 ? (
+                          <Badge variant="secondary" className="text-[10px] px-1.5 py-0 shrink-0">
+                            {myJobCount}
+                          </Badge>
+                        ) : null;
+                      })()}
+                    </span>
+                    <Switch
+                      checked={showBusinessOperator}
+                      onCheckedChange={setShowBusinessOperator}
+                      data-testid="worker-filter-me"
+                    />
+                  </label>
+                  {activeTeamMembers.map((member) => {
+                    const isEnabled = enabledTeammates.has(member.id);
+                    const jobCount = applications.filter(
+                      (app) => app.teamMemberId === member.id && app.status === "accepted"
+                    ).length;
+                    return (
+                      <label
+                        key={member.id}
+                        className="flex items-center justify-between gap-3 py-2.5 px-3 rounded-lg border border-border bg-muted/30 hover:bg-muted/50 transition-colors cursor-pointer"
+                      >
+                        <span className="flex items-center gap-2 text-sm min-w-0">
+                          <Avatar className="w-8 h-8 flex-shrink-0">
+                            <AvatarImage src={member.avatarUrl || undefined} />
+                            <AvatarFallback className="text-xs">
+                              {member.firstName?.[0]}
+                              {member.lastName?.[0]}
+                            </AvatarFallback>
+                          </Avatar>
+                          <span className="font-medium truncate">{member.firstName} {member.lastName}</span>
+                          {jobCount > 0 && (
+                            <Badge variant="secondary" className="text-[10px] px-1.5 py-0 shrink-0">
+                              {jobCount}
+                            </Badge>
+                          )}
+                        </span>
+                        <Switch
+                          checked={isEnabled}
+                          onCheckedChange={() => handleToggleTeammate(member.id)}
+                          data-testid={`worker-filter-teammate-${member.id}`}
+                        />
+                      </label>
+                    );
+                  })}
+                </div>
               </div>
-            )}
+            </DrawerContent>
+          </Drawer>
+        )}
+
+        {/* Mobile job-type toggles - evenly split width, hide on map view */}
+        {!isEmployee && view !== "map" && (
+          <div className="lg:hidden flex items-stretch gap-1 px-2 py-2 border-b bg-muted/30">
+            <button
+              type="button"
+              onClick={() => setShowAcceptedJobs((v) => !v)}
+              className={`flex-1 flex items-center justify-center gap-1.5 py-2 rounded-md text-xs font-medium transition-colors min-w-0 ${
+                showAcceptedJobs
+                  ? "bg-green-500 text-white"
+                  : "bg-muted/50 text-muted-foreground hover:bg-muted border border-border"
+              }`}
+              data-testid="mobile-toggle-accepted"
+            >
+              <div className={`w-2 h-2 rounded shrink-0 ${showAcceptedJobs ? "bg-white/90" : "bg-green-500"}`} />
+              <span className="truncate">Accepted</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setShowPendingJobs((v) => !v)}
+              className={`flex-1 flex items-center justify-center gap-1.5 py-2 rounded-md text-xs font-medium transition-colors min-w-0 ${
+                showPendingJobs
+                  ? "bg-amber-500 text-white"
+                  : "bg-muted/50 text-muted-foreground hover:bg-muted border border-border"
+              }`}
+              data-testid="mobile-toggle-pending"
+            >
+              <div className={`w-2 h-2 rounded shrink-0 ${showPendingJobs ? "bg-white/90" : "bg-amber-500"}`} />
+              <span className="truncate">Pending</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setShowAvailableJobs((v) => !v)}
+              className={`flex-1 flex items-center justify-center gap-1.5 py-2 rounded-md text-xs font-medium transition-colors min-w-0 ${
+                showAvailableJobs
+                  ? "bg-blue-500 text-white"
+                  : "bg-muted/50 text-muted-foreground hover:bg-muted border border-border"
+              }`}
+              data-testid="mobile-toggle-available"
+            >
+              <div className={`w-2 h-2 rounded shrink-0 border-2 ${showAvailableJobs ? "bg-white/90 border-white/90" : "border-blue-400 bg-blue-50 dark:bg-blue-950 dark:border-blue-400"}`} />
+              <span className="truncate">Available</span>
+            </button>
           </div>
         )}
 
@@ -1703,14 +2503,15 @@ export const WorkerCalendar = forwardRef<WorkerCalendarRef, WorkerCalendarProps>
           {view === "day" && renderDayView()}
           {view === "week" && renderWeekView()}
           {view === "month" && renderMonthView()}
-          {view === "map" && !isEmployee && (
+          {view === "map" && (
             <CalendarMapView
+              isEmployee={isEmployee}
               selectedDate={currentDate}
               onDateChange={handleDateChange}
               teammates={mapTeammates}
               jobAssignments={mapJobAssignments}
-              availableJobs={availableJobs}
-              enabledTeammates={enabledTeammates}
+              availableJobs={isEmployee ? [] : availableJobs}
+              enabledTeammates={mapEnabledTeammates}
               onToggleTeammate={handleToggleTeammate}
               focusTeammateId={focusedTeammateId}
               showAcceptedJobs={showAcceptedJobs}
@@ -1726,7 +2527,120 @@ export const WorkerCalendar = forwardRef<WorkerCalendarRef, WorkerCalendarProps>
                 zipCode: profile.zipCode,
                 latitude: profile.latitude,
                 longitude: profile.longitude,
+                avatarUrl: profile.avatarUrl,
               } : null}
+              toolbarRightContent={!isEmployee && !isDesktop ? (() => {
+                const allPeople: { id: number; avatarUrl: string | null; firstName: string | null; lastName: string | null; isOwner: boolean }[] = [];
+                if (profile) {
+                  allPeople.push({
+                    id: profile.id,
+                    avatarUrl: profile.avatarUrl ?? null,
+                    firstName: profile.firstName ?? null,
+                    lastName: profile.lastName ?? null,
+                    isOwner: true,
+                  });
+                }
+                activeTeamMembers.forEach(m => {
+                  allPeople.push({
+                    id: m.id,
+                    avatarUrl: m.avatarUrl ?? null,
+                    firstName: m.firstName ?? null,
+                    lastName: m.lastName ?? null,
+                    isOwner: false,
+                  });
+                });
+                const currentIndex = allPeople.findIndex(p =>
+                  (p.isOwner && showBusinessOperator) || (!p.isOwner && enabledTeammates.has(p.id))
+                );
+                const currentPerson = currentIndex >= 0 ? allPeople[currentIndex] : allPeople[0];
+                const canGoPrev = allPeople.length > 1 && currentIndex > 0;
+                const canGoNext = allPeople.length > 1 && currentIndex < allPeople.length - 1;
+                const handlePrev = (e: React.MouseEvent) => {
+                  e.stopPropagation();
+                  if (currentIndex > 0) {
+                    const prev = allPeople[currentIndex - 1];
+                    if (prev.isOwner) {
+                      setShowBusinessOperator(true);
+                      setEnabledTeammates(new Set());
+                    } else {
+                      setShowBusinessOperator(false);
+                      setEnabledTeammates(new Set([prev.id]));
+                    }
+                    setFocusedTeammateId(prev.id);
+                    setTimeout(() => setFocusedTeammateId(null), 500);
+                  }
+                };
+                const handleNext = (e: React.MouseEvent) => {
+                  e.stopPropagation();
+                  if (currentIndex < allPeople.length - 1) {
+                    const next = allPeople[currentIndex + 1];
+                    if (next.isOwner) {
+                      setShowBusinessOperator(true);
+                      setEnabledTeammates(new Set());
+                    } else {
+                      setShowBusinessOperator(false);
+                      setEnabledTeammates(new Set([next.id]));
+                    }
+                    setFocusedTeammateId(next.id);
+                    setTimeout(() => setFocusedTeammateId(null), 500);
+                  }
+                };
+                if (!currentPerson) {
+                  return (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="h-8 pl-1.5 pr-3 text-xs whitespace-nowrap flex-shrink-0 rounded-lg border bg-muted/50 border-border hover:bg-muted inline-flex items-center gap-2"
+                      onClick={() => setShowWorkerFilterSheet(true)}
+                      data-testid="calendar-workers-filter-button"
+                    >
+                      <Users className="w-4 h-4 flex-shrink-0" />
+                      <span>Workers</span>
+                    </Button>
+                  );
+                }
+                return (
+                  <div className="flex items-center gap-1 flex-shrink-0">
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="h-8 w-8 flex-shrink-0"
+                      disabled={!canGoPrev}
+                      onClick={handlePrev}
+                      aria-label="Previous worker"
+                    >
+                      <ChevronLeft className="w-4 h-4" />
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="h-8 pl-1.5 pr-3 text-xs whitespace-nowrap flex-shrink-0 rounded-lg border bg-muted/50 border-border hover:bg-muted inline-flex items-center gap-2"
+                      onClick={() => setShowWorkerFilterSheet(true)}
+                      data-testid="calendar-workers-filter-button"
+                    >
+                      <Avatar className="h-6 w-6 border-2 border-background rounded-full ring-0 flex-shrink-0">
+                        <AvatarImage src={currentPerson.avatarUrl || undefined} className="object-cover" />
+                        <AvatarFallback className="text-[10px] bg-muted">
+                          {currentPerson.firstName?.[0]}{currentPerson.lastName?.[0]}
+                        </AvatarFallback>
+                      </Avatar>
+                      <span className="truncate max-w-[6rem]">
+                        {currentPerson.firstName} {currentPerson.lastName?.[0]}.
+                      </span>
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="h-8 w-8 flex-shrink-0"
+                      disabled={!canGoNext}
+                      onClick={handleNext}
+                      aria-label="Next worker"
+                    >
+                      <ChevronRight className="w-4 h-4" />
+                    </Button>
+                  </div>
+                );
+              })() : undefined}
               onJobAction={(jobId, action) => {
                 const job = availableJobs.find(j => j.id === jobId);
                 if (!job) return;
@@ -1736,8 +2650,8 @@ export const WorkerCalendar = forwardRef<WorkerCalendarRef, WorkerCalendarProps>
                     onViewJob(job);
                     break;
                   case "add-to-route":
-                    // Handle adding job to route - could open a dialog to select teammate
-                    onViewJob(job);
+                    if (onApplyToJobAtStep3) onApplyToJobAtStep3(job);
+                    else onViewJob(job);
                     break;
                   case "call":
                     // TODO: Implement call functionality
@@ -1752,7 +2666,10 @@ export const WorkerCalendar = forwardRef<WorkerCalendarRef, WorkerCalendarProps>
                     break;
                 }
               }}
-              height="100%"
+              referencePoints={referencePoints}
+              referenceRadiusMiles={referenceRadiusMiles}
+              referenceRadiusMilesArray={referenceRadiusMilesArray}
+              height={isDesktop ? "100%" : "min(70vh, 640px)"}
             />
           )}
         </div>
@@ -1762,13 +2679,43 @@ export const WorkerCalendar = forwardRef<WorkerCalendarRef, WorkerCalendarProps>
         open={!!selectedEvent}
         onOpenChange={(open) => !open && setSelectedEvent(null)}
         job={selectedEvent?.job || null}
-        status={selectedEvent?.type || "opportunity"}
+        status={
+          selectedEvent?.type === "accepted" || selectedEvent?.type === "pending"
+            ? selectedEvent.type
+            : "opportunity"
+        }
         applicationId={selectedEvent?.applicationId}
         proposedRate={selectedEvent?.proposedRate}
         profile={profile}
-        teamMember={selectedEvent?.teamMember}
-        company={selectedEvent?.company}
-        activeTeamMembers={activeTeamMembers}
+        teamMember={
+          selectedEvent?.teamMember
+            ? {
+                id: selectedEvent.teamMember.id,
+                firstName: selectedEvent.teamMember.firstName ?? "Worker",
+                lastName: selectedEvent.teamMember.lastName ?? "",
+                avatarUrl: selectedEvent.teamMember.avatarUrl ?? null,
+                hourlyRate: selectedEvent.teamMember.hourlyRate ?? workerHourlyRate,
+                phone: selectedEvent.teamMember.phone ?? null,
+              }
+            : null
+        }
+        company={
+          selectedEvent?.company
+            ? {
+                id: selectedEvent.company.id,
+                companyName: selectedEvent.company.companyName ?? null,
+                phone: selectedEvent.company.phone ?? null,
+              }
+            : null
+        }
+        activeTeamMembers={activeTeamMembers.map((m) => ({
+          id: m.id,
+          firstName: m.firstName ?? "Worker",
+          lastName: m.lastName ?? "",
+          avatarUrl: m.avatarUrl ?? null,
+          hourlyRate: m.hourlyRate ?? workerHourlyRate,
+          phone: m.phone ?? null,
+        }))}
         workerHourlyRate={workerHourlyRate}
         clockInStatus={clockInStatus}
         clockInError={clockInError}
@@ -1796,12 +2743,20 @@ export const WorkerCalendar = forwardRef<WorkerCalendarRef, WorkerCalendarProps>
         profile={profile}
         activeTeamMembers={activeTeamMembers.map(m => ({
           id: m.id,
-          firstName: m.firstName,
-          lastName: m.lastName,
-          avatarUrl: m.avatarUrl,
-          hourlyRate: m.hourlyRate,
+          firstName: m.firstName ?? "Worker",
+          lastName: m.lastName ?? "",
+          avatarUrl: m.avatarUrl ?? null,
+          hourlyRate: m.hourlyRate ?? null,
+          status: m.status as "active" | "pending" | "inactive",
+          latitude: (m as { latitude?: string | null }).latitude ?? null,
+          longitude: (m as { longitude?: string | null }).longitude ?? null,
+          skillsets: Array.isArray((m as { skillsets?: unknown }).skillsets)
+            ? (m as { skillsets?: unknown[] }).skillsets
+                ?.map((s) => String(s))
+                .filter(Boolean)
+            : [],
         }))}
-        workerLocation={null}
+        workerLocation={profile?.latitude != null && profile?.longitude != null ? (() => { const lat = parseFloat(String(profile.latitude)); const lng = parseFloat(String(profile.longitude)); return Number.isFinite(lat) && Number.isFinite(lng) ? { lat, lng } : undefined; })() : undefined}
         onOpenApply={(job) => {
           setSelectedOpportunityJob(null);
           onApplyToJob(job);
@@ -1811,7 +2766,7 @@ export const WorkerCalendar = forwardRef<WorkerCalendarRef, WorkerCalendarProps>
         }}
       />
 
-      {/* Accepted Job Dialog - mirrors TodayPage's JobDetailsDialog */}
+      {/* Accepted Job Dialog - in-progress/accepted status (clock in/out, directions, chat, etc.) */}
       {selectedAcceptedEvent && (() => {
         const job = selectedAcceptedEvent.job;
         const jobStartDate = new Date(job.startDate);
@@ -1824,6 +2779,49 @@ export const WorkerCalendar = forwardRef<WorkerCalendarRef, WorkerCalendarProps>
         const jobTypeInfo = getJobTypeInfo(job);
         const JobTypeIcon = jobTypeInfo.icon;
         const hasMapLocation = job.latitude && job.longitude;
+        const mapUserLocation =
+          profile?.latitude != null && profile?.longitude != null
+            ? (() => {
+                const lat = parseFloat(String(profile.latitude));
+                const lng = parseFloat(String(profile.longitude));
+                return Number.isFinite(lat) && Number.isFinite(lng) ? { lat, lng } : null;
+              })()
+            : null;
+
+        const assignedPersonIds = new Set<number>(
+          mapJobAssignments
+            .filter((assignment) => assignment.jobId === job.id && typeof assignment.teamMemberId === "number")
+            .map((assignment) => assignment.teamMemberId as number)
+        );
+
+        const fleetPersonLocations: PersonLocation[] = mapTeammates
+          .filter((person) => assignedPersonIds.has(person.id))
+          .map((person) => {
+            const lat = person.liveLocationLat ?? person.workLocationLat;
+            const lng = person.liveLocationLng ?? person.workLocationLng;
+            if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+            const fullName = `${person.firstName || ""} ${person.lastName || ""}`.trim() || "Worker";
+            return {
+              id: person.id,
+              lat,
+              lng,
+              name: fullName,
+              avatarUrl: person.avatarUrl || null,
+              type: mapUserLocation && person.id === profile?.id ? "worker" : "teammate",
+            } as PersonLocation;
+          })
+          .filter((person): person is PersonLocation => person !== null);
+
+        if (fleetPersonLocations.length === 0 && mapUserLocation) {
+          fleetPersonLocations.push({
+            id: profile?.id || "self",
+            lat: mapUserLocation.lat,
+            lng: mapUserLocation.lng,
+            name: `${profile?.firstName || ""} ${profile?.lastName || ""}`.trim() || "You",
+            avatarUrl: profile?.avatarUrl || null,
+            type: "worker",
+          });
+        }
         
         const allMedia: { type: "image" | "video"; url: string }[] = [];
         if (job.images && Array.isArray(job.images)) {
@@ -1921,7 +2919,7 @@ export const WorkerCalendar = forwardRef<WorkerCalendarRef, WorkerCalendarProps>
             
             <div className="p-4 space-y-4">
               <div>
-                <h2 className="text-xl font-bold">{job.title}</h2>
+                <h2 className="text-xl font-bold">{getDisplayJobTitle(job)}</h2>
                 <div className="flex items-center gap-2 flex-wrap mt-2">
                   <Badge className="bg-green-500 text-white">Accepted</Badge>
                   <button 
@@ -1961,19 +2959,17 @@ export const WorkerCalendar = forwardRef<WorkerCalendarRef, WorkerCalendarProps>
               </div>
 
               {hasMapLocation && (
-                <div className="rounded-xl overflow-hidden border">
-                  <MiniJobMap
+                <div className="rounded-xl border p-[5px]">
+                  <JobLocationMap
                     job={{
                       id: job.id,
                       lat: parseFloat(job.latitude!),
                       lng: parseFloat(job.longitude!),
-                      title: job.title,
-                      trade: job.trade || undefined,
-                      hourlyRate: job.hourlyRate || undefined,
-                      city: job.city || undefined,
-                      state: job.state || undefined,
+                      title: getDisplayJobTitle(job),
                     }}
-                    className="w-full h-40"
+                    userLocation={mapUserLocation}
+                    personLocations={fleetPersonLocations}
+                    className="w-full h-40 rounded-lg overflow-hidden"
                   />
                 </div>
               )}
@@ -2171,7 +3167,7 @@ export const WorkerCalendar = forwardRef<WorkerCalendarRef, WorkerCalendarProps>
             <Sheet open={!!selectedAcceptedEvent} onOpenChange={(open) => { if (!open) { setSelectedAcceptedEvent(null); setCurrentMediaIndex(0); setMediaLoaded(false); } }}>
               <SheetContent side="bottom" className="rounded-t-xl p-0 h-[90vh] overflow-hidden">
                 <SheetHeader className="sr-only">
-                  <SheetTitle>{job.title}</SheetTitle>
+                  <SheetTitle>{getDisplayJobTitle(job)}</SheetTitle>
                   <SheetDescription>{job.trade} - {getFullAddress(job)}</SheetDescription>
                 </SheetHeader>
                 <ScrollArea className="h-full">
@@ -2186,7 +3182,7 @@ export const WorkerCalendar = forwardRef<WorkerCalendarRef, WorkerCalendarProps>
           <Dialog open={!!selectedAcceptedEvent} onOpenChange={(open) => { if (!open) { setSelectedAcceptedEvent(null); setCurrentMediaIndex(0); setMediaLoaded(false); } }}>
             <DialogContent className="max-w-lg max-h-[90vh] overflow-y-auto p-0">
               <DialogHeader className="sr-only">
-                <DialogTitle>{job.title}</DialogTitle>
+                <DialogTitle>{getDisplayJobTitle(job)}</DialogTitle>
                 <DialogDescription>{job.trade} - {getFullAddress(job)}</DialogDescription>
               </DialogHeader>
               {content}
@@ -2206,15 +3202,30 @@ export const WorkerCalendar = forwardRef<WorkerCalendarRef, WorkerCalendarProps>
             {selectedDayEvents.events.map(event => (
               <div
                 key={event.id}
-                className="p-3 rounded-lg border cursor-pointer hover:bg-muted/50 transition-colors"
+                className={`p-3 rounded-lg border transition-colors ${event.type === "imported" ? "cursor-default bg-gray-50 dark:bg-gray-900/50" : "cursor-pointer hover:bg-muted/50"}`}
                 onClick={() => {
                   setSelectedDayEvents(null);
+                  if (event.type === "imported") return;
                   if (event.type === "opportunity") {
                     setSelectedOpportunityJob(event.job);
                   } else if (event.type === "accepted") {
                     setCurrentMediaIndex(0);
                     setMediaLoaded(false);
                     setSelectedAcceptedEvent(event);
+                  } else if (event.type === "pending") {
+                    const app = event.applicationId != null ? {
+                      id: event.applicationId,
+                      status: "pending" as const,
+                      proposedRate: event.proposedRate ?? null,
+                      teamMember: event.teamMember ? {
+                        id: event.teamMember.id,
+                        firstName: event.teamMember.firstName ?? null,
+                        lastName: event.teamMember.lastName ?? null,
+                        avatarUrl: event.teamMember.avatarUrl ?? null,
+                        hourlyRate: (event.teamMember as { hourlyRate?: number | null }).hourlyRate ?? null,
+                      } : null,
+                    } : undefined;
+                    onViewJob(event.job, app ?? undefined);
                   } else {
                     setSelectedEvent(event);
                   }
@@ -2225,22 +3236,28 @@ export const WorkerCalendar = forwardRef<WorkerCalendarRef, WorkerCalendarProps>
                   <div className={`w-3 h-3 rounded ${
                     event.type === "accepted" ? "bg-green-500" :
                     event.type === "pending" ? "bg-amber-500" :
+                    event.type === "imported" ? "bg-gray-400 dark:bg-gray-500" :
                     "border-2 border-dashed border-blue-400 bg-blue-50 dark:bg-blue-950"
                   }`} />
                   <span className="font-medium">{event.title}</span>
                 </div>
                 <div className="flex items-center gap-4 text-sm text-muted-foreground">
                   {event.scheduledTime ? (
-                    <span>{event.scheduledTime}</span>
+                    <span>{formatEventTimeTo12h(event.scheduledTime)}</span>
                   ) : (
-                    <span className="italic">Flexible Time</span>
+                    <span className="italic">{event.type === "imported" ? "" : "Flexible Time"}</span>
                   )}
-                  {event.estimatedHours && (
+                  {event.type !== "imported" && event.estimatedHours && (
                     <span>{event.estimatedHours} hours</span>
                   )}
-                  <span className="text-green-600 dark:text-green-400 font-medium">
-                    {calculatePayout(event)}
-                  </span>
+                  {event.type === "imported" && event.sourceName && (
+                    <span>{event.sourceName}</span>
+                  )}
+                  {event.type !== "imported" && (
+                    <span className="text-green-600 dark:text-green-400 font-medium">
+                      {calculatePayout(event)}
+                    </span>
+                  )}
                 </div>
               </div>
             ))}
@@ -2290,19 +3307,17 @@ export const WorkerCalendar = forwardRef<WorkerCalendarRef, WorkerCalendarProps>
                   <Calendar className="w-4 h-4 mr-2" />
                   Month
                 </Button>
-                {!isEmployee && (
-                  <Button
-                    variant={view === "map" ? "default" : "outline"}
-                    className="w-full justify-start"
-                    onClick={() => {
-                      setView("map");
-                      setShowViewSelector(false);
-                    }}
-                  >
-                    <MapIcon className="w-4 h-4 mr-2" />
-                    Map
-                  </Button>
-                )}
+                <Button
+                  variant={view === "map" ? "default" : "outline"}
+                  className="w-full justify-start"
+                  onClick={() => {
+                    setView("map");
+                    setShowViewSelector(false);
+                  }}
+                >
+                  <MapIcon className="w-4 h-4 mr-2" />
+                  Map
+                </Button>
               </div>
             </div>
           </DrawerContent>
@@ -2371,22 +3386,24 @@ export const WorkerCalendar = forwardRef<WorkerCalendarRef, WorkerCalendarProps>
                       </button>
                     )}
                     
-                    {/* Export Calendar */}
-                    <button
-                      onClick={() => setSettingsSubMenu("export")}
-                      className="w-full flex items-center justify-between p-3 rounded-lg hover:bg-muted transition-colors"
-                    >
-                      <div className="flex items-center gap-3">
-                        <Download className="w-5 h-5 text-muted-foreground" />
-                        <div className="text-left">
-                          <div className="font-medium text-sm">Export Calendar</div>
-                          <div className="text-xs text-muted-foreground">Share your calendar</div>
+                    {/* Export Calendar — admins / business operators only; employees cannot export */}
+                    {!isEmployee && (
+                      <button
+                        onClick={() => setSettingsSubMenu("export")}
+                        className="w-full flex items-center justify-between p-3 rounded-lg hover:bg-muted transition-colors"
+                      >
+                        <div className="flex items-center gap-3">
+                          <Download className="w-5 h-5 text-muted-foreground" />
+                          <div className="text-left">
+                            <div className="font-medium text-sm">Export Calendar</div>
+                            <div className="text-xs text-muted-foreground">Share your calendar</div>
+                          </div>
                         </div>
-                      </div>
-                      <ChevronRight className="w-4 h-4 text-muted-foreground" />
-                    </button>
+                        <ChevronRight className="w-4 h-4 text-muted-foreground" />
+                      </button>
+                    )}
                     
-                    {/* Import Calendar */}
+                    {/* Import Calendar — per worker; all workers can import their own */}
                     <button
                       onClick={() => setSettingsSubMenu("import")}
                       className="w-full flex items-center justify-between p-3 rounded-lg hover:bg-muted transition-colors"
@@ -2401,7 +3418,7 @@ export const WorkerCalendar = forwardRef<WorkerCalendarRef, WorkerCalendarProps>
                       <ChevronRight className="w-4 h-4 text-muted-foreground" />
                     </button>
                   </div>
-                ) : settingsSubMenu === "export" ? (
+                ) : settingsSubMenu === "export" && !isEmployee ? (
                   <div className="p-4 space-y-4">
                     <div>
                       <h3 className="font-semibold mb-2 flex items-center gap-2">
@@ -2439,11 +3456,100 @@ export const WorkerCalendar = forwardRef<WorkerCalendarRef, WorkerCalendarProps>
                       <p className="text-sm text-muted-foreground mb-3">
                         Paste a calendar URL from Google Calendar or Outlook to see your events here.
                       </p>
+                      <div className="mb-4">
+                        <p className="text-xs font-medium text-muted-foreground mb-2">Imported calendars</p>
+                        <div className="rounded-md border">
+                          <Table>
+                            <TableHeader>
+                              <TableRow>
+                                <TableHead className="text-xs">Calendar URL</TableHead>
+                                <TableHead className="text-xs w-[90px] text-right">Actions</TableHead>
+                              </TableRow>
+                            </TableHeader>
+                            <TableBody>
+                              {importedCalendarList.length === 0 ? (
+                                <TableRow>
+                                  <TableCell colSpan={2} className="text-xs text-muted-foreground py-4 text-center">
+                                    No calendars imported yet. Add one below.
+                                  </TableCell>
+                                </TableRow>
+                              ) : (
+                                importedCalendarList.map((url) => (
+                                  <TableRow key={url}>
+                                    <TableCell className="py-2">
+                                      {editingCalendarUrl === url ? (
+                                        <div className="flex items-center gap-1">
+                                          <Input
+                                            className="h-8 text-xs flex-1 min-w-0"
+                                            value={editingCalendarValue}
+                                            onChange={(e) => setEditingCalendarValue(e.target.value)}
+                                            placeholder="Calendar URL"
+                                          />
+                                          <Button
+                                            size="icon"
+                                            variant="ghost"
+                                            className="h-8 w-8 shrink-0"
+                                            disabled={isSavingImportSettings || !editingCalendarValue.trim()}
+                                            onClick={() => handleSaveEditCalendar(url, editingCalendarValue)}
+                                          >
+                                            <Check className="w-4 h-4" />
+                                          </Button>
+                                          <Button
+                                            size="icon"
+                                            variant="ghost"
+                                            className="h-8 w-8 shrink-0"
+                                            disabled={isSavingImportSettings}
+                                            onClick={() => { setEditingCalendarUrl(null); setEditingCalendarValue(""); }}
+                                          >
+                                            <X className="w-4 h-4" />
+                                          </Button>
+                                        </div>
+                                      ) : (
+                                        <span className="text-xs truncate block max-w-[200px]" title={url}>{url}</span>
+                                      )}
+                                    </TableCell>
+                                    <TableCell className="py-2 text-right">
+                                      {editingCalendarUrl !== url && (
+                                        <>
+                                          <Button
+                                            size="icon"
+                                            variant="ghost"
+                                            className="h-8 w-8 shrink-0"
+                                            onClick={() => { setEditingCalendarUrl(url); setEditingCalendarValue(url); }}
+                                            aria-label="Edit calendar"
+                                          >
+                                            <Pencil className="w-3.5 h-3.5" />
+                                          </Button>
+                                          <Button
+                                            size="icon"
+                                            variant="ghost"
+                                            className="h-8 w-8 shrink-0 text-destructive hover:text-destructive"
+                                            disabled={isSavingImportSettings}
+                                            onClick={() => handleRemoveImportedCalendar(url)}
+                                            aria-label="Remove calendar"
+                                          >
+                                            <Trash2 className="w-3.5 h-3.5" />
+                                          </Button>
+                                        </>
+                                      )}
+                                    </TableCell>
+                                  </TableRow>
+                                ))
+                              )}
+                            </TableBody>
+                          </Table>
+                        </div>
+                      </div>
                       <div className="space-y-3">
                         <Input
                           placeholder="Paste calendar URL here..."
                           value={importCalendarUrl}
                           onChange={(e) => setImportCalendarUrl(e.target.value)}
+                          onPaste={(e) => {
+                            const text = e.clipboardData?.getData("text/plain")?.trim();
+                            if (text) setImportCalendarUrl(normalizeCalendarUrl(text));
+                          }}
+                          autoFocus
                           data-testid="input-import-url"
                         />
                         <Button
@@ -2503,33 +3609,35 @@ export const WorkerCalendar = forwardRef<WorkerCalendarRef, WorkerCalendarProps>
             </DialogHeader>
             
             <div className="space-y-6 py-2">
-              <div>
-                <h3 className="font-semibold mb-2 flex items-center gap-2">
-                  <Download className="w-4 h-4" />
-                  Export Your Calendar
-                </h3>
-                <p className="text-sm text-muted-foreground mb-3">
-                  Copy this link to add your Tolstoy jobs to Google Calendar, Outlook, or any calendar app.
-                </p>
-                <div className="flex gap-2">
-                  <Input
-                    value={exportCalendarUrl}
-                    readOnly
-                    className="text-xs"
-                    data-testid="input-export-url-desktop"
-                  />
-                  <Button
-                    size="icon"
-                    variant="outline"
-                    onClick={handleCopyExportUrl}
-                    data-testid="button-copy-export-url-desktop"
-                  >
-                    {copiedExportUrl ? <Check className="w-4 h-4 text-green-500" /> : <Copy className="w-4 h-4" />}
-                  </Button>
+              {!isEmployee && (
+                <div>
+                  <h3 className="font-semibold mb-2 flex items-center gap-2">
+                    <Download className="w-4 h-4" />
+                    Export Your Calendar
+                  </h3>
+                  <p className="text-sm text-muted-foreground mb-3">
+                    Copy this link to add your Tolstoy jobs to Google Calendar, Outlook, or any calendar app.
+                  </p>
+                  <div className="flex gap-2">
+                    <Input
+                      value={exportCalendarUrl}
+                      readOnly
+                      className="text-xs"
+                      data-testid="input-export-url-desktop"
+                    />
+                    <Button
+                      size="icon"
+                      variant="outline"
+                      onClick={handleCopyExportUrl}
+                      data-testid="button-copy-export-url-desktop"
+                    >
+                      {copiedExportUrl ? <Check className="w-4 h-4 text-green-500" /> : <Copy className="w-4 h-4" />}
+                    </Button>
+                  </div>
                 </div>
-              </div>
+              )}
               
-              <div className="border-t pt-6">
+              <div className={!isEmployee ? "border-t pt-6" : ""}>
                 <h3 className="font-semibold mb-2 flex items-center gap-2">
                   <Link className="w-4 h-4" />
                   Import External Calendar
@@ -2537,11 +3645,100 @@ export const WorkerCalendar = forwardRef<WorkerCalendarRef, WorkerCalendarProps>
                 <p className="text-sm text-muted-foreground mb-3">
                   Paste a calendar URL from Google Calendar or Outlook to see your events here.
                 </p>
+                <div className="mb-4">
+                  <p className="text-xs font-medium text-muted-foreground mb-2">Imported calendars</p>
+                  <div className="rounded-md border">
+                    <Table>
+                      <TableHeader>
+                        <TableRow>
+                          <TableHead className="text-xs">Calendar URL</TableHead>
+                          <TableHead className="text-xs w-[90px] text-right">Actions</TableHead>
+                        </TableRow>
+                      </TableHeader>
+                      <TableBody>
+                        {importedCalendarList.length === 0 ? (
+                          <TableRow>
+                            <TableCell colSpan={2} className="text-xs text-muted-foreground py-4 text-center">
+                              No calendars imported yet. Add one below.
+                            </TableCell>
+                          </TableRow>
+                        ) : (
+                          importedCalendarList.map((url) => (
+                            <TableRow key={url}>
+                              <TableCell className="py-2">
+                                {editingCalendarUrl === url ? (
+                                  <div className="flex items-center gap-1">
+                                    <Input
+                                      className="h-8 text-xs flex-1 min-w-0"
+                                      value={editingCalendarValue}
+                                      onChange={(e) => setEditingCalendarValue(e.target.value)}
+                                      placeholder="Calendar URL"
+                                    />
+                                    <Button
+                                      size="icon"
+                                      variant="ghost"
+                                      className="h-8 w-8 shrink-0"
+                                      disabled={isSavingImportSettings || !editingCalendarValue.trim()}
+                                      onClick={() => handleSaveEditCalendar(url, editingCalendarValue)}
+                                    >
+                                      <Check className="w-4 h-4" />
+                                    </Button>
+                                    <Button
+                                      size="icon"
+                                      variant="ghost"
+                                      className="h-8 w-8 shrink-0"
+                                      disabled={isSavingImportSettings}
+                                      onClick={() => { setEditingCalendarUrl(null); setEditingCalendarValue(""); }}
+                                    >
+                                      <X className="w-4 h-4" />
+                                    </Button>
+                                  </div>
+                                ) : (
+                                  <span className="text-xs truncate block max-w-[240px]" title={url}>{url}</span>
+                                )}
+                              </TableCell>
+                              <TableCell className="py-2 text-right">
+                                {editingCalendarUrl !== url && (
+                                  <>
+                                    <Button
+                                      size="icon"
+                                      variant="ghost"
+                                      className="h-8 w-8 shrink-0"
+                                      onClick={() => { setEditingCalendarUrl(url); setEditingCalendarValue(url); }}
+                                      aria-label="Edit calendar"
+                                    >
+                                      <Pencil className="w-3.5 h-3.5" />
+                                    </Button>
+                                    <Button
+                                      size="icon"
+                                      variant="ghost"
+                                      className="h-8 w-8 shrink-0 text-destructive hover:text-destructive"
+                                      disabled={isSavingImportSettings}
+                                      onClick={() => handleRemoveImportedCalendar(url)}
+                                      aria-label="Remove calendar"
+                                    >
+                                      <Trash2 className="w-3.5 h-3.5" />
+                                    </Button>
+                                  </>
+                                )}
+                              </TableCell>
+                            </TableRow>
+                          ))
+                        )}
+                      </TableBody>
+                    </Table>
+                  </div>
+                </div>
                 <div className="space-y-3">
                   <Input
+                    ref={importUrlInputRef}
                     placeholder="Paste calendar URL here..."
                     value={importCalendarUrl}
                     onChange={(e) => setImportCalendarUrl(e.target.value)}
+                    onPaste={(e) => {
+                      const text = e.clipboardData?.getData("text/plain")?.trim();
+                      if (text) setImportCalendarUrl(text);
+                    }}
                     data-testid="input-import-url-desktop"
                   />
                   <Button
@@ -2587,14 +3784,8 @@ export const WorkerCalendar = forwardRef<WorkerCalendarRef, WorkerCalendarProps>
               
               <div className="space-y-3">
                 <div className="p-3 bg-secondary/50 rounded-lg">
-                  <p className="font-semibold text-sm">{timeInfo.relative}</p>
+                  <p className="font-semibold text-sm">{timeInfo.dateTimeLine ?? timeInfo.relative}</p>
                   <p className="text-sm text-muted-foreground">{timeInfo.fullDate}</p>
-                  {timeInfo.timeRange && (
-                    <p className="text-sm mt-1">
-                      <Clock className="w-3 h-3 inline mr-1" />
-                      {timeInfo.timeRange}
-                    </p>
-                  )}
                 </div>
                 
                 {scheduleInfoJob.jobType === "recurring" && timeInfo.scheduleDaysDisplay && (

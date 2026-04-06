@@ -11,6 +11,39 @@ export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs))
 }
 
+const NUMBER_WORDS: Record<string, string> = {
+  zero: "0", one: "1", two: "2", three: "3", four: "4",
+  five: "5", six: "6", seven: "7", eight: "8", nine: "9", oh: "0",
+};
+
+/** Remove phone numbers and email addresses from text (e.g. chat message content). */
+export function stripPhonesAndEmails(text: string): string {
+  if (!text) return text;
+  let out = text
+    .replace(/\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g, "")
+    .replace(/\+\d{1,4}[\s.-]?(?:\(?\d{2,4}\)?[\s.-]?)+\d{4,}/g, "")
+    .replace(/\(\d{3}\)\s*\d{3}[-.\s]?\d{4}/g, "")
+    .replace(/\d{3}[-.\s]\d{3}[-.\s]\d{4}/g, "");
+
+  // Normalize number words to digits so "five one three 2 9 2 six five seven" becomes digit sequence
+  out = out.replace(/\b(zero|one|two|three|four|five|six|seven|eight|nine|oh)\b/gi, (word) =>
+    NUMBER_WORDS[word.toLowerCase()] ?? word
+  );
+
+  // Remove runs of digits (with optional spaces, dots, dashes, parens) that form US phone length (10 or 1+10)
+  // Only treat as phone when area code (first digit of 10, or second of 11) is 2-9 to avoid stripping e.g. "1000000000"
+  out = out.replace(/[\d\s.\-()]+/g, (run) => {
+    const digits = run.replace(/\D/g, "");
+    const len = digits.length;
+    if (len === 10 && digits[0] >= "2" && digits[0] <= "9") return "";
+    if (len === 11 && digits[0] === "1" && digits[1] >= "2" && digits[1] <= "9") return "";
+    return run;
+  });
+
+  out = out.replace(/\s+/g, " ").trim();
+  return out;
+}
+
 /**
  * Normalizes an avatar URL to ensure it's in the correct format.
  * Handles various formats:

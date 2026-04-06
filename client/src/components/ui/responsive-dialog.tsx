@@ -6,16 +6,25 @@ import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetDescription } from "
 import { useIsMobile } from "@/hooks/use-mobile";
 import { useScrollHeaderContainer } from "@/hooks/use-scroll-header-container";
 import { cn } from "@/lib/utils";
+import { blurFocusInsideRoot } from "@/lib/modal-focus";
 import { X, ArrowLeft } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { PopupSeparator } from "./mobile-popup";
 
-// Cleanup lingering modal overlays (fixes DropdownMenu → Dialog interactions)
+// Cleanup lingering modal overlays and restore clickability (Radix can leave inert/pointer-events on html/body)
 function cleanupOverlays() {
   setTimeout(() => {
     const root = document.getElementById('root');
-    if (root && root.getAttribute('aria-hidden') === 'true') {
-      root.removeAttribute('aria-hidden');
+    const html = document.documentElement;
+    if (html.getAttribute('inert') != null) html.removeAttribute('inert');
+    html.style.removeProperty('pointer-events');
+    if (html.getAttribute('aria-hidden') === 'true') html.removeAttribute('aria-hidden');
+    document.body.style.removeProperty('pointer-events');
+    if (document.body.getAttribute('inert') != null) document.body.removeAttribute('inert');
+    if (document.body.getAttribute('aria-hidden') === 'true') document.body.removeAttribute('aria-hidden');
+    if (root) {
+      root.style.removeProperty('pointer-events');
+      if (root.getAttribute('aria-hidden') === 'true') root.removeAttribute('aria-hidden');
     }
     // Remove lingering dropdown overlays
     document.querySelectorAll('[data-radix-popper-content-wrapper]').forEach(el => {
@@ -47,6 +56,8 @@ interface ResponsiveDialogProps {
   footer?: React.ReactNode;
   className?: string;
   contentClassName?: string;
+  /** Overlay z-index/className (e.g. !z-[10001] so Stripe iframe dialog sits above other popups). */
+  overlayClassName?: string;
   headerClassName?: string;
   footerClassName?: string;
   onPointerDownOutside?: (e: Event) => void;
@@ -97,6 +108,7 @@ export function ResponsiveDialog({
   footer,
   className,
   contentClassName,
+  overlayClassName,
   headerClassName,
   footerClassName,
   onPointerDownOutside,
@@ -126,6 +138,13 @@ export function ResponsiveDialog({
   React.useEffect(() => {
     if (!open) {
       cleanupOverlays();
+    }
+  }, [open]);
+
+  /** Radix may aria-hide #root before focus leaves the trigger; blur synchronously when opening. */
+  React.useLayoutEffect(() => {
+    if (open) {
+      blurFocusInsideRoot();
     }
   }, [open]);
 
@@ -182,11 +201,23 @@ export function ResponsiveDialog({
       )}
     </>
   );
+  const showBackInFooter = showBackButton && !!onBack && (!!footer || !!actionButtonsOnly);
+  const footerBackButton = showBackInFooter && (
+    <button
+      type="button"
+      onClick={onBack}
+      className="text-sm font-normal underline text-muted-foreground hover:text-foreground p-0 min-w-0 bg-transparent hover:bg-transparent border-0 shadow-none focus-visible:outline-none focus-visible:ring-0"
+      data-testid="responsive-dialog-back-button"
+      aria-label={backLabel}
+    >
+      {backLabel}
+    </button>
+  );
   const footerBlock = hasFooterContent && (
     <div
       className={cn(
         "flex-shrink-0 flex flex-col border-t bg-background overflow-hidden",
-        useDrawerStyle ? "rounded-t-none " + FOOTER_SHADOW_MOBILE + " " + FOOTER_SAFE_AREA : cn(FOOTER_SHADOW, "rounded-b-2xl"),
+        useDrawerStyle ? "rounded-t-none " + FOOTER_SHADOW_MOBILE : cn(FOOTER_SHADOW, "rounded-b-2xl"),
         hasProgress && !hasActions && "pb-3"
       )}
     >
@@ -194,13 +225,28 @@ export function ResponsiveDialog({
       {(footer || actionButtonsOnly) && (
         <div
           className={cn(
-            "footer-actions-container px-[23px]",
-            secondaryAction && !footer ? "justify-between" : "justify-end",
-            useDrawerStyle ? "py-4 min-h-[60px]" : "py-3",
+            "footer-actions-container w-full",
+            showBackInFooter && "footer-actions-multi-step",
+            !useDrawerStyle && "px-[23px]",
+            !showBackInFooter && "justify-end",
+            useDrawerStyle ? "pl-[14px] pr-[14px] py-0 min-h-[60px]" : "py-3",
             footerClassName
           )}
         >
-          {footer ?? actionButtonsOnly}
+          {footer ?? (showBackInFooter ? (
+            <>
+              <div className="flex min-w-0 items-center justify-start">
+                {footerBackButton}
+              </div>
+              {actionButtonsOnly && (
+                <div className="flex min-w-0 items-center justify-end gap-2 flex-wrap">
+                  {actionButtonsOnly}
+                </div>
+              )}
+            </>
+          ) : (
+            actionButtonsOnly
+          ))}
         </div>
       )}
     </div>
@@ -222,7 +268,7 @@ export function ResponsiveDialog({
       )}
     >
       <div className="flex items-center gap-2">
-        {showBackButton && onBack && (
+        {showBackButton && onBack && !showBackInFooter && (
           <>
             <button
               type="button"
@@ -260,7 +306,13 @@ export function ResponsiveDialog({
           )}
         </div>
         {headerTrailing != null && (
-          <span className="text-sm text-muted-foreground flex-shrink-0 tabular-nums">{headerTrailing}</span>
+          <div className="flex-shrink-0">
+            {typeof headerTrailing === "string" || typeof headerTrailing === "number" ? (
+              <span className="text-sm text-muted-foreground tabular-nums">{headerTrailing}</span>
+            ) : (
+              headerTrailing
+            )}
+          </div>
         )}
         {!hideCloseButton && (
           <button
@@ -281,7 +333,7 @@ export function ResponsiveDialog({
 
   const bodyAndFooter = (
     <>
-      <div ref={scrollContainerRef} className={cn("flex-1 min-h-0 min-w-0 w-full overflow-y-auto overflow-x-hidden scrollbar-pill-on-scroll px-4 sm:px-6 py-4", className)}>
+      <div ref={scrollContainerRef} className={cn("flex-1 min-h-0 min-w-0 w-full overflow-y-auto overflow-x-hidden scrollbar-pill-on-scroll px-[14px] py-4", className)}>
         {children}
       </div>
       {footerBlock}
@@ -290,15 +342,19 @@ export function ResponsiveDialog({
 
   /* Small mobile only: full-width bottom drawer. Tablet & desktop (768px+): centered dialog. */
   if (useDrawerForLayout) {
+    const sheetContainer = typeof document !== "undefined" ? document.getElementById("dialog-container") ?? undefined : undefined;
     return (
       <Sheet open={open} onOpenChange={onOpenChange}>
         <SheetContent
           side="bottom"
           hideCloseButton
+          container={sheetContainer}
+          overlayClassName={overlayClassName}
           className={cn(
             "responsive-dialog-drawer inset-x-0 left-0 right-0 w-full min-w-full max-w-[100vw] max-h-[90dvh] overflow-hidden p-0 rounded-t-2xl shadow-2xl border-0 flex flex-col",
             contentClassName
           )}
+          aria-describedby={descriptionId}
           onPointerDownOutside={handlePointerDownOutside as unknown as (e: Event) => void}
           onEscapeKeyDown={onEscapeKeyDown as unknown as (e: KeyboardEvent) => void}
         >
@@ -317,19 +373,11 @@ export function ResponsiveDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent
         hideCloseButton
+        overlayClassName={overlayClassName}
         className={cn("left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 max-h-[85vh] overflow-hidden p-0 rounded-2xl shadow-2xl border-0", contentClassName)}
         onPointerDownOutside={handlePointerDownOutside}
         onEscapeKeyDown={onEscapeKeyDown}
         aria-describedby={descriptionId}
-        onOpenAutoFocus={(e) => {
-          const target = e.target as HTMLElement;
-          if (target) {
-            setTimeout(() => {
-              target.focus();
-            }, 50);
-          }
-          e.preventDefault();
-        }}
       >
         <DialogTitle className="sr-only">{typeof title === "string" ? title : "Dialog"}</DialogTitle>
         <DialogDescription id={descriptionId} className="sr-only">{description || (typeof title === "string" ? title : "Dialog")}</DialogDescription>
@@ -342,7 +390,7 @@ export function ResponsiveDialog({
             )}
           >
             <div className="flex items-center gap-2">
-              {showBackButton && onBack && (
+              {showBackButton && onBack && !showBackInFooter && (
                 <>
                   <button
                     type="button"
@@ -381,6 +429,15 @@ export function ResponsiveDialog({
                   </DialogHeader>
                 )}
               </div>
+              {headerTrailing != null && (
+                <div className="flex-shrink-0">
+                  {typeof headerTrailing === "string" || typeof headerTrailing === "number" ? (
+                    <span className="text-sm text-muted-foreground tabular-nums">{headerTrailing}</span>
+                  ) : (
+                    headerTrailing
+                  )}
+                </div>
+              )}
               {!hideCloseButton && (
                 <button
                   type="button"

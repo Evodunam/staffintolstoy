@@ -1,6 +1,6 @@
 import { useState, useEffect, useMemo, useRef, useCallback } from "react";
-import { GoogleMap, useJsApiLoader, Marker, DirectionsRenderer, InfoWindow, Polyline } from "@react-google-maps/api";
-import { format, parseISO, isSameDay, addDays, subDays, isToday, startOfDay } from "date-fns";
+import { GoogleMap, useJsApiLoader, Marker, DirectionsRenderer, InfoWindow, Polyline, Circle as MapCircle, OverlayView } from "@react-google-maps/api";
+import { format, parseISO, isSameDay, addDays, subDays, isToday, startOfDay, endOfDay, isBefore } from "date-fns";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
@@ -10,11 +10,58 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Label } from "@/components/ui/label";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Skeleton } from "@/components/ui/skeleton";
-import { useIsMobile } from "@/hooks/use-mobile";
+import { useIsDesktop, useIsMobile } from "@/hooks/use-mobile";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { Separator } from "@/components/ui/separator";
 import { Table as TableComponent, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { GOOGLE_MAPS_LOADER_ID, GOOGLE_MAPS_LIBRARIES } from "@/lib/google-maps";
+import { REPLAY_QUERY_KEYS, parseReplayUrlState, writeReplayUrlState } from "@/lib/replay-url";
+
+const MILES_TO_METERS = 1609.344;
+
+/** Avatar pin for map (same style as Find Work JobsMap): avatar or initials + colored ring + pointer. */
+function CalendarAvatarPin({
+  name,
+  avatarUrl,
+  ringColorHex,
+  title,
+}: {
+  name: string;
+  avatarUrl?: string | null;
+  ringColorHex: string;
+  title?: string;
+}) {
+  const initials = name
+    .split(" ")
+    .map((n) => n[0])
+    .join("")
+    .toUpperCase()
+    .slice(0, 2);
+  return (
+    <div
+      className="flex flex-col items-center cursor-pointer transform -translate-x-1/2 -translate-y-full"
+      title={title}
+    >
+      <div
+        className="relative rounded-full p-0.5 shadow-lg border-2"
+        style={{ backgroundColor: ringColorHex, borderColor: ringColorHex }}
+      >
+        <Avatar className="w-8 h-8 border-2 border-white bg-muted">
+          {avatarUrl ? (
+            <AvatarImage src={avatarUrl} alt={name} />
+          ) : null}
+          <AvatarFallback className="text-xs font-semibold bg-white text-gray-800">
+            {initials}
+          </AvatarFallback>
+        </Avatar>
+      </div>
+      <div
+        className="w-2 h-2 -mt-1 rotate-45"
+        style={{ backgroundColor: ringColorHex }}
+      />
+    </div>
+  );
+}
 
 const mapStyles = [
   {
@@ -25,6 +72,8 @@ const mapStyles = [
 ];
 
 // Data model interfaces
+export type RouteType = "accepted" | "pending" | "available";
+
 export interface TeammateRoute {
   teammateId: number;
   teammateName: string;
@@ -42,8 +91,14 @@ export interface TeammateRoute {
   jobs: JobStop[];
   route?: google.maps.DirectionsResult | null;
   routeColor: string;
+  routeType: RouteType;
+  /** Path for clickable overlay and dashed available route. */
+  overviewPath?: { lat: number; lng: number }[];
   totalDistance?: string;
   totalDuration?: string;
+  routeSource?: "fleet" | "directions" | "polyline";
+  replayTrail?: Array<{ lat: number; lng: number; createdAt?: Date | null }>;
+  fullTrail?: Array<{ lat: number; lng: number; createdAt?: Date | null }>;
 }
 
 export interface JobStop {
@@ -59,9 +114,13 @@ export interface JobStop {
   isCurrent?: boolean;
   isNext?: boolean;
   isBehind?: boolean;
+  /** From job assignment: "accepted" | "pending" etc. Used for route line color. */
+  assignmentStatus?: string;
 }
 
 interface CalendarMapViewProps {
+  /** When true, hide legend and worker filter; show only this worker's accepted jobs and radius/avatar. */
+  isEmployee?: boolean;
   selectedDate: Date;
   onDateChange?: (date: Date) => void;
   teammates: Array<{
@@ -75,6 +134,7 @@ interface CalendarMapViewProps {
     liveLocationLat?: number | null;
     liveLocationLng?: number | null;
     liveLocationTimestamp?: Date | null;
+    liveLocationPath?: Array<{ lat: number; lng: number; createdAt?: Date | string | null }>;
   }>;
   workerProfile?: {
     address?: string | null;
@@ -83,7 +143,8 @@ interface CalendarMapViewProps {
     zipCode?: string | null;
     latitude?: string | null;
     longitude?: string | null;
-  } | null; // Worker's profile for fallback location
+    avatarUrl?: string | null;
+  } | null; // Worker's profile for fallback location + owner avatar on map
   jobAssignments: Array<{
     jobId: number;
     jobTitle: string;
@@ -123,21 +184,48 @@ interface CalendarMapViewProps {
   onToggleAcceptedJobs?: (show: boolean) => void;
   onTogglePendingJobs?: (show: boolean) => void;
   onToggleAvailableJobs?: (show: boolean) => void;
+  /** Same as Find Work map: draw radius circles around these points (worker + teammates). */
+  referencePoints?: Array<{ lat: number; lng: number }>;
+  /** Radius in miles for each reference point (or single radius for all when array not provided). */
+  referenceRadiusMiles?: number;
+  referenceRadiusMilesArray?: number[];
+  /** Optional content to render at the right end of the bottom panel header (e.g. worker filter button on tablet). */
+  toolbarRightContent?: React.ReactNode;
 }
 
-// Color palette for routes
-const ROUTE_COLORS = [
-  "#3B82F6", // Blue
-  "#10B981", // Green
-  "#F59E0B", // Amber
-  "#EF4444", // Red
-  "#8B5CF6", // Purple
-  "#EC4899", // Pink
-  "#06B6D4", // Cyan
-  "#F97316", // Orange
-];
+// Route line colors by filter type (match legend: Accepted / Pending / Available)
+const ROUTE_COLOR_ACCEPTED = "#22c55e";  // green
+const ROUTE_COLOR_PENDING = "#eab308";   // yellow
+const ROUTE_COLOR_AVAILABLE = "#38bdf8"; // light blue, dashed – route they can add
+const MAX_AUTOFIT_ZOOM = 12;
+const hasValidCoord = (value: number | null | undefined): value is number =>
+  typeof value === "number" && Number.isFinite(value);
+
+interface ReassignmentSuggestion {
+  jobId: number;
+  jobTitle: string;
+  currentTeammateName: string;
+  suggestedTeammateName: string;
+  gainMiles: number;
+  gainMinutes: number;
+}
+
+interface ReplayEventChip {
+  minute: number;
+  label: string;
+  kind: "job-start" | "job-end" | "ping";
+  teammateId?: number | null;
+}
+
+const toLatLngLiteral = (
+  point: google.maps.LatLng | google.maps.LatLngLiteral
+): { lat: number; lng: number } => ({
+  lat: typeof point.lat === "function" ? point.lat() : point.lat,
+  lng: typeof point.lng === "function" ? point.lng() : point.lng,
+});
 
 export function CalendarMapView({
+  isEmployee = false,
   selectedDate,
   onDateChange,
   teammates,
@@ -156,6 +244,10 @@ export function CalendarMapView({
   onTogglePendingJobs: propOnTogglePendingJobs,
   onToggleAvailableJobs: propOnToggleAvailableJobs,
   workerProfile,
+  referencePoints,
+  referenceRadiusMiles,
+  referenceRadiusMilesArray,
+  toolbarRightContent,
 }: CalendarMapViewProps) {
   const [focusedTeammateId, setFocusedTeammateId] = useState<number | null>(null);
   
@@ -183,8 +275,12 @@ export function CalendarMapView({
   }, [focusTeammateId]);
   const apiKey = import.meta.env.VITE_GOOGLE_API_KEY || "";
   const isMobile = useIsMobile();
+  const isDesktop = useIsDesktop();
+  const isMobileOrTablet = !isDesktop;
   const [selectedJobId, setSelectedJobId] = useState<number | null>(null);
-  const [bottomSheetPosition, setBottomSheetPosition] = useState<"collapsed" | "peek" | "full">("peek");
+  const [bottomSheetPosition, setBottomSheetPosition] = useState<"hidden" | "collapsed" | "peek" | "full">(
+    isMobileOrTablet ? "collapsed" : "peek"
+  );
   const [desktopPanelExpanded, setDesktopPanelExpanded] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
   const [dragStartY, setDragStartY] = useState(0);
@@ -229,17 +325,374 @@ export function CalendarMapView({
   const [directionsServices, setDirectionsServices] = useState<google.maps.DirectionsService[]>([]);
   const [directionsRenderers, setDirectionsRenderers] = useState<google.maps.DirectionsRenderer[]>([]);
   const mapRef = useRef<google.maps.Map | null>(null);
+  const routeBuildInFlightRef = useRef(false);
+  const lastRouteBuildKeyRef = useRef("");
+  const replayUrlSyncTimeoutRef = useRef<number | null>(null);
+  const replayCopyResetTimeoutRef = useRef<number | null>(null);
   const [loadingRoutes, setLoadingRoutes] = useState(false);
+  const [userGeoLocation, setUserGeoLocation] = useState<{ lat: number; lng: number } | null>(null);
+  const [optimizationSuggestions, setOptimizationSuggestions] = useState<ReassignmentSuggestion[]>([]);
+  const todayStart = startOfDay(new Date());
+  const selectedDayStart = startOfDay(selectedDate);
+  const selectedDayEnd = endOfDay(selectedDate);
+  const dateMode: "past" | "today" | "future" = isToday(selectedDate)
+    ? "today"
+    : isBefore(selectedDayEnd, todayStart)
+      ? "past"
+      : "future";
+  const replayEnabled = false;
+  const now = new Date();
+  const [replayMinute, setReplayMinute] = useState(() => now.getHours() * 60 + now.getMinutes());
+  const [replayPlaying, setReplayPlaying] = useState(false);
+  const [replayRailOpen, setReplayRailOpen] = useState(false);
+  const [showReplayJobStarts, setShowReplayJobStarts] = useState(true);
+  const [showReplayJobEnds, setShowReplayJobEnds] = useState(true);
+  const [showReplayPings, setShowReplayPings] = useState(true);
+  const [replayTeammateFilterIds, setReplayTeammateFilterIds] = useState<number[]>([]);
+  const [replayLinkCopied, setReplayLinkCopied] = useState(false);
+  const enabledTeammatesKey = useMemo(
+    () => Array.from(enabledTeammates).sort((a, b) => a - b).join(","),
+    [enabledTeammates]
+  );
+  const replayCutoff = useMemo(
+    () => new Date(selectedDayStart.getTime() + replayMinute * 60 * 1000),
+    [selectedDayStart, replayMinute]
+  );
+  const replayLabel = useMemo(
+    () => `${String(Math.floor(replayMinute / 60)).padStart(2, "0")}:${String(replayMinute % 60).padStart(2, "0")}`,
+    [replayMinute]
+  );
+  const replayEventTimeline = useMemo<ReplayEventChip[]>(() => {
+    if (!replayEnabled || dateMode !== "past") return [];
+    const minuteToChip = new Map<number, ReplayEventChip>();
+    const toMinute = (d: Date) => {
+      const minutes = Math.floor((d.getTime() - selectedDayStart.getTime()) / 60000);
+      return Math.max(0, Math.min(1439, minutes));
+    };
+    const upsert = (chip: ReplayEventChip) => {
+      const existing = minuteToChip.get(chip.minute);
+      if (!existing) {
+        minuteToChip.set(chip.minute, chip);
+        return;
+      }
+      const rank = (k: ReplayEventChip["kind"]) => (k === "job-start" ? 3 : k === "job-end" ? 2 : 1);
+      if (rank(chip.kind) > rank(existing.kind)) minuteToChip.set(chip.minute, chip);
+    };
+    jobAssignments.slice(0, 120).forEach((a) => {
+      const start = typeof a.scheduledStart === "string" ? parseISO(a.scheduledStart) : a.scheduledStart;
+      const end = typeof a.scheduledEnd === "string" ? parseISO(a.scheduledEnd) : a.scheduledEnd;
+      if (start) {
+        const m = toMinute(start);
+        upsert({
+          minute: m,
+          label: `${format(start, "HH:mm")} ${a.jobTitle} start`,
+          kind: "job-start",
+          teammateId: a.teamMemberId ?? null,
+        });
+      }
+      if (end) {
+        const m = toMinute(end);
+        upsert({
+          minute: m,
+          label: `${format(end, "HH:mm")} ${a.jobTitle} end`,
+          kind: "job-end",
+          teammateId: a.teamMemberId ?? null,
+        });
+      }
+    });
+    teammates.forEach((t) => {
+      if (!Array.isArray(t.liveLocationPath) || t.liveLocationPath.length === 0) return;
+      const step = Math.max(1, Math.floor(t.liveLocationPath.length / 12));
+      t.liveLocationPath.forEach((pt, idx) => {
+        if (idx % step !== 0 || !pt?.createdAt) return;
+        const ts = new Date(pt.createdAt);
+        if (Number.isNaN(ts.getTime())) return;
+        const m = toMinute(ts);
+        upsert({ minute: m, label: `${format(ts, "HH:mm")} ${t.firstName} ping`, kind: "ping", teammateId: t.id });
+      });
+    });
+    return Array.from(minuteToChip.values()).sort((a, b) => a.minute - b.minute);
+  }, [replayEnabled, dateMode, selectedDayStart, jobAssignments, teammates]);
+  const replayTeammateFilterSet = useMemo(
+    () => new Set(replayTeammateFilterIds),
+    [replayTeammateFilterIds]
+  );
+  const replayEventTeammates = useMemo(() => {
+    if (dateMode !== "past" || replayEventTimeline.length === 0) return [];
+    const eventTeammateIds = new Set<number>();
+    replayEventTimeline.forEach((chip) => {
+      if (typeof chip.teammateId === "number") eventTeammateIds.add(chip.teammateId);
+    });
+    return teammates
+      .filter((teammate) => eventTeammateIds.has(teammate.id))
+      .sort((a, b) => `${a.firstName} ${a.lastName}`.localeCompare(`${b.firstName} ${b.lastName}`));
+  }, [dateMode, replayEventTimeline, teammates]);
+  useEffect(() => {
+    if (replayTeammateFilterIds.length === 0) return;
+    const validIds = new Set(teammates.map((t) => t.id));
+    const next = replayTeammateFilterIds.filter((id) => validIds.has(id));
+    if (next.length === replayTeammateFilterIds.length) return;
+    setReplayTeammateFilterIds(next);
+  }, [replayTeammateFilterIds, teammates]);
+  const replayFilteredTimeline = useMemo(() => {
+    return replayEventTimeline.filter((chip) => {
+      const kindVisible =
+        chip.kind === "job-start" ? showReplayJobStarts : chip.kind === "job-end" ? showReplayJobEnds : showReplayPings;
+      if (!kindVisible) return false;
+      if (replayTeammateFilterSet.size === 0) return true;
+      if (typeof chip.teammateId !== "number") return false;
+      return replayTeammateFilterSet.has(chip.teammateId);
+    });
+  }, [replayEventTimeline, showReplayJobStarts, showReplayJobEnds, showReplayPings, replayTeammateFilterSet]);
+  const replayEventMinutes = useMemo(() => replayFilteredTimeline.map((e) => e.minute), [replayFilteredTimeline]);
+  const replayEventChips = useMemo<ReplayEventChip[]>(() => {
+    if (replayFilteredTimeline.length === 0) return [];
+    const past = replayFilteredTimeline.filter((e) => e.minute <= replayMinute).slice(-3);
+    const future = replayFilteredTimeline.filter((e) => e.minute > replayMinute).slice(0, 3);
+    const anchors = [replayFilteredTimeline[0], ...past, ...future, replayFilteredTimeline[replayFilteredTimeline.length - 1]].filter(Boolean) as ReplayEventChip[];
+    const seen = new Set<number>();
+    return anchors.filter((e) => {
+      if (seen.has(e.minute)) return false;
+      seen.add(e.minute);
+      return true;
+    });
+  }, [replayFilteredTimeline, replayMinute]);
+  const replayEventRail = useMemo<ReplayEventChip[]>(() => {
+    if (replayFilteredTimeline.length === 0) return [];
+    const around = replayFilteredTimeline.filter((e) => Math.abs(e.minute - replayMinute) <= 180);
+    return (around.length > 0 ? around : replayFilteredTimeline).slice(0, 24);
+  }, [replayFilteredTimeline, replayMinute]);
+
+  useEffect(() => {
+    if (dateMode === "past") setReplayMinute(23 * 60 + 59);
+    else if (dateMode === "future") setReplayMinute(9 * 60);
+    else setReplayMinute(now.getHours() * 60 + now.getMinutes());
+    setReplayPlaying(false);
+    setReplayRailOpen(false);
+    setReplayTeammateFilterIds([]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dateMode, selectedDayStart.getTime()]);
+  useEffect(() => {
+    if (!replayEnabled || dateMode !== "past") return;
+    const params = new URLSearchParams(window.location.search);
+    const parsed = parseReplayUrlState(params);
+    if (typeof parsed.replayMinute === "number") {
+      setReplayMinute((prev) => (prev === parsed.replayMinute ? prev : parsed.replayMinute));
+    }
+    if (typeof parsed.showReplayJobStarts === "boolean") {
+      setShowReplayJobStarts((prev) => (prev === parsed.showReplayJobStarts ? prev : parsed.showReplayJobStarts));
+    }
+    if (typeof parsed.showReplayJobEnds === "boolean") {
+      setShowReplayJobEnds((prev) => (prev === parsed.showReplayJobEnds ? prev : parsed.showReplayJobEnds));
+    }
+    if (typeof parsed.showReplayPings === "boolean") {
+      setShowReplayPings((prev) => (prev === parsed.showReplayPings ? prev : parsed.showReplayPings));
+    }
+    if (Array.isArray(parsed.replayTeammateFilterIds)) {
+      setReplayTeammateFilterIds((prev) => {
+        if (prev.length === parsed.replayTeammateFilterIds!.length && prev.every((v, i) => v === parsed.replayTeammateFilterIds![i])) {
+          return prev;
+        }
+        return parsed.replayTeammateFilterIds!;
+      });
+    }
+    if (typeof parsed.replayRailOpen === "boolean") {
+      setReplayRailOpen((prev) => (prev === parsed.replayRailOpen ? prev : parsed.replayRailOpen));
+    }
+  }, [replayEnabled, dateMode, selectedDayStart.getTime()]);
+  useEffect(() => {
+    if (replayUrlSyncTimeoutRef.current !== null) {
+      window.clearTimeout(replayUrlSyncTimeoutRef.current);
+      replayUrlSyncTimeoutRef.current = null;
+    }
+    const url = new URL(window.location.href);
+    const params = url.searchParams;
+    let changed = false;
+    if (!replayEnabled || dateMode !== "past") {
+      REPLAY_QUERY_KEYS.forEach((key) => {
+        if (params.has(key)) {
+          params.delete(key);
+          changed = true;
+        }
+      });
+      if (changed) {
+        const next = `${url.pathname}${params.toString() ? `?${params.toString()}` : ""}${url.hash}`;
+        window.history.replaceState(window.history.state, "", next);
+      }
+      return;
+    }
+
+    changed = writeReplayUrlState(params, {
+      replayMinute,
+      showReplayJobStarts,
+      showReplayJobEnds,
+      showReplayPings,
+      replayTeammateFilterIds,
+      replayRailOpen,
+    });
+
+    if (!changed) return;
+    replayUrlSyncTimeoutRef.current = window.setTimeout(() => {
+      const next = `${url.pathname}${params.toString() ? `?${params.toString()}` : ""}${url.hash}`;
+      window.history.replaceState(window.history.state, "", next);
+      replayUrlSyncTimeoutRef.current = null;
+    }, 150);
+    return () => {
+      if (replayUrlSyncTimeoutRef.current !== null) {
+        window.clearTimeout(replayUrlSyncTimeoutRef.current);
+        replayUrlSyncTimeoutRef.current = null;
+      }
+    };
+  }, [
+    replayEnabled,
+    dateMode,
+    replayMinute,
+    replayRailOpen,
+    replayTeammateFilterIds,
+    showReplayJobEnds,
+    showReplayJobStarts,
+    showReplayPings,
+  ]);
+
+  useEffect(() => {
+    if (!replayEnabled || dateMode !== "past" || !replayPlaying) return;
+    const timer = window.setInterval(() => {
+      setReplayMinute((m) => {
+        const next = m + 5;
+        if (next >= 23 * 60 + 59) {
+          setReplayPlaying(false);
+          return 23 * 60 + 59;
+        }
+        return next;
+      });
+    }, 800);
+    return () => window.clearInterval(timer);
+  }, [replayEnabled, dateMode, replayPlaying]);
+  const jumpReplayEvent = useCallback((direction: "prev" | "next") => {
+    if (replayEventMinutes.length === 0) return;
+    if (direction === "prev") {
+      const prev = [...replayEventMinutes].reverse().find((m) => m < replayMinute);
+      setReplayMinute(prev ?? replayEventMinutes[0]);
+      return;
+    }
+    const next = replayEventMinutes.find((m) => m > replayMinute);
+    setReplayMinute(next ?? replayEventMinutes[replayEventMinutes.length - 1]);
+  }, [replayEventMinutes, replayMinute]);
+  const replayChipTone = useCallback((kind: ReplayEventChip["kind"], active: boolean) => {
+    if (active) return "bg-primary text-primary-foreground border-primary";
+    if (kind === "job-start") return "border-green-300 text-green-700 dark:border-green-800 dark:text-green-300";
+    if (kind === "job-end") return "border-amber-300 text-amber-700 dark:border-amber-800 dark:text-amber-300";
+    return "border-blue-300 text-blue-700 dark:border-blue-800 dark:text-blue-300";
+  }, []);
+  const toggleReplayTeammateFilter = useCallback((teammateId: number) => {
+    setReplayTeammateFilterIds((prev) =>
+      prev.includes(teammateId) ? prev.filter((id) => id !== teammateId) : [...prev, teammateId]
+    );
+  }, []);
+  const handleCopyReplayLink = useCallback(async () => {
+    const text = window.location.href;
+    let copied = false;
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+        copied = true;
+      }
+    } catch {
+      copied = false;
+    }
+
+    if (!copied) {
+      const textArea = document.createElement("textarea");
+      textArea.value = text;
+      textArea.setAttribute("readonly", "");
+      textArea.style.position = "fixed";
+      textArea.style.left = "-9999px";
+      document.body.appendChild(textArea);
+      textArea.focus();
+      textArea.select();
+      copied = document.execCommand("copy");
+      document.body.removeChild(textArea);
+    }
+
+    setReplayLinkCopied(copied);
+    if (replayCopyResetTimeoutRef.current !== null) {
+      window.clearTimeout(replayCopyResetTimeoutRef.current);
+      replayCopyResetTimeoutRef.current = null;
+    }
+    replayCopyResetTimeoutRef.current = window.setTimeout(() => {
+      setReplayLinkCopied(false);
+      replayCopyResetTimeoutRef.current = null;
+    }, 1400);
+  }, []);
+  useEffect(() => {
+    return () => {
+      if (replayCopyResetTimeoutRef.current !== null) {
+        window.clearTimeout(replayCopyResetTimeoutRef.current);
+      }
+    };
+  }, []);
+  const fitBoundsWithZoomCap = useCallback(
+    (bounds: google.maps.LatLngBounds) => {
+      const map = mapRef.current;
+      if (!map || bounds.isEmpty() || !window.google?.maps?.event) return;
+      map.fitBounds(bounds);
+      google.maps.event.addListenerOnce(map, "idle", () => {
+        const zoom = map.getZoom();
+        if (typeof zoom === "number" && zoom > MAX_AUTOFIT_ZOOM) {
+          map.setZoom(MAX_AUTOFIT_ZOOM);
+        }
+      });
+    },
+    []
+  );
+
+  // Initial map center: admin's pinned address (profile) or geolocation, so map auto-focuses on admin
+  const initialMapCenter = useMemo(() => {
+    const fromProfile =
+      workerProfile?.latitude != null &&
+      workerProfile?.longitude != null &&
+      workerProfile.latitude !== "" &&
+      workerProfile.longitude !== "";
+    if (fromProfile) {
+      const lat = parseFloat(String(workerProfile.latitude));
+      const lng = parseFloat(String(workerProfile.longitude));
+      if (Number.isFinite(lat) && Number.isFinite(lng)) return { lat, lng };
+    }
+    if (userGeoLocation) return userGeoLocation;
+    return { lat: 37.7749, lng: -122.4194 };
+  }, [workerProfile?.latitude, workerProfile?.longitude, userGeoLocation]);
+
+  // Request geolocation when profile has no lat/lng (so map can still focus on admin)
+  useEffect(() => {
+    const hasProfileCoords = !!(workerProfile?.latitude && workerProfile?.longitude);
+    const hasAnyJobCoords =
+      jobAssignments.some((a) => {
+        const lat = a.latitude != null ? parseFloat(String(a.latitude)) : NaN;
+        const lng = a.longitude != null ? parseFloat(String(a.longitude)) : NaN;
+        return Number.isFinite(lat) && Number.isFinite(lng);
+      }) ||
+      availableJobs.some((j) => {
+        const lat = j.latitude != null ? parseFloat(String(j.latitude)) : NaN;
+        const lng = j.longitude != null ? parseFloat(String(j.longitude)) : NaN;
+        return Number.isFinite(lat) && Number.isFinite(lng);
+      });
+
+    if (
+      typeof navigator !== "undefined" &&
+      navigator.geolocation &&
+      !hasProfileCoords &&
+      !hasAnyJobCoords
+    ) {
+      navigator.geolocation.getCurrentPosition(
+        (pos) => setUserGeoLocation({ lat: pos.coords.latitude, lng: pos.coords.longitude }),
+        () => {},
+        { enableHighAccuracy: true, timeout: 10000, maximumAge: 300000 }
+      );
+    }
+  }, [workerProfile?.latitude, workerProfile?.longitude, jobAssignments, availableJobs]);
 
   // Filter job assignments for selected date and job type visibility
   const filteredJobAssignments = useMemo(() => {
-    console.log(`📅 Filtering jobs for date: ${format(selectedDate, "yyyy-MM-dd")}`);
-    console.log(`📦 Total job assignments: ${jobAssignments.length}`);
-    
-    if (jobAssignments.length === 0) {
-      console.warn(`⚠️ No job assignments received! Check if applications are being loaded correctly.`);
-    }
-    
     const filtered = jobAssignments.filter((assignment) => {
       const assignmentDate = typeof assignment.scheduledStart === "string" 
         ? parseISO(assignment.scheduledStart)
@@ -259,7 +712,6 @@ export function CalendarMapView({
         assignmentDateNormalized.getTime() === dayAfter.getTime();
       
       if (!isWithinRange) {
-        console.log(`  ⏭️ Skipping job ${assignment.jobId} (${assignment.jobTitle}): date ${format(assignmentDate, "yyyy-MM-dd")} not within ±1 day of ${format(selectedDate, "yyyy-MM-dd")}`);
         return false;
       }
       
@@ -271,11 +723,6 @@ export function CalendarMapView({
       // Note: available jobs (no teamMemberId) are handled separately in filteredAvailableJobs
       
       return true;
-    });
-    
-    console.log(`✅ Filtered to ${filtered.length} jobs for selected date`);
-    filtered.forEach(job => {
-      console.log(`  📍 Job ${job.jobId}: ${job.jobTitle} (teammate ${job.teamMemberId}, status: ${job.status}) - ${job.latitude || "NO LAT"}, ${job.longitude || "NO LNG"}`);
     });
     
     return filtered;
@@ -379,6 +826,8 @@ export function CalendarMapView({
     const newRoutes: TeammateRoute[] = [];
     const newServices: google.maps.DirectionsService[] = [];
     const newRenderers: google.maps.DirectionsRenderer[] = [];
+    const reassignmentCandidates: ReassignmentSuggestion[] = [];
+    const routeOrigins = new Map<number, { lat: number; lng: number; teammateName: string }>();
 
     // Group job assignments by teammate
     const jobsByTeammate = new Map<number, JobStop[]>();
@@ -394,12 +843,12 @@ export function CalendarMapView({
       let startLng: number | null = null;
       
       // Priority 1: Use live location (real-time GPS) if available
-      if (teammate.liveLocationLat && teammate.liveLocationLng) {
+      if (hasValidCoord(teammate.liveLocationLat) && hasValidCoord(teammate.liveLocationLng)) {
         startLat = teammate.liveLocationLat;
         startLng = teammate.liveLocationLng;
       } 
       // Priority 2: Use work location coordinates (from address geocoding) if available
-      else if (teammate.workLocationLat && teammate.workLocationLng) {
+      else if (hasValidCoord(teammate.workLocationLat) && hasValidCoord(teammate.workLocationLng)) {
         startLat = teammate.workLocationLat;
         startLng = teammate.workLocationLng;
       } 
@@ -457,26 +906,30 @@ export function CalendarMapView({
       // For pending/available jobs (no teamMemberId), apply 15mi geofence
       const isPendingOrAvailable = !assignment.teamMemberId || 
         (assignment.status?.toLowerCase() === "pending" || assignment.status?.toLowerCase() === "scheduled");
+      const applyGeofence = dateMode === "today";
       
       if (isPendingOrAvailable) {
-        // Find closest enabled teammate within 15 miles
+        // Find closest enabled teammate. Today: enforce 15mi geofence. Past/future: include all for planning/history.
         let closestTeammateId: number | null = null;
         let closestDistance = Infinity;
         
         teammateStartLocations.forEach((startLoc, teammateId) => {
           const distance = calculateDistanceMiles(startLoc.lat, startLoc.lng, lat, lng);
-          if (distance <= 15 && distance < closestDistance) {
+          const isAllowed = !applyGeofence || distance <= 15;
+          if (isAllowed && distance < closestDistance) {
             closestDistance = distance;
             closestTeammateId = teammateId;
           }
         });
         
         if (!closestTeammateId) {
-          // Job is outside 15mi geofence for all teammates - skip it
-          return;
+          // Historical/low-signal fallback: keep job visible by attaching to first enabled teammate.
+          const firstEnabled = teammates.find((t) => enabledTeammates.has(t.id));
+          if (!firstEnabled) return;
+          closestTeammateId = firstEnabled.id;
         }
         
-        // Assign to closest teammate within geofence
+        // Assign to closest teammate
         const targetTeammateId = closestTeammateId;
         
         if (!jobsByTeammate.has(targetTeammateId)) {
@@ -499,7 +952,8 @@ export function CalendarMapView({
           scheduledStart,
           scheduledEnd,
           status: assignment.status as "scheduled" | "in-progress" | "completed",
-          sequence: 0, // Will be set after sorting
+          sequence: 0,
+          assignmentStatus: assignment.status,
         });
         
         return;
@@ -529,7 +983,8 @@ export function CalendarMapView({
         scheduledStart,
         scheduledEnd,
         status: assignment.status as "scheduled" | "in-progress" | "completed",
-        sequence: 0, // Will be set after sorting
+        sequence: 0,
+        assignmentStatus: assignment.status,
       });
     });
     
@@ -537,7 +992,7 @@ export function CalendarMapView({
     // They will be displayed with route optimization suggestions in the marker info windows
 
     // Sort jobs by scheduled start time and assign sequence, determine current/next/behind status
-    const now = new Date();
+    const now = dateMode === "past" ? endOfDay(selectedDate) : new Date();
     jobsByTeammate.forEach((jobs, teammateId) => {
       jobs.sort((a, b) => a.scheduledStart.getTime() - b.scheduledStart.getTime());
       jobs.forEach((job, index) => {
@@ -569,15 +1024,20 @@ export function CalendarMapView({
     });
 
     // Build routes for each teammate
-    let colorIndex = 0;
     for (const teammate of teammates) {
       if (!enabledTeammates.has(teammate.id)) continue;
 
       const jobs = jobsByTeammate.get(teammate.id) || [];
       if (jobs.length === 0) continue;
 
-      const routeColor = ROUTE_COLORS[colorIndex % ROUTE_COLORS.length];
-      colorIndex++;
+      const hasPending = jobs.some(
+        (j) =>
+          j.assignmentStatus?.toLowerCase() === "pending" ||
+          j.assignmentStatus?.toLowerCase() === "scheduled" ||
+          (j.assignmentStatus && j.assignmentStatus.toLowerCase() !== "accepted" && j.assignmentStatus.toLowerCase() !== "assigned")
+      );
+      const routeType: RouteType = hasPending ? "pending" : "accepted";
+      const routeColor = routeType === "accepted" ? ROUTE_COLOR_ACCEPTED : ROUTE_COLOR_PENDING;
 
       // Determine starting point with fallback logic:
       // 1. Use live location (GPS) if available - real-time location from location services
@@ -589,12 +1049,12 @@ export function CalendarMapView({
       let startLng: number;
       let startAddress: string;
 
-      if (teammate.liveLocationLat && teammate.liveLocationLng) {
+      if (hasValidCoord(teammate.liveLocationLat) && hasValidCoord(teammate.liveLocationLng)) {
         // Use live location (GPS) if available - this is where the worker is RIGHT NOW
         startLat = teammate.liveLocationLat;
         startLng = teammate.liveLocationLng;
         startAddress = "Current Location (GPS)";
-      } else if (teammate.workLocationLat && teammate.workLocationLng) {
+      } else if (hasValidCoord(teammate.workLocationLat) && hasValidCoord(teammate.workLocationLng)) {
         // Fall back to work location (home/start address coordinates) if GPS not available
         startLat = teammate.workLocationLat;
         startLng = teammate.workLocationLng;
@@ -664,14 +1124,18 @@ export function CalendarMapView({
         teammateId: teammate.id,
         teammateName: `${teammate.firstName} ${teammate.lastName}`,
         teammateAvatar: teammate.avatarUrl,
-        workLocation: teammate.workLocationAddress && teammate.workLocationLat && teammate.workLocationLng
+        workLocation: teammate.workLocationAddress && hasValidCoord(teammate.workLocationLat) && hasValidCoord(teammate.workLocationLng)
           ? {
               address: teammate.workLocationAddress,
               lat: teammate.workLocationLat,
               lng: teammate.workLocationLng,
             }
-          : null,
-        liveLocation: teammate.liveLocationLat && teammate.liveLocationLng
+          : {
+              address: startAddress,
+              lat: startLat,
+              lng: startLng,
+            },
+        liveLocation: hasValidCoord(teammate.liveLocationLat) && hasValidCoord(teammate.liveLocationLng)
           ? {
               lat: teammate.liveLocationLat,
               lng: teammate.liveLocationLng,
@@ -681,7 +1145,42 @@ export function CalendarMapView({
         jobs,
         route: null,
         routeColor,
+        routeType,
+        routeSource: "polyline",
       };
+      if (dateMode === "past" && Array.isArray(teammate.liveLocationPath) && teammate.liveLocationPath.length > 0) {
+        const allHistory = teammate.liveLocationPath
+          .map((pt) => ({
+            lat: Number(pt.lat),
+            lng: Number(pt.lng),
+            createdAt: pt.createdAt ? new Date(pt.createdAt) : null,
+          }))
+          .filter((pt) => Number.isFinite(pt.lat) && Number.isFinite(pt.lng));
+        if (allHistory.length > 1) {
+          route.fullTrail = allHistory;
+        }
+        const visibleHistory = replayEnabled
+          ? allHistory.filter((pt) => !pt.createdAt || pt.createdAt.getTime() <= replayCutoff.getTime())
+          : allHistory;
+        if (visibleHistory.length > 0) {
+          const last = visibleHistory[visibleHistory.length - 1];
+          route.liveLocation = {
+            lat: last.lat,
+            lng: last.lng,
+            timestamp: last.createdAt || endOfDay(selectedDate),
+          };
+        }
+        if (visibleHistory.length > 1) {
+          route.replayTrail = visibleHistory;
+          route.overviewPath = [...visibleHistory.map((p) => ({ lat: p.lat, lng: p.lng })), ...jobs.map((j) => ({ lat: j.lat, lng: j.lng }))];
+          route.routeSource = "polyline";
+        }
+      }
+      routeOrigins.set(teammate.id, {
+        lat: startLat,
+        lng: startLng,
+        teammateName: `${teammate.firstName} ${teammate.lastName}`,
+      });
 
       // Calculate route using Google Fleet Routing API (Routes API)
       if (jobs.length > 0) {
@@ -721,27 +1220,16 @@ export function CalendarMapView({
             // Convert backend response to DirectionsResult format
             const directionsResult = data.route as google.maps.DirectionsResult;
             route.route = directionsResult;
-            
+            const ov = directionsResult.routes?.[0]?.overview_path;
+            route.overviewPath = ov ? ov.map((p) => toLatLngLiteral(p)) : undefined;
+
             // Use total distance and duration from API response
             const totalDistanceMeters = data.totalDistance || 0;
             const totalDurationSeconds = parseInt(data.totalDuration?.replace("s", "") || "0");
             
             route.totalDistance = `${(totalDistanceMeters / 1609.34).toFixed(1)} mi`;
             route.totalDuration = `${Math.round(totalDurationSeconds / 60)} min`;
-
-            // Create DirectionsRenderer for the route
-            const renderer = new google.maps.DirectionsRenderer({
-              map: mapRef.current,
-              directions: directionsResult,
-              suppressMarkers: true, // We'll use custom markers
-              polylineOptions: {
-                strokeColor: routeColor,
-                strokeWeight: 4,
-                strokeOpacity: 0.8,
-              },
-            });
-
-            newRenderers.push(renderer);
+            route.routeSource = "fleet";
             console.log(`✅ Fleet route calculated for ${route.teammateName}: ${route.totalDistance}, ${route.totalDuration}`);
           } else {
             throw new Error("No route returned from Fleet Routing API");
@@ -778,7 +1266,9 @@ export function CalendarMapView({
             });
 
             route.route = result;
-            
+            const ov = result.routes?.[0]?.overview_path;
+            route.overviewPath = ov ? ov.map((p) => toLatLngLiteral(p)) : undefined;
+
             let totalDistance = 0;
             let totalDuration = 0;
             
@@ -789,19 +1279,7 @@ export function CalendarMapView({
 
             route.totalDistance = `${(totalDistance / 1609.34).toFixed(1)} mi`;
             route.totalDuration = `${Math.round(totalDuration / 60)} min`;
-
-            const renderer = new google.maps.DirectionsRenderer({
-              map: mapRef.current,
-              directions: result,
-              suppressMarkers: true,
-              polylineOptions: {
-                strokeColor: routeColor,
-                strokeWeight: 4,
-                strokeOpacity: 0.8,
-              },
-            });
-
-            newRenderers.push(renderer);
+            route.routeSource = "directions";
             console.log(`✅ Fallback route calculated for ${route.teammateName}: ${route.totalDistance}, ${route.totalDuration}`);
           } catch (fallbackError) {
             console.error(`❌ Fallback route calculation also failed for ${route.teammateName}:`, fallbackError);
@@ -814,17 +1292,141 @@ export function CalendarMapView({
 
       newRoutes.push(route);
     }
-    
-    console.log(`📊 Built ${newRoutes.length} routes total`);
-    console.log(`📋 Enabled teammates: ${Array.from(enabledTeammates).join(", ")}`);
-    console.log(`📋 Jobs by teammate:`, Array.from(jobsByTeammate.entries()).map(([id, jobs]) => ({ teammateId: id, jobCount: jobs.length })));
+
+    // When "Available jobs" toggle is on, add a route from worker's location to available jobs
+    if (showAvailableJobs && filteredAvailableJobs.length > 0) {
+      const availableJobStops: JobStop[] = filteredAvailableJobs
+        .map((job) => {
+          const lat = job.latitude != null && job.latitude !== "" ? parseFloat(String(job.latitude)) : null;
+          const lng = job.longitude != null && job.longitude !== "" ? parseFloat(String(job.longitude)) : null;
+          if (lat == null || lng == null || !Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+          const startDate = typeof job.startDate === "string" ? parseISO(job.startDate) : job.startDate;
+          let startH = 9, startM = 0;
+          if (job.scheduledTime) {
+            const t = String(job.scheduledTime);
+            const match = t.match(/(\d+):(\d+)\s*(AM|PM)?/i);
+            if (match) {
+              startH = parseInt(match[1], 10);
+              startM = parseInt(match[2], 10);
+              if (match[3]?.toUpperCase() === "PM" && startH !== 12) startH += 12;
+              if (match[3]?.toUpperCase() === "AM" && startH === 12) startH = 0;
+            }
+          }
+          const scheduledStart = new Date(startDate);
+          scheduledStart.setHours(startH, startM, 0, 0);
+          const estimatedHours = typeof job.estimatedHours === "number" ? job.estimatedHours : 4;
+          const scheduledEnd = new Date(scheduledStart.getTime() + estimatedHours * 60 * 60 * 1000);
+          const stop: JobStop = {
+            jobId: job.id,
+            jobTitle: job.title || "Job",
+            address: job.address || job.location || "",
+            lat,
+            lng,
+            scheduledStart,
+            scheduledEnd,
+            status: "scheduled",
+            sequence: 0,
+          };
+          return stop;
+        })
+        .filter((j): j is JobStop => j !== null);
+      if (availableJobStops.length > 0) {
+        availableJobStops.sort((a, b) => a.scheduledStart.getTime() - b.scheduledStart.getTime());
+        availableJobStops.forEach((j, i) => { j.sequence = i + 1; });
+        const workerRoute: TeammateRoute = {
+          teammateId: 0,
+          teammateName: "You (available jobs)",
+          teammateAvatar: workerProfile?.avatarUrl ?? null,
+          workLocation: { address: "Your location", lat: initialMapCenter.lat, lng: initialMapCenter.lng },
+          liveLocation: null,
+          jobs: availableJobStops,
+          route: null,
+          routeColor: ROUTE_COLOR_AVAILABLE,
+          routeType: "available",
+          routeSource: "polyline",
+        };
+        try {
+          const service = new google.maps.DirectionsService();
+          const waypoints = availableJobStops.slice(0, -1).map((job) => ({
+            location: { lat: job.lat, lng: job.lng },
+            stopover: true,
+          }));
+          const destination = availableJobStops[availableJobStops.length - 1];
+          const result = await new Promise<google.maps.DirectionsResult>((resolve, reject) => {
+            service.route(
+              {
+                origin: { lat: initialMapCenter.lat, lng: initialMapCenter.lng },
+                destination: { lat: destination.lat, lng: destination.lng },
+                waypoints: waypoints.length > 0 ? waypoints : undefined,
+                optimizeWaypoints: true,
+                travelMode: google.maps.TravelMode.DRIVING,
+              },
+              (res, status) => {
+                if (status === google.maps.DirectionsStatus.OK && res) resolve(res);
+                else reject(new Error(`Directions failed: ${status}`));
+              }
+            );
+          });
+          workerRoute.route = result;
+          const wOv = result.routes?.[0]?.overview_path;
+          workerRoute.overviewPath = wOv ? wOv.map((p) => toLatLngLiteral(p)) : undefined;
+          let totalDistance = 0;
+          let totalDuration = 0;
+          result.routes[0]?.legs.forEach((leg) => {
+            if (leg.distance) totalDistance += leg.distance.value;
+            if (leg.duration) totalDuration += leg.duration.value;
+          });
+          workerRoute.totalDistance = `${(totalDistance / 1609.34).toFixed(1)} mi`;
+          workerRoute.totalDuration = `${Math.round(totalDuration / 60)} min`;
+          workerRoute.routeSource = "directions";
+          // Rendered as blue dashed Polyline (clickable) in JSX
+        } catch (err) {
+          console.warn("Available jobs route directions failed:", err);
+        }
+        newRoutes.push(workerRoute);
+      }
+    }
+
+    // Future-day reassignment guidance: suggest teammate swaps where start-to-job distance gains are meaningful.
+    if (dateMode === "future" && routeOrigins.size > 1) {
+      const jobsToEvaluate = filteredJobAssignments
+        .filter((a) => {
+          const lat = a.latitude ? parseFloat(a.latitude) : NaN;
+          const lng = a.longitude ? parseFloat(a.longitude) : NaN;
+          return Number.isFinite(lat) && Number.isFinite(lng) && !!a.teamMemberId;
+        })
+        .slice(0, 80);
+      for (const assignment of jobsToEvaluate) {
+        const lat = parseFloat(String(assignment.latitude));
+        const lng = parseFloat(String(assignment.longitude));
+        const distances = Array.from(routeOrigins.entries()).map(([teammateId, origin]) => ({
+          teammateId,
+          teammateName: origin.teammateName,
+          miles: calculateDistanceMiles(origin.lat, origin.lng, lat, lng),
+        }));
+        distances.sort((a, b) => a.miles - b.miles);
+        if (distances.length < 2) continue;
+        const current = distances.find((d) => d.teammateId === assignment.teamMemberId) ?? distances[0];
+        const best = distances[0];
+        const gainMiles = current.miles - best.miles;
+        if (best.teammateId !== current.teammateId && gainMiles >= 2) {
+          reassignmentCandidates.push({
+            jobId: assignment.jobId,
+            jobTitle: assignment.jobTitle,
+            currentTeammateName: current.teammateName,
+            suggestedTeammateName: best.teammateName,
+            gainMiles: Number(gainMiles.toFixed(1)),
+            gainMinutes: Math.max(3, Math.round((gainMiles / 30) * 60)),
+          });
+        }
+      }
+    }
 
     setRoutes(newRoutes);
     setDirectionsServices(newServices);
     setDirectionsRenderers(newRenderers);
+    setOptimizationSuggestions(reassignmentCandidates.slice(0, 8));
     setLoadingRoutes(false);
-    
-    console.log(`🗺️ Routes updated: ${newRoutes.length} routes, ${newRoutes.filter(r => r.route !== null).length} with directions`);
 
     // Auto-focus map on all routes, teammates, and available jobs
     if (mapRef.current) {
@@ -853,6 +1455,8 @@ export function CalendarMapView({
             bounds.extend(new google.maps.LatLng(lat, lng));
           }
         });
+        // Include admin location so map stays centered on them
+        bounds.extend(new google.maps.LatLng(initialMapCenter.lat, initialMapCenter.lng));
       } else {
         // Show all routes
         newRoutes.forEach((route) => {
@@ -892,20 +1496,28 @@ export function CalendarMapView({
             bounds.extend(new google.maps.LatLng(lat, lng));
           }
         });
+
+        // Always include admin's location (pinned address or geolocation) so map is centered on them
+        bounds.extend(new google.maps.LatLng(initialMapCenter.lat, initialMapCenter.lng));
       }
 
-      if (bounds.isEmpty()) {
-        // Default to San Jose area if no bounds
-        bounds.extend(new google.maps.LatLng(37.3382, -121.8863));
+      const noRouteContent = newRoutes.length === 0 && filteredAvailableJobs.length === 0;
+      if (noRouteContent) {
+        // No routes: zoom out to provide broader geographic context.
+        mapRef.current.setCenter(initialMapCenter);
+        mapRef.current.setZoom(5);
+      } else {
+        if (bounds.isEmpty()) {
+          bounds.extend(new google.maps.LatLng(initialMapCenter.lat, initialMapCenter.lng));
+        }
+        fitBoundsWithZoomCap(bounds);
       }
-      
-      mapRef.current.fitBounds(bounds);
       // Clear focus after fitting bounds
       if (focusedTeammateId) {
         setTimeout(() => setFocusedTeammateId(null), 100);
       }
     }
-  }, [isLoaded, filteredJobAssignments, teammates, enabledTeammates, focusedTeammateId, filteredAvailableJobs, calculateDistanceMiles, showAcceptedJobs, showPendingJobs, showAvailableJobs]);
+  }, [isLoaded, filteredJobAssignments, teammates, enabledTeammatesKey, focusedTeammateId, filteredAvailableJobs, calculateDistanceMiles, showAcceptedJobs, showPendingJobs, showAvailableJobs, initialMapCenter, fitBoundsWithZoomCap, dateMode, replayCutoff, replayEnabled, selectedDate]);
 
   // Note: Teammate enabling is handled in parent component (WorkerCalendar)
   // This component just receives enabledTeammates as a prop
@@ -924,19 +1536,68 @@ export function CalendarMapView({
     return () => clearInterval(interval);
   }, [isLoaded]);
 
+  const hasRouteContent = routes.length > 0 || filteredAvailableJobs.length > 0;
+  const routeBuildKey = useMemo(() => {
+    const jobsKey = filteredJobAssignments
+      .map((a) => {
+        const start = typeof a.scheduledStart === "string" ? a.scheduledStart : a.scheduledStart.toISOString();
+        const end = typeof a.scheduledEnd === "string" ? a.scheduledEnd : a.scheduledEnd.toISOString();
+        return `${a.jobId}:${a.teamMemberId}:${a.status}:${start}:${end}:${a.latitude ?? ""}:${a.longitude ?? ""}`;
+      })
+      .join("|");
+    const teammatesKey = teammates
+      .map(
+        (t) =>
+          `${t.id}:${t.liveLocationLat ?? ""}:${t.liveLocationLng ?? ""}:${t.workLocationLat ?? ""}:${t.workLocationLng ?? ""}:${
+            Array.isArray(t.liveLocationPath) ? t.liveLocationPath.length : 0
+          }`
+      )
+      .join("|");
+    const availableKey = filteredAvailableJobs
+      .map((j) => `${j.id}:${typeof j.startDate === "string" ? j.startDate : j.startDate.toISOString()}:${j.latitude ?? ""}:${j.longitude ?? ""}`)
+      .join("|");
+    return [
+      selectedDate.toISOString(),
+      dateMode,
+      enabledTeammatesKey,
+      showAcceptedJobs ? "1" : "0",
+      showPendingJobs ? "1" : "0",
+      showAvailableJobs ? "1" : "0",
+      focusedTeammateId ?? "none",
+      jobsKey,
+      teammatesKey,
+      availableKey,
+    ].join("~");
+  }, [
+    filteredJobAssignments,
+    teammates,
+    filteredAvailableJobs,
+    selectedDate,
+    dateMode,
+    enabledTeammatesKey,
+    showAcceptedJobs,
+    showPendingJobs,
+    showAvailableJobs,
+    focusedTeammateId,
+  ]);
+
   // Rebuild routes when dependencies change (date, jobs, teammates, etc.)
   useEffect(() => {
-    if (isLoaded && mapRef.current) {
-      console.log(`🔄 Rebuilding routes - Date: ${format(selectedDate, "yyyy-MM-dd")}, Jobs: ${filteredJobAssignments.length}, Teammates: ${teammates.length}, Enabled: ${enabledTeammates.size}`);
-      
-      // Clear existing renderers before building new routes
-      directionsRenderers.forEach((renderer) => {
-        renderer.setMap(null);
-      });
-      
-      buildRoutes();
-    }
-  }, [isLoaded, buildRoutes, selectedDate, filteredJobAssignments, teammates, enabledTeammates, showAcceptedJobs, showPendingJobs, showAvailableJobs]);
+    if (!isLoaded || !mapRef.current) return;
+    if (lastRouteBuildKeyRef.current === routeBuildKey) return;
+    if (routeBuildInFlightRef.current) return;
+    lastRouteBuildKeyRef.current = routeBuildKey;
+    routeBuildInFlightRef.current = true;
+
+    // Clear existing renderers before building new routes
+    directionsRenderers.forEach((renderer) => {
+      renderer.setMap(null);
+    });
+
+    void buildRoutes().finally(() => {
+      routeBuildInFlightRef.current = false;
+    });
+  }, [isLoaded, routeBuildKey, buildRoutes, directionsRenderers]);
 
   // Cleanup renderers on unmount
   useEffect(() => {
@@ -1029,18 +1690,6 @@ export function CalendarMapView({
       );
     }
     
-    if (loadError) {
-      return (
-        <div className="w-full flex flex-col items-center justify-center p-8 text-center" style={{ height }}>
-          <AlertCircle className="w-12 h-12 text-destructive mb-4" />
-          <h3 className="text-lg font-semibold mb-2">Failed to Load Google Maps</h3>
-          <p className="text-sm text-muted-foreground mb-4 max-w-md">
-            {loadError.message || "Please check your API key and ensure the Maps JavaScript API is enabled."}
-          </p>
-        </div>
-      );
-    }
-    
     return (
       <div className="w-full" style={{ height }}>
         <Skeleton className="w-full h-full" />
@@ -1062,20 +1711,21 @@ export function CalendarMapView({
     onDateChange?.(new Date());
   };
 
-  if (isMobile) {
-    // Mobile layout: Map on top, list on bottom
+  if (isMobileOrTablet) {
+    // Mobile/tablet layout: Map fills space, routes panel in-flow below (no overlay) so footer stays visible
+    const mobileRoutesExpanded = bottomSheetPosition !== "collapsed" && bottomSheetPosition !== "hidden";
     return (
       <div className="w-full flex flex-col" style={{ height }}>
-        {/* Map Section - Top */}
-        <div className="flex-1 relative min-h-0">
+        {/* Map Section - Takes remaining space */}
+        <div className="flex-1 relative min-h-0 flex-shrink-0 box-border pt-[5px] pb-[5px]">
           {!isLoaded ? (
             <div className="w-full h-full flex items-center justify-center bg-muted">
               <Skeleton className="w-full h-full" />
             </div>
           ) : (
             <GoogleMap
-              mapContainerStyle={{ width: "100%", height: "100%" }}
-              center={{ lat: 37.7749, lng: -122.4194 }}
+              mapContainerStyle={{ width: "100%", height: "100%", boxSizing: "border-box", paddingTop: "5px", paddingBottom: "5px" }}
+              center={initialMapCenter}
               zoom={10}
               onLoad={onMapLoad}
               options={{
@@ -1085,12 +1735,33 @@ export function CalendarMapView({
                 fullscreenControl: false,
               }}
             >
-              {/* Render routes with directions */}
+              {/* Coverage radius circles (same as Find Work map): worker + teammates territory */}
+              {referenceRadiusMiles != null && referenceRadiusMiles > 0 && referencePoints && referencePoints.length > 0 && referencePoints.map((pt, i) => {
+                const miles = referenceRadiusMilesArray?.[i] != null ? referenceRadiusMilesArray[i] : referenceRadiusMiles;
+                if (!Number.isFinite(miles) || miles <= 0) return null;
+                return Number.isFinite(pt.lat) && Number.isFinite(pt.lng) ? (
+                  <MapCircle
+                    key={`radius-${i}`}
+                    center={{ lat: pt.lat, lng: pt.lng }}
+                    radius={miles * MILES_TO_METERS}
+                    options={{
+                      fillColor: i === 0 ? "#22c55e" : "#3b82f6",
+                      fillOpacity: 0.08,
+                      strokeColor: i === 0 ? "#16a34a" : "#2563eb",
+                      strokeOpacity: 0.35,
+                      strokeWeight: 2,
+                      zIndex: 0,
+                    }}
+                  />
+                ) : null;
+              })}
+
+              {/* Render routes with directions (accepted = green, pending = yellow; available drawn below as dashed) */}
               {routes
-                .filter((route) => route.route !== null)
+                .filter((route) => route.route !== null && route.routeType !== "available")
                 .map((route) => (
                   <DirectionsRenderer
-                    key={route.teammateId}
+                    key={`dir-${route.teammateId}`}
                     directions={route.route!}
                     options={{
                       suppressMarkers: true,
@@ -1103,19 +1774,75 @@ export function CalendarMapView({
                   />
                 ))}
 
-              {/* Render simple polylines for routes without directions (fallback) */}
+              {/* Available jobs route: light blue dashed line only (clickable to add to route / open popup) */}
               {routes
-                .filter((route) => route.route === null && route.jobs.length > 0)
+                .filter((route) => route.routeType === "available" && (route.overviewPath?.length ?? 0) > 0)
+                .map((route) => {
+                  const path = route.overviewPath ?? (() => {
+                    const start = route.liveLocation || route.workLocation;
+                    if (!start) return [];
+                    return [{ lat: start.lat, lng: start.lng }, ...route.jobs.map((j) => ({ lat: j.lat, lng: j.lng }))];
+                  })();
+                  if (path.length < 2) return null;
+                  return (
+                    <Polyline
+                      key={`available-route-${route.teammateId}`}
+                      path={path}
+                      options={{
+                        strokeColor: ROUTE_COLOR_AVAILABLE,
+                        strokeWeight: 0,
+                        strokeOpacity: 0,
+                        geodesic: true,
+                        clickable: true,
+                        icons: [
+                          { icon: { path: "M 0,-1 0,1", strokeOpacity: 1, strokeColor: ROUTE_COLOR_AVAILABLE, scale: 4 }, repeat: "20px" },
+                        ],
+                      }}
+                      onClick={() => setSelectedRoute(route)}
+                    />
+                  );
+                })}
+
+              {/* Clickable overlay on route lines to open associated pop-up */}
+              {routes
+                .filter((route) => route.jobs.length > 0 && ((route.overviewPath?.length ?? 0) > 0 || !!(route.liveLocation || route.workLocation)))
+                .map((route) => {
+                  const path = route.overviewPath ?? (() => {
+                    const start = route.liveLocation || route.workLocation;
+                    if (!start) return [];
+                    return [{ lat: start.lat, lng: start.lng }, ...route.jobs.map((j) => ({ lat: j.lat, lng: j.lng }))];
+                  })();
+                  if (path.length < 2) return null;
+                  return (
+                    <Polyline
+                      key={`click-${route.teammateId}`}
+                      path={path}
+                      options={{
+                        strokeColor: "transparent",
+                        strokeWeight: 24,
+                        strokeOpacity: 0,
+                        clickable: true,
+                        zIndex: 10,
+                      }}
+                      onClick={() => setSelectedRoute(route)}
+                    />
+                  );
+                })}
+
+              {/* Render simple polylines for routes without directions (fallback; available has its own dashed line above) */}
+              {routes
+                .filter((route) => route.route === null && route.jobs.length > 0 && route.routeType !== "available")
                 .map((route) => {
                   const startPoint = route.liveLocation || route.workLocation;
-                  if (!startPoint) return null;
-                  
-                  // Create path: start -> job1 -> job2 -> ... -> jobN
-                  const path = [
-                    { lat: startPoint.lat, lng: startPoint.lng },
-                    ...route.jobs.map(job => ({ lat: job.lat, lng: job.lng }))
-                  ];
-                  
+                  const path = route.overviewPath && route.overviewPath.length > 1
+                    ? route.overviewPath
+                    : startPoint
+                      ? [
+                          { lat: startPoint.lat, lng: startPoint.lng },
+                          ...route.jobs.map((job) => ({ lat: job.lat, lng: job.lng })),
+                        ]
+                      : [];
+                  if (path.length < 2) return null;
                   return (
                     <Polyline
                       key={`polyline-${route.teammateId}`}
@@ -1129,26 +1856,70 @@ export function CalendarMapView({
                     />
                   );
                 })}
+              {/* Past-day ghost full trail (faint) */}
+              {dateMode === "past" && routes
+                .filter((route) => Array.isArray(route.fullTrail) && (route.fullTrail?.length ?? 0) > 1)
+                .map((route) => (
+                  <Polyline
+                    key={`ghost-${route.teammateId}`}
+                    path={(route.fullTrail || []).map((p) => ({ lat: p.lat, lng: p.lng }))}
+                    options={{
+                      strokeColor: route.routeColor,
+                      strokeWeight: 2,
+                      strokeOpacity: 0.2,
+                      geodesic: true,
+                      clickable: false,
+                    }}
+                  />
+                ))}
 
-              {/* Render markers for start points (real-time location) */}
+              {/* Historical replay markers along trail */}
+              {dateMode === "past" && routes
+                .filter((route) => Array.isArray(route.replayTrail) && (route.replayTrail?.length ?? 0) > 1)
+                .flatMap((route) => {
+                  const trail = route.replayTrail!;
+                  const maxMarkers = 6;
+                  const step = Math.max(1, Math.floor(trail.length / maxMarkers));
+                  const points = trail.filter((_, idx) => idx % step === 0).slice(0, maxMarkers);
+                  return points.map((pt, idx) => (
+                    <Marker
+                      key={`replay-${route.teammateId}-${idx}`}
+                      position={{ lat: pt.lat, lng: pt.lng }}
+                      icon={{
+                        path: google.maps.SymbolPath.CIRCLE,
+                        scale: 3,
+                        fillColor: route.routeColor,
+                        fillOpacity: 0.9,
+                        strokeColor: "#ffffff",
+                        strokeWeight: 1,
+                      }}
+                      title={pt.createdAt ? `${route.teammateName} @ ${format(pt.createdAt, "HH:mm")}` : route.teammateName}
+                    />
+                  ));
+                })}
+
+              {/* Render markers for start points (avatars, same as Find Work map) */}
               {routes.map((route) => {
                 const startPoint = route.liveLocation || route.workLocation;
                 if (!startPoint) return null;
-
+                const avatarUrl = route.teammateAvatar
+                  ? (route.teammateAvatar.startsWith("http") || route.teammateAvatar.startsWith("data:")
+                      ? route.teammateAvatar
+                      : `${window.location.origin}${route.teammateAvatar.startsWith("/") ? "" : "/"}${route.teammateAvatar}`)
+                  : null;
                 return (
-                  <Marker
+                  <OverlayView
                     key={`start-${route.teammateId}`}
                     position={{ lat: startPoint.lat, lng: startPoint.lng }}
-                    icon={{
-                      path: google.maps.SymbolPath.CIRCLE,
-                      scale: 10,
-                      fillColor: route.routeColor,
-                      fillOpacity: 1,
-                      strokeColor: "#fff",
-                      strokeWeight: 3,
-                    }}
-                    title={`${route.teammateName} - ${route.liveLocation ? "Live Location" : "Start"}`}
-                  />
+                    mapPaneName={OverlayView.OVERLAY_MOUSE_TARGET}
+                  >
+                    <CalendarAvatarPin
+                      name={route.teammateName}
+                      avatarUrl={avatarUrl}
+                      ringColorHex={route.routeColor}
+                      title={`${route.teammateName} - ${route.liveLocation ? "Live Location" : "Start"}`}
+                    />
+                  </OverlayView>
                 );
               })}
 
@@ -1249,14 +2020,55 @@ export function CalendarMapView({
                       fontWeight: "bold",
                     }}
                     onClick={() => {
-                      if (onJobAction) {
-                        onJobAction(job.id, "view");
-                      }
+                      if (onJobAction) onJobAction(job.id, "add-to-route");
                     }}
-                    title={`${job.title} - Available`}
+                    title={`${job.title} - Available (click to add to route)`}
                   />
                 );
               })}
+
+              {/* Pop-up when user clicks a route line */}
+              {selectedRoute && (() => {
+                const pos = selectedRoute.workLocation || selectedRoute.jobs[0];
+                if (!pos) return null;
+                return (
+                  <InfoWindow
+                    position={{ lat: pos.lat, lng: pos.lng }}
+                    onCloseClick={() => setSelectedRoute(null)}
+                  >
+                    <div className="p-2 min-w-[160px] max-w-[240px]">
+                      <p className="font-medium text-sm mb-2">{selectedRoute.teammateName}</p>
+                      {selectedRoute.routeType === "available" && selectedRoute.jobs.length > 0 && (
+                        <button
+                          type="button"
+                          className="w-full text-left text-xs text-primary hover:underline mb-2"
+                          onClick={() => {
+                            if (onJobAction) onJobAction(selectedRoute.jobs[0].jobId, "add-to-route");
+                            setSelectedRoute(null);
+                          }}
+                        >
+                          Add to route / Apply (step 3)
+                        </button>
+                      )}
+                      <div className="space-y-1">
+                        {selectedRoute.jobs.map((job) => (
+                          <button
+                            key={job.jobId}
+                            type="button"
+                            className="w-full text-left text-xs text-muted-foreground hover:underline"
+                            onClick={() => {
+                              setSelectedJobId(job.jobId);
+                              setSelectedRoute(null);
+                            }}
+                          >
+                            {job.sequence}. {job.jobTitle}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  </InfoWindow>
+                );
+              })()}
             </GoogleMap>
           )}
 
@@ -1289,9 +2101,175 @@ export function CalendarMapView({
               <ChevronRight className="w-4 h-4" />
             </Button>
           </div>
+          {replayEnabled && dateMode === "past" && (
+            <div className="absolute top-14 left-3 right-3 z-10 rounded-lg border border-border bg-background/90 p-2 backdrop-blur-sm shadow-sm">
+              <div className="mb-1 flex items-center justify-between text-xs">
+                <span className="font-medium">Replay time</span>
+                <div className="flex items-center gap-2">
+                  <span className="tabular-nums">{replayLabel}</span>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-6 px-2 text-[10px]"
+                    onClick={handleCopyReplayLink}
+                    data-testid="button-replay-copy-link-mobile"
+                  >
+                    {replayLinkCopied ? "Copied" : "Copy link"}
+                  </Button>
+                </div>
+              </div>
+              <div className="flex items-center gap-2">
+                <input
+                  type="range"
+                  min={0}
+                  max={1439}
+                  step={5}
+                  value={replayMinute}
+                  onChange={(e) => setReplayMinute(parseInt(e.target.value, 10))}
+                  className="w-full"
+                />
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-7 px-2 text-xs"
+                  onClick={() => setReplayPlaying((v) => !v)}
+                >
+                  {replayPlaying ? "Pause" : "Play"}
+                </Button>
+              </div>
+              <div className="mt-1 flex items-center justify-between gap-1">
+                <Button variant="outline" size="sm" className="h-6 px-2 text-[10px]" onClick={() => setReplayMinute(0)}>
+                  Start
+                </Button>
+                <Button variant="outline" size="sm" className="h-6 px-2 text-[10px]" onClick={() => jumpReplayEvent("prev")}>
+                  Prev event
+                </Button>
+                <Button variant="outline" size="sm" className="h-6 px-2 text-[10px]" onClick={() => jumpReplayEvent("next")}>
+                  Next event
+                </Button>
+                <Button variant="outline" size="sm" className="h-6 px-2 text-[10px]" onClick={() => setReplayMinute(1439)}>
+                  End
+                </Button>
+              </div>
+              <div className="mt-1 flex items-center gap-1">
+                <Button
+                  variant={showReplayJobStarts ? "default" : "outline"}
+                  size="sm"
+                  className="h-6 px-2 text-[10px]"
+                  onClick={() => setShowReplayJobStarts((v) => !v)}
+                >
+                  Starts
+                </Button>
+                <Button
+                  variant={showReplayJobEnds ? "default" : "outline"}
+                  size="sm"
+                  className="h-6 px-2 text-[10px]"
+                  onClick={() => setShowReplayJobEnds((v) => !v)}
+                >
+                  Ends
+                </Button>
+                <Button
+                  variant={showReplayPings ? "default" : "outline"}
+                  size="sm"
+                  className="h-6 px-2 text-[10px]"
+                  onClick={() => setShowReplayPings((v) => !v)}
+                >
+                  Pings
+                </Button>
+              </div>
+              {replayEventTeammates.length > 0 && (
+                <div className="mt-1 flex items-center gap-1 overflow-x-auto pb-1">
+                  <Button
+                    variant={replayTeammateFilterIds.length === 0 ? "default" : "outline"}
+                    size="sm"
+                    className="h-6 px-2 text-[10px] whitespace-nowrap"
+                    onClick={() => setReplayTeammateFilterIds([])}
+                  >
+                    All workers
+                  </Button>
+                  {replayEventTeammates.slice(0, 8).map((teammate) => (
+                    <Button
+                      key={`replay-mobile-worker-${teammate.id}`}
+                      variant={replayTeammateFilterSet.has(teammate.id) ? "default" : "outline"}
+                      size="sm"
+                      className="h-6 px-2 text-[10px] whitespace-nowrap"
+                      onClick={() => toggleReplayTeammateFilter(teammate.id)}
+                    >
+                      {teammate.firstName}
+                    </Button>
+                  ))}
+                </div>
+              )}
+              {replayEventTimeline.length > 0 && replayEventChips.length === 0 && (
+                <div className="mt-2 rounded border border-border bg-muted/40 px-2 py-1 text-[10px] text-muted-foreground">
+                  No replay events under current filters.
+                </div>
+              )}
+              {replayEventChips.length > 0 && (
+                <div className="mt-2 flex gap-1 overflow-x-auto pb-1">
+                  {replayEventChips.map((chip) => (
+                    <Button
+                      key={`chip-mobile-${chip.minute}-${chip.kind}`}
+                      variant="outline"
+                      size="sm"
+                      className={`h-6 px-2 text-[10px] whitespace-nowrap ${replayChipTone(chip.kind, chip.minute === replayMinute)}`}
+                      onClick={() => {
+                        setReplayPlaying(false);
+                        setReplayMinute(chip.minute);
+                      }}
+                      title={chip.label}
+                    >
+                      {String(Math.floor(chip.minute / 60)).padStart(2, "0")}:{String(chip.minute % 60).padStart(2, "0")}
+                    </Button>
+                  ))}
+                </div>
+              )}
+              {replayEventTimeline.length > 0 && (
+                <div className="mt-1">
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-6 px-2 text-[10px]"
+                    onClick={() => setReplayRailOpen((v) => !v)}
+                  >
+                    {replayRailOpen ? "Hide events" : "Show events"}
+                  </Button>
+                  {replayRailOpen && (
+                    <div className="mt-1 max-h-28 overflow-y-auto rounded border border-border bg-background/80 p-1">
+                      {replayEventRail.length > 0 ? (
+                        replayEventRail.map((chip) => (
+                          <button
+                            key={`rail-mobile-${chip.minute}-${chip.kind}`}
+                            type="button"
+                            className={`mb-1 block w-full rounded border px-2 py-1 text-left text-[10px] ${
+                              replayChipTone(chip.kind, chip.minute === replayMinute)
+                            }`}
+                            onClick={() => {
+                              setReplayPlaying(false);
+                              setReplayMinute(chip.minute);
+                            }}
+                            title={chip.label}
+                          >
+                            <span className="mr-2 tabular-nums">
+                              {String(Math.floor(chip.minute / 60)).padStart(2, "0")}:{String(chip.minute % 60).padStart(2, "0")}
+                            </span>
+                            {chip.label}
+                          </button>
+                        ))
+                      ) : (
+                        <div className="px-2 py-1 text-[10px] text-muted-foreground">
+                          No replay events under current filters.
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
 
-          {/* Legend - Top Right (Desktop) or Bottom (Mobile) */}
-          {!isMobile ? (
+          {/* Legend - Top Right (Desktop only); mobile/tablet use in-flow panel legend */}
+          {!isEmployee && isDesktop ? (
             <div className="absolute top-3 right-3 z-10 bg-background/90 backdrop-blur-sm border border-border rounded-lg shadow-lg p-3 max-w-[220px]">
               <div className="text-xs font-semibold mb-2">Legend</div>
               <div className="space-y-2">
@@ -1330,56 +2308,10 @@ export function CalendarMapView({
                 </div>
               </div>
             </div>
-          ) : (
-            // Mobile legend - at bottom above routes list (adjusts with bottom sheet position)
-            <div className={`absolute left-0 right-0 z-10 bg-background/95 backdrop-blur-sm border-t border-border shadow-lg px-3 py-2 transition-all ${
-              bottomSheetPosition === "collapsed" 
-                ? "bottom-[60px]" 
-                : bottomSheetPosition === "peek" 
-                  ? "bottom-[240px]" 
-                  : "bottom-0"
-            }`}>
-              <div className="text-xs font-semibold mb-2">Legend</div>
-              <div className="flex gap-4 justify-center">
-                <div className="flex items-center gap-1.5">
-                  <Checkbox
-                    id="legend-accepted-mobile"
-                    checked={showAcceptedJobs}
-                    onCheckedChange={setShowAcceptedJobs}
-                  />
-                  <Label htmlFor="legend-accepted-mobile" className="flex items-center gap-1.5 cursor-pointer text-xs">
-                    <CheckCircle2 className="w-3 h-3 text-green-500" />
-                    <span>Accepted</span>
-                  </Label>
-                </div>
-                <div className="flex items-center gap-1.5">
-                  <Checkbox
-                    id="legend-pending-mobile"
-                    checked={showPendingJobs}
-                    onCheckedChange={setShowPendingJobs}
-                  />
-                  <Label htmlFor="legend-pending-mobile" className="flex items-center gap-1.5 cursor-pointer text-xs">
-                    <Circle className="w-3 h-3 text-yellow-500" />
-                    <span>Pending</span>
-                  </Label>
-                </div>
-                <div className="flex items-center gap-1.5">
-                  <Checkbox
-                    id="legend-available-mobile"
-                    checked={showAvailableJobs}
-                    onCheckedChange={setShowAvailableJobs}
-                  />
-                  <Label htmlFor="legend-available-mobile" className="flex items-center gap-1.5 cursor-pointer text-xs">
-                    <Zap className="w-3 h-3 text-amber-500" />
-                    <span>Available</span>
-                  </Label>
-                </div>
-              </div>
-            </div>
-          )}
+          ) : null}
 
-          {/* Teammate Filter - Below Legend (Desktop only) */}
-          {!isMobile && (
+          {/* Teammate Filter - Below Legend (Desktop only); hidden for employees */}
+          {!isEmployee && isDesktop && (
             <div className="absolute top-44 right-3 z-10 bg-background/90 backdrop-blur-sm border border-border rounded-lg shadow-lg p-2 max-w-[200px]">
               <div className="text-xs font-semibold mb-2">Workers</div>
               <ScrollArea className="max-h-[200px]">
@@ -1429,131 +2361,75 @@ export function CalendarMapView({
               </ScrollArea>
             </div>
           )}
+          {!loadingRoutes && !hasRouteContent && (
+            <div className="absolute inset-x-4 bottom-4 z-10 rounded-lg border border-border bg-background/95 p-3 text-center shadow-sm backdrop-blur-sm">
+              <p className="text-sm font-medium">No routes for this date</p>
+              <p className="mt-1 text-xs text-muted-foreground">
+                Zoomed out view shown. Try another date or enable more workers.
+              </p>
+            </div>
+          )}
         </div>
 
-        {/* Routes List - Bottom Sheet (like find page) */}
-        <div 
-          className={`absolute left-0 right-0 bg-background shadow-2xl border-t transition-all ease-out ${
-            isDragging ? "duration-0" : "duration-300"
-          } ${
-            bottomSheetPosition === "full" ? "z-[100]" : "z-10"
-          } ${
-            bottomSheetPosition === "collapsed" 
-              ? "bottom-0 h-[60px] rounded-t-3xl" 
-              : bottomSheetPosition === "peek" 
-                ? "bottom-0 h-[240px] rounded-t-3xl" 
-                : "bottom-0 top-0 h-full rounded-t-none"
-          }`}
-          style={isDragging ? { 
-            height: `calc(100% - ${Math.max(0, Math.min(window.innerHeight - 60, dragCurrentY))}px)`,
-            borderTopLeftRadius: dragCurrentY < 60 ? 0 : undefined,
-            borderTopRightRadius: dragCurrentY < 60 ? 0 : undefined,
-          } : bottomSheetPosition === "full" ? {
-            top: 0,
-            height: '100%'
-          } : undefined}
-        >
-          {/* Drag Handle */}
-          <div 
-            className="flex justify-center py-3 cursor-grab active:cursor-grabbing touch-none"
-            onTouchStart={(e) => {
-              setIsDragging(true);
-              setDragStartY(e.touches[0].clientY);
-              setDragCurrentY(e.touches[0].clientY);
-            }}
-            onTouchMove={(e) => {
-              if (isDragging) {
-                setDragCurrentY(e.touches[0].clientY);
-              }
-            }}
-            onTouchEnd={() => {
-              if (isDragging) {
-                const deltaY = dragCurrentY - dragStartY;
-                const screenHeight = window.innerHeight;
-                const currentPosition = dragCurrentY;
-                
-                if (currentPosition < screenHeight * 0.25) {
-                  setBottomSheetPosition("full");
-                } else if (currentPosition < screenHeight * 0.6) {
-                  setBottomSheetPosition("peek");
-                } else {
-                  setBottomSheetPosition("collapsed");
-                }
-                setIsDragging(false);
-              }
-            }}
-            onMouseDown={(e) => {
-              setIsDragging(true);
-              setDragStartY(e.clientY);
-              setDragCurrentY(e.clientY);
-            }}
-            onMouseMove={(e) => {
-              if (isDragging) {
-                setDragCurrentY(e.clientY);
-              }
-            }}
-            onMouseUp={() => {
-              if (isDragging) {
-                const screenHeight = window.innerHeight;
-                const currentPosition = dragCurrentY;
-                
-                if (currentPosition < screenHeight * 0.25) {
-                  setBottomSheetPosition("full");
-                } else if (currentPosition < screenHeight * 0.6) {
-                  setBottomSheetPosition("peek");
-                } else {
-                  setBottomSheetPosition("collapsed");
-                }
-                setIsDragging(false);
-              }
-            }}
-            onMouseLeave={() => {
-              if (isDragging) {
-                const screenHeight = window.innerHeight;
-                const currentPosition = dragCurrentY;
-                
-                if (currentPosition < screenHeight * 0.25) {
-                  setBottomSheetPosition("full");
-                } else if (currentPosition < screenHeight * 0.6) {
-                  setBottomSheetPosition("peek");
-                } else {
-                  setBottomSheetPosition("collapsed");
-                }
-                setIsDragging(false);
-              }
-            }}
+        {/* Routes panel - in-flow below map (no overlay); does not cover footer */}
+        <div className="flex-shrink-0 border-t border-border bg-background rounded-t-2xl overflow-hidden">
+          {/* Collapsible header - always visible */}
+          <button
+            type="button"
+            onClick={() => setBottomSheetPosition(mobileRoutesExpanded ? "collapsed" : "peek")}
+            className="w-full px-4 py-3 flex items-center justify-between gap-2 text-left hover:bg-muted/50 active:bg-muted transition-colors"
           >
-            <div className="w-12 h-1.5 bg-muted-foreground/40 rounded-full" />
-          </div>
-          
-          {/* Sheet Header */}
-          <div className="px-4 pb-2 flex items-center justify-between border-b border-border/50">
-            <h2 className="font-semibold text-sm">
+            <h2 className="font-semibold text-sm truncate">
               Routes for {format(selectedDate, "MMM d, yyyy")}
             </h2>
-            {bottomSheetPosition === "full" && (
-              <Button 
-                variant="ghost" 
-                size="icon"
-                className="w-7 h-7"
-                onClick={() => setBottomSheetPosition("peek")}
-              >
-                <ChevronDown className="w-4 h-4" />
-              </Button>
-            )}
-          </div>
+            <span className="text-xs text-muted-foreground flex-shrink-0">
+              {routes.length} route{routes.length !== 1 ? "s" : ""}
+              {filteredAvailableJobs.length > 0 && ` · ${filteredAvailableJobs.length} available`}
+            </span>
+            <ChevronDown className={`w-4 h-4 flex-shrink-0 transition-transform ${mobileRoutesExpanded ? "rotate-180" : ""}`} />
+          </button>
 
-          {/* Routes List */}
-          <div className={`overflow-y-auto px-4 ${
-            bottomSheetPosition === "collapsed" 
-              ? "h-0 overflow-hidden pt-2" 
-              : bottomSheetPosition === "peek"
-                ? "h-[160px] pt-2"
-                : "h-[calc(100%-80px)] pt-[calc(0.5rem+80px)]"
-          }`}
-          style={bottomSheetPosition === "full" ? { 
-            scrollPaddingTop: '80px'
-          } : {}}
+          {/* Expanded content - scrollable, capped height so footer stays in view */}
+          {mobileRoutesExpanded && (
+            <>
+              {/* Legend - compact row; hidden for employees */}
+              {!isEmployee && (
+                <div className="px-4 py-2 border-b border-border/50 bg-muted/30">
+                  <div className="text-xs font-semibold mb-1.5">Legend</div>
+                  <div className="flex gap-3 flex-wrap">
+                    <label className="flex items-center gap-1.5 cursor-pointer text-xs">
+                      <Checkbox
+                        id="legend-accepted-mobile"
+                        checked={showAcceptedJobs}
+                        onCheckedChange={setShowAcceptedJobs}
+                      />
+                      <CheckCircle2 className="w-3 h-3 text-green-500" />
+                      <span>Accepted</span>
+                    </label>
+                    <label className="flex items-center gap-1.5 cursor-pointer text-xs">
+                      <Checkbox
+                        id="legend-pending-mobile"
+                        checked={showPendingJobs}
+                        onCheckedChange={setShowPendingJobs}
+                      />
+                      <Circle className="w-3 h-3 text-yellow-500" />
+                      <span>Pending</span>
+                    </label>
+                    <label className="flex items-center gap-1.5 cursor-pointer text-xs">
+                      <Checkbox
+                        id="legend-available-mobile"
+                        checked={showAvailableJobs}
+                        onCheckedChange={setShowAvailableJobs}
+                      />
+                      <Zap className="w-3 h-3 text-amber-500" />
+                      <span>Available</span>
+                    </label>
+                  </div>
+                </div>
+              )}
+
+              {/* Routes list - max height so nav stays visible */}
+              <div className="overflow-y-auto max-h-[min(38vh,320px)] px-4 pt-2 pb-3"
           >
             {routes.length === 0 && filteredAvailableJobs.length === 0 ? (
               <div className="py-4 text-center">
@@ -1583,7 +2459,7 @@ export function CalendarMapView({
                           route.jobs.forEach((job) => {
                             bounds.extend(new google.maps.LatLng(job.lat, job.lng));
                           });
-                          mapRef.current.fitBounds(bounds);
+                          fitBoundsWithZoomCap(bounds);
                         }
                       }}
                     >
@@ -1609,10 +2485,26 @@ export function CalendarMapView({
                         </Badge>
                       </div>
                       
-                      {/* Compact route list */}
+                      {/* Compact route list - each job row opens popup on click */}
                       <div className="space-y-0.5 mb-1.5 ml-7">
                         {route.jobs.slice(0, 2).map((job) => (
-                          <div key={job.jobId} className="flex items-center gap-1.5 text-[10px]">
+                          <div
+                            key={job.jobId}
+                            role="button"
+                            tabIndex={0}
+                            className="flex items-center gap-1.5 text-[10px] cursor-pointer hover:bg-muted/30 rounded px-1 -mx-1"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              if (onJobAction) onJobAction(job.jobId, "view");
+                            }}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter" || e.key === " ") {
+                                e.preventDefault();
+                                e.stopPropagation();
+                                if (onJobAction) onJobAction(job.jobId, "view");
+                              }
+                            }}
+                          >
                             <div
                               className="w-1.5 h-1.5 rounded-full flex-shrink-0"
                               style={{ backgroundColor: route.routeColor }}
@@ -1633,7 +2525,23 @@ export function CalendarMapView({
                           </div>
                         ))}
                         {route.jobs.length > 2 && (
-                          <div className="text-[10px] text-muted-foreground ml-2.5">
+                          <div
+                            role="button"
+                            tabIndex={0}
+                            className="text-[10px] text-muted-foreground ml-2.5 cursor-pointer hover:underline"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              const firstJob = route.jobs[2];
+                              if (firstJob && onJobAction) onJobAction(firstJob.jobId, "view");
+                            }}
+                            onKeyDown={(e) => {
+                              if ((e.key === "Enter" || e.key === " ") && route.jobs[2] && onJobAction) {
+                                e.preventDefault();
+                                e.stopPropagation();
+                                onJobAction(route.jobs[2].jobId, "view");
+                              }
+                            }}
+                          >
                             +{route.jobs.length - 2} more
                           </div>
                         )}
@@ -1678,7 +2586,18 @@ export function CalendarMapView({
                         return (
                           <div
                             key={job.id}
-                            className="p-2.5 rounded-lg border border-amber-200 dark:border-amber-800 bg-amber-50/50 dark:bg-amber-950/20"
+                            role="button"
+                            tabIndex={0}
+                            className="p-2.5 rounded-lg border border-amber-200 dark:border-amber-800 bg-amber-50/50 dark:bg-amber-950/20 cursor-pointer transition-all hover:bg-amber-100/50 dark:hover:bg-amber-900/30 active:bg-amber-200/50"
+                            onClick={() => {
+                              if (onJobAction) onJobAction(job.id, "view");
+                            }}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter" || e.key === " ") {
+                                e.preventDefault();
+                                if (onJobAction) onJobAction(job.id, "view");
+                              }
+                            }}
                           >
                             <div className="flex items-start gap-2">
                               <Badge variant="outline" className="text-[9px] border-amber-500 text-amber-700 dark:text-amber-400 px-1.5 py-0 h-4 flex-shrink-0">
@@ -1738,6 +2657,8 @@ export function CalendarMapView({
               </div>
             )}
           </div>
+            </>
+          )}
         </div>
       </div>
     );
@@ -1747,15 +2668,15 @@ export function CalendarMapView({
   return (
     <div className="w-full relative" style={{ height }}>
       {/* Map Section - Full Width */}
-      <div className="w-full h-full relative">
+      <div className="w-full h-full relative box-border pt-[5px] pb-[5px]">
         {!isLoaded ? (
           <div className="w-full h-full flex items-center justify-center bg-muted">
             <Skeleton className="w-full h-full" />
           </div>
         ) : (
           <GoogleMap
-            mapContainerStyle={{ width: "100%", height: "100%" }}
-            center={{ lat: 37.7749, lng: -122.4194 }}
+            mapContainerStyle={{ width: "100%", height: "100%", boxSizing: "border-box", paddingTop: "5px", paddingBottom: "5px" }}
+            center={initialMapCenter}
             zoom={10}
             onLoad={onMapLoad}
             options={{
@@ -1765,12 +2686,33 @@ export function CalendarMapView({
               fullscreenControl: false,
             }}
           >
-            {/* Render routes with directions */}
+            {/* Coverage radius circles (same as Find Work map): worker + teammates territory */}
+            {referenceRadiusMiles != null && referenceRadiusMiles > 0 && referencePoints && referencePoints.length > 0 && referencePoints.map((pt, i) => {
+              const miles = referenceRadiusMilesArray?.[i] != null ? referenceRadiusMilesArray[i] : referenceRadiusMiles;
+              if (!Number.isFinite(miles) || miles <= 0) return null;
+              return Number.isFinite(pt.lat) && Number.isFinite(pt.lng) ? (
+                <MapCircle
+                  key={`radius-${i}`}
+                  center={{ lat: pt.lat, lng: pt.lng }}
+                  radius={miles * MILES_TO_METERS}
+                  options={{
+                    fillColor: i === 0 ? "#22c55e" : "#3b82f6",
+                    fillOpacity: 0.08,
+                    strokeColor: i === 0 ? "#16a34a" : "#2563eb",
+                    strokeOpacity: 0.35,
+                    strokeWeight: 2,
+                    zIndex: 0,
+                  }}
+                />
+              ) : null;
+            })}
+
+            {/* Render routes with directions (accepted = green, pending = yellow; available = dashed below) */}
             {routes
-              .filter((route) => route.route !== null)
+              .filter((route) => route.route !== null && route.routeType !== "available")
               .map((route) => (
                 <DirectionsRenderer
-                  key={route.teammateId}
+                  key={`dir-${route.teammateId}`}
                   directions={route.route!}
                   options={{
                     suppressMarkers: true,
@@ -1783,19 +2725,75 @@ export function CalendarMapView({
                 />
               ))}
 
+            {/* Available jobs route: light blue dashed only (clickable) */}
+            {routes
+              .filter((route) => route.routeType === "available" && (route.overviewPath?.length ?? 0) > 0)
+              .map((route) => {
+                const path = route.overviewPath ?? (() => {
+                  const start = route.liveLocation || route.workLocation;
+                  if (!start) return [];
+                  return [{ lat: start.lat, lng: start.lng }, ...route.jobs.map((j) => ({ lat: j.lat, lng: j.lng }))];
+                })();
+                if (path.length < 2) return null;
+                return (
+                  <Polyline
+                    key={`available-route-${route.teammateId}`}
+                    path={path}
+                    options={{
+                      strokeColor: ROUTE_COLOR_AVAILABLE,
+                      strokeWeight: 0,
+                      strokeOpacity: 0,
+                      geodesic: true,
+                      clickable: true,
+                      icons: [
+                        { icon: { path: "M 0,-1 0,1", strokeOpacity: 1, strokeColor: ROUTE_COLOR_AVAILABLE, scale: 4 }, repeat: "20px" },
+                      ],
+                    }}
+                    onClick={() => setSelectedRoute(route)}
+                  />
+                );
+              })}
+
+            {/* Clickable overlay on route lines */}
+            {routes
+              .filter((route) => route.jobs.length > 0 && ((route.overviewPath?.length ?? 0) > 0 || !!(route.liveLocation || route.workLocation)))
+              .map((route) => {
+                const path = route.overviewPath ?? (() => {
+                  const start = route.liveLocation || route.workLocation;
+                  if (!start) return [];
+                  return [{ lat: start.lat, lng: start.lng }, ...route.jobs.map((j) => ({ lat: j.lat, lng: j.lng }))];
+                })();
+                if (path.length < 2) return null;
+                return (
+                  <Polyline
+                    key={`click-${route.teammateId}`}
+                    path={path}
+                    options={{
+                      strokeColor: "transparent",
+                      strokeWeight: 24,
+                      strokeOpacity: 0,
+                      clickable: true,
+                      zIndex: 10,
+                    }}
+                    onClick={() => setSelectedRoute(route)}
+                  />
+                );
+              })}
+
             {/* Render simple polylines for routes without directions (fallback) */}
             {routes
-              .filter((route) => route.route === null && route.jobs.length > 0)
+              .filter((route) => route.route === null && route.jobs.length > 0 && route.routeType !== "available")
               .map((route) => {
                 const startPoint = route.liveLocation || route.workLocation;
-                if (!startPoint) return null;
-                
-                // Create path: start -> job1 -> job2 -> ... -> jobN
-                const path = [
-                  { lat: startPoint.lat, lng: startPoint.lng },
-                  ...route.jobs.map(job => ({ lat: job.lat, lng: job.lng }))
-                ];
-                
+                const path = route.overviewPath && route.overviewPath.length > 1
+                  ? route.overviewPath
+                  : startPoint
+                    ? [
+                        { lat: startPoint.lat, lng: startPoint.lng },
+                        ...route.jobs.map((job) => ({ lat: job.lat, lng: job.lng })),
+                      ]
+                    : [];
+                if (path.length < 2) return null;
                 return (
                   <Polyline
                     key={`polyline-${route.teammateId}`}
@@ -1809,135 +2807,169 @@ export function CalendarMapView({
                   />
                 );
               })}
+            {/* Past-day ghost full trail (faint) */}
+            {dateMode === "past" && routes
+              .filter((route) => Array.isArray(route.fullTrail) && (route.fullTrail?.length ?? 0) > 1)
+              .map((route) => (
+                <Polyline
+                  key={`ghost-desktop-${route.teammateId}`}
+                  path={(route.fullTrail || []).map((p) => ({ lat: p.lat, lng: p.lng }))}
+                  options={{
+                    strokeColor: route.routeColor,
+                    strokeWeight: 2,
+                    strokeOpacity: 0.2,
+                    geodesic: true,
+                    clickable: false,
+                  }}
+                />
+              ))}
 
-            {/* Render markers for start points (real-time location) for routes - using avatars */}
+            {/* Historical replay markers along trail */}
+            {dateMode === "past" && routes
+              .filter((route) => Array.isArray(route.replayTrail) && (route.replayTrail?.length ?? 0) > 1)
+              .flatMap((route) => {
+                const trail = route.replayTrail!;
+                const maxMarkers = 8;
+                const step = Math.max(1, Math.floor(trail.length / maxMarkers));
+                const points = trail.filter((_, idx) => idx % step === 0).slice(0, maxMarkers);
+                return points.map((pt, idx) => (
+                  <Marker
+                    key={`replay-desktop-${route.teammateId}-${idx}`}
+                    position={{ lat: pt.lat, lng: pt.lng }}
+                    icon={{
+                      path: google.maps.SymbolPath.CIRCLE,
+                      scale: 3,
+                      fillColor: route.routeColor,
+                      fillOpacity: 0.9,
+                      strokeColor: "#ffffff",
+                      strokeWeight: 1,
+                    }}
+                    title={pt.createdAt ? `${route.teammateName} @ ${format(pt.createdAt, "HH:mm")}` : route.teammateName}
+                  />
+                ));
+              })}
+
+            {/* Render markers for start points (avatars, same as Find Work map) */}
             {routes.map((route) => {
               const startPoint = route.liveLocation || route.workLocation;
               if (!startPoint) return null;
-
-              // Create avatar icon - convert to full URL if needed
-              const avatarUrl = route.teammateAvatar 
-                ? (route.teammateAvatar.startsWith("http") 
-                    ? route.teammateAvatar 
+              const avatarUrl = route.teammateAvatar
+                ? (route.teammateAvatar.startsWith("http") || route.teammateAvatar.startsWith("data:")
+                    ? route.teammateAvatar
                     : `${window.location.origin}${route.teammateAvatar.startsWith("/") ? "" : "/"}${route.teammateAvatar}`)
                 : null;
-              const initials = route.teammateName
-                .split(" ")
-                .map((n) => n[0])
-                .join("")
-                .toUpperCase()
-                .slice(0, 2);
-
               return (
-                <Marker
+                <OverlayView
                   key={`start-${route.teammateId}`}
                   position={{ lat: startPoint.lat, lng: startPoint.lng }}
-                  icon={avatarUrl ? {
-                    url: avatarUrl,
-                    scaledSize: new google.maps.Size(40, 40),
-                    anchor: new google.maps.Point(20, 20),
-                  } : {
-                    path: google.maps.SymbolPath.CIRCLE,
-                    scale: 10,
-                    fillColor: route.routeColor,
-                    fillOpacity: 1,
-                    strokeColor: "#fff",
-                    strokeWeight: 3,
-                  }}
-                  label={avatarUrl ? undefined : {
-                    text: initials,
-                    color: "#fff",
-                    fontSize: "12px",
-                    fontWeight: "bold",
-                  }}
-                  title={`${route.teammateName} - ${route.liveLocation ? "Live Location" : "Start"}`}
-                />
+                  mapPaneName={OverlayView.OVERLAY_MOUSE_TARGET}
+                >
+                  <CalendarAvatarPin
+                    name={route.teammateName}
+                    avatarUrl={avatarUrl}
+                    ringColorHex={route.routeColor}
+                    title={`${route.teammateName} - ${route.liveLocation ? "Live Location" : "Start"}`}
+                  />
+                </OverlayView>
               );
             })}
 
-            {/* Render markers for ALL enabled teammates (even without routes) - using avatars */}
+            {/* Render owner's avatar pin when showBusinessOperator is true and owner doesn't have a route */}
+            {!isEmployee && workerProfile && enabledTeammates.size === 0 && (
+              (() => {
+                // Check if owner has a route (routes built from teammates, so owner won't have one unless they're also a teammate)
+                const ownerHasRoute = routes.some(r => r.teammateId === 0 || (workerProfile.avatarUrl && r.teammateAvatar === workerProfile.avatarUrl));
+                if (ownerHasRoute) return null;
+                
+                let startPoint: { lat: number; lng: number } | null = null;
+                if (workerProfile.latitude && workerProfile.longitude) {
+                  startPoint = {
+                    lat: parseFloat(workerProfile.latitude),
+                    lng: parseFloat(workerProfile.longitude),
+                  };
+                } else if (workerProfile.address) {
+                  const workerAddress = `${workerProfile.address}${workerProfile.city ? `, ${workerProfile.city}` : ""}${workerProfile.state ? `, ${workerProfile.state}` : ""}`;
+                  const geocoded = geocodedAddressesRef.current.get(workerAddress);
+                  if (geocoded) startPoint = geocoded;
+                }
+                // Fallback to map center if no location available
+                if (!startPoint) {
+                  startPoint = { lat: initialMapCenter.lat, lng: initialMapCenter.lng };
+                }
+                
+                const avatarUrl = workerProfile.avatarUrl
+                  ? (workerProfile.avatarUrl.startsWith("http") || workerProfile.avatarUrl.startsWith("data:")
+                      ? workerProfile.avatarUrl
+                      : `${window.location.origin}${workerProfile.avatarUrl.startsWith("/") ? "" : "/"}${workerProfile.avatarUrl}`)
+                  : null;
+                const name = "You";
+                return (
+                  <OverlayView
+                    key="owner-avatar"
+                    position={startPoint}
+                    mapPaneName={OverlayView.OVERLAY_MOUSE_TARGET}
+                  >
+                    <CalendarAvatarPin
+                      name={name}
+                      avatarUrl={avatarUrl}
+                      ringColorHex="#3b82f6"
+                      title={`${name} - ${workerProfile.latitude ? "Work Location" : "Default Location"}${routes.length === 0 ? " (No jobs today)" : ""}`}
+                    />
+                  </OverlayView>
+                );
+              })()
+            )}
+
+            {/* Render markers for ALL enabled teammates (even without routes) - avatars same as Find Work */}
             {teammates
               .filter(teammate => enabledTeammates.has(teammate.id))
               .filter(teammate => !routes.some(r => r.teammateId === teammate.id))
               .map((teammate) => {
-                // Use same priority logic as route building:
-                // 1. Live location (real-time GPS)
-                // 2. Work location coordinates
-                // 3. Geocoded address from cache
-                let startPoint = (teammate.liveLocationLat && teammate.liveLocationLng) 
+                let startPoint = (teammate.liveLocationLat && teammate.liveLocationLng)
                   ? { lat: teammate.liveLocationLat, lng: teammate.liveLocationLng }
                   : (teammate.workLocationLat && teammate.workLocationLng)
                     ? { lat: teammate.workLocationLat, lng: teammate.workLocationLng }
                     : null;
-                
-                // If no coordinates but has address, try geocoded cache
                 if (!startPoint && teammate.workLocationAddress) {
                   const geocoded = geocodedAddressesRef.current.get(teammate.workLocationAddress);
-                  if (geocoded) {
-                    startPoint = geocoded;
-                  } else {
-                    // Address not yet geocoded - skip for now (will be geocoded during route building)
-                    return null;
-                  }
+                  if (geocoded) startPoint = geocoded;
                 }
-                
-                // Fallback to worker profile address/coordinates if teammate has no location
                 if (!startPoint && workerProfile) {
                   if (workerProfile.latitude && workerProfile.longitude) {
                     startPoint = {
                       lat: parseFloat(workerProfile.latitude),
                       lng: parseFloat(workerProfile.longitude),
                     };
-                    console.log(`📍 Using worker profile coordinates for ${teammate.firstName} ${teammate.lastName} marker: ${startPoint.lat}, ${startPoint.lng}`);
                   } else if (workerProfile.address) {
                     const workerAddress = `${workerProfile.address}${workerProfile.city ? `, ${workerProfile.city}` : ""}${workerProfile.state ? `, ${workerProfile.state}` : ""}`;
                     const geocoded = geocodedAddressesRef.current.get(workerAddress);
-                    if (geocoded) {
-                      startPoint = geocoded;
-                      console.log(`📍 Using geocoded worker profile address for ${teammate.firstName} ${teammate.lastName} marker: ${startPoint.lat}, ${startPoint.lng}`);
-                    } else {
-                      // Address not yet geocoded - will be geocoded during route building
-                      return null;
-                    }
+                    if (geocoded) startPoint = geocoded;
                   }
                 }
-                
+                // Fallback to map center if no location available (so avatar still shows)
                 if (!startPoint) {
-                  // No location or address available - skip marker
-                  console.warn(`⚠️ No location or address for teammate ${teammate.firstName} ${teammate.lastName} (ID: ${teammate.id}) and no worker profile fallback`);
-                  return null;
+                  startPoint = { lat: initialMapCenter.lat, lng: initialMapCenter.lng };
                 }
 
-                const initials = `${teammate.firstName[0]}${teammate.lastName[0]}`.toUpperCase();
-                const avatarUrl = teammate.avatarUrl 
-                  ? (teammate.avatarUrl.startsWith("http") 
-                      ? teammate.avatarUrl 
+                const avatarUrl = teammate.avatarUrl
+                  ? (teammate.avatarUrl.startsWith("http") || teammate.avatarUrl.startsWith("data:")
+                      ? teammate.avatarUrl
                       : `${window.location.origin}${teammate.avatarUrl.startsWith("/") ? "" : "/"}${teammate.avatarUrl}`)
                   : null;
+                const name = `${teammate.firstName} ${teammate.lastName}`;
                 return (
-                  <Marker
+                  <OverlayView
                     key={`teammate-${teammate.id}`}
                     position={startPoint}
-                    icon={avatarUrl ? {
-                      url: avatarUrl,
-                      scaledSize: new google.maps.Size(36, 36),
-                      anchor: new google.maps.Point(18, 18),
-                    } : {
-                      path: google.maps.SymbolPath.CIRCLE,
-                      scale: 8,
-                      fillColor: "#94a3b8",
-                      fillOpacity: 0.7,
-                      strokeColor: "#fff",
-                      strokeWeight: 2,
-                    }}
-                    label={avatarUrl ? undefined : {
-                      text: initials,
-                      color: "#fff",
-                      fontSize: "10px",
-                      fontWeight: "bold",
-                    }}
-                    title={`${teammate.firstName} ${teammate.lastName} - ${teammate.liveLocationLat ? "Live Location" : "Work Location"}${routes.length === 0 ? " (No jobs today)" : ""}`}
-                  />
+                    mapPaneName={OverlayView.OVERLAY_MOUSE_TARGET}
+                  >
+                    <CalendarAvatarPin
+                      name={name}
+                      avatarUrl={avatarUrl}
+                      ringColorHex="#3b82f6"
+                      title={`${name} - ${teammate.liveLocationLat ? "Live Location" : teammate.workLocationLat ? "Work Location" : "Default Location"}${routes.length === 0 ? " (No jobs today)" : ""}`}
+                    />
+                  </OverlayView>
                 );
               })}
 
@@ -2038,14 +3070,55 @@ export function CalendarMapView({
                   }}
                   onClick={() => {
                     setSelectedJobId(job.id);
-                    if (onJobAction) {
-                      onJobAction(job.id, "view");
-                    }
+                    if (onJobAction) onJobAction(job.id, "add-to-route");
                   }}
-                  title={`${job.title} - Available`}
+                  title={`${job.title} - Available (click to add to route)`}
                 />
               );
             })}
+
+            {/* Pop-up when user clicks a route line */}
+            {selectedRoute && (() => {
+              const pos = selectedRoute.workLocation || selectedRoute.jobs[0];
+              if (!pos) return null;
+              return (
+                <InfoWindow
+                  position={{ lat: pos.lat, lng: pos.lng }}
+                  onCloseClick={() => setSelectedRoute(null)}
+                >
+                  <div className="p-2 min-w-[160px] max-w-[240px]">
+                    <p className="font-medium text-sm mb-2">{selectedRoute.teammateName}</p>
+                    {selectedRoute.routeType === "available" && selectedRoute.jobs.length > 0 && (
+                      <button
+                        type="button"
+                        className="w-full text-left text-xs text-primary hover:underline mb-2"
+                        onClick={() => {
+                          if (onJobAction) onJobAction(selectedRoute.jobs[0].jobId, "add-to-route");
+                          setSelectedRoute(null);
+                        }}
+                      >
+                        Add to route / Apply (step 3)
+                      </button>
+                    )}
+                    <div className="space-y-1">
+                      {selectedRoute.jobs.map((job) => (
+                        <button
+                          key={job.jobId}
+                          type="button"
+                          className="w-full text-left text-xs text-muted-foreground hover:underline"
+                          onClick={() => {
+                            setSelectedJobId(job.jobId);
+                            setSelectedRoute(null);
+                          }}
+                        >
+                          {job.sequence}. {job.jobTitle}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                </InfoWindow>
+              );
+            })()}
 
             {/* Info window for selected job */}
             {selectedJobId && (() => {
@@ -2065,92 +3138,75 @@ export function CalendarMapView({
                   position={{ lat: jobStop.lat, lng: jobStop.lng }}
                   onCloseClick={() => setSelectedJobId(null)}
                 >
-                  <div className="p-2 min-w-[200px]">
-                    <div className="flex items-center gap-2 mb-2">
-                      <Avatar className="w-8 h-8">
-                        <AvatarImage src={route.teammateAvatar || undefined} />
-                        <AvatarFallback>
-                          {route.teammateName
-                            .split(" ")
-                            .map((n) => n[0])
-                            .join("")
-                            .toUpperCase()}
-                        </AvatarFallback>
-                      </Avatar>
-                      <div>
-                        <p className="font-semibold text-sm">{route.teammateName}</p>
-                        {route.totalDistance && route.totalDuration && (
-                          <p className="text-xs text-muted-foreground">
-                            {route.totalDistance} • {route.totalDuration}
-                          </p>
-                        )}
+                  <div className="min-w-[280px] max-w-[360px] overflow-hidden rounded-2xl border border-border bg-background shadow-lg">
+                    {/* Gallery-style top (like job details popup) */}
+                    <div className="relative w-full bg-muted overflow-hidden flex-shrink-0 aspect-video rounded-t-2xl">
+                      <div className="absolute inset-0 flex flex-col items-center justify-center gap-1.5 px-4 text-center">
+                        <MapPin className="w-8 h-8 text-muted-foreground" />
+                        <p className="text-xs text-muted-foreground line-clamp-2">{jobStop.address}</p>
+                        <p className="text-[10px] text-muted-foreground/80 uppercase tracking-wide">Full address</p>
                       </div>
+                      <div className="absolute inset-x-0 top-0 h-12 bg-gradient-to-b from-black/35 via-black/15 to-transparent pointer-events-none rounded-t-2xl" />
                     </div>
-                    <Separator className="my-2" />
-                    <div>
-                      <div className="flex items-center gap-2 mb-2">
-                        <p className="font-medium text-sm flex-1">{jobStop.jobTitle}</p>
+                    {/* Content card — rounded top overlap, job-details style */}
+                    <div className="relative bg-background rounded-t-[28px] -mt-6 flex-shrink-0 flex flex-col px-4 pt-3 pb-4 shadow-[0_-2px_12px_rgba(0,0,0,0.06)]">
+                      {/* Worker on route */}
+                      <div className="flex items-center gap-2 mb-3">
+                        <Avatar className="w-9 h-9 flex-shrink-0">
+                          <AvatarImage src={route.teammateAvatar || undefined} />
+                          <AvatarFallback className="text-xs">
+                            {route.teammateName.split(" ").map((n) => n[0]).join("").toUpperCase()}
+                          </AvatarFallback>
+                        </Avatar>
+                        <div className="min-w-0 flex-1">
+                          <p className="font-semibold text-sm truncate">{route.teammateName}</p>
+                          {route.totalDistance && route.totalDuration && (
+                            <p className="text-xs text-muted-foreground">{route.totalDistance} • {route.totalDuration}</p>
+                          )}
+                        </div>
+                      </div>
+                      {/* Job title + status badges */}
+                      <div className="flex items-start gap-2 mb-2">
+                        <p className="font-medium text-sm flex-1 min-w-0 line-clamp-2">{jobStop.jobTitle}</p>
                         {jobStop.isCurrent && (
-                          <Badge variant={jobStop.isBehind ? "destructive" : "default"} className="text-xs">
-                            {jobStop.isBehind ? (
-                              <>
-                                <AlertTriangle className="w-3 h-3 mr-1" />
-                                Behind
-                              </>
-                            ) : (
-                              <>
-                                <CheckCircle2 className="w-3 h-3 mr-1" />
-                                Current
-                              </>
-                            )}
+                          <Badge variant={jobStop.isBehind ? "destructive" : "default"} className="text-xs flex-shrink-0">
+                            {jobStop.isBehind ? <><AlertTriangle className="w-3 h-3 mr-1" /> Behind</> : <><CheckCircle2 className="w-3 h-3 mr-1" /> Current</>}
                           </Badge>
                         )}
-                        {jobStop.isNext && (
-                          <Badge variant="outline" className="text-xs">
-                            <Circle className="w-3 h-3 mr-1" />
-                            Next
-                          </Badge>
+                        {jobStop.isNext && !jobStop.isCurrent && (
+                          <Badge variant="outline" className="text-xs flex-shrink-0"><Circle className="w-3 h-3 mr-1" /> Next</Badge>
                         )}
                       </div>
-                      <p className="text-xs text-muted-foreground mb-1 flex items-center gap-1">
-                        <MapPin className="w-3 h-3" />
-                        {jobStop.address}
-                      </p>
+                      {/* Date section (like job details) */}
+                      <div className="flex items-start gap-2 text-sm text-muted-foreground mb-2">
+                        <Calendar className="w-4 h-4 mt-0.5 flex-shrink-0" />
+                        <div>
+                          <p>{format(jobStop.scheduledStart, "EEEE, MMM d")}</p>
+                          <p className="text-xs">{format(jobStop.scheduledStart, "h:mm a")} – {format(jobStop.scheduledEnd, "h:mm a")}</p>
+                        </div>
+                      </div>
                       <p className="text-xs text-muted-foreground mb-2 flex items-center gap-1">
-                        <Clock className="w-3 h-3" />
-                        {format(jobStop.scheduledStart, "h:mm a")} - {format(jobStop.scheduledEnd, "h:mm a")}
+                        <MapPin className="w-3 h-3 flex-shrink-0" />
+                        <span className="line-clamp-2">{jobStop.address}</span>
                       </p>
                       {jobStop.isBehind && jobStop.isCurrent && (
-                        <p className="text-xs text-destructive font-medium">
-                          Running {Math.round((new Date().getTime() - jobStop.scheduledStart.getTime()) / (1000 * 60))} minutes late
+                        <p className="text-xs text-destructive font-medium mb-2">
+                          Running {Math.round((new Date().getTime() - jobStop.scheduledStart.getTime()) / (1000 * 60))} min late
                         </p>
                       )}
                       {onJobAction && (
-                        <div className="flex gap-1 mt-2">
-                          <Button
-                            variant="outline"
-                            size="sm"
-                            className="h-7 text-xs flex-1"
-                            onClick={() => {
-                              onJobAction(jobStop.jobId, "view");
-                              setSelectedJobId(null);
-                            }}
-                          >
-                            View
-                          </Button>
-                          <Button
-                            variant="outline"
-                            size="sm"
-                            className="h-7 text-xs flex-1"
-                            onClick={() => {
-                              onJobAction(jobStop.jobId, "directions");
-                              setSelectedJobId(null);
-                            }}
-                          >
-                            <MapIcon className="w-3 h-3 mr-1" />
-                            Route
-                          </Button>
-                        </div>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className="h-8 text-xs w-full"
+                          onClick={() => {
+                            onJobAction(jobStop.jobId, "directions");
+                            setSelectedJobId(null);
+                          }}
+                        >
+                          <MapIcon className="w-3.5 h-3.5 mr-1.5" />
+                          Directions
+                        </Button>
                       )}
                     </div>
                   </div>
@@ -2174,41 +3230,35 @@ export function CalendarMapView({
                     position={{ lat, lng }}
                     onCloseClick={() => setSelectedJobId(null)}
                   >
-                    <div className="p-2 min-w-[200px]">
-                      <div className="flex items-center gap-2 mb-2">
-                        <Badge variant="outline" className="border-purple-500 text-purple-700 dark:text-purple-400">
-                          Unassigned
-                        </Badge>
-                        <p className="font-semibold text-sm flex-1">{unassignedJob.jobTitle}</p>
+                    <div className="min-w-[280px] max-w-[360px] overflow-hidden rounded-2xl border border-border bg-background shadow-lg">
+                      <div className="relative w-full bg-muted overflow-hidden flex-shrink-0 aspect-video rounded-t-2xl">
+                        <div className="absolute inset-0 flex flex-col items-center justify-center gap-1.5 px-4 text-center">
+                          <MapPin className="w-8 h-8 text-muted-foreground" />
+                          <p className="text-xs text-muted-foreground line-clamp-2">{unassignedJob.address}</p>
+                        </div>
+                        <div className="absolute inset-x-0 top-0 h-12 bg-gradient-to-b from-black/35 via-black/15 to-transparent pointer-events-none rounded-t-2xl" />
                       </div>
-                      <Separator className="my-2" />
-                      <div>
-                        <p className="text-xs text-muted-foreground mb-1 flex items-center gap-1">
-                          <MapPin className="w-3 h-3" />
-                          {unassignedJob.address}
-                        </p>
+                      <div className="relative bg-background rounded-t-[28px] -mt-6 flex-shrink-0 flex flex-col px-4 pt-3 pb-4 shadow-[0_-2px_12px_rgba(0,0,0,0.06)]">
+                        <div className="flex items-center gap-2 mb-2">
+                          <Badge variant="outline" className="border-purple-500 text-purple-700 dark:text-purple-400 text-xs">
+                            Unassigned
+                          </Badge>
+                        </div>
+                        <p className="font-medium text-sm mb-2 line-clamp-2">{unassignedJob.jobTitle}</p>
+                        <div className="flex items-start gap-2 text-sm text-muted-foreground mb-2">
+                          <Calendar className="w-4 h-4 mt-0.5 flex-shrink-0" />
+                          <div>
+                            <p>{format(scheduledStart, "EEEE, MMM d")}</p>
+                            <p className="text-xs">{format(scheduledStart, "h:mm a")} – {format(scheduledEnd, "h:mm a")}</p>
+                          </div>
+                        </div>
                         <p className="text-xs text-muted-foreground mb-2 flex items-center gap-1">
-                          <Clock className="w-3 h-3" />
-                          {format(scheduledStart, "h:mm a")} - {format(scheduledEnd, "h:mm a")}
+                          <MapPin className="w-3 h-3 flex-shrink-0" />
+                          <span className="line-clamp-2">{unassignedJob.address}</span>
                         </p>
-                        <p className="text-xs text-muted-foreground mb-2">
+                        <p className="text-xs text-muted-foreground">
                           Status: <Badge variant="outline" className="text-xs">{unassignedJob.status}</Badge>
                         </p>
-                        {onJobAction && (
-                          <div className="flex gap-1 mt-2">
-                            <Button
-                              variant="outline"
-                              size="sm"
-                              className="h-7 text-xs flex-1"
-                              onClick={() => {
-                                onJobAction(unassignedJob.jobId, "view");
-                                setSelectedJobId(null);
-                              }}
-                            >
-                              View
-                            </Button>
-                          </div>
-                        )}
                       </div>
                     </div>
                   </InfoWindow>
@@ -2217,6 +3267,7 @@ export function CalendarMapView({
                 const lat = availableJob.latitude ? parseFloat(availableJob.latitude) : null;
                 const lng = availableJob.longitude ? parseFloat(availableJob.longitude) : null;
                 if (!lat || !lng) return null;
+                const startDate = typeof availableJob.startDate === "string" ? parseISO(availableJob.startDate) : availableJob.startDate;
 
                 return (
                   <InfoWindow
@@ -2224,41 +3275,47 @@ export function CalendarMapView({
                     position={{ lat, lng }}
                     onCloseClick={() => setSelectedJobId(null)}
                   >
-                    <div className="p-2 min-w-[200px]">
-                      <div className="flex items-center gap-2 mb-2">
-                        <Badge variant="outline" className="border-amber-500 text-amber-700 dark:text-amber-400">
-                          Available
-                        </Badge>
-                        <p className="font-semibold text-sm flex-1">{availableJob.title}</p>
+                    <div className="min-w-[280px] max-w-[360px] overflow-hidden rounded-2xl border border-border bg-background shadow-lg">
+                      <div className="relative w-full bg-muted overflow-hidden flex-shrink-0 aspect-video rounded-t-2xl">
+                        <div className="absolute inset-0 flex flex-col items-center justify-center gap-1.5 px-4 text-center">
+                          <MapPin className="w-8 h-8 text-muted-foreground" />
+                          <p className="text-xs text-muted-foreground">
+                            {[availableJob.city, availableJob.state].filter(Boolean).join(", ") || "General area"}
+                          </p>
+                          <p className="text-[10px] text-muted-foreground/80 uppercase tracking-wide">Full address when accepted</p>
+                        </div>
+                        <div className="absolute inset-x-0 top-0 h-12 bg-gradient-to-b from-black/35 via-black/15 to-transparent pointer-events-none rounded-t-2xl" />
                       </div>
-                      <Separator className="my-2" />
-                      <div>
-                        <p className="text-xs text-muted-foreground mb-2">
-                          {availableJob.address || availableJob.location || "Address not provided"}
-                        </p>
-                        {availableJob.scheduledTime && (
-                          <div className="flex items-center gap-2 text-xs text-muted-foreground mb-2">
-                            <Clock className="w-3 h-3" />
-                            <span>{availableJob.scheduledTime}</span>
+                      <div className="relative bg-background rounded-t-[28px] -mt-6 flex-shrink-0 flex flex-col px-4 pt-3 pb-4 shadow-[0_-2px_12px_rgba(0,0,0,0.06)]">
+                        <div className="flex items-center gap-2 mb-2">
+                          <Badge variant="outline" className="border-amber-500 text-amber-700 dark:text-amber-400 text-xs">
+                            Available
+                          </Badge>
+                        </div>
+                        <p className="font-medium text-sm mb-2 line-clamp-2">{availableJob.title}</p>
+                        <div className="flex items-start gap-2 text-sm text-muted-foreground mb-2">
+                          <Calendar className="w-4 h-4 mt-0.5 flex-shrink-0" />
+                          <div>
+                            <p>{format(startDate, "EEEE, MMM d")}</p>
+                            {availableJob.scheduledTime && <p className="text-xs">{availableJob.scheduledTime}</p>}
                           </div>
-                        )}
+                        </div>
                         {availableJob.hourlyRate && (
-                          <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                            <DollarSign className="w-3 h-3" />
-                            <span>${(availableJob.hourlyRate / 100).toFixed(2)}/hr</span>
-                          </div>
+                          <p className="text-xs text-muted-foreground mb-3 flex items-center gap-1">
+                            <DollarSign className="w-3 h-3" />${(availableJob.hourlyRate / 100).toFixed(2)}/hr
+                          </p>
                         )}
                         {onJobAction && (
                           <Button
-                            variant="outline"
                             size="sm"
-                            className="w-full mt-2"
+                            className="h-8 text-xs w-full"
                             onClick={() => {
-                              onJobAction(availableJob.id, "view");
+                              onJobAction(availableJob.id, "add-to-route");
                               setSelectedJobId(null);
                             }}
                           >
-                            View Job
+                            <UserPlus className="w-3.5 h-3.5 mr-1.5" />
+                            Add to route
                           </Button>
                         )}
                       </div>
@@ -2278,6 +3335,14 @@ export function CalendarMapView({
             </div>
           </div>
         )}
+        {!loadingRoutes && !hasRouteContent && (
+          <div className="absolute left-1/2 top-4 z-10 w-[min(92%,460px)] -translate-x-1/2 rounded-lg border border-border bg-background/95 p-3 text-center shadow-sm backdrop-blur-sm">
+            <p className="text-sm font-medium">No routes for this date</p>
+            <p className="mt-1 text-xs text-muted-foreground">
+              Zoomed out view shown. Try another date or enable more workers.
+            </p>
+          </div>
+        )}
       </div>
 
       {/* Desktop Bottom Panel - Routes Table */}
@@ -2286,32 +3351,146 @@ export function CalendarMapView({
           desktopPanelExpanded ? "h-[400px]" : "h-[60px]"
         }`}
       >
-        {/* Panel Header with Expand/Collapse Button */}
-        <div className="flex items-center justify-between p-4 border-b border-border">
-          <div className="flex items-center gap-3">
-            <TableIcon className="w-4 h-4 text-muted-foreground" />
-            <h3 className="font-semibold text-sm">
+        {/* Panel Header with Expand/Collapse Button and optional right content (e.g. worker filter) */}
+        <div className="flex items-center justify-between gap-2 p-4 border-b border-border">
+          <div className="flex items-center gap-3 min-w-0">
+            <TableIcon className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+            <h3 className="font-semibold text-sm truncate">
               Routes for {format(selectedDate, "MMM d, yyyy")}
             </h3>
-            <Badge variant="secondary" className="text-xs">
+            <Badge variant="outline" className="text-[10px] uppercase tracking-wide">
+              {dateMode}
+            </Badge>
+            <Badge variant="secondary" className="text-xs flex-shrink-0">
               {routes.length} {routes.length === 1 ? "route" : "routes"}
             </Badge>
           </div>
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={() => setDesktopPanelExpanded(!desktopPanelExpanded)}
-            className="h-8 w-8 p-0"
-          >
-            {desktopPanelExpanded ? (
-              <ChevronDown className="w-4 h-4" />
-            ) : (
-              <ChevronUp className="w-4 h-4" />
+          <div className="flex items-center gap-2 flex-shrink-0">
+            {replayEnabled && dateMode === "past" && (
+              <div className="hidden lg:flex items-center gap-2 rounded-md border border-border bg-muted/40 px-2 py-1">
+                <span className="text-[10px] uppercase text-muted-foreground">Replay</span>
+                <input
+                  type="range"
+                  min={0}
+                  max={1439}
+                  step={5}
+                  value={replayMinute}
+                  onChange={(e) => setReplayMinute(parseInt(e.target.value, 10))}
+                  className="w-28"
+                />
+                <span className="text-xs tabular-nums">{replayLabel}</span>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-6 px-2 text-[10px]"
+                  onClick={() => setReplayPlaying((v) => !v)}
+                >
+                  {replayPlaying ? "Pause" : "Play"}
+                </Button>
+                <Button variant="outline" size="sm" className="h-6 px-2 text-[10px]" onClick={() => jumpReplayEvent("prev")}>
+                  Prev
+                </Button>
+                <Button variant="outline" size="sm" className="h-6 px-2 text-[10px]" onClick={() => jumpReplayEvent("next")}>
+                  Next
+                </Button>
+                <Button
+                  variant={showReplayJobStarts ? "default" : "outline"}
+                  size="sm"
+                  className="h-6 px-2 text-[10px]"
+                  onClick={() => setShowReplayJobStarts((v) => !v)}
+                >
+                  Starts
+                </Button>
+                <Button
+                  variant={showReplayJobEnds ? "default" : "outline"}
+                  size="sm"
+                  className="h-6 px-2 text-[10px]"
+                  onClick={() => setShowReplayJobEnds((v) => !v)}
+                >
+                  Ends
+                </Button>
+                <Button
+                  variant={showReplayPings ? "default" : "outline"}
+                  size="sm"
+                  className="h-6 px-2 text-[10px]"
+                  onClick={() => setShowReplayPings((v) => !v)}
+                >
+                  Pings
+                </Button>
+                {replayEventTeammates.length > 0 && (
+                  <div className="ml-1 flex max-w-[240px] items-center gap-1 overflow-x-auto border-l border-border pl-2">
+                    <Button
+                      variant={replayTeammateFilterIds.length === 0 ? "default" : "outline"}
+                      size="sm"
+                      className="h-6 px-2 text-[10px] whitespace-nowrap"
+                      onClick={() => setReplayTeammateFilterIds([])}
+                    >
+                      All
+                    </Button>
+                    {replayEventTeammates.slice(0, 6).map((teammate) => (
+                      <Button
+                        key={`replay-desktop-worker-${teammate.id}`}
+                        variant={replayTeammateFilterSet.has(teammate.id) ? "default" : "outline"}
+                        size="sm"
+                        className="h-6 px-2 text-[10px] whitespace-nowrap"
+                        onClick={() => toggleReplayTeammateFilter(teammate.id)}
+                      >
+                        {teammate.firstName}
+                      </Button>
+                    ))}
+                  </div>
+                )}
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-6 px-2 text-[10px]"
+                  onClick={() => setReplayRailOpen((v) => !v)}
+                >
+                  {replayRailOpen ? "Hide events" : "Events"}
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-6 px-2 text-[10px]"
+                  onClick={handleCopyReplayLink}
+                  data-testid="button-replay-copy-link-desktop"
+                >
+                  {replayLinkCopied ? "Copied" : "Copy"}
+                </Button>
+                {replayEventChips.slice(0, 6).map((chip) => (
+                  <Button
+                    key={`chip-desktop-${chip.minute}-${chip.kind}`}
+                    variant="outline"
+                    size="sm"
+                    className={`h-6 px-2 text-[10px] ${replayChipTone(chip.kind, chip.minute === replayMinute)}`}
+                    onClick={() => {
+                      setReplayPlaying(false);
+                      setReplayMinute(chip.minute);
+                    }}
+                    title={chip.label}
+                  >
+                    {String(Math.floor(chip.minute / 60)).padStart(2, "0")}:{String(chip.minute % 60).padStart(2, "0")}
+                  </Button>
+                ))}
+              </div>
             )}
-          </Button>
+            {toolbarRightContent}
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => setDesktopPanelExpanded(!desktopPanelExpanded)}
+              className="h-8 w-8 p-0"
+            >
+              {desktopPanelExpanded ? (
+                <ChevronDown className="w-4 h-4" />
+              ) : (
+                <ChevronUp className="w-4 h-4" />
+              )}
+            </Button>
+          </div>
         </div>
 
-        {/* Panel Content - Table */}
+        {/* Panel Content - Table grouped by status; mobile: stacked cards (no horizontal scroll) */}
         {desktopPanelExpanded && (
           <div className="h-[340px] overflow-auto">
             {routes.length === 0 && filteredAvailableJobs.length === 0 ? (
@@ -2320,149 +3499,363 @@ export function CalendarMapView({
               </div>
             ) : (
               <div className="p-4">
-                {routes.length > 0 ? (
-                  <TableComponent>
-                    <TableHeader>
-                      <TableRow>
-                        <TableHead className="w-[200px]">Worker</TableHead>
-                        <TableHead className="w-[100px]">Jobs</TableHead>
-                        <TableHead>Route</TableHead>
-                        <TableHead className="w-[120px]">Distance</TableHead>
-                        <TableHead className="w-[120px]">Duration</TableHead>
-                        <TableHead className="w-[100px]">Status</TableHead>
-                      </TableRow>
-                    </TableHeader>
-                    <TableBody>
-                      {routes.map((route) => {
-                    const teammate = teammates.find((t) => t.id === route.teammateId);
+                {replayEnabled && dateMode === "past" && replayRailOpen && replayEventTimeline.length > 0 && (
+                  <div className="mb-3 rounded-lg border border-border bg-muted/30 p-2">
+                    <div className="mb-2 text-xs font-medium text-muted-foreground">Replay event rail</div>
+                    <div className="mb-2 flex items-center gap-2 text-[10px] text-muted-foreground">
+                      <span className="inline-flex items-center gap-1">
+                        <span className="h-2 w-2 rounded-full bg-green-500" />
+                        Start
+                      </span>
+                      <span className="inline-flex items-center gap-1">
+                        <span className="h-2 w-2 rounded-full bg-amber-500" />
+                        End
+                      </span>
+                      <span className="inline-flex items-center gap-1">
+                        <span className="h-2 w-2 rounded-full bg-blue-500" />
+                        Ping
+                      </span>
+                    </div>
+                    {replayEventRail.length > 0 ? (
+                      <div className="grid grid-cols-1 gap-1 md:grid-cols-2">
+                        {replayEventRail.map((chip) => (
+                          <button
+                            key={`rail-desktop-${chip.minute}-${chip.kind}`}
+                            type="button"
+                            className={`rounded border px-2 py-1 text-left text-[11px] ${
+                              replayChipTone(chip.kind, chip.minute === replayMinute)
+                            }`}
+                            onClick={() => {
+                              setReplayPlaying(false);
+                              setReplayMinute(chip.minute);
+                            }}
+                            title={chip.label}
+                          >
+                            <span className="mr-2 tabular-nums">
+                              {String(Math.floor(chip.minute / 60)).padStart(2, "0")}:{String(chip.minute % 60).padStart(2, "0")}
+                            </span>
+                            {chip.label}
+                          </button>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="rounded border border-border bg-background/60 px-2 py-1 text-[11px] text-muted-foreground">
+                        No replay events under current filters.
+                      </div>
+                    )}
+                  </div>
+                )}
+                {(() => {
+                  const acceptedRoutes = routes.filter((r) => r.routeType === "accepted");
+                  const pendingRoutes = routes.filter((r) => r.routeType === "pending");
+                  const availableRoutes = routes.filter((r) => r.routeType === "available");
+
+                  const renderRouteRow = (route: TeammateRoute) => {
                     const currentJob = route.jobs.find((j) => j.isCurrent);
                     const nextJob = route.jobs.find((j) => j.isNext);
                     const behindJobs = route.jobs.filter((j) => j.isBehind);
+                    const timelineNow = dateMode === "past" ? endOfDay(selectedDate) : new Date();
+                    const completedCount = route.jobs.filter((j) => j.scheduledEnd.getTime() <= timelineNow.getTime()).length;
+                    const upcomingCount = Math.max(0, route.jobs.length - completedCount);
+                    const statusCell = dateMode === "past" ? (
+                      <Badge variant="outline" className="text-xs">Historical</Badge>
+                    ) : dateMode === "future" ? (
+                      <Badge variant="outline" className="text-xs">Planned</Badge>
+                    ) : behindJobs.length > 0 ? (
+                      <Badge variant="destructive" className="text-xs"><AlertTriangle className="w-3 h-3 mr-1" /> Behind</Badge>
+                    ) : currentJob ? (
+                      <Badge variant="default" className="text-xs"><CheckCircle2 className="w-3 h-3 mr-1" /> On Time</Badge>
+                    ) : (
+                      <Badge variant="outline" className="text-xs">Scheduled</Badge>
+                    );
+                    const routeList = (
+                      <div className="flex flex-col gap-1">
+                        {route.jobs.slice(0, 3).map((job) => (
+                          <div key={job.jobId} className="flex items-center gap-2 text-xs">
+                            <div className="w-2 h-2 rounded-full flex-shrink-0" style={{ backgroundColor: route.routeColor }} />
+                            <span className="truncate flex-1">{job.sequence}. {job.jobTitle}</span>
+                            {dateMode !== "past" && job.isCurrent && <Badge variant="default" className="text-[10px] px-1.5 py-0">Current</Badge>}
+                            {dateMode !== "past" && job.isNext && <Badge variant="outline" className="text-[10px] px-1.5 py-0">Next</Badge>}
+                          </div>
+                        ))}
+                        {dateMode === "past" && (
+                          <div className="text-[10px] text-muted-foreground ml-4">
+                            Historical route ({completedCount} stops)
+                          </div>
+                        )}
+                        {route.jobs.length > 3 && <span className="text-xs text-muted-foreground ml-4">+{route.jobs.length - 3} more</span>}
+                      </div>
+                    );
+                    const workerCell = (
+                      <div className="flex items-center gap-2">
+                        <Avatar className="w-6 h-6">
+                          <AvatarImage src={route.teammateAvatar || undefined} />
+                          <AvatarFallback className="text-xs">{route.teammateName.split(" ").map((n) => n[0]).join("").toUpperCase()}</AvatarFallback>
+                        </Avatar>
+                        <span className="text-sm font-medium">{route.teammateName}</span>
+                        <Badge variant="outline" className="text-[10px] uppercase">
+                          {route.routeSource || "polyline"}
+                        </Badge>
+                      </div>
+                    );
+                    const focusMap = () => {
+                      if (mapRef.current && route.jobs.length > 0) {
+                        const bounds = new google.maps.LatLngBounds();
+                        if (route.workLocation) bounds.extend(new google.maps.LatLng(route.workLocation.lat, route.workLocation.lng));
+                        if (route.liveLocation) bounds.extend(new google.maps.LatLng(route.liveLocation.lat, route.liveLocation.lng));
+                        route.jobs.forEach((job) => bounds.extend(new google.maps.LatLng(job.lat, job.lng)));
+                        fitBoundsWithZoomCap(bounds);
+                      }
+                    };
+                    return { route, workerCell, routeList, statusCell, focusMap };
+                  };
 
+                  const GroupHeader = ({ label, badge }: { label: string; badge?: React.ReactNode }) => (
+                    <TableRow className="bg-muted/60 hover:bg-muted/60 border-b-2 border-border">
+                      <TableCell colSpan={6} className="font-semibold text-xs uppercase tracking-wide text-muted-foreground py-2">
+                        <div className="flex items-center gap-2">
+                          {label}
+                          {badge}
+                        </div>
+                      </TableCell>
+                    </TableRow>
+                  );
+
+                  if (isMobile) {
                     return (
-                      <TableRow
-                        key={route.teammateId}
-                        className="cursor-pointer hover:bg-muted/50"
-                        onClick={() => {
-                          // Focus on this route on the map
-                          if (mapRef.current && route.jobs.length > 0) {
-                            const bounds = new google.maps.LatLngBounds();
-                            if (route.workLocation) {
-                              bounds.extend(new google.maps.LatLng(route.workLocation.lat, route.workLocation.lng));
-                            }
-                            if (route.liveLocation) {
-                              bounds.extend(new google.maps.LatLng(route.liveLocation.lat, route.liveLocation.lng));
-                            }
-                            route.jobs.forEach((job) => {
-                              bounds.extend(new google.maps.LatLng(job.lat, job.lng));
-                            });
-                            mapRef.current.fitBounds(bounds);
-                          }
-                        }}
-                      >
-                        <TableCell>
-                          <div className="flex items-center gap-2">
-                            <Avatar className="w-6 h-6">
-                              <AvatarImage src={route.teammateAvatar || undefined} />
-                              <AvatarFallback className="text-xs">
-                                {route.teammateName
-                                  .split(" ")
-                                  .map((n) => n[0])
-                                  .join("")
-                                  .toUpperCase()}
-                              </AvatarFallback>
-                            </Avatar>
-                            <span className="text-sm font-medium">{route.teammateName}</span>
-                          </div>
-                        </TableCell>
-                        <TableCell>
-                          <Badge variant="secondary" className="text-xs">
-                            {route.jobs.length}
-                          </Badge>
-                        </TableCell>
-                        <TableCell>
-                          <div className="flex flex-col gap-1">
-                            {route.jobs.slice(0, 3).map((job, idx) => (
-                              <div key={job.jobId} className="flex items-center gap-2 text-xs">
-                                <div
-                                  className="w-2 h-2 rounded-full flex-shrink-0"
-                                  style={{ backgroundColor: route.routeColor }}
-                                />
-                                <span className="truncate flex-1">
-                                  {job.sequence}. {job.jobTitle}
-                                </span>
-                                {job.isCurrent && (
-                                  <Badge variant="default" className="text-[10px] px-1.5 py-0">
-                                    Current
-                                  </Badge>
-                                )}
-                                {job.isNext && (
-                                  <Badge variant="outline" className="text-[10px] px-1.5 py-0">
-                                    Next
-                                  </Badge>
-                                )}
-                              </div>
-                            ))}
-                            {route.jobs.length > 3 && (
-                              <span className="text-xs text-muted-foreground ml-4">
-                                +{route.jobs.length - 3} more
-                              </span>
-                            )}
-                          </div>
-                        </TableCell>
-                        <TableCell className="text-xs text-muted-foreground">
-                          {route.totalDistance || "—"}
-                        </TableCell>
-                        <TableCell className="text-xs text-muted-foreground">
-                          {route.totalDuration || "—"}
-                        </TableCell>
-                        <TableCell>
-                          {behindJobs.length > 0 ? (
-                            <Badge variant="destructive" className="text-xs">
-                              <AlertTriangle className="w-3 h-3 mr-1" />
-                              Behind
-                            </Badge>
-                          ) : currentJob ? (
-                            <Badge variant="default" className="text-xs">
-                              <CheckCircle2 className="w-3 h-3 mr-1" />
-                              On Time
-                            </Badge>
-                          ) : (
-                            <Badge variant="outline" className="text-xs">
-                              Scheduled
-                            </Badge>
-                          )}
-                        </TableCell>
-                      </TableRow>
-                      );
-                    })}
-                    </TableBody>
-                  </TableComponent>
-                ) : null}
-                
-                {/* Available Jobs Section for Desktop */}
-                {filteredAvailableJobs.length > 0 ? (
-                  <div className={`mt-4 pt-4 border-t ${routes.length > 0 ? '' : ''}`}>
+                      <div className="space-y-4 overflow-x-hidden">
+                        {acceptedRoutes.length > 0 && (
+                          <section>
+                            <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground mb-2 flex items-center gap-2">
+                              Approved
+                              <Badge variant="secondary" className="text-[10px]">{acceptedRoutes.length}</Badge>
+                            </h3>
+                            <div className="space-y-2">
+                              {acceptedRoutes.map((route) => {
+                                const r = renderRouteRow(route);
+                                return (
+                                  <div
+                                    key={route.teammateId}
+                                    role="button"
+                                    tabIndex={0}
+                                    onClick={r.focusMap}
+                                    onKeyDown={(e) => e.key === "Enter" && r.focusMap()}
+                                    className="p-3 rounded-lg border border-border bg-card text-left space-y-2"
+                                  >
+                                    <div className="flex justify-between items-start gap-2">
+                                      <span className="text-[10px] text-muted-foreground uppercase">Worker</span>
+                                      {r.workerCell}
+                                    </div>
+                                    <div className="flex justify-between items-start gap-2">
+                                      <span className="text-[10px] text-muted-foreground uppercase">Jobs</span>
+                                      <Badge variant="secondary" className="text-xs">{route.jobs.length}</Badge>
+                                    </div>
+                                    <div>
+                                      <span className="text-[10px] text-muted-foreground uppercase block mb-1">Route</span>
+                                      {r.routeList}
+                                    </div>
+                                    <div className="flex justify-between items-center gap-2 text-xs">
+                                      <span className="text-muted-foreground">Distance</span>
+                                      <span>{route.totalDistance || "—"}</span>
+                                    </div>
+                                    <div className="flex justify-between items-center gap-2 text-xs">
+                                      <span className="text-muted-foreground">Duration</span>
+                                      <span>{route.totalDuration || "—"}</span>
+                                    </div>
+                                    <div className="flex justify-between items-center gap-2">
+                                      <span className="text-[10px] text-muted-foreground uppercase">Status</span>
+                                      {r.statusCell}
+                                    </div>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          </section>
+                        )}
+                        {pendingRoutes.length > 0 && (
+                          <section>
+                            <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground mb-2 flex items-center gap-2">
+                              Pending
+                              <Badge variant="secondary" className="text-[10px]">{pendingRoutes.length}</Badge>
+                            </h3>
+                            <div className="space-y-2">
+                              {pendingRoutes.map((route) => {
+                                const r = renderRouteRow(route);
+                                return (
+                                  <div
+                                    key={route.teammateId}
+                                    role="button"
+                                    tabIndex={0}
+                                    onClick={r.focusMap}
+                                    onKeyDown={(e) => e.key === "Enter" && r.focusMap()}
+                                    className="p-3 rounded-lg border border-border bg-card text-left space-y-2"
+                                  >
+                                    <div className="flex justify-between items-start gap-2"><span className="text-[10px] text-muted-foreground uppercase">Worker</span>{r.workerCell}</div>
+                                    <div className="flex justify-between items-start gap-2"><span className="text-[10px] text-muted-foreground uppercase">Jobs</span><Badge variant="secondary" className="text-xs">{route.jobs.length}</Badge></div>
+                                    <div><span className="text-[10px] text-muted-foreground uppercase block mb-1">Route</span>{r.routeList}</div>
+                                    <div className="flex justify-between text-xs"><span className="text-muted-foreground">Distance</span><span>{route.totalDistance || "—"}</span></div>
+                                    <div className="flex justify-between text-xs"><span className="text-muted-foreground">Duration</span><span>{route.totalDuration || "—"}</span></div>
+                                    <div className="flex justify-between items-center"><span className="text-[10px] text-muted-foreground uppercase">Status</span>{r.statusCell}</div>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          </section>
+                        )}
+                        {availableRoutes.length > 0 && (
+                          <section>
+                            <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground mb-2 flex items-center gap-2">
+                              Available
+                              <Badge variant="secondary" className="text-[10px]">{availableRoutes.length}</Badge>
+                            </h3>
+                            <div className="space-y-2">
+                              {availableRoutes.map((route) => {
+                                const r = renderRouteRow(route);
+                                return (
+                                  <div
+                                    key={route.teammateId}
+                                    role="button"
+                                    tabIndex={0}
+                                    onClick={r.focusMap}
+                                    onKeyDown={(e) => e.key === "Enter" && r.focusMap()}
+                                    className="p-3 rounded-lg border border-amber-200 dark:border-amber-800 bg-amber-50/30 dark:bg-amber-950/20 text-left space-y-2"
+                                  >
+                                    <div className="flex justify-between items-start gap-2"><span className="text-[10px] text-muted-foreground uppercase">Worker</span>{r.workerCell}</div>
+                                    <div className="flex justify-between items-start gap-2"><span className="text-[10px] text-muted-foreground uppercase">Jobs</span><Badge variant="secondary" className="text-xs">{route.jobs.length}</Badge></div>
+                                    <div><span className="text-[10px] text-muted-foreground uppercase block mb-1">Route</span>{r.routeList}</div>
+                                    <div className="flex justify-between text-xs"><span className="text-muted-foreground">Distance</span><span>{route.totalDistance || "—"}</span></div>
+                                    <div className="flex justify-between text-xs"><span className="text-muted-foreground">Duration</span><span>{route.totalDuration || "—"}</span></div>
+                                    <div className="flex justify-between items-center"><span className="text-[10px] text-muted-foreground uppercase">Status</span>{r.statusCell}</div>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          </section>
+                        )}
+                        {filteredAvailableJobs.length > 0 && (
+                          <section>
+                            <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground mb-2 flex items-center gap-2">
+                              Available jobs to add
+                              <Badge variant="secondary" className="text-[10px]">{filteredAvailableJobs.length}</Badge>
+                            </h3>
+                            <div className="space-y-2">
+                              {filteredAvailableJobs.map((job) => (
+                                <div key={job.id} className="p-3 rounded-lg border border-amber-200 dark:border-amber-800 bg-amber-50/50 dark:bg-amber-950/20 space-y-2">
+                                  <div className="flex items-center gap-2">
+                                    <Badge variant="outline" className="text-xs border-amber-500 text-amber-700 dark:text-amber-400">Available</Badge>
+                                    <span className="text-sm font-medium truncate flex-1">{job.title}</span>
+                                  </div>
+                                  <div className="text-xs text-muted-foreground">
+                                    {[job.city, job.state].filter(Boolean).join(", ")}
+                                    {job.scheduledTime && ` • ${job.scheduledTime}`}
+                                  </div>
+                                  <div className="flex flex-wrap gap-1">
+                                    {teammates.slice(0, 3).map((t) => (
+                                      <Button key={t.id} variant="outline" size="sm" className="text-xs h-7" onClick={(e) => { e.stopPropagation(); onAddJobToRoute?.(job.id, t.id) ?? onJobAction?.(job.id, "add-to-route"); }}>
+                                        <Avatar className="w-3 h-3 mr-1"><AvatarImage src={t.avatarUrl || undefined} /><AvatarFallback className="text-[7px]">{t.firstName[0]}{t.lastName[0]}</AvatarFallback></Avatar>
+                                        Add
+                                      </Button>
+                                    ))}
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          </section>
+                        )}
+                      </div>
+                    );
+                  }
+
+                  return (
+                    <TableComponent className="border-collapse">
+                      <TableHeader>
+                        <TableRow>
+                          <TableHead className="w-[200px]">Worker</TableHead>
+                          <TableHead className="w-[100px]">Jobs</TableHead>
+                          <TableHead>Route</TableHead>
+                          <TableHead className="w-[120px]">Distance</TableHead>
+                          <TableHead className="w-[120px]">Duration</TableHead>
+                          <TableHead className="w-[100px]">Status</TableHead>
+                        </TableRow>
+                      </TableHeader>
+                      <TableBody>
+                        {acceptedRoutes.length > 0 && (
+                          <>
+                            <GroupHeader label="Approved" badge={<Badge variant="secondary" className="text-[10px] ml-1">{acceptedRoutes.length}</Badge>} />
+                            {acceptedRoutes.map((route) => {
+                              const r = renderRouteRow(route);
+                              return (
+                                <TableRow key={route.teammateId} className="cursor-pointer hover:bg-muted/50" onClick={r.focusMap}>
+                                  <TableCell>{r.workerCell}</TableCell>
+                                  <TableCell><Badge variant="secondary" className="text-xs">{route.jobs.length}</Badge></TableCell>
+                                  <TableCell>{r.routeList}</TableCell>
+                                  <TableCell className="text-xs text-muted-foreground">{route.totalDistance || "—"}</TableCell>
+                                  <TableCell className="text-xs text-muted-foreground">{route.totalDuration || "—"}</TableCell>
+                                  <TableCell>{r.statusCell}</TableCell>
+                                </TableRow>
+                              );
+                            })}
+                          </>
+                        )}
+                        {pendingRoutes.length > 0 && (
+                          <>
+                            <GroupHeader label="Pending" badge={<Badge variant="secondary" className="text-[10px] ml-1">{pendingRoutes.length}</Badge>} />
+                            {pendingRoutes.map((route) => {
+                              const r = renderRouteRow(route);
+                              return (
+                                <TableRow key={route.teammateId} className="cursor-pointer hover:bg-muted/50" onClick={r.focusMap}>
+                                  <TableCell>{r.workerCell}</TableCell>
+                                  <TableCell><Badge variant="secondary" className="text-xs">{route.jobs.length}</Badge></TableCell>
+                                  <TableCell>{r.routeList}</TableCell>
+                                  <TableCell className="text-xs text-muted-foreground">{route.totalDistance || "—"}</TableCell>
+                                  <TableCell className="text-xs text-muted-foreground">{route.totalDuration || "—"}</TableCell>
+                                  <TableCell>{r.statusCell}</TableCell>
+                                </TableRow>
+                              );
+                            })}
+                          </>
+                        )}
+                        {availableRoutes.length > 0 && (
+                          <>
+                            <GroupHeader label="Available" badge={<Badge variant="secondary" className="text-[10px] ml-1">{availableRoutes.length}</Badge>} />
+                            {availableRoutes.map((route) => {
+                              const r = renderRouteRow(route);
+                              return (
+                                <TableRow key={route.teammateId} className="cursor-pointer hover:bg-amber-50/30 dark:bg-amber-950/10 hover:bg-amber-50/50 dark:hover:bg-amber-950/20" onClick={r.focusMap}>
+                                  <TableCell>{r.workerCell}</TableCell>
+                                  <TableCell><Badge variant="secondary" className="text-xs">{route.jobs.length}</Badge></TableCell>
+                                  <TableCell>{r.routeList}</TableCell>
+                                  <TableCell className="text-xs text-muted-foreground">{route.totalDistance || "—"}</TableCell>
+                                  <TableCell className="text-xs text-muted-foreground">{route.totalDuration || "—"}</TableCell>
+                                  <TableCell>{r.statusCell}</TableCell>
+                                </TableRow>
+                              );
+                            })}
+                          </>
+                        )}
+                      </TableBody>
+                    </TableComponent>
+                  );
+                })()}
+
+                {/* Available Jobs to add (desktop: below table) */}
+                {!isMobile && filteredAvailableJobs.length > 0 && (
+                  <div className="mt-4 pt-4 border-t">
                     <h3 className="text-sm font-semibold mb-3 flex items-center gap-2">
                       <Zap className="w-4 h-4 text-amber-500" />
-                      Available Jobs ({filteredAvailableJobs.length})
+                      Available jobs to add ({filteredAvailableJobs.length})
                     </h3>
                     <div className="space-y-2">
                       {filteredAvailableJobs.map((job) => (
-                        <div
-                          key={job.id}
-                          className="p-3 rounded-lg border border-amber-200 dark:border-amber-800 bg-amber-50/50 dark:bg-amber-950/20"
-                        >
+                        <div key={job.id} className="p-3 rounded-lg border border-amber-200 dark:border-amber-800 bg-amber-50/50 dark:bg-amber-950/20">
                           <div className="flex items-center justify-between gap-2">
                             <div className="flex-1 min-w-0">
                               <div className="flex items-center gap-2 mb-1">
-                                <Badge variant="outline" className="text-xs border-amber-500 text-amber-700 dark:text-amber-400">
-                                  Available
-                                </Badge>
+                                <Badge variant="outline" className="text-xs border-amber-500 text-amber-700 dark:text-amber-400">Available</Badge>
                                 <span className="text-sm font-medium truncate">{job.title}</span>
                               </div>
                               <div className="text-xs text-muted-foreground">
-                                {job.address && `${job.address}, ${job.city || ""} ${job.state || ""}`}
+                                {[job.city, job.state].filter(Boolean).join(", ")}
                                 {job.scheduledTime && ` • ${job.scheduledTime}`}
                               </div>
                             </div>
@@ -2475,18 +3868,12 @@ export function CalendarMapView({
                                   className="text-xs h-7"
                                   onClick={(e) => {
                                     e.stopPropagation();
-                                    if (onAddJobToRoute) {
-                                      onAddJobToRoute(job.id, teammate.id);
-                                    } else if (onJobAction) {
-                                      onJobAction(job.id, "add-to-route");
-                                    }
+                                    onAddJobToRoute?.(job.id, teammate.id) ?? onJobAction?.(job.id, "add-to-route");
                                   }}
                                 >
                                   <Avatar className="w-3 h-3 mr-1">
                                     <AvatarImage src={teammate.avatarUrl || undefined} />
-                                    <AvatarFallback className="text-[7px]">
-                                      {teammate.firstName[0]}{teammate.lastName[0]}
-                                    </AvatarFallback>
+                                    <AvatarFallback className="text-[7px]">{teammate.firstName[0]}{teammate.lastName[0]}</AvatarFallback>
                                   </Avatar>
                                   Add
                                 </Button>
@@ -2497,7 +3884,31 @@ export function CalendarMapView({
                       ))}
                     </div>
                   </div>
-                ) : null}
+                )}
+
+                {/* Future route efficiency suggestions */}
+                {!isMobile && dateMode === "future" && optimizationSuggestions.length > 0 && (
+                  <div className="mt-4 pt-4 border-t">
+                    <h3 className="text-sm font-semibold mb-3 flex items-center gap-2">
+                      <Zap className="w-4 h-4 text-primary" />
+                      Reassignment gains ({optimizationSuggestions.length})
+                    </h3>
+                    <div className="space-y-2">
+                      {optimizationSuggestions.map((suggestion) => (
+                        <div key={`suggest-${suggestion.jobId}-${suggestion.currentTeammateName}`} className="rounded-lg border bg-card p-3">
+                          <div className="text-sm font-medium truncate">{suggestion.jobTitle}</div>
+                          <div className="mt-1 text-xs text-muted-foreground">
+                            Move from <span className="font-medium text-foreground">{suggestion.currentTeammateName}</span> to{" "}
+                            <span className="font-medium text-foreground">{suggestion.suggestedTeammateName}</span>
+                          </div>
+                          <div className="mt-1 text-xs text-primary">
+                            Saves about {suggestion.gainMiles.toFixed(1)} mi ({suggestion.gainMinutes} min)
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
               </div>
             )}
           </div>

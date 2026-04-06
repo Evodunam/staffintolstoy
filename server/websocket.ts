@@ -259,7 +259,7 @@ export function notifyApplicationUpdate(
     applicationId: number;
     jobId: number;
     jobTitle: string;
-    status: 'pending' | 'accepted' | 'rejected';
+    status: 'pending' | 'accepted' | 'rejected' | 'withdrawn';
     message?: string;
   }
 ) {
@@ -270,12 +270,18 @@ export function notifyApplicationUpdate(
     pending: 'Your application is pending review',
     accepted: 'Congratulations! Your application has been accepted',
     rejected: 'Your application was not selected for this job',
+    withdrawn: 'You are no longer assigned to this job',
   };
 
   const notification: NotificationPayload = {
     type: 'application_update',
-    title: update.status === 'accepted' ? 'Application Accepted!' : 
-           update.status === 'rejected' ? 'Application Update' : 'Application Submitted',
+    title: update.status === 'accepted'
+      ? 'Application Accepted!'
+      : update.status === 'rejected'
+        ? 'Application Update'
+        : update.status === 'withdrawn'
+          ? 'Assignment Updated'
+          : 'Application Submitted',
     message: update.message || `${statusMessages[update.status]} for "${update.jobTitle}"`,
     data: {
       applicationId: update.applicationId,
@@ -339,6 +345,7 @@ export function notifyTimesheetUpdate(
   workerId: number,
   update: {
     timesheetId: number;
+    jobId?: number;
     jobTitle: string;
     status: 'approved' | 'rejected' | 'edited' | 'disputed';
     amount?: number;
@@ -361,6 +368,7 @@ export function notifyTimesheetUpdate(
     message: update.message || statusMessages[update.status],
     data: {
       timesheetId: update.timesheetId,
+      jobId: update.jobId,
       jobTitle: update.jobTitle,
       status: update.status,
       amount: update.amount,

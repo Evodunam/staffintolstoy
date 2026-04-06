@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from "react";
 import { useMutation } from "@tanstack/react-query";
-import { useProfile, useUpdateProfile } from "@/hooks/use-profiles";
+import { useProfile, useUpdateProfile, invalidateSessionProfileQueries } from "@/hooks/use-profiles";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -220,7 +220,7 @@ export function TeammateSettingsDialog({
       });
       
       await queryClient.invalidateQueries({ queryKey: ["/api/profiles"] });
-      await queryClient.invalidateQueries({ queryKey: [api.profiles.get.path] });
+      invalidateSessionProfileQueries(queryClient);
     } catch (error: any) {
       toast({
         title: t("uploadFailed") || "Upload failed",

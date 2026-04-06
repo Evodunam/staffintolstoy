@@ -20,7 +20,7 @@ export interface JobDetailsContentProps {
   pendingCount: number;
   hoursClocked: number;
   hoursRemaining?: number;
-  /** Single line: "129 gage st, cincinnati, OH" */
+  /** Single line: address, city, state (e.g. "123 Main St, Cincinnati, OH") */
   addressLine: string;
   trade: string;
   rateDisplay: string;
@@ -108,7 +108,17 @@ export function JobDetailsContent({
           {jobTypeDisplay != null && jobTypeDisplay !== "" && (
             <div className="flex justify-between text-xs">
               <span className="text-muted-foreground">Type</span>
-              <span className="font-medium capitalize">{jobTypeDisplay}</span>
+              <span className="font-medium capitalize">
+                {jobTypeDisplay.toLowerCase() === "recurring" && recurringDaysDisplay
+                  ? `Recurring (${recurringDaysDisplay})`
+                  : jobTypeDisplay}
+              </span>
+            </div>
+          )}
+          {recurringDaysDisplay != null && recurringDaysDisplay !== "" && jobTypeDisplay?.toLowerCase() !== "recurring" && (
+            <div className="flex justify-between text-xs">
+              <span className="text-muted-foreground">Recurring days</span>
+              <span className="font-medium capitalize">{recurringDaysDisplay}</span>
             </div>
           )}
           {timeDisplay != null && timeDisplay !== "" && (
@@ -127,12 +137,6 @@ export function JobDetailsContent({
             <div className="flex justify-between text-xs">
               <span className="text-muted-foreground">End Date</span>
               <span className="font-medium">{endDateDisplay}</span>
-            </div>
-          )}
-          {recurringDaysDisplay != null && recurringDaysDisplay !== "" && (
-            <div className="flex justify-between text-xs">
-              <span className="text-muted-foreground">Recurring days</span>
-              <span className="font-medium capitalize">{recurringDaysDisplay}</span>
             </div>
           )}
         </div>

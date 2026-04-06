@@ -6,6 +6,7 @@ import { cva, type VariantProps } from "class-variance-authority"
 import { X } from "lucide-react"
 
 import { cn } from "@/lib/utils"
+import { blurFocusInside, blurFocusInsideRoot } from "@/lib/modal-focus"
 
 const Sheet = SheetPrimitive.Root
 
@@ -55,27 +56,48 @@ interface SheetContentProps
   overlayClassName?: string;
   /** When true, hide the default close button (use when providing a custom close in children) */
   hideCloseButton?: boolean;
+  /** Portal container (e.g. document.getElementById('dialog-container')). When set, sheet renders there so it can be cleaned up with other dialogs. */
+  container?: HTMLElement | null;
 }
 
 const SheetContent = React.forwardRef<
   React.ElementRef<typeof SheetPrimitive.Content>,
   SheetContentProps
->(({ side = "right", className, overlayClassName, hideCloseButton, children, "aria-describedby": ariaDescribedBy, ...props }, ref) => {
+>(({ side = "right", className, overlayClassName, hideCloseButton, container, children, "aria-describedby": _ariaDescribedBy, onOpenAutoFocus, onCloseAutoFocus, ...props }, ref) => {
   const descriptionId = React.useId();
-  const describedBy = ariaDescribedBy ?? descriptionId;
+  const contentNodeRef = React.useRef<HTMLDivElement | null>(null);
+  const setContentRef = React.useCallback(
+    (node: HTMLDivElement | null) => {
+      contentNodeRef.current = node;
+      if (typeof ref === "function") ref(node);
+      else if (ref && typeof ref === "object") (ref as React.MutableRefObject<HTMLDivElement | null>).current = node;
+    },
+    [ref]
+  );
+  React.useLayoutEffect(() => {
+    blurFocusInsideRoot();
+  }, []);
   return (
-  <SheetPortal>
+  <SheetPortal container={container ?? undefined}>
     <SheetOverlay className={overlayClassName} />
     <SheetPrimitive.Content
-      ref={ref}
-      aria-describedby={describedBy}
+      ref={setContentRef}
+      aria-describedby={descriptionId}
+      onOpenAutoFocus={(e) => {
+        blurFocusInsideRoot();
+        onOpenAutoFocus?.(e);
+        queueMicrotask(() => blurFocusInsideRoot());
+        requestAnimationFrame(() => blurFocusInsideRoot());
+      }}
+      onCloseAutoFocus={(e) => {
+        blurFocusInside(contentNodeRef.current);
+        onCloseAutoFocus?.(e);
+      }}
       className={cn(sheetVariants({ side }), className)}
       {...props}
     >
       <SheetPrimitive.Title className="sr-only">Sheet</SheetPrimitive.Title>
-      {!ariaDescribedBy && (
-        <SheetPrimitive.Description id={descriptionId} className="sr-only">Sheet content</SheetPrimitive.Description>
-      )}
+      <SheetPrimitive.Description id={descriptionId} className="sr-only">Sheet content</SheetPrimitive.Description>
       {children}
       {!hideCloseButton && (
         <SheetPrimitive.Close className="absolute right-4 top-4 rounded-sm opacity-70 ring-offset-background transition-opacity hover:opacity-100 focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:pointer-events-none data-[state=open]:bg-secondary">

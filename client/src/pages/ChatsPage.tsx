@@ -7,7 +7,8 @@ import { useIsMobile, useIsDesktop, useIsSmallMobile } from "@/hooks/use-mobile"
 import { useScrollHeader } from "@/hooks/use-scroll-header";
 import { useApproveTimesheet, useRejectTimesheet } from "@/hooks/use-timesheets";
 import { apiRequest } from "@/lib/queryClient";
-import { cn, normalizeAvatarUrl } from "@/lib/utils";
+import { cn, normalizeAvatarUrl, stripPhonesAndEmails } from "@/lib/utils";
+import { getDisplayJobTitle } from "@/lib/job-display";
 import { format, formatDistanceToNow, isSameDay } from "date-fns";
 import type { Job, Profile, JobMessage } from "@shared/schema";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
@@ -36,12 +37,14 @@ import { ResponsiveDialog } from "@/components/ui/responsive-dialog";
 import { MobilePopup } from "@/components/ui/mobile-popup";
 import { Separator } from "@/components/ui/separator";
 import { TeammateSettingsDialog } from "@/components/TeammateSettingsDialog";
-import { Loader2, ArrowLeft, Send, MessageSquare, Phone, MapPin, Building2, User, Users, Briefcase, Search, Clock, Calendar, FileText, PanelRightOpen, Bell, CheckCircle, XCircle, DollarSign, LogIn, LogOut, ExternalLink, Menu, Settings, AlertCircle, X, ChevronLeft, ChevronRight, Video, Mic, MicOff, VideoOff, Settings2, LayoutGrid, MoreVertical, UserX } from "lucide-react";
+import { Loader2, ArrowLeft, Send, MessageSquare, Phone, MapPin, User, Users, Briefcase, Search, Clock, Calendar, FileText, PanelRightOpen, Bell, CheckCircle, XCircle, DollarSign, LogIn, LogOut, ExternalLink, Menu, Settings, AlertCircle, X, ChevronLeft, ChevronRight, Video, Mic, MicOff, VideoOff, Settings2, LayoutGrid, MoreVertical, UserX } from "lucide-react";
 import { JobDetailsPanel } from "@/components/JobDetailsPanel";
 import { MarkCompleteReviewDialog } from "@/components/MarkCompleteReviewDialog";
 import { ChatMessageInput } from "@/components/ChatMessageInput";
 import { CallingDialog } from "@/components/CallingDialog";
 import { Navigation } from "@/components/Navigation";
+import { useTimesheetApprovalInvoice } from "@/contexts/TimesheetApprovalInvoiceContext";
+import { tryOpenTimesheetApprovalInvoiceFromNotification } from "@/lib/worker-timesheet-notification";
 import { AnimatedNavigationTabs } from "@/components/ui/animated-navigation-tabs";
 import { useTranslation } from "react-i18next";
 
@@ -73,6 +76,157 @@ interface ChatJob {
 
 interface MessageWithSender extends JobMessage {
   sender?: Profile;
+}
+
+function getJobLocationSummary(job: Job): { primary: string; secondary: string | null } {
+  const locationName = (job.locationName || "").trim();
+  const primaryCandidate = locationName && !/^e2e\b/i.test(locationName)
+    ? locationName
+    : (job.address || job.location || locationName || "").trim();
+  const secondary = [job.city, job.state].filter(Boolean).join(", ").trim() || null;
+  return { primary: primaryCandidate || "—", secondary };
+}
+
+/** Street + city when possible; else fall back to location summary / job.location. */
+function getJobStreetCityLine(job: Job): string {
+  const street = (job.address || "").trim();
+  const city = (job.city || "").trim();
+  if (street && city) return `${street}, ${city}`;
+  if (street) return street;
+  if (city) return city;
+  const { primary, secondary } = getJobLocationSummary(job);
+  const combined = [primary, secondary].filter(Boolean).join(", ");
+  if (combined && combined !== "—") return combined;
+  return (job.location || "").trim() || "—";
+}
+
+function participantListInitials(p: Profile): string {
+  const first = (p.firstName || "").trim();
+  const last = (p.lastName || "").trim();
+  const company = (p.companyName || "").trim();
+  if (first && last) return `${first[0]!}${last[0]!}`.toUpperCase();
+  if (first.length >= 2) return first.slice(0, 2).toUpperCase();
+  if (company.length >= 2) return company.slice(0, 2).toUpperCase();
+  if (company.length === 1) return `${company[0]!.toUpperCase()}·`;
+  if (first.length === 1) return `${first[0]!.toUpperCase()}·`;
+  return "?";
+}
+
+function jobConversationFallbackInitials(job: Job): string {
+  const title = getDisplayJobTitle(job);
+  const words = title.split(/\s+/).filter(Boolean);
+  if (words.length >= 2 && words[0]![0] && words[1]![0]) {
+    return `${words[0]![0]}${words[1]![0]}`.toUpperCase();
+  }
+  const trade = (job.trade || "GL").replace(/[^a-zA-Z]/g, "");
+  if (trade.length >= 2) return trade.slice(0, 2).toUpperCase();
+  return "JB";
+}
+
+function ChatJobListRow({
+  job,
+  participants,
+  unreadCount,
+  isUnread,
+  isSelected,
+  onSelect,
+  noParticipantsLabel,
+  density = "compact",
+}: {
+  job: Job;
+  participants: Profile[];
+  unreadCount: number;
+  isUnread: boolean;
+  isSelected: boolean;
+  onSelect: () => void;
+  noParticipantsLabel: string;
+  density?: "comfortable" | "compact";
+}) {
+  const maxAvatars = density === "comfortable" ? 3 : 2;
+  const avatarClass = density === "comfortable" ? "w-10 h-10" : "w-9 h-9";
+  const addressLine = getJobStreetCityLine(job);
+  const participantNames = participants
+    .map((p) => p.firstName || p.companyName)
+    .filter(Boolean)
+    .join(", ");
+
+  return (
+    <button
+      type="button"
+      className={cn(
+        "w-full flex items-start gap-3 p-4 text-left transition-colors",
+        "hover:bg-muted/50 dark:hover:bg-muted/25",
+        isSelected && "bg-accent",
+        !isSelected &&
+          isUnread &&
+          "bg-background dark:bg-zinc-950 shadow-[inset_3px_0_0_0_hsl(var(--primary))]",
+        !isSelected && !isUnread && "bg-muted/45 dark:bg-muted/25"
+      )}
+      onClick={onSelect}
+      data-testid={`chat-job-${job.id}`}
+      data-state-unread={isUnread ? "true" : "false"}
+    >
+      <div className="flex -space-x-2 flex-shrink-0">
+        {participants.slice(0, maxAvatars).map((p) => (
+          <Avatar key={p.id} className={cn(avatarClass, "border-2 border-background")}>
+            <AvatarImage src={normalizeAvatarUrl(p.avatarUrl) || undefined} />
+            <AvatarFallback className="text-[10px] font-semibold tracking-tight">
+              {participantListInitials(p)}
+            </AvatarFallback>
+          </Avatar>
+        ))}
+        {participants.length === 0 && (
+          <Avatar className={cn(avatarClass, "border-2 border-background")}>
+            <AvatarFallback className="text-[10px] font-semibold tracking-tight">
+              {jobConversationFallbackInitials(job)}
+            </AvatarFallback>
+          </Avatar>
+        )}
+      </div>
+      <div className="flex-1 min-w-0">
+        <div className="flex items-center justify-between gap-2">
+          <h3
+            className={cn(
+              "text-sm truncate",
+              isUnread ? "font-semibold text-foreground" : "font-medium text-muted-foreground"
+            )}
+          >
+            {getDisplayJobTitle(job)}
+          </h3>
+          <div className="flex items-center gap-1.5 flex-shrink-0">
+            {isUnread && (
+              <span
+                className="h-2 w-2 rounded-full bg-primary"
+                data-testid={`chat-job-unread-dot-${job.id}`}
+              />
+            )}
+            {unreadCount > 0 && (
+              <Badge className="bg-primary text-primary-foreground text-xs min-w-[20px] h-5 flex items-center justify-center px-1">
+                {unreadCount}
+              </Badge>
+            )}
+          </div>
+        </div>
+        <p
+          className={cn(
+            "text-xs mt-0.5 flex items-start gap-1 min-w-0",
+            isUnread ? "text-foreground/80" : "text-muted-foreground"
+          )}
+        >
+          <MapPin className="w-3 h-3 flex-shrink-0 mt-0.5 opacity-70" aria-hidden />
+          <span className="truncate">{addressLine}</span>
+        </p>
+        <p
+          className={cn(
+            "text-xs mt-0.5 truncate",
+            isUnread ? "text-foreground/70" : "text-muted-foreground/85"
+          )}
+        >
+          {participantNames || noParticipantsLabel}
+        </p>
+      </div>
+    </button>
+  );
 }
 
 // Component for timesheet approval actions in chat (matches timesheets page)
@@ -257,6 +411,7 @@ export default function ChatsPage({ embedInDashboard }: ChatsPageProps = {}) {
   const { t: tNotifications } = useTranslation("notifications");
   const { t: tEmpty } = useTranslation("empty");
   const { toast } = useToast();
+  const { openTimesheetApprovalInvoice } = useTimesheetApprovalInvoice();
   
   // Get display avatar - use impersonated team member's avatar when impersonating
   const displayAvatarUrl = useMemo(() => {
@@ -295,8 +450,17 @@ export default function ChatsPage({ embedInDashboard }: ChatsPageProps = {}) {
       ? "/dashboard/chats"
       : "/chats";
   
+  const [viewedJobIds, setViewedJobIds] = useState<Set<number>>(new Set());
   const [selectedJobId, setSelectedJobIdState] = useState<number | null>(urlJobId ? parseInt(urlJobId) : null);
   const setSelectedJobId = (id: number | null) => {
+    if (id !== null) {
+      setViewedJobIds((prev) => {
+        if (prev.has(id)) return prev;
+        const next = new Set(prev);
+        next.add(id);
+        return next;
+      });
+    }
     setSelectedJobIdState(id);
     setLocation(id ? `${chatsBasePath}/${id}` : chatsBasePath);
   };
@@ -385,6 +549,23 @@ export default function ChatsPage({ embedInDashboard }: ChatsPageProps = {}) {
       return isParticipant;
     });
   }, [chatJobs, isEmployee, profile?.id]);
+
+  const [chatSearch, setChatSearch] = useState("");
+  const searchedChatJobs = useMemo(() => {
+    const q = chatSearch.trim().toLowerCase();
+    if (!q) return filteredChatJobs;
+    return filteredChatJobs.filter(({ job, participants }) => {
+      if (job.title?.toLowerCase().includes(q)) return true;
+      if (job.locationName?.toLowerCase().includes(q)) return true;
+      if (job.city?.toLowerCase().includes(q)) return true;
+      if ((job as any).companyName?.toLowerCase().includes(q)) return true;
+      if (participants.some(p =>
+        `${p.firstName ?? ""} ${p.lastName ?? ""}`.toLowerCase().includes(q) ||
+        p.companyName?.toLowerCase().includes(q)
+      )) return true;
+      return false;
+    });
+  }, [filteredChatJobs, chatSearch]);
   
   // Sync selectedJobId from URL (handles direct navigation, browser back, deep links)
   useEffect(() => {
@@ -397,6 +578,17 @@ export default function ChatsPage({ embedInDashboard }: ChatsPageProps = {}) {
       setSelectedJobIdState(jobIdNum);
     }
   }, [urlJobId, filteredChatJobs]);
+
+  // Fetch full job by ID when a conversation is selected so Job Details panel shows real job data (same as JobContent)
+  const { data: selectedJobDetails } = useQuery<Job & { company?: Profile; locationRepresentativeName?: string }>({
+    queryKey: ['/api/jobs', selectedJobId],
+    enabled: !!selectedJobId,
+    queryFn: async () => {
+      const res = await apiRequest("GET", `/api/jobs/${selectedJobId}`);
+      if (!res.ok) throw new Error("Failed to fetch job");
+      return res.json();
+    },
+  });
 
   const { data: messages, isLoading: messagesLoading, refetch: refetchMessages } = useQuery<MessageWithSender[]>({
     queryKey: ['/api/jobs', selectedJobId, 'messages'],
@@ -477,6 +669,25 @@ export default function ChatsPage({ embedInDashboard }: ChatsPageProps = {}) {
     },
   });
 
+  const respondStartNowRequestMutation = useMutation({
+    mutationFn: async ({ jobId, messageId, action }: { jobId: number; messageId: number; action: "accept" | "decline" }) => {
+      const res = await apiRequest("POST", `/api/jobs/${jobId}/start-now-request/${messageId}/respond`, { action });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error((data as { message?: string }).message || "Failed to respond");
+      }
+      return res.json();
+    },
+    onSuccess: (_data, { jobId }) => {
+      queryClient.invalidateQueries({ queryKey: ["/api/jobs", jobId, "messages"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/chats/jobs"] });
+      refetchMessages();
+    },
+    onError: (err) => {
+      toast({ title: "Error", description: err instanceof Error ? err.message : "Could not update.", variant: "destructive" });
+    },
+  });
+
   useEffect(() => {
     if (selectedJobId) {
       const interval = setInterval(() => {
@@ -511,13 +722,19 @@ export default function ChatsPage({ embedInDashboard }: ChatsPageProps = {}) {
 
   const selectedJob = filteredChatJobs?.find(cj => cj.job.id === selectedJobId);
   const showMobileFooter = !selectedJobId;
+  // Use full job from API when available so Job Details panel matches job application/JobContent data
+  const jobForDetailsPanel: Job | null =
+    selectedJobId && selectedJobDetails && selectedJobDetails.id === selectedJobId
+      ? (selectedJobDetails as Job)
+      : selectedJob?.job ?? null;
 
   const handleSendMessage = (payload: { content: string; attachmentUrls?: string[]; mentionedProfileIds?: number[] }) => {
     if (sendMessageMutation.isPending) return;
-    const trimmed = payload.content.trim();
-    if (!trimmed && !payload.attachmentUrls?.length) return;
+    let content = payload.content.trim();
+    content = stripPhonesAndEmails(content);
+    if (!content && !payload.attachmentUrls?.length) return;
     sendMessageMutation.mutate({
-      content: trimmed || " ",
+      content: content || " ",
       attachmentUrls: payload.attachmentUrls,
       mentionedProfileIds: payload.mentionedProfileIds,
     });
@@ -605,7 +822,7 @@ export default function ChatsPage({ embedInDashboard }: ChatsPageProps = {}) {
       {!embedInDashboard && (
         <header className={`flex items-center justify-between transition-all duration-300 ease-in-out border-b border-border ${
           isMobile
-            ? `sticky top-0 z-40 -mx-4 px-4 sm:mx-0 sm:px-0 py-3 mb-4 bg-background/95 backdrop-blur-md shadow-sm ${isScrolled ? 'py-2' : 'py-3'}`
+            ? `sticky top-0 z-40 px-4 sm:px-0 py-3 mb-4 bg-background/95 backdrop-blur-md shadow-sm ${isScrolled ? 'py-2' : 'py-3'}`
             : 'pb-6 mb-6'
         }`}>
           <div className="min-w-0 flex-1">
@@ -755,6 +972,20 @@ export default function ChatsPage({ embedInDashboard }: ChatsPageProps = {}) {
       </header>
       )}
       
+      {filteredChatJobs.length > 4 && (
+        <div className="px-3 py-2 border-b border-border bg-background">
+          <div className="relative">
+            <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-muted-foreground pointer-events-none" />
+            <input
+              type="search"
+              value={chatSearch}
+              onChange={(e) => setChatSearch(e.target.value)}
+              placeholder="Search conversations…"
+              className="w-full h-8 pl-7 pr-3 text-sm rounded-lg border border-input bg-muted/40 placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring"
+            />
+          </div>
+        </div>
+      )}
       <div className="flex-1 overflow-y-auto">
         {jobsLoading ? (
           <div className="flex justify-center py-12">
@@ -770,63 +1001,133 @@ export default function ChatsPage({ embedInDashboard }: ChatsPageProps = {}) {
                 : t("chatsAppearAccepted")}
             </p>
           </div>
+        ) : searchedChatJobs.length === 0 ? (
+          <div className="flex flex-col items-center justify-center py-12 px-4 text-center">
+            <Search className="w-10 h-10 text-muted-foreground mb-3" />
+            <p className="text-sm text-muted-foreground">No conversations match &ldquo;{chatSearch}&rdquo;</p>
+            <button type="button" onClick={() => setChatSearch("")} className="mt-2 text-xs text-primary underline">Clear search</button>
+          </div>
         ) : (
           <div className="divide-y divide-border">
-            {filteredChatJobs.map(({ job, participants, unreadCount }) => (
-              <button
-                key={job.id}
-                className={`w-full flex items-start gap-3 p-4 hover-elevate text-left transition-colors ${
-                  selectedJobId === job.id ? "bg-accent" : ""
-                }`}
-                onClick={() => setSelectedJobId(job.id)}
-                data-testid={`chat-job-${job.id}`}
-              >
-                <div className="flex -space-x-2">
-                  {participants.slice(0, 3).map((p, i) => (
-                    <Avatar key={p.id} className="w-10 h-10 border-2 border-background">
-                      <AvatarImage src={normalizeAvatarUrl(p.avatarUrl) || undefined} />
-                      <AvatarFallback>{p.firstName?.[0]}{p.lastName?.[0]}</AvatarFallback>
-                    </Avatar>
-                  ))}
-                  {participants.length === 0 && (
-                    <Avatar className="w-10 h-10">
-                      <AvatarFallback>
-                        {profile?.role === 'company' ? <User className="w-4 h-4" /> : <Building2 className="w-4 h-4" />}
-                      </AvatarFallback>
-                    </Avatar>
-                  )}
-                </div>
-                <div className="flex-1 min-w-0">
-                  <div className="flex items-center justify-between gap-2">
-                    <h3 className="font-medium text-sm truncate">{job.title}</h3>
-                    {unreadCount > 0 && (
-                      <Badge className="bg-primary text-primary-foreground text-xs min-w-[20px] h-5 flex items-center justify-center">
-                        {unreadCount}
-                      </Badge>
-                    )}
-                  </div>
-                  <p className="text-xs text-muted-foreground mt-0.5 flex items-center gap-1.5 truncate">
-                    <span className="truncate">
-                      {job.locationName || job.location || "—"}
-                    </span>
-                    <span className="shrink-0">•</span>
-                    <span className="truncate">
-                      {[job.city, job.state].filter(Boolean).join(", ") || "—"}
-                    </span>
-                  </p>
-                  {participants.length > 0 && (
-                    <p className="text-xs text-muted-foreground mt-0.5 truncate">
-                      {participants.map(p => p.firstName || p.companyName).filter(Boolean).join(", ")}
-                    </p>
-                  )}
-                </div>
-              </button>
-            ))}
+            {searchedChatJobs.map(({ job, participants, unreadCount }) => {
+              const isSelected = selectedJobId === job.id;
+              const isUnread = unreadCount > 0 && !viewedJobIds.has(job.id);
+              return (
+                <ChatJobListRow
+                  key={job.id}
+                  job={job}
+                  participants={participants}
+                  unreadCount={unreadCount}
+                  isUnread={isUnread}
+                  isSelected={isSelected}
+                  onSelect={() => setSelectedJobId(job.id)}
+                  noParticipantsLabel={t("noParticipants")}
+                  density="comfortable"
+                />
+              );
+            })}
           </div>
         )}
       </div>
     </div>
   );
+
+  const MobileNotificationsPopup = () => {
+    if (!isMobile || profile?.role !== "worker") return null;
+
+    return (
+      <MobilePopup
+        open={notificationsOpen}
+        onOpenChange={setNotificationsOpen}
+        title={tNotifications("title")}
+        headerContent={
+          notifications && notifications.filter((n: any) => !n.isRead).length > 0 ? (
+            <Button
+              variant="ghost"
+              size="sm"
+              className="text-xs"
+              onClick={async () => {
+                try {
+                  await apiRequest("PATCH", "/api/notifications/read-all", { profileId: profile?.id });
+                  queryClient.invalidateQueries({ queryKey: ["/api/notifications", profile?.id] });
+                } catch (err) {
+                  console.error("Failed to mark all as read:", err);
+                }
+              }}
+              data-testid="chats-mobile-mark-all-read-button"
+            >
+              {tNotifications("markAllRead")}
+            </Button>
+          ) : undefined
+        }
+      >
+        {!notifications || notifications.length === 0 ? (
+          <div className="py-12 text-center text-muted-foreground" data-testid="chats-mobile-notifications-empty">
+            <Bell className="w-12 h-12 mx-auto mb-3 opacity-50" />
+            <p className="text-base">{tEmpty("noNotifications")}</p>
+            <p className="text-sm mt-1">{tNotifications("youllSeeUpdates")}</p>
+          </div>
+        ) : (
+          <div className="divide-y divide-border -mx-4">
+            {notifications.map((notif: any) => (
+              <div
+                key={notif.id}
+                className={`p-4 cursor-pointer active:bg-muted/50 transition-colors ${!notif.isRead ? "bg-primary/5" : ""}`}
+                onClick={async () => {
+                  if (!notif.isRead) {
+                    try {
+                      await apiRequest("PATCH", `/api/notifications/${notif.id}/read`, {});
+                      queryClient.invalidateQueries({ queryKey: ["/api/notifications", profile?.id] });
+                    } catch (err) {
+                      console.error("Failed to mark as read:", err);
+                    }
+                  }
+                  setNotificationsOpen(false);
+                  if (notif.type === "new_message") {
+                    // Already on chats page
+                  } else {
+                    setLocation("/dashboard/today");
+                  }
+                }}
+                data-testid={`chats-mobile-notification-item-${notif.id}`}
+              >
+                <div className="flex items-start gap-3">
+                  <div className={`w-10 h-10 rounded-full flex items-center justify-center flex-shrink-0 ${
+                    notif.type === "application_accepted" ? "bg-green-100 dark:bg-green-900/30" :
+                    notif.type === "application_rejected" ? "bg-red-100 dark:bg-red-900/30" :
+                    notif.type === "payment_received" ? "bg-emerald-100 dark:bg-emerald-900/30" :
+                    notif.type === "new_message" ? "bg-blue-100 dark:bg-blue-900/30" :
+                    "bg-muted"
+                  }`}>
+                    {notif.type === "application_accepted" && <CheckCircle className="w-5 h-5 text-green-600" />}
+                    {notif.type === "application_rejected" && <XCircle className="w-5 h-5 text-red-600" />}
+                    {notif.type === "payment_received" && <DollarSign className="w-5 h-5 text-emerald-600" />}
+                    {notif.type === "timesheet_approved" && <CheckCircle className="w-5 h-5 text-green-600" />}
+                    {notif.type === "new_message" && <MessageSquare className="w-5 h-5 text-blue-600" />}
+                    {notif.type === "new_job" && <Briefcase className="w-5 h-5 text-primary" />}
+                    {notif.type === "job_reminder" && <Clock className="w-5 h-5 text-amber-600" />}
+                    {!["application_accepted", "application_rejected", "payment_received", "timesheet_approved", "new_message", "new_job", "job_reminder"].includes(notif.type) && <Bell className="w-5 h-5 text-muted-foreground" />}
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <p className={`text-base ${!notif.isRead ? "font-medium" : ""}`}>{notif.title}</p>
+                    {notif.message && (
+                      <p className="text-sm text-muted-foreground line-clamp-2 mt-1">{notif.message}</p>
+                    )}
+                    <p className="text-sm text-muted-foreground mt-2">
+                      {formatDistanceToNow(new Date(notif.createdAt), { addSuffix: true })}
+                    </p>
+                  </div>
+                  {!notif.isRead && (
+                    <div className="w-2.5 h-2.5 bg-primary rounded-full flex-shrink-0 mt-2" />
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </MobilePopup>
+    );
+  };
 
   const ChatSection = () => {
     const chatScrollRef = useRef<HTMLDivElement>(null);
@@ -1084,6 +1385,73 @@ export default function ChatsPage({ embedInDashboard }: ChatsPageProps = {}) {
                   </div>
                 );
               }
+
+              // "Start job now" request from worker: show content + Accept/Decline for company when pending
+              const startNowMeta = metadata?.type === "start_job_now_request" ? (metadata as { type: string; status?: string }) : null;
+              if (startNowMeta) {
+                const isPending = startNowMeta.status !== "accepted" && startNowMeta.status !== "declined";
+                const isCompany = profile?.role === "company";
+                // Worker-side: show yellow + pending indicator only when pending AND job start date is not today (if start is today, no need to show pending)
+                const isJobStartToday = startDate ? isSameDay(startDate, new Date()) : false;
+                const showWorkerPending = isMe && isPending && !isJobStartToday;
+                return (
+                  <div
+                    key={msg.id}
+                    className={`flex items-end gap-2 ${isMe ? "justify-end" : "justify-start"}`}
+                    data-testid={`message-start-now-request-${msg.id}`}
+                  >
+                    {!isMe && (
+                      <Avatar className="w-7 h-7 cursor-pointer hover:ring-2 hover:ring-primary/50" onClick={() => msg.sender && handleAvatarClick(msg.sender)}>
+                        <AvatarImage src={normalizeAvatarUrl(msg.sender?.avatarUrl) || undefined} />
+                        <AvatarFallback className="text-xs">{msg.sender?.firstName?.[0]}{msg.sender?.lastName?.[0]}</AvatarFallback>
+                      </Avatar>
+                    )}
+                    <div className={cn(
+                      "max-w-[75%] rounded-2xl px-4 py-2",
+                      showWorkerPending
+                        ? "bg-amber-400 text-amber-950 rounded-br-sm dark:bg-amber-500 dark:text-amber-950"
+                        : isMe
+                          ? "bg-primary text-primary-foreground rounded-br-sm"
+                          : "bg-secondary rounded-bl-sm"
+                    )}>
+                      <p className="text-sm">{msg.content}</p>
+                      {showWorkerPending && (
+                        <p className="text-xs font-medium mt-1 flex items-center gap-1.5 opacity-90">
+                          <span className="inline-block w-1.5 h-1.5 rounded-full bg-amber-700 dark:bg-amber-900 animate-pulse" aria-hidden />
+                          {t("pendingCompanyResponse")}
+                        </p>
+                      )}
+                      {isCompany && isPending && selectedJobId && (
+                        <div className="flex gap-2 mt-2">
+                          <Button
+                            size="sm"
+                            variant="default"
+                            className="text-xs"
+                            disabled={respondStartNowRequestMutation.isPending}
+                            onClick={() => respondStartNowRequestMutation.mutate({ jobId: selectedJobId, messageId: msg.id, action: "accept" })}
+                          >
+                            {t("acceptStartToday")}
+                          </Button>
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            className="text-xs"
+                            disabled={respondStartNowRequestMutation.isPending}
+                            onClick={() => respondStartNowRequestMutation.mutate({ jobId: selectedJobId, messageId: msg.id, action: "decline" })}
+                          >
+                            {t("declineKeepSchedule")}
+                          </Button>
+                        </div>
+                      )}
+                      {startNowMeta.status === "accepted" && <p className="text-xs text-muted-foreground mt-1">{t("startDateUpdatedToToday")}</p>}
+                      {startNowMeta.status === "declined" && <p className="text-xs text-muted-foreground mt-1">{t("jobTimeRemainsScheduled")}</p>}
+                      <p className={cn("text-[10px] mt-1 opacity-80", showWorkerPending ? "text-amber-800 dark:text-amber-200" : "text-muted-foreground")}>
+                        {format(new Date(msg.createdAt!), "h:mm a")}
+                      </p>
+                    </div>
+                  </div>
+                );
+              }
               
               // Video call messages: render as button + dynamic status (call ended / in call)
               const meta = msg.metadata as { type?: string; roomUrl?: string; callStatus?: string; endedAt?: string; participants?: { profileId: number; name?: string; avatarUrl?: string }[] } | undefined;
@@ -1301,27 +1669,24 @@ export default function ChatsPage({ embedInDashboard }: ChatsPageProps = {}) {
     <div className="flex flex-col h-full min-h-0 w-full overflow-hidden">
       {isMobile ? (
         <>
-          {/* Mobile: fixed header above scroll content */}
+          {/* Mobile: header stacked above scroll content (responsive, no overlap) */}
           <div
             className={cn(
-              "fixed top-0 left-0 right-0 z-50 w-full border-b border-border bg-background shrink-0 transition-[padding,box-shadow] duration-200",
+              "shrink-0 w-full border-b border-border bg-background transition-[padding,box-shadow] duration-200",
               chatHeaderScrolled && "shadow-sm",
               chatHeaderScrolled ? "py-2 px-4 pt-[calc(0.5rem+env(safe-area-inset-top,0px))]" : "p-4 pt-[calc(1rem+env(safe-area-inset-top,0px))]"
             )}
           >
             {chatHeader}
           </div>
-          {/* Main scroll content: single scroll region between header and input footer */}
+          {/* Main scroll content: stacks below header */}
           <div
             ref={chatScrollRef}
             onScroll={handleChatScroll}
-            className={cn(
-              "flex-1 min-h-0 min-w-0 overflow-y-auto overflow-x-hidden overscroll-contain transition-[padding] duration-200 touch-pan-y",
-              chatHeaderScrolled ? "pt-[calc(56px+env(safe-area-inset-top,0px))]" : "pt-[calc(73px+env(safe-area-inset-top,0px))]"
-            )}
+            className="flex-1 min-h-0 min-w-0 overflow-y-auto overflow-x-hidden overscroll-contain transition-[padding] duration-200 touch-pan-y"
             style={{ WebkitOverflowScrolling: "touch" } as React.CSSProperties}
           >
-            <div className={cn("space-y-4", "py-4 pb-24 px-0")}>{chatBodyContent}</div>
+            <div className="space-y-4 py-4 pb-24 px-4">{chatBodyContent}</div>
           </div>
         </>
       ) : (
@@ -1341,7 +1706,7 @@ export default function ChatsPage({ embedInDashboard }: ChatsPageProps = {}) {
         onSubmit={handleSendMessage}
         participants={selectedJob?.participants ?? []}
         disabled={sendMessageMutation.isPending}
-        placeholder={t("chat.typeMessage")}
+        placeholder={t("typeMessage")}
         fixedAtBottom={isMobile}
         jobId={selectedJobId ?? null}
         hasActiveCall={!!messages?.some((m: MessageWithSender) => {
@@ -1352,6 +1717,22 @@ export default function ChatsPage({ embedInDashboard }: ChatsPageProps = {}) {
           setCallInviteRoomUrl(roomUrl);
           setCallInviteOpen(true);
         }}
+        job={selectedJob?.job ?? null}
+        isWorker={profile?.role === "worker"}
+        onRequestStartJobNow={() => {
+          if (!selectedJobId || sendMessageMutation.isPending) return;
+          sendMessageMutation.mutate({
+            content: "Requested to start this job today.",
+            attachmentUrls: undefined,
+            mentionedProfileIds: undefined,
+            metadata: { type: "start_job_now_request", status: "pending" },
+          });
+          toast({ title: t("startJobNowRequestSent") ?? "Request sent. The company can accept or decline in chat." });
+        }}
+        hasPendingStartNowRequest={!!messages?.some((m: MessageWithSender) => {
+          const meta = (m.metadata as { type?: string; status?: string }) ?? {};
+          return meta.type === "start_job_now_request" && meta.status !== "accepted" && meta.status !== "declined";
+        })}
       />
     </div>
   );
@@ -1385,7 +1766,7 @@ export default function ChatsPage({ embedInDashboard }: ChatsPageProps = {}) {
       <ResponsiveDialog
         open={participantPopupOpen}
         onOpenChange={setParticipantPopupOpen}
-        title={t("chat.contactInformation")}
+        title={t("contactInformation")}
         contentClassName="max-w-sm"
       >
         {selectedParticipant && (
@@ -1694,7 +2075,7 @@ export default function ChatsPage({ embedInDashboard }: ChatsPageProps = {}) {
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
               <MapPin className="w-5 h-5" />
-              {t("chat.clockInOutLocations")}
+              {t("clockInOutLocations")}
             </DialogTitle>
             <DialogDescription id="map-popup-desc">
               Clock in and clock out locations for this timesheet.
@@ -1744,7 +2125,7 @@ export default function ChatsPage({ embedInDashboard }: ChatsPageProps = {}) {
             <div className="flex justify-between items-center p-3 rounded-lg bg-muted">
               <div className="flex items-center gap-2">
                 <MapPin className="w-4 h-4 text-muted-foreground" />
-                <span className="text-sm font-medium">{t("chat.distanceBetweenLocations")}</span>
+                <span className="text-sm font-medium">{t("distanceBetweenLocations")}</span>
               </div>
               <Badge variant="outline">{formatDistance(distance)}</Badge>
             </div>
@@ -1773,46 +2154,26 @@ export default function ChatsPage({ embedInDashboard }: ChatsPageProps = {}) {
                     <MessageSquare className="w-10 h-10 text-muted-foreground mb-3" />
                     <h3 className="font-medium mb-1">{t("noActiveChats")}</h3>
                     <p className="text-xs text-muted-foreground">
-                      {profile?.role === "company" ? t("chat.chatsAppearInProgress") : t("chat.chatsAppearAccepted")}
+                      {profile?.role === "company" ? t("chatsAppearInProgress") : t("chatsAppearAccepted")}
                     </p>
                   </div>
                 ) : (
                   <div className="divide-y divide-border">
-                    {filteredChatJobs.map(({ job, participants, unreadCount }) => (
-                      <button
+                  {searchedChatJobs.map(({ job, participants, unreadCount }) => {
+                    const isSelected = selectedJobId === job.id;
+                    const isUnread = unreadCount > 0 && !viewedJobIds.has(job.id);
+                    return (
+                      <ChatJobListRow
                         key={job.id}
-                        className={`w-full flex items-start gap-3 p-4 hover-elevate text-left transition-colors ${selectedJobId === job.id ? "bg-accent" : ""}`}
-                        onClick={() => setSelectedJobId(job.id)}
-                        data-testid={`chat-job-${job.id}`}
-                      >
-                        <div className="flex -space-x-2 flex-shrink-0">
-                          {participants.slice(0, 2).map((p) => (
-                            <Avatar key={p.id} className="w-9 h-9 border-2 border-background">
-                              <AvatarImage src={normalizeAvatarUrl(p.avatarUrl) || undefined} />
-                              <AvatarFallback className="text-xs">{p.firstName?.[0]}{p.lastName?.[0]}</AvatarFallback>
-                            </Avatar>
-                          ))}
-                          {participants.length === 0 && (
-                            <Avatar className="w-9 h-9">
-                              <AvatarFallback>
-                                {profile?.role === "company" ? <User className="w-4 h-4" /> : <Building2 className="w-4 h-4" />}
-                              </AvatarFallback>
-                            </Avatar>
-                          )}
-                        </div>
-                        <div className="flex-1 min-w-0">
-                          <div className="flex items-center justify-between gap-2">
-                            <h3 className="font-medium text-sm truncate">{job.title}</h3>
-                            {unreadCount > 0 && (
-                              <Badge className="bg-primary text-primary-foreground text-xs min-w-[20px] h-5">{unreadCount}</Badge>
-                            )}
-                          </div>
-                          <p className="text-xs text-muted-foreground truncate">
-                            {participants.map((p) => p.firstName || p.companyName).join(", ") || t("noParticipants")}
-                          </p>
-                        </div>
-                      </button>
-                    ))}
+                        job={job}
+                        participants={participants}
+                        unreadCount={unreadCount}
+                        isUnread={isUnread}
+                        isSelected={isSelected}
+                        onSelect={() => setSelectedJobId(job.id)}
+                        noParticipantsLabel={t("noParticipants")}
+                      />
+                    )})}
                   </div>
                 )}
               </div>
@@ -1829,7 +2190,7 @@ export default function ChatsPage({ embedInDashboard }: ChatsPageProps = {}) {
               )}
             </div>
             <JobDetailsPanel
-              job={selectedJob?.job || null}
+              job={jobForDetailsPanel}
               participants={selectedJob?.participants || []}
               isOpen={showJobDetails && !!selectedJobId}
               onClose={() => setShowJobDetails(false)}
@@ -1898,46 +2259,26 @@ export default function ChatsPage({ embedInDashboard }: ChatsPageProps = {}) {
                   <MessageSquare className="w-10 h-10 text-muted-foreground mb-3" />
                   <h3 className="font-medium mb-1">{t("noActiveChats")}</h3>
                   <p className="text-xs text-muted-foreground">
-                    {profile?.role === "company" ? t("chat.chatsAppearInProgress") : t("chat.chatsAppearAccepted")}
+                    {profile?.role === "company" ? t("chatsAppearInProgress") : t("chatsAppearAccepted")}
                   </p>
                 </div>
               ) : (
                 <div className="divide-y divide-border">
-                  {filteredChatJobs.map(({ job, participants, unreadCount }) => (
-                    <button
-                      key={job.id}
-                      className={`w-full flex items-start gap-3 p-4 hover-elevate text-left transition-colors ${selectedJobId === job.id ? "bg-accent" : ""}`}
-                      onClick={() => setSelectedJobId(job.id)}
-                      data-testid={`chat-job-${job.id}`}
-                    >
-                      <div className="flex -space-x-2 flex-shrink-0">
-                        {participants.slice(0, 2).map((p) => (
-                          <Avatar key={p.id} className="w-9 h-9 border-2 border-background">
-                            <AvatarImage src={normalizeAvatarUrl(p.avatarUrl) || undefined} />
-                            <AvatarFallback className="text-xs">{p.firstName?.[0]}{p.lastName?.[0]}</AvatarFallback>
-                          </Avatar>
-                        ))}
-                        {participants.length === 0 && (
-                          <Avatar className="w-9 h-9">
-                            <AvatarFallback>
-                              {profile?.role === "company" ? <User className="w-4 h-4" /> : <Building2 className="w-4 h-4" />}
-                            </AvatarFallback>
-                          </Avatar>
-                        )}
-                      </div>
-                      <div className="flex-1 min-w-0">
-                        <div className="flex items-center justify-between gap-2">
-                          <h3 className="font-medium text-sm truncate">{job.title}</h3>
-                          {unreadCount > 0 && (
-                            <Badge className="bg-primary text-primary-foreground text-xs min-w-[20px] h-5">{unreadCount}</Badge>
-                          )}
-                        </div>
-                        <p className="text-xs text-muted-foreground truncate">
-                          {participants.map((p) => p.firstName || p.companyName).join(", ") || t("noParticipants")}
-                        </p>
-                      </div>
-                    </button>
-                  ))}
+                  {searchedChatJobs.map(({ job, participants, unreadCount }) => {
+                    const isSelected = selectedJobId === job.id;
+                    const isUnread = unreadCount > 0 && !viewedJobIds.has(job.id);
+                    return (
+                      <ChatJobListRow
+                        key={job.id}
+                        job={job}
+                        participants={participants}
+                        unreadCount={unreadCount}
+                        isUnread={isUnread}
+                        isSelected={isSelected}
+                        onSelect={() => setSelectedJobId(job.id)}
+                        noParticipantsLabel={t("noParticipants")}
+                      />
+                    )})}
                 </div>
               )}
             </div>
@@ -1992,7 +2333,7 @@ export default function ChatsPage({ embedInDashboard }: ChatsPageProps = {}) {
         )}
         {/* Tablet in dashboard: Details opens as pop-up (ResponsiveDialog), not 3rd column */}
         <JobDetailsPanel
-          job={selectedJob?.job || null}
+          job={jobForDetailsPanel}
           participants={selectedJob?.participants || []}
           isOpen={showJobDetails}
           onClose={() => setShowJobDetails(false)}
@@ -2064,7 +2405,7 @@ export default function ChatsPage({ embedInDashboard }: ChatsPageProps = {}) {
           </div>
         )}
         <JobDetailsPanel
-          job={selectedJob?.job || null}
+          job={jobForDetailsPanel}
           participants={selectedJob?.participants || []}
           isOpen={showJobDetails}
           onClose={() => setShowJobDetails(false)}
@@ -2090,6 +2431,7 @@ export default function ChatsPage({ embedInDashboard }: ChatsPageProps = {}) {
             }}
           />
         )}
+        <MobileNotificationsPopup />
       </>
     );
   }
@@ -2171,7 +2513,7 @@ export default function ChatsPage({ embedInDashboard }: ChatsPageProps = {}) {
         
         {/* Mobile Job Details Dialog */}
         <JobDetailsPanel
-          job={selectedJob?.job || null}
+          job={jobForDetailsPanel}
           participants={selectedJob?.participants || []}
           isOpen={showJobDetails}
           onClose={() => setShowJobDetails(false)}
@@ -2261,7 +2603,7 @@ export default function ChatsPage({ embedInDashboard }: ChatsPageProps = {}) {
               {!isEmployee && (
                 <>
                   <button
-                    onClick={() => setLocation("/dashboard")}
+                    onClick={() => setLocation("/dashboard/find")}
                     className="flex flex-col items-center justify-center gap-0.5 px-3 h-full transition-colors text-muted-foreground"
                     data-testid="mobile-nav-find"
                   >
@@ -2345,6 +2687,7 @@ export default function ChatsPage({ embedInDashboard }: ChatsPageProps = {}) {
             </div>
           </nav>
         ))}
+        <MobileNotificationsPopup />
       </div>
     );
   }
@@ -2373,7 +2716,7 @@ export default function ChatsPage({ embedInDashboard }: ChatsPageProps = {}) {
               <img src={imagePreview.urls[imagePreview.index]} alt="" className="max-w-full max-h-full object-contain" onClick={(e) => e.stopPropagation()} />
             </div>
           )}
-          <JobDetailsPanel job={selectedJob?.job || null} participants={selectedJob?.participants || []} isOpen={showJobDetails} onClose={() => setShowJobDetails(false)} isMobile={true} isCompany={isCompanyEmbed} onMarkComplete={isCompanyEmbed ? (jobId, jobTitle) => { setShowJobDetails(false); setMarkCompleteJobId(jobId); setMarkCompleteJobTitle(jobTitle); } : undefined} onStartCallForParticipant={PEERCALLS_BASE_URL && selectedJobId ? handleStartCallForParticipant : undefined} />
+          <JobDetailsPanel job={jobForDetailsPanel} participants={selectedJob?.participants || []} isOpen={showJobDetails} onClose={() => setShowJobDetails(false)} isMobile={true} isCompany={isCompanyEmbed} onMarkComplete={isCompanyEmbed ? (jobId, jobTitle) => { setShowJobDetails(false); setMarkCompleteJobId(jobId); setMarkCompleteJobTitle(jobTitle); } : undefined} onStartCallForParticipant={PEERCALLS_BASE_URL && selectedJobId ? handleStartCallForParticipant : undefined} />
           {isCompanyEmbed && <MarkCompleteReviewDialog open={!!markCompleteJobId} jobId={markCompleteJobId} jobTitle={markCompleteJobTitle} onOpenChange={(open) => { if (!open) { setMarkCompleteJobId(null); setMarkCompleteJobTitle(""); } }} />}
           {showMobileFooter && (isCompanyEmbed ? (
             <nav className="md:hidden fixed bottom-0 left-0 right-0 bg-background border-t border-border z-50 h-14" aria-label="Company dashboard navigation" data-testid="mobile-footer-nav">
@@ -2384,7 +2727,22 @@ export default function ChatsPage({ embedInDashboard }: ChatsPageProps = {}) {
                 <button onClick={() => setLocation("/company-dashboard/chats")} className={`flex flex-col items-center justify-center gap-0.5 px-2 min-w-0 flex-1 h-full transition-colors ${location === "/company-dashboard/chats" ? "text-primary" : "text-muted-foreground"}`} data-testid="mobile-nav-chats"><MessageSquare className="w-5 h-5 shrink-0" /><span className="text-[11px] font-medium truncate">{tCompany("nav.messages")}</span></button>
               </div>
             </nav>
-          ) : null)}
+          ) : (
+            <nav className="md:hidden fixed bottom-0 left-0 right-0 bg-background border-t border-border z-50 h-14" aria-label="Worker dashboard navigation" data-testid="mobile-footer-nav">
+              <div className="flex items-center justify-around h-full">
+                <button onClick={() => setLocation("/dashboard/today")} className={`flex flex-col items-center justify-center gap-0.5 px-3 h-full transition-colors ${(location || "").startsWith("/dashboard/today") ? "text-primary" : "text-muted-foreground"}`} data-testid="mobile-nav-today"><Clock className="w-5 h-5" /><span className="text-[11px] font-medium">{tNav("nav.today")}</span></button>
+                {!isEmployee && (
+                  <>
+                    <button onClick={() => setLocation("/dashboard/find")} className={`flex flex-col items-center justify-center gap-0.5 px-3 h-full transition-colors ${(location || "").startsWith("/dashboard/find") ? "text-primary" : "text-muted-foreground"}`} data-testid="mobile-nav-find"><Search className="w-5 h-5" /><span className="text-[11px] font-medium">{tNav("nav.find")}</span></button>
+                    <button onClick={() => setLocation("/dashboard/jobs")} className={`flex flex-col items-center justify-center gap-0.5 px-3 h-full transition-colors ${(location || "").startsWith("/dashboard/jobs") ? "text-primary" : "text-muted-foreground"}`} data-testid="mobile-nav-jobs"><Briefcase className="w-5 h-5" /><span className="text-[11px] font-medium">{tNav("nav.jobs")}</span></button>
+                  </>
+                )}
+                <button onClick={() => setLocation("/dashboard/calendar")} className={`flex flex-col items-center justify-center gap-0.5 px-3 h-full transition-colors ${(location || "").startsWith("/dashboard/calendar") ? "text-primary" : "text-muted-foreground"}`} data-testid="mobile-nav-calendar"><Calendar className="w-5 h-5" /><span className="text-[11px] font-medium">{tNav("nav.calendar")}</span></button>
+                <button className="flex flex-col items-center justify-center gap-0.5 px-3 h-full transition-colors text-primary" data-testid="mobile-nav-chats"><MessageSquare className="w-5 h-5" /><span className="text-[11px] font-medium">{tNav("nav.messages")}</span></button>
+              </div>
+            </nav>
+          ))}
+          <MobileNotificationsPopup />
         </div>
       );
     }
@@ -2413,7 +2771,7 @@ export default function ChatsPage({ embedInDashboard }: ChatsPageProps = {}) {
 
   const workerTabsItems = [
     ...(!isEmployee ? [
-      { id: "find", label: tNav("nav.find"), onClick: () => setLocation("/dashboard") } as const,
+      { id: "find", label: tNav("nav.find"), onClick: () => setLocation("/dashboard/find") } as const,
       { id: "jobs", label: tNav("nav.jobs"), onClick: () => setLocation("/dashboard/jobs") } as const,
     ] : []),
     { id: "today", label: tNav("nav.today"), onClick: () => setLocation("/dashboard/today") } as const,
@@ -2500,6 +2858,9 @@ export default function ChatsPage({ embedInDashboard }: ChatsPageProps = {}) {
                             onClick={() => {
                               // Use deep linking based on notification type and data
                               const data = notif.data || {};
+                              if (tryOpenTimesheetApprovalInvoiceFromNotification(notif, openTimesheetApprovalInvoice)) {
+                                return;
+                              }
                               if (notif.url) {
                                 // External URLs (e.g. call invite) open in new tab so the action opens that exact call
                                 if (notif.url.startsWith("http://") || notif.url.startsWith("https://")) {
@@ -2644,51 +3005,27 @@ export default function ChatsPage({ embedInDashboard }: ChatsPageProps = {}) {
                 <h3 className="font-medium mb-1">{t("noActiveChats")}</h3>
                 <p className="text-xs text-muted-foreground">
                   {profile?.role === 'company' 
-                    ? t("chat.chatsAppearInProgress")
-                    : t("chat.chatsAppearAccepted")}
+                    ? t("chatsAppearInProgress")
+                    : t("chatsAppearAccepted")}
                 </p>
               </div>
             ) : (
               <div className="divide-y divide-border">
-                {filteredChatJobs.map(({ job, participants, unreadCount }) => (
-                  <button
-                    key={job.id}
-                    className={`w-full flex items-start gap-3 p-4 hover-elevate text-left transition-colors ${
-                      selectedJobId === job.id ? "bg-accent" : ""
-                    }`}
-                    onClick={() => setSelectedJobId(job.id)}
-                    data-testid={`chat-job-${job.id}`}
-                  >
-                    <div className="flex -space-x-2 flex-shrink-0">
-                      {participants.slice(0, 2).map((p) => (
-                        <Avatar key={p.id} className="w-9 h-9 border-2 border-background">
-                          <AvatarImage src={normalizeAvatarUrl(p.avatarUrl) || undefined} />
-                          <AvatarFallback className="text-xs">{p.firstName?.[0]}{p.lastName?.[0]}</AvatarFallback>
-                        </Avatar>
-                      ))}
-                      {participants.length === 0 && (
-                        <Avatar className="w-9 h-9">
-                          <AvatarFallback>
-                            {profile?.role === 'company' ? <User className="w-4 h-4" /> : <Building2 className="w-4 h-4" />}
-                          </AvatarFallback>
-                        </Avatar>
-                      )}
-                    </div>
-                    <div className="flex-1 min-w-0">
-                      <div className="flex items-center justify-between gap-2">
-                        <h3 className="font-medium text-sm truncate">{job.title}</h3>
-                        {unreadCount > 0 && (
-                          <Badge className="bg-primary text-primary-foreground text-xs min-w-[20px] h-5">
-                            {unreadCount}
-                          </Badge>
-                        )}
-                      </div>
-                      <p className="text-xs text-muted-foreground truncate">
-                        {participants.map(p => p.firstName || p.companyName).join(", ") || t("noParticipants")}
-                      </p>
-                    </div>
-                  </button>
-                ))}
+                {searchedChatJobs.map(({ job, participants, unreadCount }) => {
+                  const isSelected = selectedJobId === job.id;
+                  const isUnread = unreadCount > 0 && !viewedJobIds.has(job.id);
+                  return (
+                    <ChatJobListRow
+                      key={job.id}
+                      job={job}
+                      participants={participants}
+                      unreadCount={unreadCount}
+                      isUnread={isUnread}
+                      isSelected={isSelected}
+                      onSelect={() => setSelectedJobId(job.id)}
+                      noParticipantsLabel={t("noParticipants")}
+                    />
+                  )})}
               </div>
             )}
           </div>
@@ -2710,7 +3047,7 @@ export default function ChatsPage({ embedInDashboard }: ChatsPageProps = {}) {
         
         {/* Desktop: side panel. Tablet: popup (ResponsiveDialog/Drawer) */}
         <JobDetailsPanel
-          job={selectedJob?.job || null}
+          job={jobForDetailsPanel}
           participants={selectedJob?.participants || []}
           isOpen={showJobDetails && !!selectedJobId}
           onClose={() => setShowJobDetails(false)}
@@ -2790,99 +3127,7 @@ export default function ChatsPage({ embedInDashboard }: ChatsPageProps = {}) {
         </div>
       )}
 
-      {/* Notifications Full Page Popup (Mobile Only) */}
-      {isMobile && profile?.role === 'worker' && (
-        <MobilePopup
-        open={notificationsOpen}
-        onOpenChange={setNotificationsOpen}
-        title={tNotifications("title")}
-        headerContent={
-          notifications && notifications.filter((n: any) => !n.isRead).length > 0 ? (
-            <Button 
-              variant="ghost" 
-              size="sm" 
-              className="text-xs"
-              onClick={async () => {
-                try {
-                  await apiRequest("PATCH", "/api/notifications/read-all", { profileId: profile?.id });
-                  queryClient.invalidateQueries({ queryKey: ['/api/notifications', profile?.id] });
-                } catch (err) {
-                  console.error("Failed to mark all as read:", err);
-                }
-              }}
-              data-testid="chats-mobile-mark-all-read-button"
-            >
-              {tNotifications("markAllRead")}
-            </Button>
-          ) : undefined
-        }
-      >
-        {!notifications || notifications.length === 0 ? (
-          <div className="py-12 text-center text-muted-foreground" data-testid="chats-mobile-notifications-empty">
-            <Bell className="w-12 h-12 mx-auto mb-3 opacity-50" />
-            <p className="text-base">{tEmpty("noNotifications")}</p>
-            <p className="text-sm mt-1">{tNotifications("youllSeeUpdates")}</p>
-          </div>
-        ) : (
-          <div className="divide-y divide-border -mx-4">
-            {notifications.map((notif: any) => (
-              <div 
-                key={notif.id}
-                className={`p-4 cursor-pointer active:bg-muted/50 transition-colors ${!notif.isRead ? "bg-primary/5" : ""}`}
-                onClick={async () => {
-                  if (!notif.isRead) {
-                    try {
-                      await apiRequest("PATCH", `/api/notifications/${notif.id}/read`, {});
-                      queryClient.invalidateQueries({ queryKey: ['/api/notifications', profile?.id] });
-                    } catch (err) {
-                      console.error("Failed to mark as read:", err);
-                    }
-                  }
-                  setNotificationsOpen(false);
-                  if (notif.type === "new_message") {
-                    // Already on chats page
-                  } else {
-                    setLocation("/dashboard/today");
-                  }
-                }}
-                data-testid={`chats-mobile-notification-item-${notif.id}`}
-              >
-                <div className="flex items-start gap-3">
-                  <div className={`w-10 h-10 rounded-full flex items-center justify-center flex-shrink-0 ${
-                    notif.type === "application_accepted" ? "bg-green-100 dark:bg-green-900/30" :
-                    notif.type === "application_rejected" ? "bg-red-100 dark:bg-red-900/30" :
-                    notif.type === "payment_received" ? "bg-emerald-100 dark:bg-emerald-900/30" :
-                    notif.type === "new_message" ? "bg-blue-100 dark:bg-blue-900/30" :
-                    "bg-muted"
-                  }`}>
-                    {notif.type === "application_accepted" && <CheckCircle className="w-5 h-5 text-green-600" />}
-                    {notif.type === "application_rejected" && <XCircle className="w-5 h-5 text-red-600" />}
-                    {notif.type === "payment_received" && <DollarSign className="w-5 h-5 text-emerald-600" />}
-                    {notif.type === "timesheet_approved" && <CheckCircle className="w-5 h-5 text-green-600" />}
-                    {notif.type === "new_message" && <MessageSquare className="w-5 h-5 text-blue-600" />}
-                    {notif.type === "new_job" && <Briefcase className="w-5 h-5 text-primary" />}
-                    {notif.type === "job_reminder" && <Clock className="w-5 h-5 text-amber-600" />}
-                    {!["application_accepted", "application_rejected", "payment_received", "timesheet_approved", "new_message", "new_job", "job_reminder"].includes(notif.type) && <Bell className="w-5 h-5 text-muted-foreground" />}
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <p className={`text-base ${!notif.isRead ? "font-medium" : ""}`}>{notif.title}</p>
-                    {notif.message && (
-                      <p className="text-sm text-muted-foreground line-clamp-2 mt-1">{notif.message}</p>
-                    )}
-                    <p className="text-sm text-muted-foreground mt-2">
-                      {formatDistanceToNow(new Date(notif.createdAt), { addSuffix: true })}
-                    </p>
-                  </div>
-                  {!notif.isRead && (
-                    <div className="w-2.5 h-2.5 bg-primary rounded-full flex-shrink-0 mt-2" />
-                  )}
-                </div>
-              </div>
-            ))}
-          </div>
-        )}
-      </MobilePopup>
-      )}
+      <MobileNotificationsPopup />
     </div>
   );
 }

@@ -28,6 +28,7 @@ export function JobStartingBanner() {
     queryKey: ["/api/today/assignments"],
     queryFn: async () => {
       const res = await fetch("/api/today/assignments", { credentials: "include" });
+      if (res.status === 401) return [];
       if (!res.ok) throw new Error("Failed to fetch assignments");
       return res.json();
     },

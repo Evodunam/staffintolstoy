@@ -72,7 +72,7 @@ export function registerObjectStorageRoutes(app: Express): void {
    *   "name": "filename.jpg",
    *   "size": 12345,
    *   "contentType": "image/jpeg",
-   *   "bucket": "avatar" // Optional: "avatar" | "bio" | "jobs" | "reviews" (defaults to "avatar")
+   *   "bucket": "avatar" // Optional: "avatar" | "bio" | "jobs" | "reviews" | "chats" | "receipts" (defaults to "avatar")
    * }
    *
    * Response:
@@ -278,11 +278,16 @@ export function registerObjectStorageRoutes(app: Express): void {
         hasBucket: objectPath.split("/").length >= 3,
       });
       
-      // In dev mode, check if storage is configured before attempting to access
-      // This prevents errors from being thrown in the storage service
+      // In dev mode when storage is not configured: serve a placeholder for avatar paths so the UI doesn't 404
       if (isDev && (!process.env.IDRIVE_E2_ACCESS_KEY_ID || !process.env.IDRIVE_E2_SECRET_ACCESS_KEY)) {
+        if (objectPath.startsWith("/objects/avatar/")) {
+          const placeholderSvg = `<svg xmlns="http://www.w3.org/2000/svg" width="96" height="96" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="3"/><path d="M4 20c0-3.5 3.5-4 8-4s8 .5 8 4"/></svg>`;
+          res.setHeader("Content-Type", "image/svg+xml");
+          res.setHeader("Cache-Control", "public, max-age=3600");
+          return res.status(200).send(placeholderSvg);
+        }
         console.warn("Dev mode: Object storage not configured, returning 404 for:", objectPath);
-        return res.status(404).json({ 
+        return res.status(404).json({
           error: "Object not found (storage not configured in dev mode)",
         });
       }
@@ -294,7 +299,7 @@ export function registerObjectStorageRoutes(app: Express): void {
         console.log("Legacy path detected, trying buckets for UUID:", uuid);
         
         // Try common buckets in order of likelihood
-        const bucketsToTry = ["avatar", "bio", "jobs", "reviews", "chats"];
+        const bucketsToTry = ["avatar", "bio", "jobs", "reviews", "chats", "receipts"];
         
         for (const bucket of bucketsToTry) {
           try {
@@ -362,7 +367,13 @@ export function registerObjectStorageRoutes(app: Express): void {
           });
         }
         
-        // Also check for ObjectNotFoundError
+        // In dev, missing avatar objects: serve placeholder so UI doesn't 404
+        if (isDev && objectPath.startsWith("/objects/avatar/") && error instanceof ObjectNotFoundError) {
+          const placeholderSvg = `<svg xmlns="http://www.w3.org/2000/svg" width="96" height="96" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="3"/><path d="M4 20c0-3.5 3.5-4 8-4s8 .5 8 4"/></svg>`;
+          res.setHeader("Content-Type", "image/svg+xml");
+          res.setHeader("Cache-Control", "public, max-age=3600");
+          return res.status(200).send(placeholderSvg);
+        }
         if (error instanceof ObjectNotFoundError) {
           return res.status(404).json({ error: "Object not found" });
         }
@@ -372,7 +383,7 @@ export function registerObjectStorageRoutes(app: Express): void {
         if (pathParts.length === 2 && pathParts[1] === "uploads") {
           // Path is /objects/uploads/uuid - try buckets
           const uuid = pathParts[pathParts.length - 1] || pathParts[1];
-          const bucketsToTry = ["avatar", "bio", "jobs", "reviews", "chats"];
+          const bucketsToTry = ["avatar", "bio", "jobs", "reviews", "chats", "receipts"];
           
           for (const bucket of bucketsToTry) {
             try {

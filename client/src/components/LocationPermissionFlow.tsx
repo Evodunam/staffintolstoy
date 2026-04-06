@@ -359,18 +359,34 @@ export function LocationPermissionFlow({
               </DialogDescription>
             </DialogHeader>
             
-            <div className="py-6 text-center">
-              <div className="mx-auto w-16 h-16 bg-destructive/10 rounded-full flex items-center justify-center mb-4">
-                <AlertCircle className="h-8 w-8 text-destructive" />
+            <div className="py-4 space-y-4">
+              <div className="text-center">
+                <div className="mx-auto w-16 h-16 bg-destructive/10 rounded-full flex items-center justify-center mb-4">
+                  <AlertCircle className="h-8 w-8 text-destructive" />
+                </div>
+                <p className="text-sm text-muted-foreground mb-4">
+                  Without precise location access, we'll use approximate location (IP-based) when you clock in.
+                </p>
               </div>
-              <p className="text-sm text-muted-foreground">
-                Without location access, you'll need to manually clock in and out for each job.
-              </p>
+              
+              <Card className="bg-amber-50 dark:bg-amber-950 border-amber-200 dark:border-amber-800">
+                <CardContent className="pt-4">
+                  <div className="flex items-start gap-3">
+                    <AlertCircle className="h-5 w-5 text-amber-600 mt-0.5" />
+                    <div>
+                      <p className="font-medium text-amber-900 dark:text-amber-100">Note</p>
+                      <p className="text-sm text-amber-800 dark:text-amber-200">
+                        When using approximate location, timesheet approval may be delayed until your location can be verified.
+                      </p>
+                    </div>
+                  </div>
+                </CardContent>
+              </Card>
             </div>
             
             <DialogFooter>
               <Button variant="outline" onClick={onClose} data-testid="button-close-settings">
-                Close
+                Continue Anyway
               </Button>
               <Button onClick={async () => {
                 const { openAppSettings } = await import('@/lib/nativeLocationTracking');

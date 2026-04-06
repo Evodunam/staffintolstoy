@@ -2,8 +2,7 @@ import { useState, useEffect } from "react";
 import { useLocation } from "wouter";
 import { useMutation } from "@tanstack/react-query";
 import { useAuth } from "@/hooks/use-auth";
-import { useProfile } from "@/hooks/use-profiles";
-import { api } from "@shared/routes";
+import { useProfile, invalidateSessionProfileQueries } from "@/hooks/use-profiles";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -46,7 +45,7 @@ export default function AccountSettings() {
     },
     onSuccess: () => {
       toast({ title: t("skillsUpdated"), description: t("skillSetsSaved") });
-      queryClient.invalidateQueries({ queryKey: [api.profiles.get.path] });
+      invalidateSessionProfileQueries(queryClient);
     },
     onError: () => {
       toast({ title: tCommon("error"), description: t("couldNotSaveChanges"), variant: "destructive" });

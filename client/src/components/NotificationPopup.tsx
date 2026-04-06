@@ -21,6 +21,9 @@ import { useProfile, useUpdateProfile } from "@/hooks/use-profiles";
 import { useToast } from "@/hooks/use-toast";
 import { formatDistanceToNow } from "date-fns";
 import { useLocation } from "wouter";
+import { useAuth } from "@/hooks/use-auth";
+import { useTimesheetApprovalInvoice } from "@/contexts/TimesheetApprovalInvoiceContext";
+import { tryOpenTimesheetApprovalInvoiceFromNotification } from "@/lib/worker-timesheet-notification";
 
 interface NotificationPopupProps {
   profileId: number | undefined;
@@ -55,6 +58,7 @@ type NotificationType =
 export function NotificationPopup({ profileId }: NotificationPopupProps) {
   const [open, setOpen] = useState(false);
   const [, setLocation] = useLocation();
+  const { openTimesheetApprovalInvoice } = useTimesheetApprovalInvoice();
   const isMobile = useIsMobile();
   const { toast } = useToast();
   const { t } = useTranslation();
@@ -497,7 +501,12 @@ export function NotificationPopup({ profileId }: NotificationPopupProps) {
     if (!notification.isRead) {
       markAsRead(notification.id);
     }
-    
+
+    if (tryOpenTimesheetApprovalInvoiceFromNotification(notification, openTimesheetApprovalInvoice)) {
+      setOpen(false);
+      return;
+    }
+
     const route = getNotificationRoute(notification);
     if (route) {
       setLocation(route);
@@ -543,9 +552,9 @@ export function NotificationPopup({ profileId }: NotificationPopupProps) {
       
       // Timesheet-related
       timesheet_submitted: "Review",
-      timesheet_approved: "View Payment",
+      timesheet_approved: "View invoice",
       timesheet_rejected: "View",
-      timesheet_auto_approved: "View Payment",
+      timesheet_auto_approved: "View invoice",
       timesheet_edited: "View Timesheet",
       timesheet_reported: "View Strikes",
       clock_in_reminder: "Clock In",
@@ -863,6 +872,26 @@ export function NotificationPopup({ profileId }: NotificationPopupProps) {
                 </div>
               )}
             </ScrollArea>
+            {notifications.length > 0 && (
+              <div className="p-2 border-t border-border">
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="w-full text-muted-foreground"
+                  onClick={() => {
+                    setOpen(false);
+                    setLocation(
+                      profile?.role === "company"
+                        ? "/company-dashboard/notifications"
+                        : "/dashboard/notifications"
+                    );
+                  }}
+                  data-testid="notifications-view-all"
+                >
+                  {t("notificationsCenter.viewAll")}
+                </Button>
+              </div>
+            )}
           </TabsContent>
           
           <TabsContent value="devices" className="m-0">

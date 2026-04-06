@@ -28,6 +28,7 @@ import { RequiredOnboardingModal } from "@/components/RequiredOnboardingModal";
 import { useTranslation } from "react-i18next";
 import { LayeredAvatars } from "@/components/LayeredAvatars";
 import { apiRequest } from "@/lib/queryClient";
+import { parseJobLatLng } from "@/lib/geo";
 
 function formatUrgency(startDate: Date, t: (key: string, options?: any) => string): { label: string; color: string } {
   const now = new Date();
@@ -377,7 +378,15 @@ export default function FindWorkPage() {
   const [applyStage, setApplyStage] = useState<1 | 2>(1);
   const [selectedApplicants, setSelectedApplicants] = useState<Set<number | "self">>(() => new Set<number | "self">(["self"]));
   const [useSmartRate, setUseSmartRate] = useState(false);
-  
+  const [smartApplyRateEnabled] = usePersistentFilter<boolean>("smart_apply_rate_enabled", true);
+
+  // When apply flow opens, default "use smart rate" from global setting (applies to self + all teammates)
+  useEffect(() => {
+    if (applyJob) {
+      setUseSmartRate(smartApplyRateEnabled);
+    }
+  }, [applyJob?.id, smartApplyRateEnabled]);
+
   // AI Dispatch settings
   const [showAiDispatchDialog, setShowAiDispatchDialog] = useState(false);
   const [aiDispatchEnabled, setAiDispatchEnabled] = usePersistentFilter<boolean>("ai_dispatch_enabled", false);
@@ -621,13 +630,15 @@ export default function FindWorkPage() {
   const jobPins = useMemo(() => {
     if (!jobs) return [];
     return jobs
-      .filter(job => job.latitude && job.longitude)
-      .map(job => {
+      .map((job) => {
+        const coords = parseJobLatLng(job);
+        if (!coords) return null;
         const application = applicationsByJobId.get(job.id);
+        const urgency = formatUrgency(new Date(job.startDate), t);
         return {
           id: job.id,
-          lat: parseFloat(job.latitude!),
-          lng: parseFloat(job.longitude!),
+          lat: coords.lat,
+          lng: coords.lng,
           title: job.title,
           trade: job.trade,
           hourlyRate: job.hourlyRate,
@@ -635,9 +646,12 @@ export default function FindWorkPage() {
           state: job.state || undefined,
           status: application ? (application.status === "accepted" ? "confirmed" : "pending") : "open",
           application: application || null,
+          urgencyColor: urgency.color,
+          payout: job.hourlyRate ? calculatePayout(job.hourlyRate, job.estimatedHours ?? undefined) : undefined,
         };
-      });
-  }, [jobs, applicationsByJobId]);
+      })
+      .filter((p): p is NonNullable<typeof p> => p != null);
+  }, [jobs, applicationsByJobId, t]);
   
   const handleDismiss = (job: Job) => {
     setJobToDismiss(job);
@@ -979,14 +993,15 @@ export default function FindWorkPage() {
               )}
             </div>
             
-            <div className="flex-1 h-full">
+            <div className="flex-1 h-full flex flex-col min-h-0 px-[14px]">
               <JobsMap
                 jobs={jobPins}
                 workerLocation={workerLocation}
                 selectedJobId={selectedJob?.id}
                 onJobSelect={handleJobSelectFromMap}
+                showPricePills
                 height="100%"
-                className="h-full"
+                className="h-full min-h-0"
               />
             </div>
             {selectedJob && (

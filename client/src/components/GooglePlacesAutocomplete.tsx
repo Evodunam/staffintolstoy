@@ -2,9 +2,11 @@ import { useEffect, useLayoutEffect, useRef, useState, useCallback } from "react
 import { createPortal } from "react-dom";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { cn } from "@/lib/utils";
 import { MapPin } from "lucide-react";
 
-interface AddressComponents {
+/** Address parts + lat/lng from Places API when user selects a suggestion (used globally for maps, location matching, fleet routing). */
+export interface AddressComponents {
   streetNumber?: string;
   streetName?: string;
   address2?: string;
@@ -12,6 +14,9 @@ interface AddressComponents {
   state?: string;
   zipCode?: string;
   country?: string;
+  /** Set when user picks a suggestion; persist with address for maps and distance filtering. */
+  latitude?: number;
+  longitude?: number;
 }
 
 interface GooglePlacesAutocompleteProps {
@@ -23,6 +28,8 @@ interface GooglePlacesAutocompleteProps {
   id?: string;
   required?: boolean;
   className?: string;
+  /** Class for the root container (label + input). Use e.g. pt-6 pb-6 px-6 for section padding. */
+  containerClassName?: string;
   /** When true, show address suggestions globally (no region restriction). Default false = US/CA only. */
   global?: boolean;
 }
@@ -54,10 +61,12 @@ interface AutocompletePrediction {
 
 /**
  * GooglePlacesAutocomplete - Uses Places API (New) REST API
- * 
- * GLOBAL RULE: All address inputs MUST use this component with Places API (New)
- * Styled to match company settings desktop page design system
- * NEVER uses legacy JavaScript API - only REST API (New)
+ *
+ * GLOBAL RULE: All address inputs MUST use this component with Places API (New).
+ * When the user selects a suggestion from the dropdown, onChange receives
+ * AddressComponents including latitude/longitude (from the place, no extra Geocode call).
+ * Persist lat/lng with the address for maps, location matching, and fleet routing.
+ * NEVER uses legacy JavaScript API - only REST API (New).
  */
 export function GooglePlacesAutocomplete({
   value,
@@ -68,6 +77,7 @@ export function GooglePlacesAutocomplete({
   id,
   required = false,
   className = "",
+  containerClassName = "",
   global = false,
 }: GooglePlacesAutocompleteProps) {
   const inputRef = useRef<HTMLInputElement>(null);
@@ -225,10 +235,15 @@ export function GooglePlacesAutocomplete({
       }
 
       const formattedAddress = place.formattedAddress || place.displayName?.text || value;
-      
+      const hasLocation = place.location && typeof place.location.latitude === "number" && typeof place.location.longitude === "number";
+
       onChange(formattedAddress, {
         ...components,
         address2: "",
+        ...(hasLocation && {
+          latitude: place.location.latitude,
+          longitude: place.location.longitude,
+        }),
       });
 
       if (onPlaceSelect) {
@@ -359,7 +374,7 @@ export function GooglePlacesAutocomplete({
   }, []);
 
   return (
-    <div ref={containerRef} className="relative">
+    <div ref={containerRef} className={cn("relative", containerClassName)}>
       {label && (
         <Label htmlFor={id} className="text-sm font-medium">
           {label}
@@ -389,12 +404,13 @@ export function GooglePlacesAutocomplete({
           createPortal(
             <div
               data-google-places-dropdown
-              className="fixed z-[9999] bg-background border border-border rounded-lg shadow-lg max-h-60 overflow-y-auto"
+              className="fixed z-[99999] bg-background border border-border rounded-lg shadow-lg max-h-60 overflow-y-auto"
               style={{
                 top: dropdownRect.top,
                 left: dropdownRect.left,
                 width: dropdownRect.width,
                 boxShadow: "0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06)",
+                pointerEvents: "auto",
               }}
             >
               {predictions.map((prediction, index) => {
@@ -411,6 +427,11 @@ export function GooglePlacesAutocomplete({
                     role="option"
                     aria-selected={isSelected}
                     onMouseDown={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      handleSelectPrediction(prediction);
+                    }}
+                    onClick={(e) => {
                       e.preventDefault();
                       e.stopPropagation();
                       handleSelectPrediction(prediction);

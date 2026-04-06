@@ -1,5 +1,4 @@
 import { useQuery } from "@tanstack/react-query";
-import { apiRequest } from "@/lib/queryClient";
 import { AlertTriangle, FileText, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -18,10 +17,12 @@ export function W9RequirementBanner({ profileId, onDismiss }: W9RequirementBanne
   const { data: pendingPayouts, isLoading } = useQuery({
     queryKey: ["/api/worker/pending-w9-payouts"],
     queryFn: async () => {
-      const response = await apiRequest("GET", "/api/worker/pending-w9-payouts");
-      return response.json();
+      const res = await fetch("/api/worker/pending-w9-payouts", { credentials: "include" });
+      if (res.status === 401) return { count: 0 };
+      if (!res.ok) throw new Error("Failed to load W-9 payout status");
+      return res.json();
     },
-    refetchInterval: 30000, // Refetch every 30 seconds
+    refetchInterval: (query) => (query.state.data?.count ? 5000 : 30000), // Poll every 5s while payouts held, else 30s
   });
 
   // Don't show banner if no pending payouts
@@ -30,7 +31,7 @@ export function W9RequirementBanner({ profileId, onDismiss }: W9RequirementBanne
   }
 
   const handleUploadW9 = () => {
-    setLocation("/dashboard/menu?tab=profile&section=business");
+    setLocation("/dashboard/account-documents?tab=w9");
   };
 
   return (

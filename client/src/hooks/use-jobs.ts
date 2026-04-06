@@ -1,9 +1,10 @@
-import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { useQuery, useInfiniteQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { api, buildUrl } from "@shared/routes";
 import { type InsertJob, type Job } from "@shared/schema";
 import { useToast } from "@/hooks/use-toast";
 import { useAuth } from "@/hooks/use-auth";
 import { useProfile } from "@/hooks/use-profiles";
+import { queryClient } from "@/lib/queryClient";
 
 export function useJobs(filters?: { trade?: string; location?: string }) {
   return useQuery({
@@ -92,31 +93,149 @@ export function useUpdateJobStatus() {
 }
 
 // Hook for worker find-work endpoint (filters out fully staffed and dismissed jobs).
+// maxDistanceMiles: 1–50, radius from admin + teammate locations; server filters jobs within that range.
+// skipLocationFilter: dev only – server returns all jobs without location filter when true.
+/** Thrown when find-work request hits client timeout (slow network or heavy query). */
+export const FIND_WORK_TIMEOUT_MESSAGE = "FIND_WORK_TIMEOUT";
+
 // Pass enabled: !!profile && profile.role === 'worker' to avoid 403 when user has no profile yet.
 export function useFindWork(
-  filters?: { trade?: string; location?: string },
+  filters?: { trade?: string; location?: string; maxDistanceMiles?: number; skipLocationFilter?: boolean },
   options?: { enabled?: boolean }
 ) {
   const enabled = options?.enabled !== false;
+  const FIND_WORK_TIMEOUT_MS = 12_000;
+  // Primitive query key so identity churn doesn’t reset cache / flash empty between renders.
+  const fwTrade = filters?.trade ?? "";
+  const fwLocation = filters?.location ?? "";
+  const fwMaxMi = filters?.maxDistanceMiles ?? -1;
+  const fwSkipLoc = filters?.skipLocationFilter === true ? 1 : 0;
+
   return useQuery<Job[]>({
-    queryKey: ["/api/jobs/find-work", filters],
-    queryFn: async () => {
+    queryKey: ["/api/jobs/find-work", fwTrade, fwLocation, fwMaxMi, fwSkipLoc],
+    // Show cached data instantly while a background refetch runs (stale-while-revalidate).
+    staleTime: 60_000,
+    gcTime: 5 * 60_000,
+    placeholderData: (previousData) => previousData,
+    queryFn: async ({ signal }) => {
       const params = new URLSearchParams();
       if (filters?.trade) params.append("trade", filters.trade);
       if (filters?.location) params.append("location", filters.location);
-      
-      const url = `/api/jobs/find-work?${params.toString()}`;
-      const res = await fetch(url, { credentials: "include" });
-      if (!res.ok) {
-        if (res.status === 401 || res.status === 403) {
-          return [];
-        }
-        throw new Error("Failed to fetch jobs");
+      if (filters?.maxDistanceMiles != null && filters.maxDistanceMiles >= 0) {
+        params.append("maxDistanceMiles", String(filters.maxDistanceMiles));
       }
-      return res.json();
+      if (filters?.skipLocationFilter === true) params.append("skipLocationFilter", "1");
+
+      const url = `/api/jobs/find-work?${params.toString()}`;
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), FIND_WORK_TIMEOUT_MS);
+      if (signal) {
+        signal.addEventListener("abort", () => {
+          clearTimeout(timeoutId);
+          controller.abort();
+        });
+      }
+      try {
+        const res = await fetch(url, {
+          credentials: "include",
+          signal: controller.signal,
+        });
+        clearTimeout(timeoutId);
+        if (!res.ok) {
+          if (res.status === 401 || res.status === 403) {
+            return [];
+          }
+          throw new Error("Failed to fetch jobs");
+        }
+        return res.json();
+      } catch (e: unknown) {
+        clearTimeout(timeoutId);
+        const name = e && typeof e === "object" && "name" in e ? String((e as { name: string }).name) : "";
+        if (name === "AbortError") {
+          throw new Error(FIND_WORK_TIMEOUT_MESSAGE);
+        }
+        throw e;
+      }
     },
     enabled,
   });
+}
+
+const FIND_WORK_PAGE_SIZE = 25;
+
+/** Paginated find-work: first page loads quickly, "Load more" fetches next page. Use jobs = data?.pages.flatMap(p => p.jobs) ?? []. */
+export function useFindWorkInfinite(
+  filters?: { trade?: string; location?: string; maxDistanceMiles?: number; skipLocationFilter?: boolean },
+  options?: { enabled?: boolean; pageSize?: number }
+) {
+  const enabled = options?.enabled !== false;
+  const pageSize = options?.pageSize ?? FIND_WORK_PAGE_SIZE;
+  const FIND_WORK_TIMEOUT_MS = 25_000;
+
+  const fwTrade = filters?.trade ?? "";
+  const fwLocation = filters?.location ?? "";
+  const fwMaxMi = filters?.maxDistanceMiles ?? -1;
+  const fwSkipLoc = filters?.skipLocationFilter === true ? 1 : 0;
+
+  const infinite = useInfiniteQuery({
+    queryKey: ["/api/jobs/find-work", "infinite", pageSize, fwTrade, fwLocation, fwMaxMi, fwSkipLoc],
+    enabled,
+    initialPageParam: 0 as number,
+    getNextPageParam: (lastPage: { jobs: Job[]; nextCursor: number | null }) =>
+      lastPage.nextCursor ?? undefined,
+    // Avoid empty flash when query key changes (e.g. radius tweak) or background refetch.
+    placeholderData: (previousData) => previousData,
+    queryFn: async ({ pageParam, signal }) => {
+      const params = new URLSearchParams();
+      if (filters?.trade) params.append("trade", filters.trade);
+      if (filters?.location) params.append("location", filters.location);
+      if (filters?.maxDistanceMiles != null && filters.maxDistanceMiles >= 0) {
+        params.append("maxDistanceMiles", String(filters.maxDistanceMiles));
+      }
+      if (filters?.skipLocationFilter === true) params.append("skipLocationFilter", "1");
+      params.set("limit", String(pageSize));
+      if (pageParam) params.set("cursor", String(pageParam));
+
+      const url = `/api/jobs/find-work?${params.toString()}`;
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), FIND_WORK_TIMEOUT_MS);
+      if (signal) {
+        signal.addEventListener("abort", () => {
+          clearTimeout(timeoutId);
+          controller.abort();
+        });
+      }
+      try {
+        const res = await fetch(url, { credentials: "include", signal: controller.signal });
+        clearTimeout(timeoutId);
+        if (!res.ok) {
+          if (res.status === 401) {
+            queryClient.setQueryData(["/api/auth/user"], null);
+            return { jobs: [], nextCursor: null };
+          }
+          if (res.status === 403) return { jobs: [], nextCursor: null };
+          throw new Error("Failed to fetch jobs");
+        }
+        const data = await res.json();
+        if (Array.isArray(data)) return { jobs: data, nextCursor: null };
+        return { jobs: data.jobs ?? [], nextCursor: data.nextCursor ?? null };
+      } catch (e: unknown) {
+        clearTimeout(timeoutId);
+        const name = e && typeof e === "object" && "name" in e ? String((e as { name: string }).name) : "";
+        if (name === "AbortError") throw new Error(FIND_WORK_TIMEOUT_MESSAGE);
+        throw e;
+      }
+    },
+    staleTime: 60_000,
+    gcTime: 5 * 60_000,
+  });
+
+  const jobs = infinite.data?.pages.flatMap((p) => p.jobs ?? []) ?? [];
+  return {
+    ...infinite,
+    jobs,
+    findWorkJobs: jobs,
+  };
 }
 
 // Hook for dismissing jobs (not interested)
@@ -218,6 +337,7 @@ export function useCompanyJobs() {
   return useQuery<CompanyJob[]>({
     queryKey: ["/api/company/jobs"],
     enabled: !!isAuthenticated && !!profile && isCompany,
+    staleTime: 30_000,
     queryFn: async () => {
       const res = await fetch("/api/company/jobs", { credentials: "include" });
       if (!res.ok) {

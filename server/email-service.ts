@@ -14,7 +14,7 @@ const RESEND_FROM_DEFAULT = process.env.RESEND_FROM_EMAIL || 'Tolstoy Staffing <
 const COMPANY_EMAIL_TYPES = new Set<string>([
   'new_job_posted_admin', 'worker_inquiry', 'worker_accepted_job', 'balance_low', 'balance_recharged',
   'job_posted', 'job_filled', 'welcome_company', 'team_member_joined', 'team_invite_sent', 'company_onboarding_reminder',
-  'close_project_review',
+  'close_project_review', 'worker_request_start_job_now', 'job_abandoned_company',
 ]);
 
 const BRAND_COLORS = {
@@ -203,6 +203,7 @@ export type EmailType =
   | 'job_start_reminder'
   | 'payout_pending_bank_setup'
   | 'payout_pending_w9'
+  | 'payout_failed_fix_bank'
   | 'payout_sent'
   | 'new_job_message'
   | 'call_invite'
@@ -222,6 +223,9 @@ export type EmailType =
   | 'affiliate_welcome'
   | 'affiliate_commission_available'
   | 'close_project_review'
+  | 'worker_request_start_job_now'
+  | 'job_abandoned_company'
+  | 'job_abandoned_worker'
   | 'geolocation_clock_in_reminder'
   | 'geolocation_clock_out_reminder'
   | 'geolocation_auto_clocked_out';
@@ -717,6 +721,55 @@ ${showAiDispatchPrompt ? `<p style="margin:0 0 10px;font-size:11px;color:${BRAND
     `
   }),
 
+  job_abandoned_company: (data) => ({
+    subject: `Worker Abandoned Job: ${data.jobTitle}`,
+    content: `
+      <h2 style="margin: 0 0 12px; font-size: 20px; color: ${BRAND_COLORS.danger};">Assignment Abandoned</h2>
+      <p style="margin: 0 0 20px; color: ${BRAND_COLORS.textMuted}; line-height: 1.6;">
+        ${data.workerName || 'A worker'} abandoned <strong>${data.jobTitle || 'your job'}</strong>.
+      </p>
+      ${getCard(`
+        <p style="margin: 0; color: ${BRAND_COLORS.textMuted}; font-size: 14px;">
+          <strong>Worker:</strong> ${data.workerName || 'Worker'}<br>
+          <strong>Reason:</strong> ${data.reasonLabel || 'Not provided'}<br>
+          ${data.details ? `<strong>Details:</strong> ${data.details}<br>` : ''}
+          <strong>Time:</strong> ${data.abandonedAt ? new Date(data.abandonedAt).toLocaleString() : new Date().toLocaleString()}
+        </p>
+      `)}
+      <div style="text-align: center; margin-top: 24px;">
+        ${getButton('Open Chat', data.chatUrl || `${BASE_URL}/company-dashboard/chats/${data.jobId || ''}`, 'warning')}
+      </div>
+      <div style="text-align: center; margin-top: 12px;">
+        ${getButton('Repost Job (Set New Time Frame)', data.repostUrl || `${BASE_URL}/post-job?new=1`, 'success')}
+      </div>
+    `
+  }),
+
+  job_abandoned_worker: (data) => ({
+    subject: `You Abandoned: ${data.jobTitle}`,
+    content: `
+      <h2 style="margin: 0 0 12px; font-size: 20px; color: ${BRAND_COLORS.warning};">Job Abandonment Confirmed</h2>
+      <p style="margin: 0 0 20px; color: ${BRAND_COLORS.textMuted}; line-height: 1.6;">
+        You abandoned <strong>${data.jobTitle || 'this job'}</strong> with ${data.companyName || 'the company'}.
+      </p>
+      ${getCard(`
+        <p style="margin: 0; color: ${BRAND_COLORS.textMuted}; font-size: 14px;">
+          <strong>Reason:</strong> ${data.reasonLabel || 'Not provided'}<br>
+          ${data.details ? `<strong>Details:</strong> ${data.details}<br>` : ''}
+          <strong>Time:</strong> ${data.abandonedAt ? new Date(data.abandonedAt).toLocaleString() : new Date().toLocaleString()}
+        </p>
+      `)}
+      <div style="background: #fff7ed; border: 1px solid #fdba74; border-radius: 10px; padding: 12px; margin-top: 18px;">
+        <p style="margin: 0; color: #9a3412; font-size: 13px; line-height: 1.5;">
+          This event may impact your account standing. The company can submit a negative review and abandonment may lead to a strike after review.
+        </p>
+      </div>
+      <div style="text-align: center; margin-top: 18px;">
+        ${getButton('Open Job Chat', data.chatUrl || `${BASE_URL}/dashboard/chats/${data.jobId || ''}`, 'warning')}
+      </div>
+    `
+  }),
+
   balance_low: (data) => ({
     subject: `Low Balance Alert - $${data.balance} Remaining`,
     content: `
@@ -1162,6 +1215,33 @@ ${showAiDispatchPrompt ? `<p style="margin:0 0 10px;font-size:11px;color:${BRAND
     `
   }),
 
+  payout_failed_fix_bank: (data) => ({
+    subject: `Payment could not be sent – please update your bank account ($${data.amount})`,
+    content: `
+      <h2 style="margin: 0 0 16px; font-size: 20px; color: ${BRAND_COLORS.warning};">Payment could not be sent</h2>
+      <p style="margin: 0 0 24px; color: ${BRAND_COLORS.textMuted}; line-height: 1.6;">
+        Hi ${data.workerName}, your timesheet for <strong>${data.jobTitle}</strong> was approved and you're owed <strong>$${data.amount}</strong>, but we couldn't send the payment to your bank account.
+      </p>
+      <p style="margin: 0 0 24px; color: ${BRAND_COLORS.textMuted}; line-height: 1.6;">
+        Please update your bank account details in your dashboard so we can retry sending your payment. Common issues include an invalid account number, incorrect routing number, or a closed account.
+      </p>
+      ${getCard(`
+        <h3 style="margin: 0 0 16px; font-size: 16px; font-weight: 600; color: ${BRAND_COLORS.text};">Payment Details</h3>
+        <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%">
+          ${getListRow('Amount', `$${data.amount}`)}
+          ${getListRow('Job', data.jobTitle)}
+          ${getListRow('Status', 'Failed – Update bank to receive payment', true)}
+        </table>
+      `)}
+      <div style="text-align: center; margin-top: 24px;">
+        ${getButton('Update bank account', `${data.dashboardLink || (process.env.BASE_URL || process.env.APP_URL || 'http://localhost:5000')}/worker?tab=payments`, 'primary')}
+      </div>
+      <p style="margin: 24px 0 0; color: ${BRAND_COLORS.textMuted}; font-size: 13px; text-align: center;">
+        Once you update your bank account, we'll retry the payment automatically.
+      </p>
+    `
+  }),
+
   payout_pending_w9: (data) => {
     const documentsUrl = data.documentsUrl || `${BASE_URL}/dashboard/account-documents`;
     return {
@@ -1290,6 +1370,24 @@ ${showAiDispatchPrompt ? `<p style="margin:0 0 10px;font-size:11px;color:${BRAND
         ${reviewUrl ? getButton('Close out project', reviewUrl, 'primary') : ''}
       </div>
       ${reviewUrl ? `<p style="margin: 12px 0 0; font-size: 13px; color: ${BRAND_COLORS.textMuted}; word-break: break-all;">${reviewUrl}</p>` : ''}
+      `
+    };
+  },
+
+  worker_request_start_job_now: (data) => {
+    const workerName = data.workerName || 'A worker';
+    const jobTitle = data.jobTitle || 'your job';
+    const chatUrl = data.chatUrl ? `${BASE_URL}${data.chatUrl.startsWith('/') ? '' : '/'}${data.chatUrl}` : `${BASE_URL}/company-dashboard/chats/${data.jobId || ''}`;
+    return {
+      subject: `${workerName} requested to start "${jobTitle}" today`,
+      content: `
+      <h2 style="margin: 0 0 16px; font-size: 20px; color: ${BRAND_COLORS.text};">Request to start job today</h2>
+      <p style="margin: 0 0 16px; font-size: 15px; color: ${BRAND_COLORS.text}; line-height: 1.6;">
+        <strong>${workerName}</strong> has requested to start <strong>${jobTitle}</strong> today. You can accept to move the start date to today (keeping the same start and end times) so they can clock in, or decline to keep the current schedule.
+      </p>
+      <div style="text-align: center; margin: 24px 0;">
+        ${getButton('View request in chat', chatUrl, 'primary')}
+      </div>
       `
     };
   },
@@ -1814,6 +1912,25 @@ export function getSampleDataForType(type: EmailType): Record<string, any> {
       return { ...common, clockInTime: '8:00 AM' };
     case 'worker_clocked_out':
       return { ...common, hours: '8', totalCost: '224.00', timesheetId: 1 };
+    case 'job_abandoned_company':
+      return {
+        ...common,
+        workerName: 'Sample Worker',
+        reasonLabel: 'Schedule conflict',
+        details: 'Unexpected conflict with another assignment.',
+        abandonedAt: new Date().toISOString(),
+        chatUrl: `${BASE_URL_SAMPLE}/company-dashboard/chats/${common.jobId || 1}`,
+        repostUrl: `${BASE_URL_SAMPLE}/post-job`,
+      };
+    case 'job_abandoned_worker':
+      return {
+        ...common,
+        companyName: 'Sample Company LLC',
+        reasonLabel: 'Schedule conflict',
+        details: 'Unexpected conflict with another assignment.',
+        abandonedAt: new Date().toISOString(),
+        chatUrl: `${BASE_URL_SAMPLE}/dashboard/chats/${common.jobId || 1}`,
+      };
     case 'balance_low':
       return { balance: '150.00' };
     case 'balance_recharged':
@@ -1844,6 +1961,8 @@ export function getSampleDataForType(type: EmailType): Record<string, any> {
       return { ...common, workerName: 'Sample Worker', startTime: '8:00 AM' };
     case 'payout_pending_bank_setup':
       return { ...common, workerName: 'Sample Worker', dashboardLink: BASE_URL_SAMPLE };
+    case 'payout_failed_fix_bank':
+      return { ...common, workerName: 'Sample Worker', amount: '225.00', jobTitle: common.jobTitle, dashboardLink: BASE_URL_SAMPLE };
     case 'payout_pending_w9':
       return { ...common, workerName: 'Sample Worker', documentsUrl: `${BASE_URL_SAMPLE}/dashboard/account-documents` };
     case 'payout_sent':
@@ -1892,6 +2011,8 @@ export function getSampleDataForType(type: EmailType): Record<string, any> {
       return { firstName: 'Jane', referralLink: `${BASE_URL_SAMPLE}/company-onboarding?ref=jane-doe`, dashboardUrl: `${BASE_URL_SAMPLE}/affiliate-dashboard` };
     case 'affiliate_commission_available':
       return { firstName: 'Jane', amountCents: 2080, description: 'Commission from timesheet #123', hasPayoutSetup: false, dashboardUrl: `${BASE_URL_SAMPLE}/affiliate-dashboard` };
+    case 'worker_request_start_job_now':
+      return { ...common, workerName: 'Sample Worker', chatUrl: `/company-dashboard/chats/${common.jobId || 1}` };
     default:
       return common;
   }

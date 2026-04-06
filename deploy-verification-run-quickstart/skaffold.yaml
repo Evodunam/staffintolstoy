@@ -1,0 +1,14 @@
+apiVersion: skaffold/v4beta7
+kind: Config
+manifests:
+  rawYaml:
+  - service.yaml
+deploy:
+  cloudrun: {}
+verify:
+- name: verification-test
+  container:
+    name: verification-echo
+    image: ubuntu
+    command: ["/bin/sh"]
+    args: ["-c", "echo verification-ok"]

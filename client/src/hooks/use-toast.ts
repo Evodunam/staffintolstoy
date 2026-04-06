@@ -7,6 +7,7 @@ import type {
 
 const TOAST_LIMIT = 1
 const TOAST_REMOVE_DELAY = 4000 // Auto-dismiss after 4 seconds
+const TOAST_EXIT_DURATION = 250 // Duration for exit animation before removing from DOM
 
 type ToasterToast = ToastProps & {
   id: string
@@ -55,7 +56,7 @@ interface State {
 
 const toastTimeouts = new Map<string, ReturnType<typeof setTimeout>>()
 
-const addToRemoveQueue = (toastId: string) => {
+const addToRemoveQueue = (toastId: string, delayMs: number = TOAST_EXIT_DURATION) => {
   if (toastTimeouts.has(toastId)) {
     return
   }
@@ -66,7 +67,7 @@ const addToRemoveQueue = (toastId: string) => {
       type: "REMOVE_TOAST",
       toastId: toastId,
     })
-  }, TOAST_REMOVE_DELAY)
+  }, delayMs)
 
   toastTimeouts.set(toastId, timeout)
 }

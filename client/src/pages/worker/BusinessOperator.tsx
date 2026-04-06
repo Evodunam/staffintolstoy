@@ -16,7 +16,6 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Slider } from "@/components/ui/slider";
 import { Progress } from "@/components/ui/progress";
-import { ScrollArea } from "@/components/ui/scroll-area";
 import { useToast } from "@/hooks/use-toast";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import * as faceapi from "@vladmandic/face-api";
@@ -24,37 +23,13 @@ import { useTranslation } from "react-i18next";
 import { GooglePlacesAutocomplete } from "@/components/GooglePlacesAutocomplete";
 import { 
   ArrowLeft, Users, DollarSign, Briefcase, Plus, Edit2, Trash2, 
-  ChevronRight, ChevronLeft, MapPin, Phone, Mail, Wrench, Shield, User as UserIcon,
+  ChevronRight, ChevronLeft, ChevronDown, ChevronUp, MapPin, Phone, Mail, Wrench, Shield, User as UserIcon,
   Send, Clock, CheckCircle, XCircle, Camera, Upload, Loader2, Zap, Droplets, 
   Wind, Hammer, PaintBucket, Building2, Shovel, HardHat, AlertCircle, MoreVertical,
   Copy, Link, RefreshCw, UserCog, Info, Share2
 } from "lucide-react";
-
-const SERVICE_CATEGORIES = {
-  general: [
-    { id: "Laborer", label: "Laborer", desc: "Furniture assembly, demolition, moving, general labor", icon: HardHat },
-    { id: "Landscaping", label: "Landscaping", desc: "Lawn care, gardening, outdoor work", icon: Shovel },
-    { id: "Painting", label: "Painting", desc: "Interior and exterior painting", icon: PaintBucket },
-    { id: "Drywall", label: "Drywall", desc: "Hanging, mudding, and taping", icon: Building2 },
-    { id: "Concrete", label: "Concrete", desc: "Pouring, finishing, repairs", icon: Building2 },
-  ],
-  carpentry: [
-    { id: "Carpentry Lite", label: "Carpentry Lite", desc: "Trim, tools, framing walls, small stairs", icon: Hammer },
-    { id: "Carpentry Elite", label: "Carpentry Elite", desc: "Full structures, homes, complex builds", icon: Hammer, isElite: true },
-  ],
-  electrical: [
-    { id: "Electrical Lite", label: "Electrical Lite", desc: "Outlets, ceiling fans, replacing fixtures", icon: Zap },
-    { id: "Electrical Elite", label: "Electrical Elite", desc: "Full home wiring, new installations", icon: Zap, isElite: true },
-  ],
-  plumbing: [
-    { id: "Plumbing Lite", label: "Plumbing Lite", desc: "Faucets, toilets, repairs", icon: Droplets },
-    { id: "Plumbing Elite", label: "Plumbing Elite", desc: "Full installs from scratch", icon: Droplets, isElite: true },
-  ],
-  hvac: [
-    { id: "HVAC Lite", label: "HVAC Lite", desc: "Repairs, existing systems", icon: Wind },
-    { id: "HVAC Elite", label: "HVAC Elite", desc: "Full installs, ducting, minisplits, AC units", icon: Wind, isElite: true },
-  ],
-};
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
+import { INDUSTRY_CATEGORIES } from "@shared/industries";
 
 const SKILL_OPTIONS = [
   { id: "electrical", label: "Electrical", tier: "elite" },
@@ -131,7 +106,6 @@ export function BusinessOperatorContent({ embedded = false }: { embedded?: boole
   
   const WIZARD_STEPS = [
     t("wizardSteps.userDetails"),
-    t("wizardSteps.address"),
     t("wizardSteps.role"),
     t("wizardSteps.rateAndSkills")
   ];
@@ -147,7 +121,7 @@ export function BusinessOperatorContent({ embedded = false }: { embedded?: boole
   const [newInviteMember, setNewInviteMember] = useState({
     firstName: "",
     lastName: "",
-    hourlyRate: 15,
+    hourlyRate: 20,
     email: "",
     phone: "",
     role: "employee" as "admin" | "employee",
@@ -155,12 +129,16 @@ export function BusinessOperatorContent({ embedded = false }: { embedded?: boole
   const [createdInviteMember, setCreatedInviteMember] = useState<TeamMember | null>(null);
   const [paymentFlowInfoOpen, setPaymentFlowInfoOpen] = useState(false);
   const [onboardingLinkInfoOpen, setOnboardingLinkInfoOpen] = useState(false);
+  const [facePhotoPopupMember, setFacePhotoPopupMember] = useState<TeamMember | null>(null);
+  const [facePhotoUploading, setFacePhotoUploading] = useState(false);
+  const facePhotoFileInputRef = useRef<HTMLInputElement>(null);
   
   const [avatarPreview, setAvatarPreview] = useState<string | null>(null);
   const [faceVerified, setFaceVerified] = useState(false);
   const [faceError, setFaceError] = useState<string | null>(null);
   const [isVerifyingFace, setIsVerifyingFace] = useState(false);
   const [modelsLoaded, setModelsLoaded] = useState(false);
+  const [wizardExpandedIndustries, setWizardExpandedIndustries] = useState<string[]>(() => INDUSTRY_CATEGORIES.map((i) => i.id));
   const avatarInputRef = useRef<HTMLInputElement>(null);
   const editAvatarInputRef = useRef<HTMLInputElement>(null);
   
@@ -173,24 +151,32 @@ export function BusinessOperatorContent({ embedded = false }: { embedded?: boole
     city: "",
     state: "",
     zipCode: "",
+    latitude: undefined as number | undefined,
+    longitude: undefined as number | undefined,
     role: "employee" as "admin" | "employee",
-    hourlyRate: 25,
+    hourlyRate: 20,
     skillsets: [] as string[],
     avatarUrl: "",
   });
   
-  // Cleanup effect to ensure no lingering aria-hidden attributes block the page
+  // Cleanup effect to ensure no lingering inert/aria-hidden/pointer-events block the page when all popups are closed
   useEffect(() => {
     const cleanup = () => {
-      // Check if any pop-ups are open
-      const hasOpenPopups = addMemberOpen || !!editMember || paymentFlowInfoOpen || 
-                           onboardingLinkInfoOpen || skillsetDialogOpen || inviteOpen;
-      
+      const hasOpenPopups = addMemberOpen || !!editMember || paymentFlowInfoOpen ||
+                           onboardingLinkInfoOpen || skillsetDialogOpen || inviteOpen || !!facePhotoPopupMember;
+
       if (!hasOpenPopups) {
-        // If no pop-ups are open, ensure root is not aria-hidden
         const root = document.getElementById('root');
-        if (root && root.getAttribute('aria-hidden') === 'true') {
-          root.removeAttribute('aria-hidden');
+        const html = document.documentElement;
+        if (html.getAttribute('inert') != null) html.removeAttribute('inert');
+        html.style.removeProperty('pointer-events');
+        if (html.getAttribute('aria-hidden') === 'true') html.removeAttribute('aria-hidden');
+        document.body.style.removeProperty('pointer-events');
+        if (document.body.getAttribute('inert') != null) document.body.removeAttribute('inert');
+        if (document.body.getAttribute('aria-hidden') === 'true') document.body.removeAttribute('aria-hidden');
+        if (root) {
+          root.style.removeProperty('pointer-events');
+          if (root.getAttribute('aria-hidden') === 'true') root.removeAttribute('aria-hidden');
         }
       }
     };
@@ -295,6 +281,38 @@ export function BusinessOperatorContent({ embedded = false }: { embedded?: boole
     };
     reader.readAsDataURL(file);
   };
+
+  const handleFacePhotoPopupUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    const member = facePhotoPopupMember;
+    if (!file || !member) return;
+    e.target.value = "";
+    setFacePhotoUploading(true);
+    const reader = new FileReader();
+    reader.onload = async (ev) => {
+      const imageData = ev.target?.result as string;
+      const hasFace = await detectFace(imageData);
+      if (!hasFace) {
+        setFacePhotoUploading(false);
+        toast({ title: tCommon("error"), description: t("pleaseUploadClearFacePhoto"), variant: "destructive" });
+        return;
+      }
+      updateMemberMutation.mutate(
+        { id: member.id, data: { avatarUrl: imageData } },
+        {
+          onSuccess: () => {
+            setFacePhotoPopupMember(null);
+            setFacePhotoUploading(false);
+            toast({ title: t("teamMemberUpdatedSuccessfully"), description: t("facePhotoAdded") });
+          },
+          onError: () => {
+            setFacePhotoUploading(false);
+          },
+        }
+      );
+    };
+    reader.readAsDataURL(file);
+  };
   
   const handleServiceToggle = (serviceId: string) => {
     const current = newMember.skillsets;
@@ -369,6 +387,24 @@ export function BusinessOperatorContent({ embedded = false }: { embedded?: boole
     },
   });
 
+  // Geocode address when user typed/pasted but didn't select from dropdown, so we always save lat/lng for map pins
+  const geocodeAddress = async (address: string, city?: string | null, state?: string | null, zipCode?: string | null): Promise<{ lat: number; lng: number } | null> => {
+    const apiKey = import.meta.env.VITE_GOOGLE_API_KEY;
+    if (!apiKey) return null;
+    const query = [address, city, state, zipCode].filter(Boolean).join(", ");
+    if (!query.trim()) return null;
+    try {
+      const res = await fetch(
+        `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(query)}&key=${apiKey}`
+      );
+      const data = await res.json();
+      const loc = data.results?.[0]?.geometry?.location;
+      return loc ? { lat: loc.lat, lng: loc.lng } : null;
+    } catch {
+      return null;
+    }
+  };
+
   const addMemberMutation = useMutation({
     mutationFn: async (data: typeof newMember) => {
       const res = await apiRequest("POST", `/api/worker-team/${team?.id}/members`, data);
@@ -413,7 +449,6 @@ export function BusinessOperatorContent({ embedded = false }: { embedded?: boole
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["/api/worker-team", team?.id, "members"] });
       setEditMember(null);
-      toast({ title: t("updated"), description: t("teamMemberUpdatedSuccessfully") });
     },
     onError: (error: any) => {
       console.error("Failed to update team member:", error);
@@ -555,6 +590,8 @@ export function BusinessOperatorContent({ embedded = false }: { embedded?: boole
       city: "",
       state: "",
       zipCode: "",
+      latitude: undefined,
+      longitude: undefined,
       role: "employee",
       hourlyRate: 15,
       skillsets: [],
@@ -564,17 +601,17 @@ export function BusinessOperatorContent({ embedded = false }: { embedded?: boole
     setFaceVerified(false);
     setFaceError(null);
     setWizardStep(0);
+    setWizardExpandedIndustries(INDUSTRY_CATEGORIES.map((i) => i.id));
   };
   
   const canProceedStep = (step: number): boolean => {
     switch (step) {
       case 0:
-        return !!newMember.firstName && !!newMember.lastName && !!newMember.email && !!newMember.phone && faceVerified;
+        return !!newMember.firstName && !!newMember.lastName && !!newMember.email && !!newMember.phone && faceVerified
+          && !!newMember.address && (!!newMember.city || !!newMember.state || !!newMember.zipCode);
       case 1:
-        return !!newMember.address && !!newMember.city && !!newMember.state && !!newMember.zipCode;
-      case 2:
         return true;
-      case 3:
+      case 2:
         return newMember.skillsets.length > 0;
       default:
         return false;
@@ -632,15 +669,6 @@ export function BusinessOperatorContent({ embedded = false }: { embedded?: boole
       setSkillsetMember({ ...skillsetMember, skillsets: [...current, category] });
     }
   };
-
-  // Get all skill categories flattened for the skillset dialog
-  const allSkillCategories = [
-    ...SERVICE_CATEGORIES.general,
-    ...SERVICE_CATEGORIES.carpentry,
-    ...SERVICE_CATEGORIES.electrical,
-    ...SERVICE_CATEGORIES.plumbing,
-    ...SERVICE_CATEGORIES.hvac,
-  ];
 
   const isLoading = teamLoading || membersLoading;
   const hasTeam = !!team;
@@ -773,53 +801,18 @@ export function BusinessOperatorContent({ embedded = false }: { embedded?: boole
 
             {members.length > 0 ? (
               <>
+                {(() => {
+                  const membersWithPhoto = members.filter((m) => m.avatarUrl);
+                  const membersWithoutPhoto = members.filter((m) => !m.avatarUrl);
+                  return (
+                    <>
                 {/* Mobile / narrow view: cards with wrapping (no horizontal scroll) */}
                 <div className="lg:hidden space-y-3">
-                  {members.map((member) => {
-                    const hasLiveLocation = member.liveLocationLat && member.liveLocationLng;
-                    const hasStaticLocation = member.latitude && member.longitude;
-                    const locationTimestamp = member.liveLocationTimestamp 
-                      ? new Date(member.liveLocationTimestamp) 
-                      : null;
-                    const isLocationRecent = locationTimestamp 
-                      ? (new Date().getTime() - locationTimestamp.getTime()) < 5 * 60 * 1000
-                      : false;
-                    
-                    let locationMapUrl = null;
-                    let locationColor = null;
-                    let locationLabel = "";
-                    
-                    if (hasLiveLocation && isLocationRecent) {
-                      locationColor = "green";
-                      locationLabel = "Current location";
-                      locationMapUrl = import.meta.env.VITE_GOOGLE_API_KEY
-                        ? `https://maps.googleapis.com/maps/api/staticmap?center=${member.liveLocationLat},${member.liveLocationLng}&zoom=14&size=56x56&scale=2&markers=icon:https://chart.googleapis.com/chart?chst=d_map_pin_letter%26chld=%E2%80%A2%7C4CAF50%7C${member.liveLocationLat},${member.liveLocationLng}&key=${import.meta.env.VITE_GOOGLE_API_KEY}`
-                        : null;
-                    } else if (hasStaticLocation) {
-                      locationColor = "amber";
-                      locationLabel = "Work location";
-                      locationMapUrl = import.meta.env.VITE_GOOGLE_API_KEY
-                        ? `https://maps.googleapis.com/maps/api/staticmap?center=${member.latitude},${member.longitude}&zoom=13&size=56x56&scale=2&markers=color:orange%7C${member.latitude},${member.longitude}&key=${import.meta.env.VITE_GOOGLE_API_KEY}`
-                        : null;
-                    }
-                    
-                    return (
+                  {membersWithPhoto.map((member) => (
                     <Card key={member.id}>
                       <CardContent className="p-4">
                         <div className="flex items-start justify-between gap-3">
                           <div className="flex items-start gap-3 flex-1 min-w-0">
-                            {/* Location indicator */}
-                            {locationMapUrl && (
-                              <div className="flex flex-col items-center gap-1 flex-shrink-0">
-                                <div className={`relative w-12 h-12 rounded-lg overflow-hidden border-2 ${locationColor === "green" ? "border-green-500/50" : "border-amber-500/50"} shadow-sm`}>
-                                  <img src={locationMapUrl} alt={locationLabel} className="w-full h-full object-cover" />
-                                  <div className={`absolute bottom-0.5 right-0.5 w-2.5 h-2.5 ${locationColor === "green" ? "bg-green-500" : "bg-amber-500"} rounded-full border border-white ${locationColor === "green" ? "animate-pulse" : ""}`} />
-                                </div>
-                                <span className={`text-[9px] font-medium ${locationColor === "green" ? "text-green-600" : "text-amber-600"}`}>
-                                  {locationColor === "green" ? "Live" : "Work"}
-                                </span>
-                              </div>
-                            )}
                             <Avatar className="w-12 h-12 flex-shrink-0">
                               <AvatarImage src={member.avatarUrl || undefined} />
                               <AvatarFallback>
@@ -846,6 +839,12 @@ export function BusinessOperatorContent({ embedded = false }: { embedded?: boole
                                   {member.role === "admin" ? t("admin") : t("employee")}
                                 </Badge>
                                 <span className="text-sm font-medium">${member.hourlyRate}<span className="text-muted-foreground">/hr</span></span>
+                                {!member.avatarUrl && (
+                                  <Badge variant="outline" className="text-xs bg-amber-50 text-amber-700 border-amber-300 dark:bg-amber-950/50 dark:text-amber-400 dark:border-amber-700">
+                                    <Camera className="w-3 h-3 mr-1" />
+                                    {t("addFacePhotoRequired")}
+                                  </Badge>
+                                )}
                               </div>
                               {member.skillsets && member.skillsets.length > 0 && (
                                 <div className="flex flex-wrap gap-1 mb-2">
@@ -962,8 +961,149 @@ export function BusinessOperatorContent({ embedded = false }: { embedded?: boole
                         </div>
                       </CardContent>
                     </Card>
-                    );
-                  })}
+                  ))}
+                  {membersWithoutPhoto.length > 0 && (
+                    <>
+                      <p className="text-sm font-medium text-amber-700 dark:text-amber-400 mt-6 mb-2">
+                        {t("facePhotoRequiredGroup") || "Face photo required – these workers need a face photo to be operational"}
+                      </p>
+                      {membersWithoutPhoto.map((member) => (
+                        <Card key={member.id}>
+                          <CardContent className="p-4">
+                            <div className="flex items-start justify-between gap-3">
+                              <div className="flex items-start gap-3 flex-1 min-w-0">
+                                <div
+                                  role="button"
+                                  tabIndex={0}
+                                  onClick={() => setFacePhotoPopupMember(member)}
+                                  onKeyDown={(e) => e.key === "Enter" && setFacePhotoPopupMember(member)}
+                                  className="flex flex-col items-center gap-1 flex-shrink-0 cursor-pointer rounded-lg border-2 border-dashed border-amber-500/50 p-1 hover:bg-amber-50 dark:hover:bg-amber-950/30"
+                                >
+                                  <Avatar className="w-12 h-12">
+                                    <AvatarFallback>
+                                      {member.firstName?.[0]}{member.lastName?.[0]}
+                                    </AvatarFallback>
+                                  </Avatar>
+                                  <span className="text-[9px] font-medium text-amber-600">{t("addFacePhotoRequired")}</span>
+                                </div>
+                                <div className="flex-1 min-w-0">
+                                  <div className="flex items-center gap-2 mb-1">
+                                    <p className="font-medium text-sm">{member.firstName} {member.lastName}</p>
+                                    {member.status === "pending" && (
+                                      <Badge variant="outline" className="text-xs bg-amber-50 text-amber-700 border-amber-300">
+                                        <Clock className="w-3 h-3 mr-1" />
+                                        {t("pending")}
+                                      </Badge>
+                                    )}
+                                  </div>
+                                  <div className="flex items-center gap-2 mb-2">
+                                    <Badge variant={member.role === "admin" ? "default" : "secondary"} className="text-xs">
+                                      {member.role === "admin" ? (
+                                        <Shield className="w-3 h-3 mr-1" />
+                                      ) : (
+                                        <UserIcon className="w-3 h-3 mr-1" />
+                                      )}
+                                      {member.role === "admin" ? t("admin") : t("employee")}
+                                    </Badge>
+                                    <span className="text-sm font-medium">${member.hourlyRate}<span className="text-muted-foreground">/hr</span></span>
+                                    <Badge
+                                      variant="outline"
+                                      className="text-xs bg-amber-50 text-amber-700 border-amber-300 dark:bg-amber-950/50 dark:text-amber-400 dark:border-amber-700 cursor-pointer"
+                                      onClick={() => setFacePhotoPopupMember(member)}
+                                    >
+                                      <Camera className="w-3 h-3 mr-1" />
+                                      {t("addFacePhotoRequired")}
+                                    </Badge>
+                                  </div>
+                                  {member.skillsets && member.skillsets.length > 0 && (
+                                    <div className="flex flex-wrap gap-1 mb-2">
+                                      {member.skillsets.slice(0, 3).map((skill) => (
+                                        <Badge key={skill} variant="outline" className="text-xs">
+                                          {SKILL_OPTIONS.find((s) => s.id === skill)?.label || skill}
+                                        </Badge>
+                                      ))}
+                                      {member.skillsets.length > 3 && (
+                                        <Badge variant="outline" className="text-xs">
+                                          +{member.skillsets.length - 3}
+                                        </Badge>
+                                      )}
+                                    </div>
+                                  )}
+                                  <div className="space-y-1 text-xs text-muted-foreground">
+                                    {(member.city || member.state) && (
+                                      <p className="flex items-center gap-1">
+                                        <MapPin className="w-3 h-3" />
+                                        {[member.city, member.state].filter(Boolean).join(", ")}
+                                      </p>
+                                    )}
+                                    {member.email && (
+                                      <p className="flex items-center gap-1">
+                                        <Mail className="w-3 h-3" />
+                                        {member.email}
+                                      </p>
+                                    )}
+                                    {member.phone && (
+                                      <p className="flex items-center gap-1">
+                                        <Phone className="w-3 h-3" />
+                                        {member.phone}
+                                      </p>
+                                    )}
+                                  </div>
+                                </div>
+                              </div>
+                              <DropdownMenu>
+                                <DropdownMenuTrigger asChild>
+                                  <Button variant="ghost" size="icon" data-testid={`button-member-menu-${member.id}`}>
+                                    <MoreVertical className="w-4 h-4" />
+                                  </Button>
+                                </DropdownMenuTrigger>
+                                <DropdownMenuContent align="end">
+                                  <DropdownMenuItem onSelect={(e) => { e.preventDefault(); setFacePhotoPopupMember(member); }} data-testid={`menu-add-face-${member.id}`}>
+                                    <Camera className="w-4 h-4 mr-2" />
+                                    {t("addFacePhotoRequired")}
+                                  </DropdownMenuItem>
+                                  <DropdownMenuItem onSelect={(e) => { e.preventDefault(); setFaceError(null); setFaceVerified(!!member.avatarUrl); setEditMember(member); }} data-testid={`menu-edit-${member.id}`}>
+                                    <Edit2 className="w-4 h-4 mr-2" />
+                                    {tCommon("edit")}
+                                  </DropdownMenuItem>
+                                  {member.status === "pending" && (
+                                    <>
+                                      <DropdownMenuSeparator />
+                                      <DropdownMenuItem onClick={() => copyInviteLink(member)} data-testid={`menu-copy-link-${member.id}`}>
+                                        <Link className="w-4 h-4 mr-2" />
+                                        {t("shareOnboardingLink")}
+                                      </DropdownMenuItem>
+                                      <DropdownMenuItem onClick={() => resendInviteMutation.mutate(member.id)} disabled={resendInviteMutation.isPending} data-testid={`menu-resend-${member.id}`}>
+                                        <RefreshCw className="w-4 h-4 mr-2" />
+                                        {t("resendInvitation")}
+                                      </DropdownMenuItem>
+                                      {import.meta.env.DEV && (
+                                        <DropdownMenuItem onClick={() => autoAcceptInviteMutation.mutate(member.id)} disabled={autoAcceptInviteMutation.isPending} className="text-amber-600" data-testid={`menu-auto-accept-${member.id}`}>
+                                          <CheckCircle className="w-4 h-4 mr-2" />
+                                          {t("autoAcceptDev")}
+                                        </DropdownMenuItem>
+                                      )}
+                                    </>
+                                  )}
+                                  {import.meta.env.DEV && member.status === "active" && (
+                                    <DropdownMenuItem onClick={() => handleImpersonateTeamMember(member.id)} className="text-purple-600" data-testid={`menu-impersonate-${member.id}`}>
+                                      <UserCog className="w-4 h-4 mr-2" />
+                                      {t("impersonateDev")}
+                                    </DropdownMenuItem>
+                                  )}
+                                  <DropdownMenuSeparator />
+                                  <DropdownMenuItem onClick={() => { if (confirm(t("removeThisTeamMember"))) deleteMemberMutation.mutate(member.id); }} className="text-destructive focus:text-destructive" data-testid={`menu-delete-${member.id}`}>
+                                    <Trash2 className="w-4 h-4 mr-2" />
+                                    {t("remove")}
+                                  </DropdownMenuItem>
+                                </DropdownMenuContent>
+                              </DropdownMenu>
+                            </div>
+                          </CardContent>
+                        </Card>
+                      ))}
+                    </>
+                  )}
                 </div>
 
                 {/* Desktop Table View: responsive, text wraps to container (no horizontal scroll) */}
@@ -981,69 +1121,10 @@ export function BusinessOperatorContent({ embedded = false }: { embedded?: boole
                         </TableRow>
                       </TableHeader>
                       <TableBody>
-                        {members.map((member) => {
-                          const coords = getMemberLocationCoords(member);
-                          const staticMapUrl = coords && import.meta.env.VITE_GOOGLE_API_KEY
-                            ? `https://maps.googleapis.com/maps/api/staticmap?center=${coords.lat},${coords.lng}&zoom=14&size=48x48&scale=2&markers=color:green%7C${coords.lat},${coords.lng}&key=${import.meta.env.VITE_GOOGLE_API_KEY}`
-                            : null;
-                          return (
+                        {membersWithPhoto.map((member) => (
                           <TableRow key={member.id}>
                             <TableCell className="min-w-0 break-words align-top">
                               <div className="flex items-center gap-3 min-w-0">
-                                {/* Location indicator with map card */}
-                                {(() => {
-                                  const hasLiveLocation = member.liveLocationLat && member.liveLocationLng;
-                                  const hasStaticLocation = member.latitude && member.longitude;
-                                  const locationTimestamp = member.liveLocationTimestamp 
-                                    ? new Date(member.liveLocationTimestamp) 
-                                    : null;
-                                  const isLocationRecent = locationTimestamp 
-                                    ? (new Date().getTime() - locationTimestamp.getTime()) < 5 * 60 * 1000 // 5 minutes
-                                    : false;
-                                  
-                                  if (hasLiveLocation && isLocationRecent) {
-                                    // Green - Live location is on and recent
-                                    const mapUrl = import.meta.env.VITE_GOOGLE_API_KEY
-                                      ? `https://maps.googleapis.com/maps/api/staticmap?center=${member.liveLocationLat},${member.liveLocationLng}&zoom=14&size=56x56&scale=2&markers=icon:https://chart.googleapis.com/chart?chst=d_map_pin_letter%26chld=%E2%80%A2%7C4CAF50%7C${member.liveLocationLat},${member.liveLocationLng}&key=${import.meta.env.VITE_GOOGLE_API_KEY}`
-                                      : null;
-                                    return (
-                                      <div className="flex items-center gap-1.5 flex-shrink-0" title="Location on - Current location">
-                                        <span className="w-2.5 h-2.5 rounded-full bg-green-500 ring-2 ring-green-500/30 animate-pulse" aria-hidden />
-                                        {mapUrl ? (
-                                          <div className="relative w-14 h-14 rounded-xl overflow-hidden border-2 border-green-500/50 shadow-sm">
-                                            <img src={mapUrl} alt="Current location" className="w-full h-full object-cover" />
-                                            <div className="absolute bottom-0.5 right-0.5 w-3 h-3 bg-green-500 rounded-full border border-white" />
-                                          </div>
-                                        ) : (
-                                          <div className="w-14 h-14 rounded-xl border-2 border-green-500/50 bg-green-50 flex items-center justify-center">
-                                            <MapPin className="w-5 h-5 text-green-600" />
-                                          </div>
-                                        )}
-                                      </div>
-                                    );
-                                  } else if (hasStaticLocation) {
-                                    // Yellow - Has static location but no recent live location
-                                    const mapUrl = import.meta.env.VITE_GOOGLE_API_KEY
-                                      ? `https://maps.googleapis.com/maps/api/staticmap?center=${member.latitude},${member.longitude}&zoom=13&size=56x56&scale=2&markers=color:orange%7C${member.latitude},${member.longitude}&key=${import.meta.env.VITE_GOOGLE_API_KEY}`
-                                      : null;
-                                    return (
-                                      <div className="flex items-center gap-1.5 flex-shrink-0" title="Work location - Location services off">
-                                        <span className="w-2.5 h-2.5 rounded-full bg-amber-500 ring-2 ring-amber-500/30" aria-hidden />
-                                        {mapUrl ? (
-                                          <div className="relative w-14 h-14 rounded-xl overflow-hidden border-2 border-amber-500/50 shadow-sm">
-                                            <img src={mapUrl} alt="Work location" className="w-full h-full object-cover" />
-                                            <div className="absolute bottom-0.5 right-0.5 w-3 h-3 bg-amber-500 rounded-full border border-white" />
-                                          </div>
-                                        ) : (
-                                          <div className="w-14 h-14 rounded-xl border-2 border-amber-500/50 bg-amber-50 flex items-center justify-center">
-                                            <MapPin className="w-5 h-5 text-amber-600" />
-                                          </div>
-                                        )}
-                                      </div>
-                                    );
-                                  }
-                                  return null;
-                                })()}
                                 <Avatar className="w-10 h-10">
                                   <AvatarImage src={member.avatarUrl || undefined} />
                                   <AvatarFallback>
@@ -1196,12 +1277,159 @@ export function BusinessOperatorContent({ embedded = false }: { embedded?: boole
                               </DropdownMenu>
                             </TableCell>
                           </TableRow>
-                          );
-                        })}
+                        ))}
+                        {membersWithoutPhoto.length > 0 && (
+                          <>
+                            <TableRow className="bg-amber-50 dark:bg-amber-950/30">
+                              <TableCell colSpan={6} className="text-sm font-medium text-amber-800 dark:text-amber-200 py-3">
+                                {t("facePhotoRequiredGroup") || "Face photo required – these workers need a face photo to be operational"}
+                              </TableCell>
+                            </TableRow>
+                            {membersWithoutPhoto.map((member) => (
+                              <TableRow key={member.id}>
+                                <TableCell className="min-w-0 break-words align-top">
+                                  <div className="flex items-center gap-3 min-w-0">
+                                    <button
+                                      type="button"
+                                      onClick={() => setFacePhotoPopupMember(member)}
+                                      className="flex flex-col items-center gap-1 flex-shrink-0 rounded-lg border-2 border-dashed border-amber-500/50 p-1 hover:bg-amber-50 dark:hover:bg-amber-950/30 cursor-pointer"
+                                    >
+                                      <Avatar className="w-10 h-10">
+                                        <AvatarFallback>
+                                          {member.firstName?.[0]}{member.lastName?.[0]}
+                                        </AvatarFallback>
+                                      </Avatar>
+                                      <span className="text-[9px] font-medium text-amber-600">{t("addFacePhotoRequired")}</span>
+                                    </button>
+                                    <div className="min-w-0">
+                                      <div className="flex items-center gap-2 flex-wrap">
+                                        <p className="font-medium break-words">{member.firstName} {member.lastName}</p>
+                                        {member.status === "pending" && (
+                                          <Badge variant="outline" className="text-xs bg-amber-50 text-amber-700 border-amber-300">
+                                            <Clock className="w-3 h-3 mr-1" />
+                                            {t("pending")}
+                                          </Badge>
+                                        )}
+                                        <Badge
+                                          variant="outline"
+                                          className="text-xs bg-amber-50 text-amber-700 border-amber-300 dark:bg-amber-950/50 dark:text-amber-400 dark:border-amber-700 cursor-pointer"
+                                          onClick={() => setFacePhotoPopupMember(member)}
+                                        >
+                                          <Camera className="w-3 h-3 mr-1" />
+                                          {t("addFacePhotoRequired")}
+                                        </Badge>
+                                      </div>
+                                    </div>
+                                  </div>
+                                </TableCell>
+                                <TableCell className="min-w-0 break-words align-top">
+                                  <Badge variant={member.role === "admin" ? "default" : "secondary"}>
+                                    {member.role === "admin" ? <Shield className="w-3 h-3 mr-1" /> : <UserIcon className="w-3 h-3 mr-1" />}
+                                    {member.role === "admin" ? t("admin") : t("employee")}
+                                  </Badge>
+                                </TableCell>
+                                <TableCell className="min-w-0 break-words align-top">
+                                  <span className="font-medium">${member.hourlyRate}</span>
+                                  <span className="text-muted-foreground">/hr</span>
+                                </TableCell>
+                                <TableCell className="min-w-0 break-words align-top">
+                                  <div className="flex flex-wrap gap-1 min-w-0">
+                                    {member.skillsets && member.skillsets.length > 0 ? (
+                                      member.skillsets.slice(0, 3).map((skill) => (
+                                        <Badge key={skill} variant="outline" className="text-xs">
+                                          {SKILL_OPTIONS.find((s) => s.id === skill)?.label || skill}
+                                        </Badge>
+                                      ))
+                                    ) : (
+                                      <span className="text-muted-foreground text-sm">{tCommon("none")}</span>
+                                    )}
+                                    {member.skillsets && member.skillsets.length > 3 && (
+                                      <Badge variant="outline" className="text-xs">+{member.skillsets.length - 3}</Badge>
+                                    )}
+                                  </div>
+                                </TableCell>
+                                <TableCell className="min-w-0 break-words align-top">
+                                  <div className="text-sm space-y-0.5 min-w-0">
+                                    {(member.city || member.state) && (
+                                      <p className="flex items-center gap-1 text-muted-foreground">
+                                        <MapPin className="w-3 h-3" />
+                                        {[member.city, member.state].filter(Boolean).join(", ")}
+                                      </p>
+                                    )}
+                                    {member.email && (
+                                      <p className="flex items-center gap-1 text-muted-foreground">
+                                        <Mail className="w-3 h-3" />
+                                        {member.email}
+                                      </p>
+                                    )}
+                                    {member.phone && (
+                                      <p className="flex items-center gap-1 text-muted-foreground">
+                                        <Phone className="w-3 h-3" />
+                                        {member.phone}
+                                      </p>
+                                    )}
+                                  </div>
+                                </TableCell>
+                                <TableCell className="text-right min-w-0 align-top">
+                                  <DropdownMenu>
+                                    <DropdownMenuTrigger asChild>
+                                      <Button variant="ghost" size="icon" data-testid={`button-member-menu-${member.id}`}>
+                                        <MoreVertical className="w-4 h-4" />
+                                      </Button>
+                                    </DropdownMenuTrigger>
+                                    <DropdownMenuContent align="end">
+                                      <DropdownMenuItem onSelect={(e) => { e.preventDefault(); setFacePhotoPopupMember(member); }} data-testid={`menu-add-face-${member.id}`}>
+                                        <Camera className="w-4 h-4 mr-2" />
+                                        {t("addFacePhotoRequired")}
+                                      </DropdownMenuItem>
+                                      <DropdownMenuItem onSelect={(e) => { e.preventDefault(); setFaceError(null); setFaceVerified(!!member.avatarUrl); setEditMember(member); }} data-testid={`menu-edit-${member.id}`}>
+                                        <Edit2 className="w-4 h-4 mr-2" />
+                                        {tCommon("edit")}
+                                      </DropdownMenuItem>
+                                      {member.status === "pending" && (
+                                        <>
+                                          <DropdownMenuSeparator />
+                                          <DropdownMenuItem onClick={() => copyInviteLink(member)} data-testid={`menu-copy-link-${member.id}`}>
+                                            <Link className="w-4 h-4 mr-2" />
+                                            {t("shareOnboardingLink")}
+                                          </DropdownMenuItem>
+                                          <DropdownMenuItem onClick={() => resendInviteMutation.mutate(member.id)} disabled={resendInviteMutation.isPending} data-testid={`menu-resend-${member.id}`}>
+                                            <RefreshCw className="w-4 h-4 mr-2" />
+                                            {t("resendInvitation")}
+                                          </DropdownMenuItem>
+                                          {import.meta.env.DEV && (
+                                            <DropdownMenuItem onClick={() => autoAcceptInviteMutation.mutate(member.id)} disabled={autoAcceptInviteMutation.isPending} className="text-amber-600" data-testid={`menu-auto-accept-${member.id}`}>
+                                              <CheckCircle className="w-4 h-4 mr-2" />
+                                              {t("autoAcceptDev")}
+                                            </DropdownMenuItem>
+                                          )}
+                                        </>
+                                      )}
+                                      {import.meta.env.DEV && member.status === "active" && (
+                                        <DropdownMenuItem onClick={() => handleImpersonateTeamMember(member.id)} className="text-purple-600" data-testid={`menu-impersonate-${member.id}`}>
+                                          <UserCog className="w-4 h-4 mr-2" />
+                                          {t("impersonateDev")}
+                                        </DropdownMenuItem>
+                                      )}
+                                      <DropdownMenuSeparator />
+                                      <DropdownMenuItem onClick={() => { if (confirm(t("removeThisTeamMember"))) deleteMemberMutation.mutate(member.id); }} className="text-destructive focus:text-destructive" data-testid={`menu-delete-${member.id}`}>
+                                        <Trash2 className="w-4 h-4 mr-2" />
+                                        {t("remove")}
+                                      </DropdownMenuItem>
+                                    </DropdownMenuContent>
+                                  </DropdownMenu>
+                                </TableCell>
+                              </TableRow>
+                            ))}
+                          </>
+                        )}
                       </TableBody>
                     </Table>
                   </div>
                 </Card>
+                    </>
+                  );
+                })()}
               </>
             ) : (
               <Card>
@@ -1358,6 +1586,107 @@ export function BusinessOperatorContent({ embedded = false }: { embedded?: boole
         </div>
       </MobilePopup>
 
+      {/* Face photo required – upload, share link, or send email */}
+      <ResponsiveDialog
+        open={!!facePhotoPopupMember}
+        onOpenChange={(open) => {
+          if (!open) setFacePhotoPopupMember(null);
+        }}
+        title={facePhotoPopupMember ? t("facePhotoRequiredTitle", { name: `${facePhotoPopupMember.firstName} ${facePhotoPopupMember.lastName}`.trim() || "Worker" }) : ""}
+        description={t("facePhotoRequiredDescription")}
+        contentClassName="sm:max-w-md"
+        hideDefaultFooter
+        footer={
+          <div className="flex w-full gap-3 pt-2">
+            <Button variant="outline" className="flex-1" onClick={() => setFacePhotoPopupMember(null)}>
+              {tCommon("close") || "Close"}
+            </Button>
+          </div>
+        }
+      >
+        {facePhotoPopupMember && (
+          <div className="space-y-4">
+            <input
+              ref={facePhotoFileInputRef}
+              type="file"
+              accept="image/*"
+              onChange={handleFacePhotoPopupUpload}
+              className="hidden"
+              data-testid="input-face-photo-popup-upload"
+            />
+            <Button
+              variant="outline"
+              className="w-full justify-start gap-2"
+              onClick={() => facePhotoFileInputRef.current?.click()}
+              disabled={facePhotoUploading}
+              data-testid="button-face-photo-upload"
+            >
+              {facePhotoUploading ? (
+                <Loader2 className="w-4 h-4 animate-spin" />
+              ) : (
+                <Upload className="w-4 h-4" />
+              )}
+              {facePhotoUploading ? (tCommon("sending") || "Uploading...") : t("uploadPhoto")}
+            </Button>
+
+            <div className="space-y-2">
+              <p className="text-sm font-medium">{t("shareLink")}</p>
+              {getOnboardingUrl(facePhotoPopupMember) ? (
+                <div className="flex gap-2">
+                  <Input
+                    readOnly
+                    value={getOnboardingUrl(facePhotoPopupMember)}
+                    className="flex-1 text-xs font-mono"
+                    data-testid="input-onboarding-url-face-photo"
+                  />
+                  <Button
+                    variant="outline"
+                    size="icon"
+                    onClick={async () => {
+                      const url = getOnboardingUrl(facePhotoPopupMember);
+                      if (url) {
+                        await navigator.clipboard.writeText(url);
+                        toast({ title: tCommon("copied") || "Copied", description: t("shareLink") });
+                      }
+                    }}
+                    data-testid="button-copy-link-face-photo"
+                  >
+                    <Copy className="w-4 h-4" />
+                  </Button>
+                </div>
+              ) : (
+                <p className="text-sm text-muted-foreground">{t("linkNotReadyForFacePhoto")}</p>
+              )}
+            </div>
+
+            <div className="space-y-2">
+              <p className="text-sm font-medium">{t("sendEmailToWorker")}</p>
+              {facePhotoPopupMember.status === "pending" ? (
+                <Button
+                  variant="outline"
+                  className="w-full justify-start gap-2"
+                  onClick={() => {
+                    resendInviteMutation.mutate(facePhotoPopupMember.id);
+                    toast({ title: t("resendInvitation"), description: t("setupEmailWillBeSent") || "Invite email sent." });
+                  }}
+                  disabled={resendInviteMutation.isPending}
+                  data-testid="button-resend-invite-face-photo"
+                >
+                  {resendInviteMutation.isPending ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
+                  {t("resendEmail")}
+                </Button>
+              ) : (
+                <p className="text-sm text-muted-foreground">
+                  {getOnboardingUrl(facePhotoPopupMember)
+                    ? t("shareLinkWithWorkerForPhoto")
+                    : t("linkNotReadyForFacePhoto")}
+                </p>
+              )}
+            </div>
+          </div>
+        )}
+      </ResponsiveDialog>
+
       <MobilePopup
         open={addMemberOpen}
         onOpenChange={(open) => {
@@ -1399,13 +1728,13 @@ export function BusinessOperatorContent({ embedded = false }: { embedded?: boole
           <>
             {/* Action Buttons Footer */}
             <MobilePopupFooter isMobile={isMobile}>
-              <div className="flex justify-between gap-3">
+              <div className="flex w-full gap-3">
                 {wizardStep > 0 ? (
-                  <Button variant="outline" onClick={prevWizardStep} data-testid="button-wizard-back" className="h-12 rounded-xl" style={{ width: '35%' }}>
+                  <Button variant="outline" onClick={prevWizardStep} data-testid="button-wizard-back" className="h-12 flex-1 rounded-xl">
                     <ChevronLeft className="w-4 h-4 mr-1" /> {tCommon("back")}
                   </Button>
                 ) : (
-                  <Button variant="ghost" onClick={() => setAddMemberOpen(false)} className="h-12 rounded-xl text-muted-foreground" style={{ width: '35%' }}>
+                  <Button variant="ghost" onClick={() => setAddMemberOpen(false)} className="h-12 flex-1 rounded-xl text-muted-foreground">
                     {tCommon("cancel")}
                   </Button>
                 )}
@@ -1415,18 +1744,25 @@ export function BusinessOperatorContent({ embedded = false }: { embedded?: boole
                     onClick={nextWizardStep} 
                     disabled={!canProceedStep(wizardStep)}
                     data-testid="button-wizard-next"
-                    className="h-12 text-base font-semibold rounded-xl shadow-lg"
-                    style={{ width: '65%' }}
+                    className="h-12 flex-1 text-base font-semibold rounded-xl shadow-lg"
                   >
                     {tCommon("next")} <ChevronRight className="w-4 h-4 ml-1" />
                   </Button>
                 ) : (
                   <Button
-                    onClick={() => addMemberMutation.mutate(newMember)}
+                    onClick={async () => {
+                      let payload = { ...newMember };
+                      const hasAddress = !!(payload.address?.trim() || payload.city || payload.state || payload.zipCode);
+                      const missingCoords = (payload.latitude == null || payload.longitude == null) && hasAddress;
+                      if (missingCoords) {
+                        const coords = await geocodeAddress(payload.address, payload.city, payload.state, payload.zipCode);
+                        if (coords) payload = { ...payload, latitude: coords.lat, longitude: coords.lng };
+                      }
+                      addMemberMutation.mutate(payload);
+                    }}
                     disabled={!canProceedStep(wizardStep) || addMemberMutation.isPending}
                     data-testid="button-send-invitation"
-                    className="h-12 text-base font-semibold rounded-xl shadow-lg"
-                    style={{ width: '65%' }}
+                    className="h-12 flex-1 text-base font-semibold rounded-xl shadow-lg"
                   >
                     {addMemberMutation.isPending ? (
                       <>
@@ -1449,6 +1785,21 @@ export function BusinessOperatorContent({ embedded = false }: { embedded?: boole
         <div className="space-y-4 pb-24">
               {wizardStep === 0 && (
                 <>
+                  <div className="flex flex-col items-center gap-2 mb-4">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setAddMemberOpen(false);
+                        setInviteStep(0);
+                        setNewInviteMember({ firstName: "", lastName: "", hourlyRate: 20, email: "", phone: "", role: "employee" });
+                        setInviteOpen(true);
+                      }}
+                      className="text-sm font-medium text-primary hover:underline"
+                      data-testid="send-invite-instead"
+                    >
+                      {t("sendInviteInstead") || "Send invite instead"}
+                    </button>
+                  </div>
                   <div className="flex flex-col items-center mb-6">
                     <input
                       ref={avatarInputRef}
@@ -1541,23 +1892,21 @@ export function BusinessOperatorContent({ embedded = false }: { embedded?: boole
                       data-testid="input-phone"
                     />
                   </div>
-                </>
-              )}
 
-              {wizardStep === 1 && (
-                <>
                   <div className="space-y-2">
                     <GooglePlacesAutocomplete
                       id="input-address"
                       label={t("streetAddress")}
-                      value={newMember.address || ""}
+                      value={newMember.address?.includes(",") ? newMember.address : [newMember.address, newMember.city, newMember.state, newMember.zipCode].filter(Boolean).join(", ") || newMember.address || ""}
                       onChange={(address, components) => {
                         setNewMember({
                           ...newMember,
-                          address: address,
-                          city: components.city || newMember.city || "",
-                          state: components.state || newMember.state || "",
-                          zipCode: components.zipCode || newMember.zipCode || "",
+                          address: address || "",
+                          city: (components.city ?? newMember.city) || "",
+                          state: (components.state ?? newMember.state) || "",
+                          zipCode: (components.zipCode ?? newMember.zipCode) || "",
+                          latitude: components.latitude,
+                          longitude: components.longitude,
                         });
                       }}
                       placeholder={t("streetAddressPlaceholder")}
@@ -1565,48 +1914,10 @@ export function BusinessOperatorContent({ embedded = false }: { embedded?: boole
                     />
                     <p className="text-xs text-muted-foreground">{t("whereTeamMemberIsBased")}</p>
                   </div>
-
-                  <div className="space-y-2">
-                    <Label htmlFor="city">{t("city")} *</Label>
-                    <Input
-                      id="city"
-                      value={newMember.city}
-                      onChange={(e) => setNewMember({ ...newMember, city: e.target.value })}
-                      placeholder={t("cityPlaceholder")}
-                      data-testid="input-city"
-                    />
-                  </div>
-
-                  <div className="grid grid-cols-2 gap-4">
-                    <div className="space-y-2">
-                      <Label htmlFor="state">{t("state")} *</Label>
-                      <Input
-                        id="state"
-                        value={newMember.state}
-                        onChange={(e) => setNewMember({ ...newMember, state: e.target.value })}
-                        placeholder={t("statePlaceholder")}
-                        data-testid="input-state"
-                      />
-                    </div>
-                    <div className="space-y-2">
-                      <Label htmlFor="zipCode">{t("zipCode")} *</Label>
-                      <Input
-                        id="zipCode"
-                        value={newMember.zipCode}
-                        onChange={(e) => setNewMember({ ...newMember, zipCode: e.target.value })}
-                        placeholder={t("zipCodePlaceholder")}
-                        data-testid="input-zip"
-                      />
-                    </div>
-                  </div>
-                  
-                  <p className="text-xs text-muted-foreground mt-2">
-                    {t("locationHelpsMatchJobs")}
-                  </p>
                 </>
               )}
 
-              {wizardStep === 2 && (
+              {wizardStep === 1 && (
                 <>
                   <p className="text-sm text-muted-foreground mb-4">
                     {t("chooseAccessLevel")}
@@ -1619,6 +1930,9 @@ export function BusinessOperatorContent({ embedded = false }: { embedded?: boole
                           : "border-border hover:border-primary/50"
                       }`}
                       onClick={() => setNewMember({ ...newMember, role: "employee" })}
+                      onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setNewMember({ ...newMember, role: "employee" }); } }}
+                      role="button"
+                      tabIndex={0}
                       data-testid="role-employee"
                     >
                       <div className="flex items-center gap-3">
@@ -1646,6 +1960,9 @@ export function BusinessOperatorContent({ embedded = false }: { embedded?: boole
                           : "border-border hover:border-primary/50"
                       }`}
                       onClick={() => setNewMember({ ...newMember, role: "admin" })}
+                      onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setNewMember({ ...newMember, role: "admin" }); } }}
+                      role="button"
+                      tabIndex={0}
                       data-testid="role-admin"
                     >
                       <div className="flex items-center gap-3">
@@ -1669,7 +1986,7 @@ export function BusinessOperatorContent({ embedded = false }: { embedded?: boole
                 </>
               )}
 
-              {wizardStep === 3 && (
+              {wizardStep === 2 && (
                 <>
                   <div className="text-center mb-6">
                     <span className="text-5xl font-bold">${newMember.hourlyRate}</span>
@@ -1699,47 +2016,78 @@ export function BusinessOperatorContent({ embedded = false }: { embedded?: boole
                     <p className="text-sm text-muted-foreground -mt-2">
                       {t("chooseServicesTeamMemberCanPerform")}
                     </p>
-                    
-                    {Object.entries(SERVICE_CATEGORIES).map(([category, services]) => (
-                      <div key={category} className="space-y-2">
-                        <h4 className="text-sm font-medium capitalize text-muted-foreground">{category}</h4>
-                        <div className="grid grid-cols-1 gap-2">
-                          {services.map((service) => {
-                            const Icon = service.icon;
-                            const isSelected = newMember.skillsets.includes(service.id);
-                            const isElite = (service as any).isElite;
-                            return (
-                              <div
-                                key={service.id}
-                                className={`p-3 rounded-lg border-2 cursor-pointer transition-all ${
-                                  isSelected 
-                                    ? isElite ? "border-amber-500 bg-amber-50 dark:bg-amber-950/20" : "border-primary bg-primary/5"
-                                    : "border-border hover:border-primary/50"
-                                }`}
-                                onClick={() => handleServiceToggle(service.id)}
-                                data-testid={`skill-${service.id}`}
-                              >
-                                <div className="flex items-center gap-3">
-                                  <Icon className={`w-5 h-5 ${isElite ? "text-amber-600" : ""}`} />
-                                  <div className="flex-1">
-                                    <div className="flex items-center gap-2">
-                                      <span className="font-medium text-sm">{service.label}</span>
-                                      {isElite && (
-                                        <Badge variant="outline" className="text-xs bg-amber-100 text-amber-700 border-amber-300">
-                                          {t("elite")}
-                                        </Badge>
-                                      )}
-                                    </div>
-                                    <p className="text-xs text-muted-foreground">{service.desc}</p>
-                                  </div>
-                                  {isSelected && <CheckCircle className="w-5 h-5 text-primary" />}
+                    <div className="space-y-3">
+                      {INDUSTRY_CATEGORIES.map((industry) => {
+                        const Icon = industry.icon;
+                        const selectedCount = industry.roles.filter((r) => newMember.skillsets.includes(r.id)).length;
+                        const isExpanded = wizardExpandedIndustries.includes(industry.id);
+                        return (
+                          <div key={industry.id} className="border rounded-lg overflow-hidden">
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setWizardExpandedIndustries((prev) =>
+                                  prev.includes(industry.id) ? prev.filter((id) => id !== industry.id) : [...prev, industry.id]
+                                )
+                              }
+                              className="w-full flex items-center justify-between p-3 hover:bg-muted/50 transition-colors text-left"
+                              data-testid={`wizard-industry-toggle-${industry.id}`}
+                            >
+                              <div className="flex items-center gap-3">
+                                <div className="w-8 h-8 rounded-full bg-primary/10 flex items-center justify-center">
+                                  <Icon className="w-4 h-4 text-primary" />
                                 </div>
+                                <span className="font-medium">{industry.label}</span>
+                                {selectedCount > 0 && (
+                                  <Badge variant="default" className="text-xs">
+                                    {selectedCount} selected
+                                  </Badge>
+                                )}
                               </div>
-                            );
-                          })}
-                        </div>
-                      </div>
-                    ))}
+                              {isExpanded ? (
+                                <ChevronUp className="w-4 h-4 text-muted-foreground" />
+                              ) : (
+                                <ChevronDown className="w-4 h-4 text-muted-foreground" />
+                              )}
+                            </button>
+                            {isExpanded && (
+                              <div className="border-t bg-muted/20 p-2 space-y-1">
+                                {industry.roles.map((role) => {
+                                  const checked = newMember.skillsets.includes(role.id);
+                                  return (
+                                    <div
+                                      key={role.id}
+                                      className={`flex items-start space-x-3 p-2 rounded-md transition-colors cursor-pointer ${checked ? "bg-primary/10" : "hover:bg-muted/50"}`}
+                                      onClick={() => handleServiceToggle(role.id)}
+                                      data-testid={`skill-${role.id}`}
+                                    >
+                                      <Checkbox
+                                        id={`wizard-skill-${role.id}`}
+                                        checked={checked}
+                                        onCheckedChange={() => handleServiceToggle(role.id)}
+                                        className="mt-0.5"
+                                        onClick={(e) => e.stopPropagation()}
+                                      />
+                                      <Label htmlFor={`wizard-skill-${role.id}`} className="flex-1 cursor-pointer">
+                                        <span className="font-medium text-sm flex items-center gap-2">
+                                          {role.label}
+                                          {role.isElite && (
+                                            <Badge variant="secondary" className="text-xs">
+                                              Certified
+                                            </Badge>
+                                          )}
+                                        </span>
+                                        <span className="text-xs text-muted-foreground block mt-0.5">{role.desc}</span>
+                                      </Label>
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
                   </div>
                 </>
               )}
@@ -1753,19 +2101,59 @@ export function BusinessOperatorContent({ embedded = false }: { embedded?: boole
             setEditMember(null);
             setFaceError(null);
             setFaceVerified(false);
-            // Cleanup any lingering overlays
-            setTimeout(() => {
+            // Aggressive cleanup so page is clickable after close: restore pointer-events, aria-hidden, inert on html/body/root
+            const runCleanup = () => {
               const root = document.getElementById('root');
-              if (root && root.getAttribute('aria-hidden') === 'true') {
-                root.removeAttribute('aria-hidden');
+              const html = document.documentElement;
+              // Radix can leave html/body with inert or pointer-events: none after close; clear so page is clickable
+              if (html.getAttribute('inert') != null) html.removeAttribute('inert');
+              html.style.removeProperty('pointer-events');
+              if (html.getAttribute('aria-hidden') === 'true') html.removeAttribute('aria-hidden');
+              document.body.style.removeProperty('pointer-events');
+              if (document.body.getAttribute('inert') != null) document.body.removeAttribute('inert');
+              if (document.body.getAttribute('aria-hidden') === 'true') document.body.removeAttribute('aria-hidden');
+              if (root) {
+                root.style.removeProperty('pointer-events');
+                if (root.getAttribute('aria-hidden') === 'true') root.removeAttribute('aria-hidden');
               }
-              // Remove any lingering overlay divs
-              document.querySelectorAll('[data-radix-popper-content-wrapper]').forEach(el => {
-                if (el.parentElement && !el.querySelector('[data-state="open"]')) {
-                  el.parentElement.style.display = 'none';
+              document.querySelectorAll('[data-radix-popper-content-wrapper]').forEach((el) => {
+                const content = el.querySelector('[data-state="open"]');
+                if (!content && el.parentElement) {
+                  (el.parentElement as HTMLElement).style.pointerEvents = 'none';
+                  setTimeout(() => {
+                    if (el.parentElement && !(el.parentElement as HTMLElement).querySelector('[data-state="open"]')) {
+                      (el.parentElement as HTMLElement).style.display = 'none';
+                    }
+                  }, 300);
                 }
               });
-            }, 150);
+              // Disable and remove closed dialog/sheet overlays (in dialog-container and in body – Sheet portals to body on mobile)
+              document.querySelectorAll('[data-state="closed"]').forEach((el) => {
+                (el as HTMLElement).style.pointerEvents = 'none';
+              });
+              const container = document.getElementById('dialog-container');
+              if (container) {
+                Array.from(container.children).forEach((child) => {
+                  const el = child as HTMLElement;
+                  const hasOpen = el.querySelector('[data-state="open"]');
+                  const onlyClosed = el.querySelector('[data-state="closed"]') && !hasOpen;
+                  if (onlyClosed || (el.getAttribute?.('data-state') === 'closed')) el.remove();
+                });
+              }
+              // Remove closed Radix portal roots that are direct children of body (e.g. Sheet on mobile)
+              Array.from(document.body.children).forEach((child) => {
+                const el = child as HTMLElement;
+                if (el.id === 'root' || el.id === 'dialog-container') return;
+                const hasOpen = el.querySelector('[data-state="open"]');
+                const onlyClosed = el.querySelector('[data-state="closed"]') && !hasOpen;
+                if (onlyClosed || (el.getAttribute?.('data-state') === 'closed')) el.remove();
+              });
+            };
+            runCleanup();
+            setTimeout(runCleanup, 50);
+            setTimeout(runCleanup, 250);
+            setTimeout(runCleanup, 500);
+            setTimeout(runCleanup, 1000);
           }
         }}
         title={editMember ? `Edit ${editMember.firstName} ${editMember.lastName}` : "Edit Teammate"}
@@ -1773,28 +2161,36 @@ export function BusinessOperatorContent({ embedded = false }: { embedded?: boole
         contentClassName="sm:max-w-lg"
         primaryAction={{
           label: updateMemberMutation.isPending ? "Saving..." : "Save Changes",
-          onClick: () => {
-            if (editMember) {
-              updateMemberMutation.mutate({
-                id: editMember.id,
-                data: {
-                  firstName: editMember.firstName,
-                  lastName: editMember.lastName,
-                  email: editMember.email,
-                  phone: editMember.phone,
-                  address: editMember.address,
-                  city: editMember.city,
-                  state: editMember.state,
-                  zipCode: editMember.zipCode,
-                  role: editMember.role,
-                  hourlyRate: editMember.hourlyRate,
-                  skillsets: editMember.skillsets,
-                  avatarUrl: editMember.avatarUrl ?? undefined,
-                },
-              });
+          onClick: async () => {
+            if (!editMember) return;
+            let data: Partial<TeamMember> = {
+              firstName: editMember.firstName,
+              lastName: editMember.lastName,
+              email: editMember.email,
+              phone: editMember.phone,
+              address: editMember.address,
+              city: editMember.city,
+              state: editMember.state,
+              zipCode: editMember.zipCode,
+              latitude: editMember.latitude ?? undefined,
+              longitude: editMember.longitude ?? undefined,
+              role: editMember.role,
+              hourlyRate: editMember.hourlyRate ?? 20,
+              skillsets: editMember.skillsets,
+              avatarUrl: editMember.avatarUrl ?? undefined,
+            };
+            const hasAddress = !!(editMember.address?.trim() || editMember.city || editMember.state || editMember.zipCode);
+            const missingCoords = (editMember.latitude == null || editMember.longitude == null) && hasAddress;
+            if (missingCoords) {
+              const coords = await geocodeAddress(editMember.address ?? "", editMember.city, editMember.state, editMember.zipCode);
+              if (coords) {
+                data.latitude = String(coords.lat);
+                data.longitude = String(coords.lng);
+              }
             }
+            updateMemberMutation.mutate({ id: editMember.id, data });
           },
-          disabled: updateMemberMutation.isPending || !editMember?.firstName?.trim() || !editMember?.lastName?.trim(),
+          disabled: updateMemberMutation.isPending || !editMember?.firstName?.trim() || !editMember?.lastName?.trim() || !editMember?.address?.trim() || !editMember?.city?.trim() || !editMember?.state?.trim() || !editMember?.zipCode?.trim(),
           icon: updateMemberMutation.isPending ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : undefined,
           testId: "button-edit-save"
         }}
@@ -1809,10 +2205,10 @@ export function BusinessOperatorContent({ embedded = false }: { embedded?: boole
         }}
       >
         {editMember && (
-          <ScrollArea className="max-h-[60vh] pr-4 -mr-4">
-            <div className="space-y-5">
+          <div className="min-h-0 pr-4 -mr-4">
+            <div className="space-y-0">
               {/* Avatar */}
-              <div className="flex flex-col items-center">
+              <div className="flex flex-col items-center pb-5">
                 <input
                   ref={editAvatarInputRef}
                   type="file"
@@ -1852,13 +2248,14 @@ export function BusinessOperatorContent({ embedded = false }: { embedded?: boole
                   </p>
                 )}
               </div>
+              <div className="border-t border-border my-5" />
 
-              <div className="grid grid-cols-2 gap-4">
+              <div className="grid grid-cols-2 gap-4 pt-1">
                 <div className="space-y-2">
                   <Label htmlFor="edit-firstName">{t("firstName")} *</Label>
                   <Input
                     id="edit-firstName"
-                    value={editMember.firstName}
+                    value={editMember.firstName ?? ""}
                     onChange={(e) => setEditMember({ ...editMember, firstName: e.target.value })}
                     placeholder={t("firstNamePlaceholder")}
                     data-testid="edit-input-first-name"
@@ -1868,15 +2265,16 @@ export function BusinessOperatorContent({ embedded = false }: { embedded?: boole
                   <Label htmlFor="edit-lastName">{t("lastName")} *</Label>
                   <Input
                     id="edit-lastName"
-                    value={editMember.lastName}
+                    value={editMember.lastName ?? ""}
                     onChange={(e) => setEditMember({ ...editMember, lastName: e.target.value })}
                     placeholder={t("lastNamePlaceholder")}
                     data-testid="edit-input-last-name"
                   />
                 </div>
               </div>
+              <div className="border-t border-border my-5" />
 
-              <div className="space-y-2">
+              <div className="space-y-2 pt-1">
                 <Label htmlFor="edit-email">{tCommon("email")}</Label>
                 <Input
                   id="edit-email"
@@ -1887,8 +2285,9 @@ export function BusinessOperatorContent({ embedded = false }: { embedded?: boole
                   data-testid="edit-input-email"
                 />
               </div>
+              <div className="border-t border-border my-5" />
 
-              <div className="space-y-2">
+              <div className="space-y-2 pt-1">
                 <Label htmlFor="edit-phone">{tCommon("phone")}</Label>
                 <Input
                   id="edit-phone"
@@ -1898,11 +2297,12 @@ export function BusinessOperatorContent({ embedded = false }: { embedded?: boole
                   data-testid="edit-input-phone"
                 />
               </div>
+              <div className="border-t border-border my-5" />
 
-              <div className="space-y-2">
+              <div className="space-y-2 pt-1">
                 <GooglePlacesAutocomplete
                   id="edit-address"
-                  label={t("streetAddress")}
+                  label={`${t("streetAddress")} *`}
                   value={editMember.address ?? ""}
                   onChange={(address, components) => {
                     setEditMember({
@@ -1911,48 +2311,18 @@ export function BusinessOperatorContent({ embedded = false }: { embedded?: boole
                       city: components.city ?? editMember.city ?? "",
                       state: components.state ?? editMember.state ?? "",
                       zipCode: components.zipCode ?? editMember.zipCode ?? "",
+                      latitude: components.latitude != null ? String(components.latitude) : undefined,
+                      longitude: components.longitude != null ? String(components.longitude) : undefined,
                     });
                   }}
                   placeholder={t("streetAddressPlaceholder")}
                 />
                 <p className="text-xs text-muted-foreground">{t("whereTeamMemberIsBased")}</p>
+                <p className="text-xs text-muted-foreground">Select from the dropdown to fill city, state, and ZIP. Location is required for matching jobs to you and your teammates.</p>
               </div>
+              <div className="border-t border-border my-5" />
 
-              <div className="grid grid-cols-2 gap-4">
-                <div className="space-y-2">
-                  <Label htmlFor="edit-city">{t("city")}</Label>
-                  <Input
-                    id="edit-city"
-                    value={editMember.city ?? ""}
-                    onChange={(e) => setEditMember({ ...editMember, city: e.target.value || null })}
-                    placeholder={t("cityPlaceholder")}
-                    data-testid="edit-input-city"
-                  />
-                </div>
-                <div className="space-y-2">
-                  <Label htmlFor="edit-state">{t("state")}</Label>
-                  <Input
-                    id="edit-state"
-                    value={editMember.state ?? ""}
-                    onChange={(e) => setEditMember({ ...editMember, state: e.target.value || null })}
-                    placeholder={t("statePlaceholder")}
-                    data-testid="edit-input-state"
-                  />
-                </div>
-              </div>
-
-              <div className="space-y-2">
-                <Label htmlFor="edit-zipCode">{t("zipCode")}</Label>
-                <Input
-                  id="edit-zipCode"
-                  value={editMember.zipCode ?? ""}
-                  onChange={(e) => setEditMember({ ...editMember, zipCode: e.target.value || null })}
-                  placeholder={t("zipCodePlaceholder")}
-                  data-testid="edit-input-zip"
-                />
-              </div>
-
-              <div className="space-y-2">
+              <div className="space-y-2 pt-1">
                 <Label className="text-base font-semibold">{t("role")}</Label>
                 <Select
                   value={editMember.role}
@@ -1961,7 +2331,7 @@ export function BusinessOperatorContent({ embedded = false }: { embedded?: boole
                   <SelectTrigger data-testid="edit-select-role" className="h-11">
                     <SelectValue />
                   </SelectTrigger>
-                  <SelectContent>
+                  <SelectContent className="z-[10000]">
                     <SelectItem value="employee">{t("employee")}</SelectItem>
                     <SelectItem value="admin">{t("admin")}</SelectItem>
                   </SelectContent>
@@ -1970,22 +2340,28 @@ export function BusinessOperatorContent({ embedded = false }: { embedded?: boole
                   {editMember.role === "admin" ? t("adminRoleDescription") : t("employeeRoleDescription")}
                 </p>
               </div>
+              <div className="border-t border-border my-5" />
 
-              <div className="space-y-2">
+              <div className="space-y-2 pt-1">
                 <Label className="text-base font-semibold">{t("hourlyRate")} *</Label>
                 <Input
                   type="number"
-                  min={15}
-                  max={60}
-                  value={editMember.hourlyRate}
-                  onChange={(e) => setEditMember({ ...editMember, hourlyRate: Number(e.target.value) || 15 })}
+                  min={1}
+                  max={200}
+                  value={editMember.hourlyRate ?? 20}
+                  onChange={(e) => {
+                    const raw = Number(e.target.value);
+                    const clamped = Number.isFinite(raw) ? Math.min(200, Math.max(1, raw)) : 20;
+                    setEditMember({ ...editMember, hourlyRate: clamped });
+                  }}
                   data-testid="edit-input-hourly-rate"
                   className="h-11 text-lg"
                 />
                 <p className="text-xs text-muted-foreground">{t("setHourlyRateForTeamMember")}</p>
               </div>
+              <div className="border-t border-border my-5" />
 
-              <div className="space-y-2">
+              <div className="space-y-2 pt-1">
                 <div className="flex items-center justify-between">
                   <Label className="text-base font-semibold">{t("skillsets")}</Label>
                   <Button
@@ -2016,7 +2392,7 @@ export function BusinessOperatorContent({ embedded = false }: { embedded?: boole
                 )}
               </div>
             </div>
-          </ScrollArea>
+          </div>
         )}
       </ResponsiveDialog>
 
@@ -2040,6 +2416,7 @@ export function BusinessOperatorContent({ embedded = false }: { embedded?: boole
         }}
         title={t("updateSkillsets")}
         description={t("selectSkillsThatMatchExperience")}
+        elevated
       >
           {skillsetMember && (
             <div className="space-y-4">
@@ -2059,36 +2436,64 @@ export function BusinessOperatorContent({ embedded = false }: { embedded?: boole
                 </p>
               </div>
 
-              {/* Skills List */}
-              <div className="space-y-3 max-h-[50vh] overflow-y-auto pr-2">
-                {allSkillCategories.map((skill) => (
-                  <div 
-                    key={skill.id} 
-                    className={`flex items-start space-x-3 p-3 rounded-lg border transition-colors cursor-pointer ${
-                      (skillsetMember.skillsets || []).includes(skill.id) 
-                        ? 'border-primary bg-primary/5' 
-                        : 'border-border hover:bg-muted/50'
-                    }`}
-                    onClick={() => toggleSkillsetCategory(skill.id)}
-                    data-testid={`skillset-option-${skill.id}`}
-                  >
-                    <Checkbox
-                      id={`member-skill-${skill.id}`}
-                      checked={(skillsetMember.skillsets || []).includes(skill.id)}
-                      onCheckedChange={() => toggleSkillsetCategory(skill.id)}
-                      className="mt-0.5"
-                    />
-                    <Label htmlFor={`member-skill-${skill.id}`} className="flex-1 cursor-pointer">
-                      <span className="font-medium flex items-center gap-2">
-                        {skill.label}
-                        {(skill as any).isElite && (
-                          <Badge variant="secondary" className="text-xs">{t("certified")}</Badge>
-                        )}
-                      </span>
-                      <span className="text-sm text-muted-foreground block mt-0.5">{skill.desc}</span>
-                    </Label>
-                  </div>
-                ))}
+              {/* Skills List – 1:1 with WorkerDashboard (INDUSTRY_CATEGORIES, same layout and copy). */}
+              <div className="space-y-3 pr-2">
+                {INDUSTRY_CATEGORIES.map((industry) => {
+                  const Icon = industry.icon;
+                  const selectedCount = industry.roles.filter((r) => (skillsetMember.skillsets || []).includes(r.id)).length;
+                  return (
+                    <Collapsible key={industry.id} defaultOpen={selectedCount > 0} className="group">
+                      <div className="border rounded-lg overflow-hidden">
+                        <CollapsibleTrigger
+                          className="w-full flex items-center justify-between p-3 hover:bg-muted/50 transition-colors text-left"
+                          data-testid={`accordion-${industry.id}`}
+                        >
+                          <div className="flex items-center gap-3">
+                            <div className="w-8 h-8 rounded-full bg-primary/10 flex items-center justify-center flex-shrink-0">
+                              <Icon className="w-4 h-4 text-primary" />
+                            </div>
+                            <span className="font-medium">{industry.label}</span>
+                            {selectedCount > 0 && (
+                              <Badge variant="default" className="text-xs">{selectedCount} selected</Badge>
+                            )}
+                          </div>
+                          <ChevronDown className="w-4 h-4 text-muted-foreground shrink-0 transition-transform duration-200 group-data-[state=open]:rotate-180" />
+                        </CollapsibleTrigger>
+                        <CollapsibleContent>
+                          <div className="border-t bg-muted/20 p-2 space-y-1">
+                            {industry.roles.map((role) => {
+                              const checked = (skillsetMember.skillsets || []).includes(role.id);
+                              return (
+                                <div
+                                  key={role.id}
+                                  className={`flex items-start space-x-3 p-2 rounded-md transition-colors cursor-pointer ${checked ? "bg-primary/10" : "hover:bg-muted/50"}`}
+                                  onClick={() => toggleSkillsetCategory(role.id)}
+                                  data-testid={`skillset-option-${role.id}`}
+                                >
+                                  <Checkbox
+                                    id={`member-skill-${role.id}`}
+                                    checked={checked}
+                                    onCheckedChange={() => toggleSkillsetCategory(role.id)}
+                                    className="mt-0.5"
+                                  />
+                                  <Label htmlFor={`member-skill-${role.id}`} className="flex-1 cursor-pointer">
+                                    <span className="font-medium text-sm flex items-center gap-2">
+                                      {role.label}
+                                      {role.isElite && (
+                                        <Badge variant="secondary" className="text-xs">{t("certified")}</Badge>
+                                      )}
+                                    </span>
+                                    <span className="text-xs text-muted-foreground block mt-0.5">{role.desc}</span>
+                                  </Label>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </CollapsibleContent>
+                      </div>
+                    </Collapsible>
+                  );
+                })}
               </div>
 
               <Button
@@ -2203,9 +2608,10 @@ export function BusinessOperatorContent({ embedded = false }: { embedded?: boole
         contentClassName="sm:max-w-lg"
         footer={
           inviteStep === 0 ? (
-            <div className="flex justify-between gap-2">
+            <div className="flex w-full gap-2">
               <Button
                 variant="outline"
+                className="flex-1"
                 onClick={() => {
                   setInviteOpen(false);
                   setInviteStep(0);
@@ -2222,6 +2628,7 @@ export function BusinessOperatorContent({ embedded = false }: { embedded?: boole
                 {tCommon("cancel")}
               </Button>
               <Button
+                className="flex-1"
                 onClick={() => {
                   if (newInviteMember.firstName && newInviteMember.lastName && newInviteMember.hourlyRate && newInviteMember.email && newInviteMember.phone) {
                     setInviteStep(1);
@@ -2233,9 +2640,10 @@ export function BusinessOperatorContent({ embedded = false }: { embedded?: boole
               </Button>
             </div>
           ) : inviteStep === 1 ? (
-            <div className="flex justify-between gap-2">
+            <div className="flex w-full gap-2">
               <Button
                 variant="outline"
+                className="flex-1"
                 onClick={() => {
                   setInviteStep(0);
                 }}
@@ -2243,6 +2651,7 @@ export function BusinessOperatorContent({ embedded = false }: { embedded?: boole
                 {tCommon("back")}
               </Button>
               <Button
+                className="flex-1"
                 onClick={async () => {
                   if (team?.id) {
                     try {
@@ -2296,9 +2705,10 @@ export function BusinessOperatorContent({ embedded = false }: { embedded?: boole
               </Button>
             </div>
           ) : (
-            <div className="flex justify-between gap-2">
+            <div className="flex w-full gap-2">
               <Button
                 variant="outline"
+                className="flex-1"
                 onClick={() => {
                   setInviteStep(1);
                 }}
@@ -2306,6 +2716,7 @@ export function BusinessOperatorContent({ embedded = false }: { embedded?: boole
                 {tCommon("back")}
               </Button>
               <Button
+                className="flex-1"
                 onClick={() => {
                   setInviteOpen(false);
                   setInviteStep(0);
@@ -2360,11 +2771,15 @@ export function BusinessOperatorContent({ embedded = false }: { embedded?: boole
                   <Label className="text-base font-semibold">{t("hourlyRate")} *</Label>
                   <Input
                     type="number"
-                    min="15"
-                    max="60"
-                    value={newInviteMember.hourlyRate}
-                    onChange={(e) => setNewInviteMember({ ...newInviteMember, hourlyRate: Number(e.target.value) })}
-                    placeholder="25"
+                    min={1}
+                    max={200}
+                    value={newInviteMember.hourlyRate ?? 20}
+                    onChange={(e) => {
+                      const raw = Number(e.target.value);
+                      const clamped = Number.isFinite(raw) ? Math.min(200, Math.max(1, raw)) : 20;
+                      setNewInviteMember({ ...newInviteMember, hourlyRate: clamped });
+                    }}
+                    placeholder="20"
                     className="h-12 text-lg"
                     data-testid="invite-input-hourly-rate"
                   />
@@ -2437,10 +2852,6 @@ export function BusinessOperatorContent({ embedded = false }: { embedded?: boole
                 <div className="flex items-center justify-between py-2 border-b">
                   <span className="text-sm font-medium text-muted-foreground">{t("name") || "Name"}:</span>
                   <span className="text-sm font-semibold">{newInviteMember.firstName} {newInviteMember.lastName}</span>
-                </div>
-                <div className="flex items-center justify-between py-2 border-b">
-                  <span className="text-sm font-medium text-muted-foreground">{t("hourlyRate")}:</span>
-                  <span className="text-sm font-semibold">${newInviteMember.hourlyRate}/hr</span>
                 </div>
                 <div className="flex items-center justify-between py-2 border-b">
                   <span className="text-sm font-medium text-muted-foreground">{t("email") || "Email"}:</span>

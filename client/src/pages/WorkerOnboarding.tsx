@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from "react";
 import { z } from "zod";
 import { useAuth } from "@/hooks/use-auth";
-import { useCreateProfile, useProfile, useUpdateProfile } from "@/hooks/use-profiles";
+import { useCreateProfile, useProfile, useUpdateProfile, invalidateSessionProfileQueries, profileMeQueryKey } from "@/hooks/use-profiles";
 import { useLocation, Link } from "wouter";
 import { Button } from "@/components/ui/button";
 import { getUrlForPath } from "@/lib/subdomain-utils";
@@ -13,6 +13,7 @@ import { GooglePlacesAutocomplete } from "@/components/GooglePlacesAutocomplete"
 import { Progress } from "@/components/ui/progress";
 import { useIsMobile } from "@/hooks/use-mobile";
 import { Slider } from "@/components/ui/slider";
+import { RateSlider } from "@/components/RateSlider";
 import { Card, CardContent } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
@@ -55,7 +56,6 @@ import { Badge } from "@/components/ui/badge";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { cn } from "@/lib/utils";
 import type { PayoutAccount } from "@shared/schema";
-import { api } from "@shared/routes";
 
 const TOTAL_STEPS = 7; // Step 1: Account, Step 2: Location, Step 3: Skills & Services, Step 4: Business Operator & Teammates (skippable), Step 5: Payout, Step 6: Documents, Step 7: Contract
 
@@ -135,10 +135,10 @@ const step3Schema = z.object({
   serviceCategories: z.array(z.string()).min(1, "Select at least one service category"),
 });
 
-// Time to first job: 1-2 days ends at $20 (suggested rate); higher rates = longer wait. Range $0–$60.
+// Time to first job: 1-2 days ends at $20 (suggested rate); higher rates = longer wait. Range $0–$200.
 function getJobFindingTime(rate: number): { time: string; days: string; percentile: number } {
   const minRate = 0;
-  const maxRate = 60;
+  const maxRate = 200;
   const clampedRate = Math.max(minRate, Math.min(maxRate, rate));
   const percentile = maxRate > minRate
     ? Math.max(0, Math.min(100, ((clampedRate - minRate) / (maxRate - minRate)) * 100))
@@ -318,7 +318,7 @@ export default function WorkerOnboarding() {
   const [formData, setFormData] = useState<any>({
     businessName: "",
     serviceCategories: [],
-    hourlyRate: 15,
+    hourlyRate: 18,
     portfolioImages: [],
     password: "",
     confirmPassword: "",
@@ -330,7 +330,19 @@ export default function WorkerOnboarding() {
   const [step4RoleChoice, setStep4RoleChoice] = useState<null | "doing_work" | "managing_team">(null);
   /** Worker add-teammate wizard: 0 = list, 1 = details (1-for-1 like company add teammate) */
   const [workerInviteStep, setWorkerInviteStep] = useState(0);
-  const [workerInviteData, setWorkerInviteData] = useState({ firstName: "", lastName: "", email: "", phone: "" });
+  const [workerInviteData, setWorkerInviteData] = useState({
+    firstName: "",
+    lastName: "",
+    email: "",
+    phone: "",
+    address: "",
+    city: "",
+    state: "",
+    zipCode: "",
+    latitude: undefined as number | undefined,
+    longitude: undefined as number | undefined,
+    avatarUrl: "",
+  });
   const [portfolioTags, setPortfolioTags] = useState<string[]>([]);
   // Prior work photos: id, url (objectPath), name, size, optional tag
   const [portfolioItems, setPortfolioItems] = useState<Array<{ id: string; url: string; name: string; size: number; tag?: string }>>([]);
@@ -352,8 +364,10 @@ export default function WorkerOnboarding() {
   const contractScrollRef = useRef<HTMLDivElement>(null);
   const signatureCanvasRef = useRef<HTMLCanvasElement>(null);
   const signaturePadContainerRef = useRef<HTMLDivElement>(null);
+  const acknowledgedSignatureRef = useRef<string | null>(null);
   const portfolioInputRef = useRef<HTMLInputElement>(null);
   const avatarInputRef = useRef<HTMLInputElement>(null);
+  const teammateAvatarInputRef = useRef<HTMLInputElement>(null);
   const [modelsLoaded, setModelsLoaded] = useState(false);
   
   // Bank account state
@@ -429,15 +443,17 @@ export default function WorkerOnboarding() {
   const hasFullAddress = !!(formData.address && formData.city && formData.state && formData.zipCode);
 
   // W-9 status from Mercury (only show "W-9 on File" when Mercury has the attachment)
-  const { data: w9Status, isLoading: w9StatusLoading } = useQuery({
+  const { data: w9Status, isLoading: w9StatusLoading, isError: w9StatusError, refetch: refetchW9Status } = useQuery({
     queryKey: ["/api/worker/w9-status"],
-    queryFn: async () => {
-      const res = await fetch("/api/worker/w9-status", { credentials: "include" });
+    queryFn: async ({ signal }) => {
+      const res = await fetch("/api/worker/w9-status", { credentials: "include", signal });
       if (res.status === 404) return { attached: false, recipientId: null };
       if (!res.ok) throw new Error("Failed to fetch W-9 status");
       return res.json() as Promise<{ attached: boolean; recipientId: string | null }>;
     },
     enabled: !!user && currentStep === 6 && existingProfile?.role === "worker",
+    retry: 1,
+    retryDelay: 2500,
   });
 
   // Worker team + members (for step 4 managing_team add-teammate flow, 1-for-1 like company)
@@ -546,7 +562,7 @@ export default function WorkerOnboarding() {
           : "Your Google reviews have been synced.",
       });
       if (existingProfile?.id) {
-        await queryClient.invalidateQueries({ queryKey: ["/api/profiles", user?.id] });
+        invalidateSessionProfileQueries(queryClient);
       }
     } catch (err: unknown) {
       safeToast({
@@ -579,7 +595,7 @@ export default function WorkerOnboarding() {
         }
       } finally {
         setSyncingGoogleReviews(false);
-        if (existingProfile?.id) queryClient.invalidateQueries({ queryKey: ["/api/profiles", user?.id] });
+        if (existingProfile?.id) invalidateSessionProfileQueries(queryClient);
       }
     })();
   }, [currentStep, step3SubStep]);
@@ -693,12 +709,32 @@ export default function WorkerOnboarding() {
         if (!createRes.ok) throw new Error("Failed to create team");
         team = await createRes.json();
       }
+      const hasTeammateAddress = !!(
+        workerInviteData.address?.trim() &&
+        workerInviteData.city?.trim() &&
+        workerInviteData.state?.trim() &&
+        workerInviteData.zipCode?.trim()
+      );
+      if (!hasTeammateAddress) {
+        safeToast({ title: "Enter the worker's address", description: "Address, city, state, and zip are required.", variant: "destructive" });
+        setInviteSending(false);
+        return;
+      }
+      const lat = typeof workerInviteData.latitude === "number" && Number.isFinite(workerInviteData.latitude) ? workerInviteData.latitude : undefined;
+      const lng = typeof workerInviteData.longitude === "number" && Number.isFinite(workerInviteData.longitude) ? workerInviteData.longitude : undefined;
       const addRes = await apiRequest("POST", `/api/worker-team/${team.id}/members`, {
         firstName: workerInviteData.firstName?.trim() || "Teammate",
         lastName: workerInviteData.lastName?.trim() || "—",
         email,
         phone: workerInviteData.phone?.trim() || undefined,
+        address: workerInviteData.address?.trim() || undefined,
+        city: workerInviteData.city?.trim() || undefined,
+        state: workerInviteData.state?.trim() || undefined,
+        zipCode: workerInviteData.zipCode?.trim() || undefined,
+        ...(lat != null && lng != null ? { latitude: String(lat), longitude: String(lng) } : {}),
+        avatarUrl: workerInviteData.avatarUrl?.trim() || undefined,
         role: "employee",
+        hourlyRate: 20,
       });
       if (!addRes.ok) {
         const err = await addRes.json().catch(() => ({}));
@@ -708,7 +744,7 @@ export default function WorkerOnboarding() {
       await queryClient.invalidateQueries({ queryKey: ["/api/worker-team", team.id, "members"] });
       safeToast({ title: "Invitation sent", description: "They can join from the link in their email." });
       setWorkerInviteStep(0);
-      setWorkerInviteData({ firstName: "", lastName: "", email: "", phone: "" });
+      setWorkerInviteData({ firstName: "", lastName: "", email: "", phone: "", address: "", city: "", state: "", zipCode: "", latitude: undefined, longitude: undefined, avatarUrl: "" });
     } catch (e: any) {
       safeToast({ title: "Could not send invite", description: e?.message || "Please try again later.", variant: "destructive" });
     } finally {
@@ -807,6 +843,19 @@ export default function WorkerOnboarding() {
     if (file) {
       await handleAvatarUpload(file);
     }
+  };
+
+  // Optional teammate avatar (no face verification)
+  const handleTeammateAvatarChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      const dataUrl = ev.target?.result as string;
+      if (dataUrl) setWorkerInviteData((p) => ({ ...p, avatarUrl: dataUrl }));
+    };
+    reader.readAsDataURL(file);
+    e.target.value = "";
   };
 
   // Handle camera capture
@@ -977,6 +1026,45 @@ export default function WorkerOnboarding() {
       .catch(() => {});
   }, []);
 
+  // Pre-fill from existing profile when user is redirected here with incomplete onboarding (so they only complete missing items; every save persists to account)
+  const profilePreFillDoneRef = useRef<number | null>(null);
+  useEffect(() => {
+    const p = existingProfile as Record<string, unknown> | null | undefined;
+    if (!p?.id || profilePreFillDoneRef.current === p.id) return;
+    profilePreFillDoneRef.current = p.id as number;
+    const rate = p.hourlyRate ?? p.hourly_rate;
+    const rateNum = typeof rate === "number" ? rate : undefined;
+    const hourlyRateDollars = rateNum != null && rateNum > 100 ? rateNum / 100 : rateNum ?? 18;
+    setFormData((prev: any) => ({
+      ...prev,
+      firstName: (p.firstName ?? p.first_name ?? prev.firstName ?? "") as string,
+      lastName: (p.lastName ?? p.last_name ?? prev.lastName ?? "") as string,
+      email: (p.email ?? prev.email ?? "") as string,
+      phone: (p.phone ?? prev.phone ?? "") as string,
+      address: (p.address ?? prev.address ?? "") as string,
+      city: (p.city ?? prev.city ?? "") as string,
+      state: (p.state ?? prev.state ?? "") as string,
+      zipCode: (p.zipCode ?? p.zip_code ?? prev.zipCode ?? "") as string,
+      latitude: (() => { const v = (p as Record<string, unknown>).latitude; if (typeof v === "number" && Number.isFinite(v)) return v; if (typeof v === "string") { const n = parseFloat(v); return Number.isFinite(n) ? n : undefined; } return undefined; })(),
+      longitude: (() => { const v = (p as Record<string, unknown>).longitude; if (typeof v === "number" && Number.isFinite(v)) return v; if (typeof v === "string") { const n = parseFloat(v); return Number.isFinite(n) ? n : undefined; } return undefined; })(),
+      avatarUrl: (p.avatarUrl ?? p.avatar_url ?? prev.avatarUrl ?? "") as string,
+      serviceCategories: Array.isArray(p.serviceCategories) ? p.serviceCategories : (Array.isArray(p.service_categories) ? p.service_categories : prev.serviceCategories ?? []),
+      hourlyRate: hourlyRateDollars,
+      businessName: (p.businessName ?? p.companyName ?? prev.businessName ?? "") as string,
+      bio: (p.bio ?? prev.bio ?? "") as string,
+    }));
+    if (p.avatarUrl ?? p.avatar_url) {
+      setAvatarPreview((p.avatarUrl ?? p.avatar_url) as string);
+      if (p.faceVerified === true || p.face_verified === true) setFaceVerified(true);
+    }
+    if ((p as { bankAccountLinked?: boolean }).bankAccountLinked === true || (p as { mercuryRecipientId?: string }).mercuryRecipientId) {
+      setBankConnected(true);
+    }
+    if ((p as { contractSigned?: boolean }).contractSigned === true && !signatureData) {
+      setHasScrolledToBottom(true);
+    }
+  }, [existingProfile]);
+
   // Sync URL ?step=N and ?sub= (step 3: rate|categories|portfolio) to state (direct link or browser back)
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -1031,8 +1119,7 @@ export default function WorkerOnboarding() {
     if (urlParams.get("identity") === "return") {
       identityReturnPendingSuccess.current = true;
       setShowIdVerificationMiniStep(false);
-      queryClient.invalidateQueries({ queryKey: ["/api/profiles", user?.id] });
-      queryClient.invalidateQueries({ queryKey: ["/api/profiles"] });
+      invalidateSessionProfileQueries(queryClient);
       const clean = new URLSearchParams(window.location.search);
       clean.delete("identity");
       const newSearch = clean.toString();
@@ -1293,8 +1380,8 @@ export default function WorkerOnboarding() {
     if (step === 3) {
       // Step 3a: Validate hourly rate
       if (step3SubStep === "rate") {
-        if (formData.hourlyRate == null || formData.hourlyRate < 0 || formData.hourlyRate > 60) {
-          safeToast({ title: "Please set a valid hourly rate between $0 and $60", variant: "destructive" });
+        if (formData.hourlyRate == null || formData.hourlyRate < 1 || formData.hourlyRate > 200) {
+          safeToast({ title: "Please set a valid hourly rate between $1 and $200", variant: "destructive" });
           return false;
         }
       }
@@ -1333,6 +1420,8 @@ export default function WorkerOnboarding() {
     // When leaving step 2 (Location), persist address to profile so payout-account API has it
     if (currentStep === 2 && existingProfile?.id && formData.address) {
       const next = 3;
+      const lat = typeof formData.latitude === "number" && !Number.isNaN(formData.latitude) ? formData.latitude : undefined;
+      const lng = typeof formData.longitude === "number" && !Number.isNaN(formData.longitude) ? formData.longitude : undefined;
       updateProfile({
         id: existingProfile.id,
         data: {
@@ -1340,6 +1429,7 @@ export default function WorkerOnboarding() {
           city: formData.city || undefined,
           state: formData.state || undefined,
           zipCode: formData.zipCode || undefined,
+          ...(lat != null && lng != null ? { latitude: lat, longitude: lng } : {}),
           onboardingStep: next,
         },
         skipToast: true,
@@ -1507,7 +1597,7 @@ export default function WorkerOnboarding() {
     const ref = new URLSearchParams(window.location.search).get("ref");
     createProfile({ ...step1Data, ...(ref ? { ref } : {}), skipToast: true } as Parameters<typeof createProfile>[0], {
       onSuccess: () => {
-        queryClient.invalidateQueries({ queryKey: ["/api/profiles", user.id] });
+        invalidateSessionProfileQueries(queryClient);
       },
       onError: () => safeToast({ title: "Error creating profile", variant: "destructive" }),
     });
@@ -1530,7 +1620,7 @@ export default function WorkerOnboarding() {
     if (currentStep === 4) {
       setStep4RoleChoice(null);
       setWorkerInviteStep(0);
-      setWorkerInviteData({ firstName: "", lastName: "", email: "", phone: "" });
+      setWorkerInviteData({ firstName: "", lastName: "", email: "", phone: "", address: "", city: "", state: "", zipCode: "", latitude: undefined, longitude: undefined, avatarUrl: "" });
       setCurrentStep(3);
       setStep3SubStep("portfolio");
       saveOnboardingProgress({ currentStep: 3, step3SubStep: "portfolio" });
@@ -1673,8 +1763,9 @@ export default function WorkerOnboarding() {
     safeToast({ title: "Link copied!", description: "Share it with your friends to earn $100!" });
   };
 
-  // Handle completion after stage 2
-  const handleCompleteOnboarding = async () => {
+  // Handle completion after stage 2. Pass acknowledgedName when user clicks Acknowledge (name used as signature, no draw/scroll).
+  const handleCompleteOnboarding = async (acknowledgedName?: string) => {
+    acknowledgedSignatureRef.current = acknowledgedName ?? null;
     // First, handle authentication if needed
     if (!user) {
       // If user provided password, register them
@@ -1746,6 +1837,9 @@ export default function WorkerOnboarding() {
       city: formData.city,
       state: formData.state,
       zipCode: formData.zipCode,
+      ...(typeof formData.latitude === "number" && !Number.isNaN(formData.latitude) && typeof formData.longitude === "number" && !Number.isNaN(formData.longitude)
+        ? { latitude: formData.latitude, longitude: formData.longitude }
+        : {}),
       avatarUrl: formData.avatarUrl,
       hourlyRate: formData.hourlyRate,
       serviceCategories: formData.serviceCategories,
@@ -1782,17 +1876,18 @@ export default function WorkerOnboarding() {
       }
     }
 
-    // Helper function to save digital signature
-    const saveDigitalSignature = async (profileId: number) => {
-      if (!signatureData) return;
-      
+    // Helper function to save digital signature (signatureOverride: acknowledged name or drawn image data)
+    const saveDigitalSignature = async (profileId: number, signatureOverride?: string | null) => {
+      const data = signatureOverride ?? signatureData;
+      if (!data) return;
+      const signedName = formData.firstName && formData.lastName ? `${formData.firstName} ${formData.lastName}` : "Contractor";
       try {
         await apiRequest("POST", "/api/signatures", {
           profileId,
           documentType: "contractor_agreement",
           documentVersion: "1.0",
-          signedName: formData.firstName && formData.lastName ? `${formData.firstName} ${formData.lastName}` : "Contractor",
-          signatureData: signatureData,
+          signedName,
+          signatureData: data,
           ipAddress: "", // Will be captured server-side
           signedAt: new Date(),
         });
@@ -1805,18 +1900,20 @@ export default function WorkerOnboarding() {
     if (existingProfile) {
       updateProfile({ id: existingProfile.id, data: profileData, skipToast: true }, {
         onSuccess: async (updatedProfile) => {
-          // Save digital signature if contract was signed
-          if (signatureData && existingProfile.id) {
-            await saveDigitalSignature(existingProfile.id);
+          const sig = acknowledgedSignatureRef.current ?? signatureData;
+          if (sig && existingProfile.id) {
+            await saveDigitalSignature(existingProfile.id, sig);
+            acknowledgedSignatureRef.current = null;
           }
           clearOnboardingProgress();
           await queryClient.invalidateQueries({ queryKey: ["/api/signatures"] });
+          invalidateSessionProfileQueries(queryClient);
           const isEmployee = existingProfile.teamId !== null && existingProfile.teamId !== undefined;
           const target = isEmployee ? "/dashboard/today" : "/dashboard";
           // Defer to escape React Query's callback flow; skip toast (triggers Radix setRef bug).
           setTimeout(() => {
             if (updatedProfile && user?.id) {
-              queryClient.setQueryData([api.profiles.get.path, user.id], updatedProfile);
+              queryClient.setQueryData(profileMeQueryKey(user.id), updatedProfile);
             }
             setLocation(target);
           }, 0);
@@ -1833,11 +1930,17 @@ export default function WorkerOnboarding() {
             const res = await apiRequest("GET", `/api/profiles?userId=${user?.id}`);
             const profiles = await res.json();
             const newProfile = Array.isArray(profiles) ? profiles[0] : profiles;
-            if (signatureData && newProfile?.id) {
-              await saveDigitalSignature(newProfile.id);
+            const sig = acknowledgedSignatureRef.current ?? signatureData;
+            if (sig && newProfile?.id) {
+              await saveDigitalSignature(newProfile.id, sig);
+              acknowledgedSignatureRef.current = null;
             }
             clearOnboardingProgress();
             await queryClient.invalidateQueries({ queryKey: ["/api/signatures"] });
+            invalidateSessionProfileQueries(queryClient);
+            if (newProfile && user?.id) {
+              queryClient.setQueryData(profileMeQueryKey(user.id), newProfile);
+            }
             const isEmployee = !!newProfile?.teamId;
             const target = isEmployee ? "/dashboard/today" : "/dashboard";
             // Defer to escape React Query's callback flow; skip toast (triggers Radix setRef bug).
@@ -1884,7 +1987,7 @@ export default function WorkerOnboarding() {
       id: 3,
       title: "Skills & Services",
       subSteps: [
-        { id: "hourly-rate", label: "Hourly Rate", completed: formData.hourlyRate != null && formData.hourlyRate >= 0 },
+        { id: "hourly-rate", label: "Hourly Rate", completed: formData.hourlyRate != null && formData.hourlyRate >= 1 },
         { id: "categories", label: "Service Categories", completed: !!(formData.serviceCategories && formData.serviceCategories.length > 0) },
         { id: "portfolio", label: "Prior Work Photos", completed: !!(formData.portfolioImages && formData.portfolioImages.length > 0) },
       ]
@@ -3548,12 +3651,15 @@ export default function WorkerOnboarding() {
                       const city = fromComponents.city || parsed?.city || "";
                       const state = fromComponents.state || parsed?.state || "";
                       const zipCode = fromComponents.zipCode || parsed?.zipCode || "";
+                      const lat = typeof components.latitude === "number" ? components.latitude : undefined;
+                      const lng = typeof components.longitude === "number" ? components.longitude : undefined;
                       setFormData({
                         ...formData,
                         address: address,
                         city,
                         state,
                         zipCode,
+                        ...(lat != null && lng != null ? { latitude: lat, longitude: lng } : {}),
                       });
                       if (errors.address) {
                         const newErrors = { ...errors };
@@ -3693,18 +3799,15 @@ export default function WorkerOnboarding() {
 
                   {/* Slider - neutral track */}
                   <div className="mb-4">
-                    <Slider
-                      value={[formData.hourlyRate]}
-                      onValueChange={([value]) => setFormData({ ...formData, hourlyRate: value })}
-                      min={0}
-                      max={60}
-                      step={1}
+                    <RateSlider
+                      value={formData.hourlyRate}
+                      onValueChange={(value) => setFormData({ ...formData, hourlyRate: value })}
                       className="w-full [&_[role=slider]]:h-5 [&_[role=slider]]:w-5"
                     />
                   </div>
                   <div className="flex justify-between text-sm text-gray-500">
-                    <span>$0/hr</span>
-                    <span>$60/hr</span>
+                    <span>$1/hr</span>
+                    <span>$200/hr</span>
                   </div>
                 </div>
               </CardContent>
@@ -4065,12 +4168,9 @@ export default function WorkerOnboarding() {
                   
                   {/* Custom Slider Overlay */}
                   <div className="absolute inset-0">
-                    <Slider
-                      value={[formData.hourlyRate]}
-                      onValueChange={([value]) => setFormData({ ...formData, hourlyRate: value })}
-                      min={0}
-                      max={60}
-                      step={1}
+                    <RateSlider
+                      value={formData.hourlyRate}
+                      onValueChange={(value) => setFormData({ ...formData, hourlyRate: value })}
                       className="h-12 [&_[role=slider]]:h-10 [&_[role=slider]]:w-10 [&_[role=slider]]:border-4 [&_[role=slider]]:border-white [&_[role=slider]]:shadow-xl [&_[role=slider]]:bg-primary [&>span:first-child]:bg-transparent [&>span:first-child]:h-12"
                     />
                   </div>
@@ -4078,8 +4178,8 @@ export default function WorkerOnboarding() {
 
                 {/* Rate Labels */}
                 <div className="flex justify-between text-sm font-medium mb-8">
-                  <span className="text-green-600">$0/hr</span>
-                  <span className="text-red-600">$60/hr</span>
+                  <span className="text-green-600">$1/hr</span>
+                  <span className="text-red-600">$200/hr</span>
                 </div>
 
                 {/* Pro Tip - Start Lower */}
@@ -4240,31 +4340,43 @@ export default function WorkerOnboarding() {
                   <Button
                     type="button"
                     variant="outline"
-                    className="h-auto min-h-[140px] w-full max-w-sm py-8 px-6 flex flex-col items-center justify-center text-center gap-3 rounded-xl border-2 hover:border-primary/50 hover:bg-primary/5 transition-colors"
+                    className="h-auto min-h-[200px] w-full max-w-sm p-0 flex flex-col items-stretch text-center rounded-xl border-2 hover:border-primary/50 hover:bg-primary/5 transition-colors overflow-hidden"
                     onClick={() => {
                       setStep4RoleChoice("doing_work");
                       nextStep();
                     }}
                     data-testid="button-doing-work"
                   >
-                    <div className="w-14 h-14 rounded-full bg-primary/10 flex items-center justify-center flex-shrink-0">
-                      <User className="w-7 h-7 text-primary" />
+                    <div className="w-full h-24 sm:h-28 flex-shrink-0 bg-muted">
+                      <img
+                        src="https://corporateweb-v3-corporatewebv3damstrawebassetbuck-1lruglqypgb84.s3-ap-southeast-2.amazonaws.com/public/products-solo-body-2.jpg"
+                        alt=""
+                        className="w-full h-full object-cover object-center"
+                      />
                     </div>
-                    <span className="font-semibold text-lg">I'm doing the work</span>
-                    <span className="text-sm text-muted-foreground">Solo or primary worker</span>
+                    <div className="py-4 px-4 flex flex-col gap-1">
+                      <span className="font-semibold text-lg">I'm doing the work</span>
+                      <span className="text-sm text-muted-foreground">Solo or primary worker</span>
+                    </div>
                   </Button>
                   <Button
                     type="button"
                     variant="outline"
-                    className="h-auto min-h-[140px] w-full max-w-sm py-8 px-6 flex flex-col items-center justify-center text-center gap-3 rounded-xl border-2 hover:border-primary/50 hover:bg-primary/5 transition-colors"
+                    className="h-auto min-h-[200px] w-full max-w-sm p-0 flex flex-col items-stretch text-center rounded-xl border-2 hover:border-primary/50 hover:bg-primary/5 transition-colors overflow-hidden"
                     onClick={() => setStep4RoleChoice("managing_team")}
                     data-testid="button-managing-team"
                   >
-                    <div className="w-14 h-14 rounded-full bg-primary/10 flex items-center justify-center flex-shrink-0">
-                      <UserPlus className="w-7 h-7 text-primary" />
+                    <div className="w-full h-24 sm:h-28 flex-shrink-0 bg-muted">
+                      <img
+                        src="https://www.zuper.co/wp-content/uploads/2023/02/63ff262d802b18a12b123490_How-to-Build-and-Maintain-a-Solid-Field-Service-Team-01-2.jpg"
+                        alt=""
+                        className="w-full h-full object-cover object-center"
+                      />
                     </div>
-                    <span className="font-semibold text-lg">I'm managing a team</span>
-                    <span className="text-sm text-muted-foreground">Invite teammates to join</span>
+                    <div className="py-4 px-4 flex flex-col gap-1">
+                      <span className="font-semibold text-lg">I'm managing a team</span>
+                      <span className="text-sm text-muted-foreground">Invite teammates to join</span>
+                    </div>
                   </Button>
                 </div>
               </>
@@ -4334,9 +4446,39 @@ export default function WorkerOnboarding() {
                   <div className="space-y-4">
                     <div className="flex items-center justify-between gap-2">
                       <h4 className="font-medium">Invite team member</h4>
-                      <Button type="button" variant="ghost" size="sm" onClick={() => { setWorkerInviteStep(0); setWorkerInviteData({ firstName: "", lastName: "", email: "", phone: "" }); }}>Back</Button>
+                      <Button type="button" variant="ghost" size="sm" onClick={() => { setWorkerInviteStep(0); setWorkerInviteData({ firstName: "", lastName: "", email: "", phone: "", address: "", city: "", state: "", zipCode: "", latitude: undefined, longitude: undefined, avatarUrl: "" }); }}>Back</Button>
                     </div>
                     <p className="text-xs text-muted-foreground">Enter their details. We'll send an invitation email.</p>
+                    <div>
+                      <Label className="text-muted-foreground">Photo (optional)</Label>
+                      <div className="flex items-center gap-3 mt-1.5">
+                        <button
+                          type="button"
+                          onClick={() => teammateAvatarInputRef.current?.click()}
+                          className="rounded-full border-2 border-dashed border-border hover:border-primary/50 hover:bg-muted/50 transition-colors p-0.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                        >
+                          <Avatar className="h-14 w-14">
+                            {workerInviteData.avatarUrl && <AvatarImage src={workerInviteData.avatarUrl} alt="" />}
+                            <AvatarFallback className="text-lg bg-muted">
+                              {(workerInviteData.firstName || workerInviteData.lastName)
+                                ? `${(workerInviteData.firstName || "?").charAt(0)}${(workerInviteData.lastName || "?").charAt(0)}`.toUpperCase() || "?"
+                                : <Camera className="w-6 h-6 text-muted-foreground" />}
+                            </AvatarFallback>
+                          </Avatar>
+                        </button>
+                        <div className="text-sm text-muted-foreground">
+                          {workerInviteData.avatarUrl ? "Change photo" : "Click to add a face photo"}
+                        </div>
+                      </div>
+                      <input
+                        ref={teammateAvatarInputRef}
+                        type="file"
+                        accept="image/*"
+                        className="hidden"
+                        onChange={handleTeammateAvatarChange}
+                        data-testid="input-teammate-avatar"
+                      />
+                    </div>
                     <div className="grid grid-cols-2 gap-3">
                       <div>
                         <Label>First name</Label>
@@ -4377,9 +4519,45 @@ export default function WorkerOnboarding() {
                         data-testid="input-teammate-phone"
                       />
                     </div>
+                    <div>
+                      <Label>Worker address *</Label>
+                      <div className="relative mt-1">
+                        <div className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-500 z-10 pointer-events-none">
+                          <MapPin className="w-4 h-4" />
+                        </div>
+                        <div className="pl-10">
+                          <GooglePlacesAutocomplete
+                            id="teammate-address-onboarding"
+                            label=""
+                            value={workerInviteData.address || ""}
+                            onChange={(address, components) => {
+                              const fromComponents = {
+                                city: components.city || workerInviteData.city || "",
+                                state: components.state || workerInviteData.state || "",
+                                zipCode: components.zipCode || workerInviteData.zipCode || "",
+                              };
+                              const hasFromPlaces = !!(fromComponents.city && fromComponents.state && fromComponents.zipCode);
+                              const parsed = !hasFromPlaces && address ? parseUSAddressLine(address) : null;
+                              const lat = typeof components.latitude === "number" ? components.latitude : undefined;
+                              const lng = typeof components.longitude === "number" ? components.longitude : undefined;
+                              setWorkerInviteData((p) => ({
+                                ...p,
+                                address: address,
+                                city: fromComponents.city || parsed?.city || "",
+                                state: fromComponents.state || parsed?.state || "",
+                                zipCode: fromComponents.zipCode || parsed?.zipCode || "",
+                                ...(lat != null && lng != null ? { latitude: lat, longitude: lng } : {}),
+                              }));
+                            }}
+                            placeholder="Enter worker's address (city, state, zip required)"
+                          />
+                        </div>
+                      </div>
+                      <p className="text-xs text-muted-foreground mt-1.5">Select from the dropdown so we save city, state, and zip.</p>
+                    </div>
                     <div className="flex gap-2 pt-2">
-                      <Button type="button" variant="outline" onClick={() => { setWorkerInviteStep(0); setWorkerInviteData({ firstName: "", lastName: "", email: "", phone: "" }); }} className="flex-1">Cancel</Button>
-                      <Button type="button" onClick={handleSendOneTeammateInvite} disabled={inviteSending || !workerInviteData.email?.trim()} className="flex-1" data-testid="button-send-teammate-invite">
+                      <Button type="button" variant="outline" onClick={() => { setWorkerInviteStep(0); setWorkerInviteData({ firstName: "", lastName: "", email: "", phone: "", address: "", city: "", state: "", zipCode: "", latitude: undefined, longitude: undefined, avatarUrl: "" }); }} className="flex-1">Cancel</Button>
+                      <Button type="button" onClick={handleSendOneTeammateInvite} disabled={inviteSending || !workerInviteData.email?.trim() || !workerInviteData.address?.trim() || !workerInviteData.city?.trim() || !workerInviteData.state?.trim() || !workerInviteData.zipCode?.trim()} className="flex-1" data-testid="button-send-teammate-invite">
                         {inviteSending ? <><Loader2 className="w-4 h-4 mr-2 animate-spin" />Sending...</> : "Send invite"}
                       </Button>
                     </div>
@@ -4726,6 +4904,19 @@ export default function WorkerOnboarding() {
                     <Loader2 className="w-5 h-5 animate-spin text-muted-foreground" />
                     <p className="text-sm text-muted-foreground">Checking W-9 status with Mercury…</p>
                   </div>
+                ) : w9StatusError ? (
+                  <div className="flex flex-col sm:flex-row sm:items-center gap-3 p-4 bg-muted/50 rounded-lg border border-border">
+                    <AlertCircle className="w-5 h-5 text-amber-600 shrink-0" />
+                    <div className="flex-1 min-w-0">
+                      <p className="text-sm font-medium">Couldn’t verify W-9 with Mercury</p>
+                      <p className="text-xs text-muted-foreground mt-1">
+                        Check timed out or network error. You can still upload your W-9; use Retry to check again.
+                      </p>
+                    </div>
+                    <Button type="button" variant="outline" size="sm" className="shrink-0" onClick={() => refetchW9Status()}>
+                      Retry
+                    </Button>
+                  </div>
                 ) : w9Status?.attached ? (
                   <div className="flex items-center gap-3 p-4 bg-green-50 rounded-lg border border-green-200">
                     <CheckCircle2 className="w-5 h-5 text-green-600" />
@@ -4763,7 +4954,7 @@ export default function WorkerOnboarding() {
                               data: { w9DocumentUrl: base64Data, w9UploadedAt: new Date() },
                               skipToast: true,
                             });
-                            await queryClient.invalidateQueries({ queryKey: ["/api/profiles", user.id] });
+                            invalidateSessionProfileQueries(queryClient);
                             await queryClient.invalidateQueries({ queryKey: ["/api/worker/w9-status"] });
                             safeToast({
                               title: "W-9 uploaded",
@@ -4796,102 +4987,16 @@ export default function WorkerOnboarding() {
           </div>
         )}
 
-        {/* Step 7: Contract - in-card style within onboarding layout */}
+        {/* Step 7: Contract - uses full main scroll area (one scroll, no inner max-height) */}
         {currentStep === 7 && (
           <div className="space-y-4">
             <div className="bg-white rounded-2xl shadow-lg overflow-hidden border border-gray-200">
               <div className="h-1.5 bg-gray-800" />
-              <div className="relative">
-                <div className="flex items-center justify-end gap-2 px-4 py-2 border-b border-gray-100 bg-gray-50/80">
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="sm"
-                    className="text-stone-600 hover:text-stone-900 hover:bg-stone-100"
-                    onClick={scrollToBottomOfContract}
-                    data-testid="button-scroll-to-bottom"
-                  >
-                    <ChevronDown className="w-4 h-4 mr-1" />
-                    Scroll to bottom
-                  </Button>
-                </div>
-                <div
-                  ref={contractScrollRef}
-                  onScroll={handleContractScroll}
-                  className="p-8 md:p-12 overflow-y-auto"
-                  style={{ maxHeight: "55vh" }}
-                >
-                  <div className="max-w-none text-stone-900" style={{ fontFamily: "'Times New Roman', Times, serif" }}>
-                    <pre className="whitespace-pre-wrap text-sm md:text-base leading-relaxed" style={{ fontFamily: "'Times New Roman', Times, serif", color: "#1c1917" }}>
-                      {CONTRACT_TEXT}
-                    </pre>
-                  </div>
-                </div>
-                {!hasScrolledToBottom && (
-                  <div className="absolute bottom-0 left-0 right-0 h-12 bg-gradient-to-t from-white to-transparent pointer-events-none" aria-hidden />
-                )}
-              </div>
-              <div className="border-t-2 border-stone-200 bg-stone-50/80 p-6 md:p-8">
-                <h3 className="font-semibold mb-4 flex items-center gap-2 text-stone-900" style={{ fontFamily: "'Times New Roman', Times, serif" }}>
-                  <Pen className="w-5 h-5" /> Contractor Signature
-                </h3>
-                {!hasScrolledToBottom && (
-                  <p className="text-sm text-stone-600 mb-4 italic">Please scroll through the entire document to enable signing, or use the &quot;Scroll to bottom&quot; button above.</p>
-                )}
-                <div
-                  className={`p-6 text-center mb-4 relative transition-all bg-white rounded-lg ${signatureData ? "border-2 border-stone-900" : "border-2 border-dashed border-stone-300"}`}
-                  onMouseEnter={() => setSignatureHovered(true)}
-                  onMouseLeave={() => setSignatureHovered(false)}
-                >
-                  {signatureData ? (
-                    <div className="space-y-2">
-                      {signatureData.startsWith("data:") ? (
-                        <img src={signatureData} alt="Your signature" className="max-h-20 w-auto mx-auto object-contain" />
-                      ) : (
-                        <p className="text-2xl italic text-stone-900" style={{ fontFamily: "'Brush Script MT', cursive" }}>
-                          {signatureData}
-                        </p>
-                      )}
-                      <div className="border-t border-stone-400 pt-2 mt-4 mx-auto max-w-[200px]">
-                        <p className="text-xs text-stone-600">
-                          Date: {new Date().toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric" })}
-                        </p>
-                      </div>
-                      {signatureHovered && (
-                        <button
-                          type="button"
-                          onClick={(e) => { e.stopPropagation(); setSignatureData(null); }}
-                          className="absolute top-2 right-2 text-xs text-stone-500 hover:text-red-600 transition-colors"
-                        >
-                          Clear
-                        </button>
-                      )}
-                    </div>
-                  ) : hasScrolledToBottom ? (
-                    <div ref={signaturePadContainerRef} className="space-y-3">
-                      <p className="text-sm text-stone-600">Draw your signature below</p>
-                      <canvas
-                        ref={signatureCanvasRef}
-                        className="block w-full border border-stone-300 rounded-lg bg-white touch-none cursor-crosshair"
-                        style={{ height: 200 }}
-                        data-testid="signature-canvas"
-                      />
-                      <div className="flex items-center justify-center gap-2">
-                        <Button type="button" variant="outline" size="sm" onClick={clearSignaturePad}>
-                          Clear
-                        </Button>
-                        <Button type="button" size="sm" className="bg-gray-900 hover:bg-gray-800 text-white" onClick={captureSignature} data-testid="button-done-signature">
-                          Done
-                        </Button>
-                      </div>
-                    </div>
-                  ) : (
-                    <div>
-                      <p className="text-stone-500 mb-2">Scroll to bottom first to enable signing</p>
-                      <div className="border-t border-stone-300 mx-auto max-w-[200px]" />
-                      <p className="text-xs text-stone-400 mt-1">Signature Line</p>
-                    </div>
-                  )}
+              <div className="p-6 md:p-8">
+                <div className="max-w-none text-stone-900" style={{ fontFamily: "'Times New Roman', Times, serif" }}>
+                  <pre className="whitespace-pre-wrap text-sm md:text-base leading-relaxed" style={{ fontFamily: "'Times New Roman', Times, serif", color: "#1c1917" }}>
+                    {CONTRACT_TEXT}
+                  </pre>
                 </div>
               </div>
               <div className="h-1.5 bg-gray-800" />
@@ -4977,7 +5082,7 @@ export default function WorkerOnboarding() {
                         onClick={nextStep}
                         className="h-12 text-base font-semibold rounded-xl shadow-lg flex-1 min-w-0 bg-gray-900 text-white hover:bg-gray-800"
                         style={{ width: "65%", flexShrink: 0 }}
-                        disabled={formData.hourlyRate == null || formData.hourlyRate < 0 || formData.hourlyRate > 60}
+                        disabled={formData.hourlyRate == null || formData.hourlyRate < 1 || formData.hourlyRate > 200}
                         data-testid="button-next-step-footer"
                       >
                         Next
@@ -5050,10 +5155,10 @@ export default function WorkerOnboarding() {
                     )}
                     {currentStep === 7 && (
                       <Button
-                        onClick={handleCompleteOnboarding}
+                        onClick={() => handleCompleteOnboarding([formData.firstName, formData.lastName].filter(Boolean).join(" ") || undefined)}
                         className="h-12 text-base font-semibold rounded-xl shadow-lg flex-1 min-w-0 bg-gray-900 text-white hover:bg-gray-800"
                         style={{ width: "65%", flexShrink: 0 }}
-                        disabled={isCreating || isUpdating || isRegistering || !signatureData || !hasScrolledToBottom}
+                        disabled={isCreating || isUpdating || isRegistering || !formData.firstName?.trim() || !formData.lastName?.trim()}
                         data-testid="button-complete-onboarding"
                       >
                         {isRegistering || isCreating || isUpdating ? (
@@ -5062,7 +5167,7 @@ export default function WorkerOnboarding() {
                             {isRegistering ? "Creating Account..." : "Saving..."}
                           </>
                         ) : (
-                          "Complete"
+                          "Acknowledge"
                         )}
                       </Button>
                     )}
@@ -5126,7 +5231,7 @@ export default function WorkerOnboarding() {
                 <Button 
                   onClick={nextStep} 
                   className="h-11 min-w-64 px-8 bg-gray-900 text-white hover:bg-gray-800"
-                  disabled={formData.hourlyRate == null || formData.hourlyRate < 0 || formData.hourlyRate > 60}
+                  disabled={formData.hourlyRate == null || formData.hourlyRate < 1 || formData.hourlyRate > 200}
                   data-testid="button-next-step-footer"
                 >
                   Next
@@ -5194,9 +5299,9 @@ export default function WorkerOnboarding() {
               )}
               {currentStep === 7 && (
                 <Button 
-                  onClick={handleCompleteOnboarding}
+                  onClick={() => handleCompleteOnboarding([formData.firstName, formData.lastName].filter(Boolean).join(" ") || undefined)} 
                   className="h-11 min-w-64 px-8 bg-gray-900 text-white hover:bg-gray-800"
-                  disabled={isCreating || isUpdating || isRegistering || !signatureData || !hasScrolledToBottom}
+                  disabled={isCreating || isUpdating || isRegistering || !formData.firstName?.trim() || !formData.lastName?.trim()}
                   data-testid="button-complete-onboarding"
                 >
                   {isRegistering || isCreating || isUpdating ? (
@@ -5205,7 +5310,7 @@ export default function WorkerOnboarding() {
                       {isRegistering ? "Creating Account..." : "Saving..."}
                     </>
                   ) : (
-                    "Complete"
+                    "Acknowledge"
                   )}
                 </Button>
               )}

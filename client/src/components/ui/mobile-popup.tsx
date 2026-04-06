@@ -10,9 +10,9 @@ import { useIsMobile, useIsDesktop } from "@/hooks/use-mobile";
 import { useScrollHeaderContainer } from "@/hooks/use-scroll-header-container";
 import { cn } from "@/lib/utils";
 
-// Cleanup lingering modal overlays (fixes DropdownMenu → Dialog interactions)
-function cleanupOverlays() {
-  setTimeout(() => {
+// Cleanup lingering modal overlays (fixes DropdownMenu → Dialog interactions and blocking layer after close). Exported for use when closing other dialogs (e.g. Quick Settings).
+export function cleanupOverlays() {
+  const run = () => {
     const root = document.getElementById('root');
     if (root && root.getAttribute('aria-hidden') === 'true') {
       root.removeAttribute('aria-hidden');
@@ -29,7 +29,14 @@ function cleanupOverlays() {
         }, 300);
       }
     });
-  }, 150);
+    // Disable closed Radix overlays so they don't block interactions (they can linger in DOM after close)
+    const container = document.getElementById('dialog-container') ?? document.body;
+    container.querySelectorAll('[data-state="closed"]').forEach((el) => {
+      (el as HTMLElement).style.pointerEvents = 'none';
+    });
+  };
+  setTimeout(run, 0);
+  setTimeout(run, 150);
 }
 
 /** Line separator matching job-details popup style. Use between sections. */
@@ -78,6 +85,8 @@ interface MobilePopupProps {
   maxWidth?: "sm" | "md" | "lg" | "xl" | "2xl";
   /** Hide X close (e.g. when using custom chrome). Default false. */
   hideCloseButton?: boolean;
+  /** When true, use higher z-index so this popup appears on top of another open dialog (e.g. breadcrumb "next" popup). */
+  elevated?: boolean;
 }
 
 const SOFT_BLACK = "bg-neutral-900 hover:bg-neutral-800 text-white border-0";
@@ -102,6 +111,7 @@ export function MobilePopup({
   secondaryAction,
   maxWidth = "md",
   hideCloseButton = false,
+  elevated = false,
 }: MobilePopupProps) {
   const isMobile = useIsMobile();
   const isDesktop = useIsDesktop();
@@ -109,11 +119,9 @@ export function MobilePopup({
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const isScrolled = useScrollHeaderContainer(scrollContainerRef);
 
-  // Cleanup overlays when popup closes
+  // Cleanup overlays when popup opens or closes so any lingering dropdown/aria-hidden is cleared and popup is exitable
   useEffect(() => {
-    if (!open) {
-      cleanupOverlays();
-    }
+    cleanupOverlays();
   }, [open]);
 
   const maxWidthClass = {
@@ -247,11 +255,13 @@ export function MobilePopup({
       )}
     >
       {progressBar}
-      {(footer || actionButtonsOnly) && (
-        <div className="footer-actions-container flex-row justify-between gap-3 p-4 sm:p-6">
-          {footer ?? actionButtonsOnly}
+      {footer != null ? (
+        footer
+      ) : hasActions ? (
+        <div className="footer-actions-container flex-row justify-between gap-3 p-4 sm:p-6 w-full">
+          {actionButtonsOnly}
         </div>
-      )}
+      ) : null}
     </div>
   );
 
@@ -266,9 +276,20 @@ export function MobilePopup({
 
   /* Mobile and tablet: bottom-up drawer. Desktop: centered dialog. */
   if (!isDesktop) {
+    const drawerContainerEl = elevated && open ? document.getElementById("dialog-container") ?? undefined : undefined;
     return (
-      <Drawer open={open} onOpenChange={onOpenChange}>
-        <DrawerContent className="rounded-t-[28px] max-h-[90dvh] w-full max-w-full flex flex-col overflow-hidden">
+      <Drawer
+        open={open}
+        onOpenChange={onOpenChange}
+        container={drawerContainerEl}
+      >
+        <DrawerContent
+          overlayClassName={elevated ? "z-[10000]" : undefined}
+          className={cn(
+            "rounded-t-[28px] max-h-[90dvh] w-full max-w-full flex flex-col overflow-hidden",
+            elevated && "z-[10001]"
+          )}
+        >
           <DrawerTitle className="sr-only">{title}</DrawerTitle>
           <DrawerDescription className="sr-only">{description || title}</DrawerDescription>
           <div className={drawerContainer}>
@@ -287,8 +308,14 @@ export function MobilePopup({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent
         hideCloseButton
-        className={cn(maxWidthClass, "p-0 rounded-2xl shadow-2xl border-0 max-h-[85vh] overflow-hidden")}
+        overlayClassName={elevated ? "z-[10000]" : undefined}
+        className={cn(maxWidthClass, "p-0 rounded-2xl shadow-2xl border-0 max-h-[85vh] overflow-hidden", elevated && "z-[10001]")}
         aria-describedby={descriptionId}
+        onPointerDownOutside={(e) => {
+          if ((e.target as HTMLElement).closest?.("[data-google-places-dropdown]")) {
+            e.preventDefault();
+          }
+        }}
       >
         <DialogTitle className="sr-only">{title}</DialogTitle>
         <DialogDescription id={descriptionId} className="sr-only">{description || title}</DialogDescription>
@@ -304,17 +331,15 @@ export function MobilePopup({
   );
 }
 
+/** Single full-width footer actions strip. Use as MobilePopup footer prop; padding and layout only (chrome is from the popup). */
 export function MobilePopupFooter({ children, isMobile }: { children: ReactNode; isMobile?: boolean }) {
   return (
     <div
       className={cn(
-        "flex-shrink-0 flex flex-col border-t bg-background overflow-hidden rounded-t-none min-h-[60px] sm:min-h-0",
-        isMobile ? FOOTER_SHADOW_MOBILE + " " + FOOTER_SAFE_AREA : FOOTER_SHADOW
+        "footer-actions-container flex w-full min-h-0 flex-col sm:flex-row gap-2 p-4 sm:p-6 min-h-[60px] sm:min-h-0 items-stretch sm:items-stretch justify-stretch"
       )}
     >
-      <div className="footer-actions-container flex-col sm:flex-row gap-2 p-4 sm:p-6">
-        {children}
-      </div>
+      {children}
     </div>
   );
 }

@@ -1,4 +1,4 @@
-import { QueryClient, QueryFunction } from "@tanstack/react-query";
+import { QueryClient, QueryFunction, type QueryFunctionContext } from "@tanstack/react-query";
 
 async function throwIfResNotOk(res: Response) {
   if (!res.ok) {
@@ -14,6 +14,17 @@ async function throwIfResNotOk(res: Response) {
     err.status = res.status;
     throw err;
   }
+}
+
+/**
+ * GET JSON from url; on 404 returns fallback without throwing (avoids console error).
+ * Use for endpoints that may not exist yet (e.g. /api/worker/payouts).
+ */
+export async function fetchJsonOrFallback<T>(url: string, fallback: T): Promise<T> {
+  const res = await fetch(url, { method: "GET", credentials: "include" });
+  if (res.status === 404) return fallback;
+  await throwIfResNotOk(res);
+  return res.json();
 }
 
 /**
@@ -61,6 +72,31 @@ export async function apiRequest(
   }
 }
 
+/** True if the error is a network/connection failure (server down, no network). */
+function isConnectionError(error: unknown): boolean {
+  if (error instanceof TypeError) {
+    const msg = (error.message ?? "").toLowerCase();
+    if (msg.includes("fetch") || msg.includes("failed to fetch") || msg.includes("networkerror") || msg.includes("network request failed")) {
+      return true;
+    }
+  }
+  const anyErr = error as { message?: string; code?: string };
+  const msg = (anyErr?.message ?? "").toLowerCase();
+  const code = anyErr?.code ?? "";
+  return (
+    msg.includes("connection refused") ||
+    msg.includes("err_connection_refused") ||
+    msg.includes("err_connection_reset") ||
+    code === "ECONNREFUSED" ||
+    code === "ECONNRESET" ||
+    code === "ENOTFOUND"
+  );
+}
+
+/** Throttle connection-error warnings per key (once per 30s) to avoid console spam when server is down. */
+const connectionWarnLast = new Map<string, number>();
+const CONNECTION_WARN_THROTTLE_MS = 30_000;
+
 type UnauthorizedBehavior = "returnNull" | "throw";
 export const getQueryFn: <T>(options: {
   on401: UnauthorizedBehavior;
@@ -79,33 +115,51 @@ export const getQueryFn: <T>(options: {
       await throwIfResNotOk(res);
       return await res.json();
     } catch (error: any) {
-      // Handle network errors (connection refused, etc.)
-      if (error instanceof TypeError && (error.message.includes("fetch") || error.message.includes("Failed to fetch"))) {
-        // Silently return empty data for connection errors to prevent UI crashes
-        // Only log in development mode
-        if (import.meta.env.DEV) {
-          console.warn(`Connection error for ${queryKey.join("/")}: Server may not be running`);
-        }
-        
-        // Return appropriate empty data structure based on query type
-        const queryKeyStr = queryKey.join("/");
-        if (queryKeyStr.includes("device-tokens") || queryKeyStr.includes("notifications") || queryKeyStr.includes("timesheets") || queryKeyStr.includes("payout")) {
-          return [] as T;
-        }
-        // For other queries, return null
-        return null as T;
+      if (!isConnectionError(error)) {
+        throw error;
       }
-      // Re-throw other errors
-      throw error;
+      // Return empty data for connection errors to prevent UI crashes and avoid throwing
+      const key = queryKey.join("/");
+      if (import.meta.env.DEV) {
+        const now = Date.now();
+        const last = connectionWarnLast.get(key) ?? 0;
+        if (now - last >= CONNECTION_WARN_THROTTLE_MS) {
+          connectionWarnLast.set(key, now);
+          console.warn(`Connection error for ${key}: Server may not be running`);
+        }
+      }
+      const queryKeyStr = queryKey.join("/");
+      if (queryKeyStr.includes("device-tokens") || queryKeyStr.includes("notifications") || queryKeyStr.includes("timesheets") || queryKeyStr.includes("payout")) {
+        return [] as T;
+      }
+      return null as T;
     }
   };
+
+/** Clears stale session when any default query gets 401 (avoids hammering APIs after cookie expiry). */
+function wrapQueryFnWith401SessionReset<T>(inner: QueryFunction<T>): QueryFunction<T> {
+  return async (ctx: QueryFunctionContext) => {
+    try {
+      return await inner(ctx);
+    } catch (e: unknown) {
+      const status = (e as { status?: number })?.status;
+      if (status === 401) {
+        queryClient.setQueryData(["/api/auth/user"], null);
+      }
+      throw e;
+    }
+  };
+}
 
 export const queryClient = new QueryClient({
   defaultOptions: {
     queries: {
-      queryFn: getQueryFn({ on401: "throw" }),
+      queryFn: wrapQueryFnWith401SessionReset(getQueryFn({ on401: "throw" })),
       refetchInterval: false,
-      refetchOnWindowFocus: false,
+      // Enable window-focus refetch so queries with explicit staleTime (job feed, timesheets, etc.)
+      // automatically refresh when the user returns to the tab — without hammering queries
+      // that keep staleTime: Infinity (the default below, so they're never considered stale).
+      refetchOnWindowFocus: true,
       staleTime: Infinity,
       retry: false,
     },

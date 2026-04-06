@@ -1,5 +1,5 @@
 import React, { useState, useMemo, useEffect, useCallback } from "react";
-import { format, isToday, isTomorrow, differenceInDays, differenceInMonths, isPast, addHours, isSameDay } from "date-fns";
+import { format, isToday, isTomorrow, differenceInDays, differenceInMonths, isPast, addHours, isSameDay, startOfDay, addMonths, addWeeks } from "date-fns";
 import { Dialog, DialogContent, DialogTitle, DialogDescription } from "@/components/ui/dialog";
 import { Drawer, DrawerContent, DrawerTitle, DrawerDescription } from "@/components/ui/drawer";
 import { Button } from "@/components/ui/button";
@@ -13,18 +13,20 @@ import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/h
 import { UserProfileCard } from "@/components/ui/user-profile-card";
 import { 
   MapPin, Send, X, Calendar, Users, 
-  ChevronLeft, ChevronRight, Play, Image as ImageIcon, Info, Loader2,
+  ChevronLeft, ChevronRight, ChevronDown, ChevronUp, Play, Image as ImageIcon, Info, Loader2,
   CalendarCheck, CalendarX, Clock, Navigation, XCircle, Car, Settings, ArrowLeft, Check, MessageSquare,
   DollarSign, CheckCircle2, Flag, Shield, Key, FileCheck, AlertTriangle, Wrench, AlertCircle, Settings2,
-  Edit2, MapPinned
+  Edit2, MapPinned, Receipt
 } from "lucide-react";
 import { Input } from "@/components/ui/input";
 import { Slider } from "@/components/ui/slider";
+import { RateSlider } from "@/components/RateSlider";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Accordion, AccordionContent, AccordionItem, AccordionTrigger } from "@/components/ui/accordion";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { NumberFlowComponent } from "@/components/ui/number-flow";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { MiniJobMap, JobLocationMap } from "./JobsMap";
@@ -33,10 +35,146 @@ import { LayeredAvatars } from "./LayeredAvatars";
 import { GooglePlacesAutocomplete } from "./GooglePlacesAutocomplete";
 import type { Job, Profile, Timesheet } from "@shared/schema";
 import { useTranslation } from "react-i18next";
+import { useLocation } from "wouter";
 import { useScrollHeaderContainer } from "@/hooks/use-scroll-header-container";
-import { cn, normalizeAvatarUrl } from "@/lib/utils";
-import { getAllRoles } from "@shared/industries";
+import { cn, normalizeAvatarUrl, formatTime12h } from "@/lib/utils";
+import { getDisplayJobTitle } from "@/lib/job-display";
+import { INDUSTRY_CATEGORIES, getLiteElitePartner } from "@shared/industries";
 import { ResponsiveDialog } from "@/components/ui/responsive-dialog";
+import { MaterialInvoiceDialog } from "@/components/MaterialInvoiceDialog";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
+import { usePersistentFilter } from "@/hooks/use-persistent-filter";
+
+/** Converts stored rate (cents or dollars) to dollars. Values > 100 are treated as cents. Matches WorkerDashboard so map pill and panel show same payout. */
+function rateToDollars(v: number | null | undefined): number {
+  if (v == null) return 30;
+  return v > 100 ? v / 100 : v;
+}
+
+/** Worker hourly rate in dollars; profile/job may be in cents. Matches WorkerDashboard getWorkerHourlyRate. */
+function getWorkerHourlyRate(profileRate: number | null | undefined, jobRate: number): number {
+  if (profileRate != null && profileRate > 0) return rateToDollars(profileRate);
+  return rateToDollars(jobRate);
+}
+
+/** Compute effective total hours + day span for payout math and breakdown copy. */
+function getPayoutBreakdownFromJob(job: Job): { totalHours: number; hoursPerDay: number; days: number } {
+  const totalHours = job.estimatedHours ?? 8;
+  const start = job.startDate ? new Date(job.startDate) : null;
+  const end = job.endDate ? new Date(job.endDate) : null;
+
+  let days = 1;
+  if (job.jobType === "recurring" && (job.recurringWeeks ?? 0) > 0 && job.scheduleDays?.length) {
+    days = (job.recurringWeeks ?? 1) * job.scheduleDays.length;
+  } else if (start && end && end > start) {
+    const startDay = startOfDay(start);
+    const endDay = startOfDay(end);
+    const diff = differenceInDays(endDay, startDay);
+    if (diff >= 0) days = diff + 1;
+  }
+
+  const hoursPerDay = days > 0 ? totalHours / days : totalHours;
+  return { totalHours, hoursPerDay, days };
+}
+
+/** Format payout breakdown line: "8 hrs × $38/hr = $304" or "144 total hrs × 12 days × $20/hr = $2,880". */
+function formatPayoutBreakdown(
+  totalHours: number,
+  hoursPerDay: number,
+  days: number,
+  rateDollars: number,
+  subtotal: number
+): string {
+  const rate = Math.round(rateDollars);
+  const sub = Math.round(subtotal).toLocaleString();
+  const totalHoursDisplay =
+    Number.isInteger(totalHours) ? String(totalHours) : totalHours.toFixed(1).replace(/\.0$/, "");
+  if (days <= 1) {
+    return `${totalHoursDisplay} hrs × $${rate}/hr = $${sub}`;
+  }
+  return `${totalHoursDisplay} total hrs × ${days} days × $${rate}/hr = $${sub}`;
+}
+
+function getPayoutBreakdownPieces(
+  totalHours: number,
+  days: number,
+  rateDollars: number,
+  subtotal: number
+): { prefix: string; rateLabel: string; suffix: string } {
+  const rate = Math.round(rateDollars);
+  const sub = Math.round(subtotal).toLocaleString();
+  const totalHoursDisplay =
+    Number.isInteger(totalHours) ? String(totalHours) : totalHours.toFixed(1).replace(/\.0$/, "");
+  if (days <= 1) {
+    return {
+      prefix: `${totalHoursDisplay} hrs × `,
+      rateLabel: `$${rate}/hr`,
+      suffix: ` = $${sub}`,
+    };
+  }
+  return {
+    prefix: `${totalHoursDisplay} total hrs × ${days} days × `,
+    rateLabel: `$${rate}/hr`,
+    suffix: ` = $${sub}`,
+  };
+}
+
+function buildInlineApplyMessageTemplates(input: {
+  firstName: string;
+  roleLabel: string;
+  companyLabel: string;
+  tradeLabel: string;
+  timeLabel: string;
+  locationLabel: string;
+  skillLabel: string;
+}): string[] {
+  const { firstName, roleLabel, companyLabel, tradeLabel, timeLabel, locationLabel, skillLabel } = input;
+  const hello = [`Hi ${companyLabel},`, `Hello ${companyLabel},`, `Good day ${companyLabel},`, `Hey ${companyLabel},`];
+  const openers = [
+    `I'm ${firstName}, a ${roleLabel} with hands-on ${tradeLabel} experience.`,
+    `My name is ${firstName}, and I've been focused on ${tradeLabel} work.`,
+    `I'm ${firstName}. I can help on this ${tradeLabel} assignment right away.`,
+    `I'm ${firstName}, and this ${tradeLabel} role matches my background well.`,
+    `I'm ${firstName}, and I'm interested in supporting this ${tradeLabel} project.`,
+  ];
+  const proof = [
+    `I'm comfortable with ${skillLabel} and fast onboarding on-site.`,
+    `I work clean, communicate clearly, and keep pace with production targets.`,
+    `I'm reliable with attendance and can follow site direction closely.`,
+    `I prioritize safety, quality, and finishing scopes on schedule.`,
+    `I've handled similar scopes and can jump in with minimal ramp-up.`,
+  ];
+  const availability = [
+    `I'm available for ${timeLabel}.`,
+    `My schedule is open for ${timeLabel}.`,
+    `I can commit to ${timeLabel}.`,
+    `I'm ready for this timeline: ${timeLabel}.`,
+  ];
+  const close = [
+    `I can work at ${locationLabel} and would like to be considered.`,
+    `Happy to support this job at ${locationLabel}.`,
+    `I'm ready to start and can be on-site at ${locationLabel}.`,
+    `Please consider my application for this role.`,
+  ];
+
+  const templates: string[] = [];
+  const seen = new Set<string>();
+  let i = 0;
+  while (templates.length < 40 && i < 2000) {
+    const h = hello[(i + Math.floor(i / 2) + 1) % hello.length];
+    const o = openers[(i + Math.floor(i / 3) + 2) % openers.length];
+    const p = proof[(i * 2 + Math.floor(i / 5) + 3) % proof.length];
+    const a = availability[(i + Math.floor(i / 7) + 1) % availability.length];
+    const c = close[(i * 3 + Math.floor(i / 11) + 2) % close.length];
+    const msg = `${h} ${o} ${p} ${a} ${c}`;
+    if (!seen.has(msg)) {
+      seen.add(msg);
+      templates.push(msg);
+    }
+    i++;
+  }
+  return templates;
+}
 
 interface TeamMemberBasic {
   id: number;
@@ -78,6 +216,8 @@ interface EnhancedJobDialogProps {
   onOpenChange: (open: boolean) => void;
   job: Job | null;
   profile: Profile | null | undefined;
+  /** When worker has no face photo, show business operator avatar on applied jobs (used for employees). */
+  operatorAvatarUrl?: string | null;
   activeTeamMembers?: TeamMemberBasic[];
   workerLocation?: { lat: number; lng: number } | null;
   onOpenApply?: (job: Job) => void;
@@ -89,6 +229,10 @@ interface EnhancedJobDialogProps {
   onGetDirections?: (job: Job) => void;
   onAssignTeamMember?: (applicationId: number, teamMemberId: number | null) => void;
   isWithdrawing?: boolean;
+  /** When set, open apply flow at this step (e.g. 3 = message step). Used when opening from calendar "Add to route". */
+  initialApplyStage?: 1 | 2 | 3;
+  /** Radius (miles) from job to consider a worker/teammate "within territory". When not set, uses default 50. Should match find-work maxDistanceMiles when opening from find-work. */
+  territoryRadiusMiles?: number;
 }
 
 function useIsMobile(): boolean {
@@ -104,19 +248,20 @@ function useIsMobile(): boolean {
   return isMobile;
 }
 
+// Job time type: use jobType as source of truth so badge/timeline match (recurring > on_demand > one_time).
 function getJobTypeInfo(job: Job, t: (key: string) => string): { label: string; color: string; tooltip: string } {
-  if (job.isOnDemand || job.jobType === "on_demand") {
+  if (job.jobType === "recurring") {
+    return {
+      label: t("recurring"),
+      color: "bg-blue-500",
+      tooltip: t("recurringTooltip")
+    };
+  }
+  if (job.jobType === "on_demand" || job.isOnDemand) {
     return {
       label: t("onDemand"),
       color: "bg-purple-500",
       tooltip: t("onDemandTooltip")
-    };
-  }
-  if (job.jobType === "recurring") {
-    return {
-      label: t("recurring"),
-      color: "bg-blue-500", 
-      tooltip: t("recurringTooltip")
     };
   }
   return {
@@ -138,29 +283,24 @@ function getRelativeDay(date: Date, t: (key: string, opts?: any) => string): str
   return format(date, "EEE, MMM d");
 }
 
-// Helper to format time string from "HH:MM" to "ham/pm"
-// Also handles legacy formats that already contain am/pm
+// Format time string to 12h with " AM" / " PM" (e.g. "08:00" -> "8:00 AM", "17:00" -> "5:00 PM")
+// Handles legacy formats that already contain am/pm by returning as-is
 function formatTimeString(time: string | null | undefined): string {
   if (!time) return "";
-  
-  // If already contains am/pm, it's a legacy format - return as-is
-  if (time.toLowerCase().includes('am') || time.toLowerCase().includes('pm')) {
-    return time;
+  const t = time.trim();
+  if (!t) return "";
+
+  if (t.toLowerCase().includes("am") || t.toLowerCase().includes("pm")) return t;
+  if (t.includes(" - ")) {
+    const [start, end] = t.split(" - ").map((s) => s.trim());
+    const start12 = start ? formatTime12h(start) : "";
+    const end12 = end ? formatTime12h(end) : "";
+    if (start12 && end12) return `${start12} - ${end12}`;
+    if (start12) return start12;
+    if (end12) return end12;
+    return t;
   }
-  
-  // If it contains " - ", it's a legacy time range - return as-is
-  if (time.includes(' - ')) {
-    return time;
-  }
-  
-  // Standard 24h format (HH:MM)
-  const parts = time.split(":").map(Number);
-  if (parts.length < 2 || isNaN(parts[0])) return time;
-  
-  const [hours, minutes] = parts;
-  const period = hours >= 12 ? "pm" : "am";
-  const displayHours = hours % 12 || 12;
-  return minutes ? `${displayHours}:${minutes.toString().padStart(2, "0")}${period}` : `${displayHours}${period}`;
+  return formatTime12h(t);
 }
 
 // Format schedule days array to readable format (e.g., ["monday", "tuesday", "wednesday"] -> "Mon-Wed")
@@ -196,34 +336,34 @@ function formatScheduleDays(days: string[] | null | undefined): string {
   return sorted.map(d => dayAbbrev[d] || d).join(", ");
 }
 
-function formatJobTime(job: Job, t: (key: string, opts?: any) => string): { relative: string; timeRange: string; fullDate: string; scheduleDaysDisplay?: string } {
+function formatJobTime(job: Job, t: (key: string, opts?: any) => string): {
+  relative: string;
+  timeRange: string;
+  fullDate: string;
+  scheduleDaysDisplay?: string;
+  /** Recurring: explicit start–end calendar range (e.g. Mar 17, 2025 – Jun 30, 2025) */
+  schedulePeriodDisplay?: string;
+} {
   const startDate = new Date(job.startDate);
   const relative = getRelativeDay(startDate, t);
   const fullDate = format(startDate, "EEEE, MMMM d, yyyy");
   
-  // Helper to format time without :00 minutes
+  // Helper to format time as 12h with " AM" / " PM"
   const formatTime = (date: Date) => {
-    const hours = date.getHours();
-    const minutes = date.getMinutes();
-    const ampm = hours >= 12 ? 'pm' : 'am';
-    const hour12 = hours % 12 || 12;
-    if (minutes === 0) {
-      return `${hour12}${ampm}`;
-    }
-    return `${hour12}:${minutes.toString().padStart(2, '0')}${ampm}`;
+    const h = date.getHours();
+    const m = date.getMinutes();
+    if (h === 0) return `12:${String(m).padStart(2, "0")} AM`;
+    if (h === 12) return `12:${String(m).padStart(2, "0")} PM`;
+    if (h < 12) return `${h}:${String(m).padStart(2, "0")} AM`;
+    return `${h - 12}:${String(m).padStart(2, "0")} PM`;
   };
   
   let timeRange = "";
   let scheduleDaysDisplay: string | undefined;
+  let schedulePeriodDisplay: string | undefined;
   
-  // On-Demand jobs have no fixed end time
-  if (job.isOnDemand) {
-    if (startDate.getHours() !== 0 || startDate.getMinutes() !== 0) {
-      timeRange = t("starting", { time: formatTime(startDate) });
-    } else {
-      timeRange = t("flexibleHours");
-    }
-  } else if (job.jobType === "recurring") {
+  // Use jobType as source of truth: recurring first, then on-demand, then one-time
+  if (job.jobType === "recurring") {
     // Recurring jobs - use scheduleDays and endTime fields
     if (job.scheduleDays && job.scheduleDays.length > 0) {
       scheduleDaysDisplay = formatScheduleDays(job.scheduleDays);
@@ -235,6 +375,34 @@ function formatJobTime(job: Job, t: (key: string, opts?: any) => string): { rela
       timeRange = `${startTimeStr} - ${endTimeStr}`;
     } else if (job.scheduledTime) {
       timeRange = formatTimeString(job.scheduledTime);
+    }
+
+    // Contract / posting period: startDate + endDate (or derived from recurringMonths / recurringWeeks)
+    const startLabel = format(startDate, "MMM d, yyyy");
+    let periodEnd: Date | null = null;
+    if (job.endDate) {
+      const e = new Date(job.endDate);
+      if (!Number.isNaN(e.getTime())) periodEnd = e;
+    }
+    if (!periodEnd && job.recurringMonths != null && Number(job.recurringMonths) > 0) {
+      periodEnd = addMonths(startDate, Number(job.recurringMonths));
+    }
+    if (!periodEnd && job.recurringWeeks != null && Number(job.recurringWeeks) > 0) {
+      periodEnd = addWeeks(startDate, Number(job.recurringWeeks));
+    }
+    if (periodEnd) {
+      const endLabel = format(periodEnd, "MMM d, yyyy");
+      schedulePeriodDisplay =
+        isSameDay(startOfDay(startDate), startOfDay(periodEnd)) ? startLabel : `${startLabel} – ${endLabel}`;
+    } else {
+      schedulePeriodDisplay = `${t("scheduleStartsOn") || "Starts"} ${startLabel}`;
+    }
+  } else if (job.jobType === "on_demand" || job.isOnDemand) {
+    // On-Demand jobs have no fixed end time
+    if (startDate.getHours() !== 0 || startDate.getMinutes() !== 0) {
+      timeRange = t("starting", { time: formatTime(startDate) });
+    } else {
+      timeRange = t("flexibleHours");
     }
   } else if (job.scheduledTime && job.endTime) {
     // One-day job with separate start/end time fields
@@ -257,13 +425,16 @@ function formatJobTime(job: Job, t: (key: string, opts?: any) => string): { rela
     }
   }
   
-  return { relative, timeRange, fullDate, scheduleDaysDisplay };
+  return { relative, timeRange, fullDate, scheduleDaysDisplay, schedulePeriodDisplay };
 }
 
 function formatTimeRange(job: Job, t: (key: string, opts?: any) => string): string {
   const { relative, timeRange, fullDate } = formatJobTime(job, t);
   return `${relative}${timeRange ? ` (${timeRange})` : ''} - ${fullDate}`;
 }
+
+/** Default radius (miles) to consider a worker/teammate "within territory" of a job location when territoryRadiusMiles is not provided. */
+const DEFAULT_JOB_TERRITORY_RADIUS_MILES = 50;
 
 function calculateDistance(lat1: number, lon1: number, lat2: number, lon2: number): number {
   const R = 3959;
@@ -358,7 +529,6 @@ function MeetCompanyCard({
   format,
   showMessageButton,
   onMessageCompany,
-  onViewAllJobs,
 }: {
   company: Profile | null;
   job: Job;
@@ -368,7 +538,6 @@ function MeetCompanyCard({
   format: (d: Date, f: string) => string;
   showMessageButton: boolean;
   onMessageCompany?: () => void;
-  onViewAllJobs?: () => void;
 }) {
   return (
     <div className="rounded-2xl border border-border bg-muted/30 p-4 shadow-sm">
@@ -397,21 +566,8 @@ function MeetCompanyCard({
           )}
           {typeof companyJobsCount === "number" && (
             <div>
-              <div className="flex items-end justify-between gap-2">
-                <div>
-                  <p className="text-2xl font-bold">{companyJobsCount}</p>
-                  <p className="text-xs text-muted-foreground">{t("jobsPostedLabel") || "Jobs posted"}</p>
-                </div>
-                {onViewAllJobs && companyJobsCount > 0 && (
-                  <button
-                    type="button"
-                    onClick={onViewAllJobs}
-                    className="text-xs font-medium text-primary hover:underline whitespace-nowrap"
-                  >
-                    {t("viewAll") || "View All"}
-                  </button>
-                )}
-              </div>
+              <p className="text-2xl font-bold">{companyJobsCount}</p>
+              <p className="text-xs text-muted-foreground">{t("jobsPostedLabel") || "Jobs posted"}</p>
             </div>
           )}
           <div>
@@ -645,16 +801,13 @@ function TeamMemberEditPopup({
         <div>
           <Label className="text-sm">{t("hourlyRate")}</Label>
           <div className="flex items-center gap-3 mt-2">
-            <span className="text-sm text-muted-foreground">$15</span>
-            <Slider
-              value={[editData.hourlyRate]}
-              onValueChange={([v]) => setEditData({ ...editData, hourlyRate: v })}
-              min={15}
-              max={60}
-              step={1}
+            <span className="text-sm text-muted-foreground">$1</span>
+            <RateSlider
+              value={editData.hourlyRate}
+              onValueChange={(v) => setEditData({ ...editData, hourlyRate: v })}
               className="flex-1"
             />
-            <span className="text-sm text-muted-foreground">$60</span>
+            <span className="text-sm text-muted-foreground">$200</span>
           </div>
           <p className="text-center font-semibold text-lg mt-2 text-green-600 dark:text-green-400">
             ${editData.hourlyRate}/hr
@@ -940,103 +1093,85 @@ function ApplySheet({
   const isAdmin = (profile as any)?.isBusinessOperator === true;
   
   // Track if opened from calendar popup (for smart rate auto-apply)
-  const [useSmartRate, setUseSmartRate] = useState(false);
+  const [useSmartRate, setUseSmartRate] = useState(true);
+  const [smartApplyRateEnabled] = usePersistentFilter<boolean>("smart_apply_rate_enabled", true);
+  const [firstApplicantRandomRateSheet, setFirstApplicantRandomRateSheet] = useState<number | null>(null);
+
+  const { data: applicationRateStatsSheet } = useQuery<{ applicationCount: number; minProposedRateCents: number | null; maxProposedRateCents: number | null }>({
+    queryKey: ["/api/jobs", job.id, "application-rate-stats"],
+    queryFn: async () => {
+      const res = await fetch(`/api/jobs/${job.id}/application-rate-stats`, { credentials: "include" });
+      if (!res.ok) return { applicationCount: 0, minProposedRateCents: null, maxProposedRateCents: null };
+      return res.json();
+    },
+    enabled: open && !!job.id,
+  });
+
+  useEffect(() => {
+    if (job?.id) {
+      setUseSmartRate(smartApplyRateEnabled);
+      setFirstApplicantRandomRateSheet(null);
+    }
+  }, [job?.id, smartApplyRateEnabled]);
+  useEffect(() => {
+    if (applicationRateStatsSheet?.applicationCount === 0 && firstApplicantRandomRateSheet === null && job?.id) {
+      const rate = Math.round((18 + Math.random() * 10) * 100) / 100;
+      setFirstApplicantRandomRateSheet(Math.min(28, Math.max(18, rate)));
+    }
+  }, [applicationRateStatsSheet?.applicationCount, job?.id, firstApplicantRandomRateSheet]);
+
+  // Suggested rate: first applicant = random $18–$28; otherwise competitive vs other applications
+  // (Must be declared before combinedPayout / getSelectedRate — they close over it.)
+  const smartRateSuggestion = useMemo(() => {
+    const applicationCount = applicationRateStatsSheet?.applicationCount ?? 0;
+    const minCents = applicationRateStatsSheet?.minProposedRateCents ?? null;
+    if (applicationCount === 0) {
+      if (firstApplicantRandomRateSheet != null) return firstApplicantRandomRateSheet;
+      const seed = job.id;
+      const fallback = 18 + (seed % 11) + (seed % 10) / 10;
+      return Math.round(Math.min(28, Math.max(18, fallback)) * 100) / 100;
+    }
+    if (minCents != null && minCents > 0) {
+      const minDollars = minCents / 100;
+      return Math.round(Math.max(18, Math.min(28, minDollars - 1)) * 100) / 100;
+    }
+    const userRate = profile?.hourlyRate || 30;
+    const jobRate = job.hourlyRate ? job.hourlyRate / 100 : null;
+    const tradePremiums: Record<string, number> = {
+      Electrical: 1.15, Plumbing: 1.12, HVAC: 1.10, Carpentry: 1.08, Concrete: 1.05,
+      Drywall: 1.03, Painting: 1.02, "General Labor": 1.0, Demolition: 1.0, Cleaning: 0.95,
+    };
+    const skillLevelMultipliers: Record<string, number> = { elite: 1.12, lite: 1.05, any: 1.0 };
+    let baseRate = jobRate ? jobRate * 0.88 : userRate * 0.85;
+    baseRate *= tradePremiums[job.trade || "General Labor"] || 1.0;
+    baseRate *= skillLevelMultipliers[job.skillLevel || "any"] || 1.0;
+    if (job.serviceCategory?.includes("Elite")) baseRate *= 1.10;
+    else if (job.serviceCategory?.includes("Lite")) baseRate *= 1.04;
+    const requiredSkillsCount = job.requiredSkills?.length || 0;
+    if (requiredSkillsCount > 0) baseRate *= 1 + Math.min(requiredSkillsCount, 5) * 0.01;
+    let finalRate = Math.max(18, Math.min(28, Math.round(baseRate * 100) / 100));
+    if (finalRate > userRate && jobRate != null && jobRate <= userRate) finalRate = Math.min(finalRate, userRate * 0.98);
+    return finalRate;
+  }, [job.id, job.hourlyRate, job.trade, job.skillLevel, job.serviceCategory, job.requiredSkills, profile?.hourlyRate, applicationRateStatsSheet, firstApplicantRandomRateSheet]);
 
   const combinedPayout = useMemo(() => {
     const hours = job.estimatedHours || 8;
     let totalPayout = 0;
-    
-    selectedApplicants.forEach(id => {
+
+    selectedApplicants.forEach((id) => {
       if (id === "self") {
-        const rate = useSmartRate ? smartRateSuggestion : (profile?.hourlyRate || 30);
+        const rate = useSmartRate ? smartRateSuggestion : profile?.hourlyRate || 30;
         totalPayout += rate * hours;
       } else {
-        const member = acceptedTeamMembers.find(m => m.id === id);
-        const rate = useSmartRate ? smartRateSuggestion : (member?.hourlyRate || 30);
+        const member = acceptedTeamMembers.find((m) => m.id === id);
+        const rate = useSmartRate ? smartRateSuggestion : member?.hourlyRate || 30;
         totalPayout += rate * hours;
       }
     });
-    
+
     return totalPayout;
   }, [selectedApplicants, profile?.hourlyRate, acceptedTeamMembers, job.estimatedHours, useSmartRate, smartRateSuggestion]);
 
-  // Calculate smart rate suggestion - intelligent based on job requirements
-  const smartRateSuggestion = useMemo(() => {
-    const userRate = profile?.hourlyRate || 30;
-    const jobRate = job.hourlyRate ? job.hourlyRate / 100 : null;
-    
-    // Trade premium multipliers (higher-paying trades)
-    const tradePremiums: Record<string, number> = {
-      "Electrical": 1.15,
-      "Plumbing": 1.12,
-      "HVAC": 1.10,
-      "Carpentry": 1.08,
-      "Concrete": 1.05,
-      "Drywall": 1.03,
-      "Painting": 1.02,
-      "General Labor": 1.0,
-      "Demolition": 1.0,
-      "Cleaning": 0.95,
-    };
-    
-    // Skill level multipliers
-    const skillLevelMultipliers: Record<string, number> = {
-      "elite": 1.12,
-      "lite": 1.05,
-      "any": 1.0,
-    };
-    
-    // Calculate base competitive rate
-    let baseRate: number;
-    
-    if (jobRate) {
-      // Use job rate with competitive discount
-      baseRate = jobRate * 0.88;
-    } else {
-      // Fallback to user rate
-      baseRate = userRate * 0.85;
-    }
-    
-    // Apply trade premium
-    const trade = job.trade || "General Labor";
-    const tradeMultiplier = tradePremiums[trade] || 1.0;
-    baseRate *= tradeMultiplier;
-    
-    // Apply skill level premium
-    const skillLevel = job.skillLevel || "any";
-    const skillMultiplier = skillLevelMultipliers[skillLevel] || 1.0;
-    baseRate *= skillMultiplier;
-    
-    // Apply service category premium (if it contains "Elite" or "Lite")
-    if (job.serviceCategory) {
-      if (job.serviceCategory.includes("Elite")) {
-        baseRate *= 1.10;
-      } else if (job.serviceCategory.includes("Lite")) {
-        baseRate *= 1.04;
-      }
-    }
-    
-    // Required skills complexity (more skills = slightly higher rate)
-    const requiredSkillsCount = job.requiredSkills?.length || 0;
-    if (requiredSkillsCount > 0) {
-      const skillsMultiplier = 1 + (Math.min(requiredSkillsCount, 5) * 0.01); // Max 5% boost
-      baseRate *= skillsMultiplier;
-    }
-    
-    // Ensure minimum $15 and maximum $25.99
-    let finalRate = Math.max(15, Math.min(baseRate, 25.99));
-    
-    // Round to 2 decimal places
-    finalRate = Math.round(finalRate * 100) / 100;
-    
-    // If user's rate is lower, don't suggest above it (unless job clearly pays more)
-    if (finalRate > userRate && jobRate && jobRate <= userRate) {
-      finalRate = Math.min(finalRate, userRate * 0.98);
-    }
-    
-    return finalRate;
-  }, [job.hourlyRate, job.trade, job.skillLevel, job.serviceCategory, job.requiredSkills, profile?.hourlyRate]);
-  
   const toggleApplicant = useCallback((id: number | "self") => {
     setSelectedApplicants(prev => {
       const newSet = new Set(prev);
@@ -1539,7 +1674,7 @@ function ApplySheet({
       <>
         <Drawer open={open && !showTeamSelector} onOpenChange={onOpenChange}>
           <DrawerContent className="max-h-[85vh] rounded-t-3xl">
-            <DrawerTitle className="sr-only">{t("applyFor", { jobTitle: job.title })}</DrawerTitle>
+            <DrawerTitle className="sr-only">{t("applyFor", { jobTitle: getDisplayJobTitle(job) })}</DrawerTitle>
             <DrawerDescription className="sr-only">{t("submitYourApplication")}</DrawerDescription>
             <div className="w-12 h-1.5 bg-muted rounded-full mx-auto mt-2 mb-1" />
             {content}
@@ -1566,7 +1701,7 @@ function ApplySheet({
     <>
       <Dialog open={open && !showTeamSelector} onOpenChange={onOpenChange}>
         <DialogContent className="max-w-md p-0 rounded-2xl overflow-hidden">
-          <DialogTitle className="sr-only">Apply for {job.title}</DialogTitle>
+          <DialogTitle className="sr-only">Apply for {getDisplayJobTitle(job)}</DialogTitle>
           <DialogDescription className="sr-only">Submit your application</DialogDescription>
           {content}
         </DialogContent>
@@ -1626,14 +1761,30 @@ function FullPageGallerySlider({
 
   return (
     <div className="relative flex flex-col w-full h-full bg-black">
-      <button
-        type="button"
-        onClick={onClose}
-        className="absolute top-4 right-4 z-50 w-10 h-10 rounded-full bg-black/50 hover:bg-black/70 flex items-center justify-center text-white transition-colors"
-        aria-label={tCommon("close") || "Close"}
-      >
-        <X className="w-5 h-5" />
-      </button>
+      {/* Breadcrumb header: back to job + Gallery */}
+      <div className="flex-shrink-0 flex items-center gap-2 px-4 py-3 bg-black/60 border-b border-white/10 z-50">
+        <button
+          type="button"
+          onClick={onClose}
+          className="w-10 h-10 rounded-full bg-white/10 hover:bg-white/20 flex items-center justify-center text-white transition-colors flex-shrink-0"
+          aria-label={tCommon("back") || "Back"}
+        >
+          <ArrowLeft className="w-5 h-5" />
+        </button>
+        <div className="flex-1 min-w-0 flex items-center gap-2 text-white text-sm">
+          <span className="truncate" title={getDisplayJobTitle(job)}>{getDisplayJobTitle(job)}</span>
+          <ChevronRight className="w-4 h-4 flex-shrink-0 text-white/70" />
+          <span className="text-white/90 flex-shrink-0">{(t("gallery") || "Gallery")}</span>
+        </div>
+        <button
+          type="button"
+          onClick={onClose}
+          className="w-10 h-10 rounded-full bg-white/10 hover:bg-white/20 flex items-center justify-center text-white transition-colors flex-shrink-0"
+          aria-label={tCommon("close") || "Close"}
+        >
+          <X className="w-5 h-5" />
+        </button>
+      </div>
       <div className="flex-1 min-h-0 relative flex items-center justify-center">
         {slide?.type === "image" && slide.url && (
           <>
@@ -1656,7 +1807,7 @@ function FullPageGallerySlider({
         {slide?.type === "map" && job.latitude && job.longitude && (
           <div className="w-full h-full min-h-0">
             <JobLocationMap
-              job={{ id: job.id, lat: parseFloat(job.latitude), lng: parseFloat(job.longitude), title: job.title }}
+              job={{ id: job.id, lat: parseFloat(job.latitude), lng: parseFloat(job.longitude), title: getDisplayJobTitle(job) }}
               height="100%"
               className="h-full w-full rounded-none overflow-hidden"
               showApproximateRadius
@@ -1720,6 +1871,17 @@ export function JobContent({
   isMobile,
   inlineApplyMode = false,
   onApplySuccess,
+  showParticipantsSection = true,
+  initialApplyStage,
+  application,
+  groupedApplications,
+  onWithdraw,
+  onWithdrawAll,
+  isWithdrawing = false,
+  onAssignTeamMember,
+  onGetDirections,
+  operatorAvatarUrl,
+  territoryRadiusMiles,
 }: {
   job: Job;
   profile: Profile | null;
@@ -1731,6 +1893,20 @@ export function JobContent({
   isMobile: boolean;
   inlineApplyMode?: boolean;
   onApplySuccess?: () => void;
+  /** When false, hides the "Participants / Company seeking" block (slots, legend, pill grid). */
+  showParticipantsSection?: boolean;
+  /** When 3, open apply at message step (step 3) with self selected. Used from calendar "Add to route". */
+  initialApplyStage?: 1 | 2 | 3;
+  /** When set, show application view: same content as job details with status badge, application payout, and Withdraw footer. */
+  application?: ApplicationData | null;
+  groupedApplications?: GroupedApplications | null;
+  onWithdraw?: (applicationId: number) => void;
+  onWithdrawAll?: (applicationIds: number[]) => void;
+  isWithdrawing?: boolean;
+  onAssignTeamMember?: (applicationId: number, teamMemberId: number | null) => void;
+  onGetDirections?: (job: Job) => void;
+  operatorAvatarUrl?: string | null;
+  territoryRadiusMiles?: number;
 }) {
   const [currentMediaIndex, setCurrentMediaIndex] = useState(0);
   const [imageLoaded, setImageLoaded] = useState(false);
@@ -1743,14 +1919,57 @@ export function JobContent({
   const [inlineApplyStage, setInlineApplyStage] = useState<1 | 2 | 3>(1); // 1 = details, 2 = participants, 3 = message
   const [applyMessage, setApplyMessage] = useState("");
   const [selectedApplicants, setSelectedApplicants] = useState<Set<number | "self">>(() => new Set<number | "self">(["self"]));
-  const [useSmartRateInline, setUseSmartRateInline] = useState(false);
+
+  // When opening from calendar "Add to route", jump to step 3 (message) with self selected
+  useEffect(() => {
+    if (initialApplyStage === 3) {
+      setShowInlineApply(true);
+      setInlineApplyStage(3);
+      setSelectedApplicants(new Set<number | "self">(["self"]));
+    }
+  }, [initialApplyStage]);
+  const [useSmartRateInline, setUseSmartRateInline] = useState(true);
+  const [customInlineRate, setCustomInlineRate] = useState<number | null>(null);
+  const [rateEditorOpen, setRateEditorOpen] = useState(false);
+  const [rateEditorDraft, setRateEditorDraft] = useState("");
+  const [smartApplyRateEnabledMain] = usePersistentFilter<boolean>("smart_apply_rate_enabled", true);
+  useEffect(() => {
+    if (job?.id) setUseSmartRateInline(true); // default to suggested rate when opening a job
+  }, [job?.id]);
+
+  useEffect(() => {
+    setCustomInlineRate(null);
+    setRateEditorOpen(false);
+    setRateEditorDraft("");
+  }, [job?.id]);
+
   const [showTeamSelector, setShowTeamSelector] = useState(false);
   const [showCompanyJobsPopup, setShowCompanyJobsPopup] = useState(false);
   const [companyJobsTab, setCompanyJobsTab] = useState<"open" | "closed">("open");
   const [teammateSettingsOpen, setTeammateSettingsOpen] = useState(false);
   const [selectedTeammateForSettings, setSelectedTeammateForSettings] = useState<TeamMemberBasic | null>(null);
   const [settingsSection, setSettingsSection] = useState<"list" | "edit">("list");
+  const [showApplicationTeamPicker, setShowApplicationTeamPicker] = useState(false);
+  const [selectedAppForReassign, setSelectedAppForReassign] = useState<ApplicationData | null>(null);
+  const [showWithdrawStep, setShowWithdrawStep] = useState(false);
+  const [withdrawStep, setWithdrawStep] = useState<"reason" | "confirm">("reason");
+  const [withdrawReason, setWithdrawReason] = useState<string | null>(null);
+  /** On mobile, footer payout/details block is collapsed by default; tap to expand. */
+  const [mobileFooterDetailsExpanded, setMobileFooterDetailsExpanded] = useState(false);
+  const [materialInvoiceOpen, setMaterialInvoiceOpen] = useState(false);
+  const [firstApplicantRandomRate, setFirstApplicantRandomRate] = useState<number | null>(null);
   const { t } = useTranslation("enhancedJobDialog");
+  const [, setLocation] = useLocation();
+
+  const { data: applicationRateStats } = useQuery<{ applicationCount: number; minProposedRateCents: number | null; maxProposedRateCents: number | null }>({
+    queryKey: ["/api/jobs", job.id, "application-rate-stats"],
+    queryFn: async () => {
+      const res = await fetch(`/api/jobs/${job.id}/application-rate-stats`, { credentials: "include" });
+      if (!res.ok) return { applicationCount: 0, minProposedRateCents: null, maxProposedRateCents: null };
+      return res.json();
+    },
+    enabled: !!job.id,
+  });
 
   // Reset settings state when dialog closes
   useEffect(() => {
@@ -1759,6 +1978,16 @@ export function JobContent({
       setSettingsSection("list");
     }
   }, [teammateSettingsOpen]);
+
+  useEffect(() => {
+    if (job?.id) setFirstApplicantRandomRate(null);
+  }, [job?.id]);
+  useEffect(() => {
+    if (applicationRateStats?.applicationCount === 0 && firstApplicantRandomRate === null && job?.id) {
+      const rate = Math.round((18 + Math.random() * 10) * 100) / 100;
+      setFirstApplicantRandomRate(Math.min(28, Math.max(18, rate)));
+    }
+  }, [applicationRateStats?.applicationCount, job?.id, firstApplicantRandomRate]);
   const { t: tCommon } = useTranslation("common");
   const { t: tCal } = useTranslation("calendar");
   const { toast } = useToast();
@@ -1805,12 +2034,21 @@ export function JobContent({
     return calculateDistance(workerLocation.lat, workerLocation.lng, parseFloat(job.latitude), parseFloat(job.longitude));
   }, [workerLocation, job.latitude, job.longitude]);
 
-  /** Partial address (no street numbers) for map empty state until they win the gig. */
+  /** Partial address (no street numbers) for map until they win the gig. */
   const partialAddress = useMemo(() => {
     const streetWithoutNumber = (job.address || "").replace(/^\d+\s*[-/]?\s*\d*\s*/, "").trim();
     const parts = [streetWithoutNumber, job.city, job.state, job.zipCode].filter(Boolean);
     return parts.length ? parts.join(", ") : null;
   }, [job.address, job.city, job.state, job.zipCode]);
+
+  /** Full address for display when application is accepted; otherwise partial. */
+  const displayAddress = useMemo(() => {
+    if (application?.status === "accepted") {
+      const full = [job.address, job.city, job.state, job.zipCode].filter(Boolean).join(", ");
+      return full || partialAddress || null;
+    }
+    return partialAddress;
+  }, [application?.status, job.address, job.city, job.state, job.zipCode, partialAddress]);
 
   /** Origins for drive time: worker + teammates with coords. id = "self" | member id for per-card lookup. */
   const driveTimeOrigins = useMemo(() => {
@@ -1924,27 +2162,92 @@ export function JobContent({
     return () => { cancelled = true; };
   }, [job.latitude, job.longitude, driveTimeOrigins]);
   
+  const payoutBreakdown = useMemo(() => getPayoutBreakdownFromJob(job), [job.startDate, job.endDate, job.estimatedHours, job.jobType, job.recurringWeeks, job.scheduleDays]);
+
+  // Use same rate logic as WorkerDashboard jobPins so map pill and panel show the same payout
   const estimatedPayout = useMemo(() => {
-    const hours = job.estimatedHours || 8;
-    // If participants are selected, calculate total payout for all selected
+    const hours = payoutBreakdown.totalHours;
+    const selfRateDollars = getWorkerHourlyRate(profile?.hourlyRate ?? undefined, job.hourlyRate ?? 0);
+    const selfRate = selfRateDollars > 0 ? selfRateDollars : 30; // fallback so panel never shows $0
     if (selectedApplicants.size > 0) {
       let totalPayout = 0;
       selectedApplicants.forEach(id => {
         if (id === "self") {
-          const rate = profile?.hourlyRate || 30;
-          totalPayout += rate * hours;
+          totalPayout += selfRate * hours;
         } else {
           const member = activeTeamMembers.find(m => m.id === id);
-          const rate = member?.hourlyRate || 30;
+          const rate = member ? (rateToDollars(member.hourlyRate) || 30) : 30;
           totalPayout += rate * hours;
         }
       });
       return totalPayout;
     }
-    // Default to self rate if no one selected
-    const rate = profile?.hourlyRate || 30;
-    return rate * hours;
-  }, [profile?.hourlyRate, job.estimatedHours, selectedApplicants, activeTeamMembers]);
+    return selfRate * hours;
+  }, [profile?.hourlyRate, job.hourlyRate, selectedApplicants, activeTeamMembers, payoutBreakdown.totalHours]);
+
+  // Application view: combined payout and status badge. Always use proposedRate (applied rate) so reassigning worker does not change displayed rate.
+  const allApps = application && groupedApplications ? groupedApplications.applications : application ? [application] : [];
+  const applicationCombinedPayout = useMemo(() => {
+    if (!application || allApps.length === 0) return null;
+    const hours = payoutBreakdown.totalHours;
+    return allApps.reduce((total, app) => {
+      // Use only submitted proposedRate so swapping teammates never changes displayed payout
+      const rateDollars = rateToDollars(app.proposedRate ?? profile?.hourlyRate ?? (job.hourlyRate ? job.hourlyRate / 100 : 0));
+      return total + (rateDollars * hours);
+    }, 0);
+  }, [application, allApps, job.hourlyRate, profile?.hourlyRate, payoutBreakdown.totalHours]);
+  const displayPayout = applicationCombinedPayout != null ? applicationCombinedPayout : estimatedPayout;
+  const getApplicationStatusBadge = useCallback(() => {
+    if (!application) return null;
+    switch (application.status) {
+      case "pending":
+        return <Badge variant="outline" className="bg-yellow-50 dark:bg-yellow-900/30 text-yellow-700 dark:text-yellow-300 border-yellow-200 dark:border-yellow-800">{t("pendingReview")}</Badge>;
+      case "accepted":
+        return <Badge variant="outline" className="bg-green-50 dark:bg-green-900/30 text-green-700 dark:text-green-300 border-green-200 dark:border-green-800">{t("accepted")}</Badge>;
+      case "rejected":
+        return <Badge variant="outline" className="bg-red-50 dark:bg-red-900/30 text-red-700 dark:text-red-300 border-red-200 dark:border-red-800">{t("notSelected")}</Badge>;
+      default:
+        return null;
+    }
+  }, [application, t]);
+
+  // Timesheets for accepted application (used in JobContent when application.status === 'accepted')
+  const { data: timesheets = [], isLoading: timesheetsLoading } = useQuery<Timesheet[]>({
+    queryKey: ['/api/timesheets/job', job.id],
+    queryFn: async () => {
+      const res = await fetch(`/api/timesheets/job/${job.id}`, { credentials: "include" });
+      if (!res.ok) return [];
+      return res.json();
+    },
+    enabled: !!application && application.status === "accepted",
+  });
+  const timesheetSummary = useMemo(() => {
+    if (!timesheets.length) return null;
+    let totalHours = 0;
+    let totalPayout = 0;
+    let pendingCount = 0;
+    let approvedCount = 0;
+    let paidCount = 0;
+    let processingCount = 0;
+    timesheets.forEach(ts => {
+      const hours = parseFloat(ts.adjustedHours || ts.totalHours || "0");
+      const rateInDollars = (ts.hourlyRate || 0) / 100;
+      totalHours += hours;
+      totalPayout += hours * rateInDollars;
+      if (ts.paymentStatus === "completed") paidCount++;
+      else if (ts.paymentStatus === "processing") processingCount++;
+      else if (ts.status === "approved") approvedCount++;
+      else pendingCount++;
+    });
+    return { totalHours: totalHours.toFixed(2), totalPayout: totalPayout.toFixed(2), pendingCount, approvedCount, paidCount, processingCount, totalCount: timesheets.length };
+  }, [timesheets]);
+  const getPaymentStatusBadge = useCallback((ts: Timesheet) => {
+    if (ts.paymentStatus === "completed") return <Badge variant="outline" className="bg-green-50 dark:bg-green-900/30 text-green-700 dark:text-green-300 border-green-200 dark:border-green-800"><CheckCircle2 className="w-3 h-3 mr-1" /> {t("paid")}</Badge>;
+    if (ts.paymentStatus === "processing") return <Badge variant="outline" className="bg-blue-50 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300 border-blue-200 dark:border-blue-800"><Loader2 className="w-3 h-3 mr-1 animate-spin" /> {t("transferring")}</Badge>;
+    if (ts.status === "approved") return <Badge variant="outline" className="bg-purple-50 dark:bg-purple-900/30 text-purple-700 dark:text-purple-300 border-purple-200 dark:border-purple-800"><Check className="w-3 h-3 mr-1" /> {t("submitted")}</Badge>;
+    if (ts.status === "pending" && ts.clockOutTime) return <Badge variant="outline" className="bg-yellow-50 dark:bg-yellow-900/30 text-yellow-700 dark:text-yellow-300 border-yellow-200 dark:border-yellow-800"><Clock className="w-3 h-3 mr-1" /> {t("pendingApproval")}</Badge>;
+    return <Badge variant="outline" className="bg-gray-50 dark:bg-gray-900/30 text-gray-700 dark:text-gray-300 border-gray-200 dark:border-gray-800"><Clock className="w-3 h-3 mr-1" /> {t("inProgress")}</Badge>;
+  }, [t]);
 
   useEffect(() => {
     setImageLoaded(false);
@@ -1954,107 +2257,77 @@ export function JobContent({
     setApplyMessage("");
     setSelectedApplicants(new Set<number | "self">(["self"]));
     setUseSmartRateInline(false);
+    setCustomInlineRate(null);
+    setRateEditorOpen(false);
+    setRateEditorDraft("");
+    setShowApplicationTeamPicker(false);
+    setSelectedAppForReassign(null);
   }, [job.id]);
 
   const canApplyMultiple = workersNeeded > 1 && activeTeamMembers.length > 0;
   const isAdmin = (profile as any)?.isBusinessOperator === true;
 
-  // Calculate smart rate suggestion for inline apply - intelligent based on job requirements
+  // Suggested rate: first applicant = random $18–$28; otherwise competitive vs other applications
   const smartRateSuggestionInline = useMemo(() => {
+    const applicationCount = applicationRateStats?.applicationCount ?? 0;
+    const minCents = applicationRateStats?.minProposedRateCents ?? null;
+
+    if (applicationCount === 0) {
+      if (firstApplicantRandomRate != null) return firstApplicantRandomRate;
+      const seed = job.id;
+      const fallback = 18 + (seed % 11) + (seed % 10) / 10;
+      return Math.round(Math.min(28, Math.max(18, fallback)) * 100) / 100;
+    }
+
+    if (minCents != null && minCents > 0) {
+      const minDollars = minCents / 100;
+      const competitiveRate = Math.max(18, Math.min(28, minDollars - 1));
+      return Math.round(competitiveRate * 100) / 100;
+    }
+
     const userRate = profile?.hourlyRate || 30;
     const jobRate = job.hourlyRate ? job.hourlyRate / 100 : null;
-    
-    // Trade premium multipliers (higher-paying trades)
     const tradePremiums: Record<string, number> = {
-      "Electrical": 1.15,
-      "Plumbing": 1.12,
-      "HVAC": 1.10,
-      "Carpentry": 1.08,
-      "Concrete": 1.05,
-      "Drywall": 1.03,
-      "Painting": 1.02,
-      "General Labor": 1.0,
-      "Demolition": 1.0,
-      "Cleaning": 0.95,
+      Electrical: 1.15, Plumbing: 1.12, HVAC: 1.10, Carpentry: 1.08, Concrete: 1.05,
+      Drywall: 1.03, Painting: 1.02, "General Labor": 1.0, Demolition: 1.0, Cleaning: 0.95,
     };
-    
-    // Skill level multipliers
-    const skillLevelMultipliers: Record<string, number> = {
-      "elite": 1.12,
-      "lite": 1.05,
-      "any": 1.0,
-    };
-    
-    // Calculate base competitive rate
-    let baseRate: number;
-    
-    if (jobRate) {
-      // Use job rate with competitive discount
-      baseRate = jobRate * 0.88;
-    } else {
-      // Fallback to user rate
-      baseRate = userRate * 0.85;
-    }
-    
-    // Apply trade premium
-    const trade = job.trade || "General Labor";
-    const tradeMultiplier = tradePremiums[trade] || 1.0;
-    baseRate *= tradeMultiplier;
-    
-    // Apply skill level premium
-    const skillLevel = job.skillLevel || "any";
-    const skillMultiplier = skillLevelMultipliers[skillLevel] || 1.0;
-    baseRate *= skillMultiplier;
-    
-    // Apply service category premium (if it contains "Elite" or "Lite")
-    if (job.serviceCategory) {
-      if (job.serviceCategory.includes("Elite")) {
-        baseRate *= 1.10;
-      } else if (job.serviceCategory.includes("Lite")) {
-        baseRate *= 1.04;
-      }
-    }
-    
-    // Required skills complexity (more skills = slightly higher rate)
+    const skillLevelMultipliers: Record<string, number> = { elite: 1.12, lite: 1.05, any: 1.0 };
+    let baseRate = jobRate ? jobRate * 0.88 : userRate * 0.85;
+    baseRate *= tradePremiums[job.trade || "General Labor"] || 1.0;
+    baseRate *= skillLevelMultipliers[job.skillLevel || "any"] || 1.0;
+    if (job.serviceCategory?.includes("Elite")) baseRate *= 1.10;
+    else if (job.serviceCategory?.includes("Lite")) baseRate *= 1.04;
     const requiredSkillsCount = job.requiredSkills?.length || 0;
-    if (requiredSkillsCount > 0) {
-      const skillsMultiplier = 1 + (Math.min(requiredSkillsCount, 5) * 0.01); // Max 5% boost
-      baseRate *= skillsMultiplier;
-    }
-    
-    // Ensure minimum $15 and maximum $25.99
-    let finalRate = Math.max(15, Math.min(baseRate, 25.99));
-    
-    // Round to 2 decimal places
-    finalRate = Math.round(finalRate * 100) / 100;
-    
-    // If user's rate is lower, don't suggest above it (unless job clearly pays more)
-    if (finalRate > userRate && jobRate && jobRate <= userRate) {
-      finalRate = Math.min(finalRate, userRate * 0.98);
-    }
-    
+    if (requiredSkillsCount > 0) baseRate *= 1 + Math.min(requiredSkillsCount, 5) * 0.01;
+    let finalRate = Math.max(18, Math.min(28, Math.round(baseRate * 100) / 100));
+    if (finalRate > userRate && jobRate != null && jobRate <= userRate) finalRate = Math.min(finalRate, userRate * 0.98);
     return finalRate;
-  }, [job.hourlyRate, job.trade, job.skillLevel, job.serviceCategory, job.requiredSkills, profile?.hourlyRate]);
+  }, [job.id, job.hourlyRate, job.trade, job.skillLevel, job.serviceCategory, job.requiredSkills, profile?.hourlyRate, applicationRateStats, firstApplicantRandomRate]);
 
   const combinedApplyPayout = useMemo(() => {
-    const hours = job.estimatedHours || 8;
+    const hours = payoutBreakdown.totalHours;
+    if (customInlineRate != null && customInlineRate > 0) {
+      const workerCount = selectedApplicants.size > 0 ? selectedApplicants.size : 1;
+      return customInlineRate * hours * workerCount;
+    }
     let totalPayout = 0;
     selectedApplicants.forEach(id => {
       if (id === "self") {
-        const rate = useSmartRateInline ? smartRateSuggestionInline : (profile?.hourlyRate || 30);
+        const rate = useSmartRateInline ? smartRateSuggestionInline : (rateToDollars(profile?.hourlyRate) || 30);
         totalPayout += rate * hours;
       } else {
         const member = activeTeamMembers.find(m => m.id === id);
-        const rate = useSmartRateInline ? smartRateSuggestionInline : (member?.hourlyRate || 30);
+        const rate = useSmartRateInline ? smartRateSuggestionInline : (rateToDollars(member?.hourlyRate) || 30);
         totalPayout += rate * hours;
       }
     });
     return totalPayout;
-  }, [selectedApplicants, profile?.hourlyRate, activeTeamMembers, job.estimatedHours, useSmartRateInline, smartRateSuggestionInline]);
+  }, [selectedApplicants, profile?.hourlyRate, activeTeamMembers, payoutBreakdown.totalHours, useSmartRateInline, smartRateSuggestionInline, customInlineRate]);
 
   // Calculate selected rate for display in footer
   const getSelectedRateInline = useMemo(() => {
     if (selectedApplicants.size === 0) return null;
+    if (customInlineRate != null && customInlineRate > 0) return customInlineRate;
     
     if (useSmartRateInline) {
       return smartRateSuggestionInline;
@@ -2065,17 +2338,52 @@ export function JobContent({
     
     selectedApplicants.forEach(id => {
       if (id === "self") {
-        totalRate += profile?.hourlyRate || 30;
+        totalRate += rateToDollars(profile?.hourlyRate) || 30;
         count++;
       } else {
         const member = activeTeamMembers.find(m => m.id === id);
-        totalRate += member?.hourlyRate || 30;
+        totalRate += rateToDollars(member?.hourlyRate) || 30;
         count++;
       }
     });
     
     return count > 0 ? totalRate / count : null;
-  }, [selectedApplicants, useSmartRateInline, smartRateSuggestionInline, profile?.hourlyRate, activeTeamMembers]);
+  }, [selectedApplicants, useSmartRateInline, smartRateSuggestionInline, profile?.hourlyRate, activeTeamMembers, customInlineRate]);
+
+  const livePreSubmitPayout = !application
+    ? (selectedApplicants.size > 0 ? combinedApplyPayout : displayPayout)
+    : displayPayout;
+
+  const randomizedInlineApplyTemplates = useMemo(() => {
+    const firstName = profile?.firstName?.trim() || "I";
+    const companyLabel = (job as { locationRepresentativeName?: string })?.locationRepresentativeName || "team";
+    const tradeLabel = (job.trade || job.serviceCategory || "general labor").toLowerCase();
+    const roleLabel = tradeLabel.includes("labor") ? "worker" : tradeLabel;
+    const timeInfoForTemplate = formatJobTime(job, t);
+    const timeLabel = timeInfoForTemplate.scheduleDaysDisplay
+      ? `${timeInfoForTemplate.scheduleDaysDisplay}${timeInfoForTemplate.timeRange ? `, ${timeInfoForTemplate.timeRange}` : ""}`
+      : `${timeInfoForTemplate.relative}${timeInfoForTemplate.timeRange ? `, ${timeInfoForTemplate.timeRange}` : ""}`;
+    const locationLabel = [job.city, job.state].filter(Boolean).join(", ") || "the project location";
+    const skillLabel = (job.requiredSkills?.slice(0, 2).join(" and ") || job.trade || "the listed scope").toLowerCase();
+    return buildInlineApplyMessageTemplates({
+      firstName,
+      roleLabel,
+      companyLabel,
+      tradeLabel,
+      timeLabel,
+      locationLabel,
+      skillLabel,
+    });
+  }, [profile?.firstName, job, t]);
+
+  // Step 3 auto-template: pick one of 40 randomized messages when message box is empty.
+  useEffect(() => {
+    if (!showInlineApply || inlineApplyStage !== 3) return;
+    if (applyMessage.trim().length > 0) return;
+    if (randomizedInlineApplyTemplates.length === 0) return;
+    const idx = Math.floor(Math.random() * randomizedInlineApplyTemplates.length);
+    setApplyMessage(randomizedInlineApplyTemplates[idx]);
+  }, [showInlineApply, inlineApplyStage, applyMessage, randomizedInlineApplyTemplates]);
 
   // Fetch company profile for stage 2 (inline apply) and for "Meet the company" section
   const { data: companyProfileInline } = useQuery<Profile | null>({
@@ -2142,11 +2450,55 @@ export function JobContent({
       .map((a: any) => {
         const start = new Date(a.job.startDate);
         const end = a.job.endDate ? new Date(a.job.endDate) : addHours(start, a.job.estimatedHours || 8);
-        return { id: a.job.id, title: a.job.title, start, end };
+        return { id: a.job.id, title: a.job.title, trade: a.job.trade, start, end };
       });
     const conflicts = jobEnd ? scheduled.filter((ev) => ev.start < jobEnd && ev.end > jobStart) : [];
     return { scheduled, conflicts };
   }, [jobStart, jobEnd, allApplicationsForAvailability]);
+
+  const jobLatLng = useMemo(() => {
+    const lat = job.latitude != null ? parseFloat(String(job.latitude)) : NaN;
+    const lng = job.longitude != null ? parseFloat(String(job.longitude)) : NaN;
+    return Number.isFinite(lat) && Number.isFinite(lng) ? { lat, lng } : null;
+  }, [job.latitude, job.longitude]);
+
+  // Fallback: when job has no lat/lng but has full address, geocode so territory checks can use it
+  const [geocodedJobLatLng, setGeocodedJobLatLng] = useState<{ lat: number; lng: number } | null>(null);
+  const jobAddressKey = [job.id, (job as any).address, (job as any).city, (job as any).state, (job as any).zipCode].filter(Boolean).join("|");
+  useEffect(() => {
+    if (jobLatLng) {
+      setGeocodedJobLatLng(null);
+      return;
+    }
+    const parts = [(job as any).address, (job as any).city, (job as any).state, (job as any).zipCode].filter(Boolean);
+    if (parts.length === 0) {
+      setGeocodedJobLatLng(null);
+      return;
+    }
+    const apiKey = import.meta.env.VITE_GOOGLE_API_KEY;
+    if (!apiKey) return;
+    const addressQuery = parts.join(", ");
+    let cancelled = false;
+    fetch(
+      `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(addressQuery)}&key=${apiKey}`
+    )
+      .then((res) => res.json())
+      .then((data) => {
+        if (cancelled) return;
+        const loc = data.results?.[0]?.geometry?.location;
+        if (loc && typeof loc.lat === "number" && typeof loc.lng === "number") {
+          setGeocodedJobLatLng({ lat: loc.lat, lng: loc.lng });
+        } else {
+          setGeocodedJobLatLng(null);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setGeocodedJobLatLng(null);
+      });
+    return () => { cancelled = true; };
+  }, [jobAddressKey, jobLatLng]);
+
+  const jobLatLngOrGeocoded = jobLatLng ?? geocodedJobLatLng;
 
   const orderedTeammatesForScroll = useMemo(() => {
     const accepted = allApplicationsForAvailability.filter((a: any) => a.status === "accepted");
@@ -2165,23 +2517,64 @@ export function JobContent({
       });
     };
     const selfConflict = hasConflict(selfApps);
-    const list: { p: typeof profile | TeamMemberBasic; skillMatch: boolean; available: boolean }[] = [];
+    const list: { p: typeof profile | TeamMemberBasic; skillMatch: boolean; available: boolean; inTerritory: boolean }[] = [];
+    const radiusMiles = territoryRadiusMiles ?? DEFAULT_JOB_TERRITORY_RADIUS_MILES;
+    const inTerritoryFor = (lat: number | null, lng: number | null) => {
+      if (!jobLatLngOrGeocoded) return true; // no job coordinates → don't mark as outside territory
+      if (lat == null || lng == null || !Number.isFinite(lat) || !Number.isFinite(lng)) return false; // unknown worker location → not within job location
+      return calculateDistance(jobLatLngOrGeocoded.lat, jobLatLngOrGeocoded.lng, lat, lng) <= radiusMiles;
+    };
     if (profile) {
       const sm = checkSkillMatchForJob((profile as any)?.skillsets, job);
-      list.push({ p: profile, skillMatch: sm, available: !selfConflict });
+      const selfLat = workerLocation?.lat ?? ((profile as any)?.latitude != null ? parseFloat(String((profile as any).latitude)) : null);
+      const selfLng = workerLocation?.lng ?? ((profile as any)?.longitude != null ? parseFloat(String((profile as any).longitude)) : null);
+      const inT = inTerritoryFor(selfLat, selfLng);
+      list.push({ p: profile, skillMatch: sm, available: !selfConflict, inTerritory: inT });
     }
     acceptedTeamMembers.forEach(m => {
       const sm = checkSkillMatchForJob(m.skillsets, job);
       const av = !hasConflict(byMember[m.id] || []);
-      list.push({ p: m, skillMatch: sm, available: av });
+      const mlat = (m as any).latitude != null ? parseFloat(String((m as any).latitude)) : null;
+      const mlng = (m as any).longitude != null ? parseFloat(String((m as any).longitude)) : null;
+      const inT = inTerritoryFor(mlat, mlng);
+      list.push({ p: m, skillMatch: sm, available: av, inTerritory: inT });
     });
-    const score = (x: { skillMatch: boolean; available: boolean }) => (x.skillMatch ? 2 : 0) + (x.available ? 1 : 0);
+    const score = (x: { skillMatch: boolean; available: boolean; inTerritory: boolean }) =>
+      (x.inTerritory ? 4 : 0) + (x.skillMatch ? 2 : 0) + (x.available ? 1 : 0);
     list.sort((a, b) => score(b) - score(a));
     return list;
-  }, [profile, acceptedTeamMembers, job, allApplicationsForAvailability, jobStart, jobEnd]);
+  }, [profile, acceptedTeamMembers, job, jobLatLngOrGeocoded, workerLocation, allApplicationsForAvailability, jobStart, jobEnd, territoryRadiusMiles]);
+
+  // When worker has no approved teammates, auto-select self in participants
+  useEffect(() => {
+    if (acceptedTeamMembers.length === 0 && selectedApplicants.size === 0) {
+      setSelectedApplicants(new Set(["self"]));
+    }
+  }, [acceptedTeamMembers.length, selectedApplicants.size]);
+
+  // Auto-fill participants when job/panel opens: only in-territory people (and self if needed); do not auto-select teammates outside job location
+  useEffect(() => {
+    if (!job?.id || workersNeeded < 1) return;
+    const withKey = orderedTeammatesForScroll.map(({ p, inTerritory }) => ({
+      key: profile && p === profile ? "self" as const : (p as TeamMemberBasic).id,
+      inTerritory,
+    }));
+    const keysToFill: (number | "self")[] = [];
+    withKey.filter((x) => x.inTerritory).forEach((x) => { if (keysToFill.length < workersNeeded) keysToFill.push(x.key); });
+    if (keysToFill.length < workersNeeded && !keysToFill.includes("self")) {
+      keysToFill.push("self");
+    }
+    if (keysToFill.length > 0) {
+      setSelectedApplicants(new Set(keysToFill));
+    }
+  }, [job?.id]);
 
   const scheduledByMember = useMemo(() => {
-    if (!jobStart || !jobEnd) return {} as Record<number | "self", { scheduled: { id: number; title: string; start: Date; end: Date }[]; conflicts: { id: number }[] }>;
+    if (!jobStart || !jobEnd)
+      return {} as Record<
+        number | "self",
+        { scheduled: { id: number; title: string; trade: string; start: Date; end: Date }[]; conflicts: { id: number }[] }
+      >;
     const accepted = allApplicationsForAvailability.filter((a: any) => a.status === "accepted");
     const selfApps = accepted.filter((a: any) => !a.teamMember?.id);
     const byMember: Record<number, any[]> = { };
@@ -2192,9 +2585,12 @@ export function JobContent({
         .map((a: any) => {
           const start = new Date(a.job.startDate);
           const end = a.job.endDate ? new Date(a.job.endDate) : addHours(start, a.job.estimatedHours || 8);
-          return { id: a.job.id, title: a.job.title, start, end };
+          return { id: a.job.id, title: a.job.title, trade: a.job.trade, start, end };
         });
-    const out: Record<number | "self", { scheduled: { id: number; title: string; start: Date; end: Date }[]; conflicts: { id: number }[] }> = {} as any;
+    const out: Record<
+      number | "self",
+      { scheduled: { id: number; title: string; trade: string; start: Date; end: Date }[]; conflicts: { id: number }[] }
+    > = {} as any;
     const selfSched = toScheduled(selfApps);
     out["self"] = { scheduled: selfSched, conflicts: jobEnd ? selfSched.filter((ev) => ev.start < jobEnd! && ev.end > jobStart!) : [] };
     acceptedTeamMembers.forEach(m => {
@@ -2205,14 +2601,15 @@ export function JobContent({
   }, [jobStart, jobEnd, allApplicationsForAvailability, acceptedTeamMembers]);
 
   const { availableWorkers, conflictWorkers } = useMemo(() => {
-    type Row = { key: "self" | number; p: TeamMemberBasic | Profile; skillMatch: boolean; available: boolean; matchingSkills: string[] };
-    const rows: Row[] = orderedTeammatesForScroll.map(({ p, skillMatch, available }) => {
+    type Row = { key: "self" | number; p: TeamMemberBasic | Profile; skillMatch: boolean; available: boolean; inTerritory: boolean; matchingSkills: string[] };
+    const rows: Row[] = orderedTeammatesForScroll.map(({ p, skillMatch, available, inTerritory }) => {
       const skills = (p as any).skillsets ?? (p as any).serviceCategories ?? [];
       return {
         key: profile && p === profile ? "self" : (p as TeamMemberBasic).id,
         p,
         skillMatch,
         available,
+        inTerritory,
         matchingSkills: getMatchingSkillsForJob(Array.isArray(skills) ? skills : [], job),
       };
     });
@@ -2278,13 +2675,18 @@ export function JobContent({
   };
 
   const applyMutation = useMutation({
-    mutationFn: async (data: { jobId: number; message: string; selectedApplicants: { id: number | "self"; name: string }[]; useSmartRate?: boolean }) => {
+    mutationFn: async (data: { jobId: number; message: string; selectedApplicants: { id: number | "self"; name: string }[]; useSmartRate?: boolean; proposedRate?: number }) => {
       const response = await apiRequest("POST", "/api/applications", data);
       return response.json();
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["/api/applications"] });
       queryClient.invalidateQueries({ queryKey: ["/api/jobs"] });
+      // Refetch worker applications so Find Work map updates in real time (job pill → yellow / applied)
+      if (profile?.id) {
+        queryClient.invalidateQueries({ queryKey: ["/api/applications/worker", profile.id] });
+      }
+      queryClient.invalidateQueries({ queryKey: ["/api/jobs/find-work"] });
       toast({
         title: t("applicationSubmitted"),
         description: selectedApplicants.size > 1 
@@ -2321,7 +2723,8 @@ export function JobContent({
       jobId: job.id, 
       message: applyMessage, 
       selectedApplicants: applicants,
-      useSmartRate: useSmartRateInline,
+      useSmartRate: customInlineRate == null && useSmartRateInline,
+      ...(customInlineRate != null ? { proposedRate: Math.round(customInlineRate * 100) } : {}),
     });
   };
 
@@ -2377,23 +2780,34 @@ export function JobContent({
             <>
               <div className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden">
                 <div className="bg-background rounded-t-[28px] rounded-b-2xl shadow-[0_-2px_12px_rgba(0,0,0,0.06)] px-4 sm:px-6 pt-6 pb-6 min-h-full">
-                  {/* Job title */}
-                  <h2 className="text-xl sm:text-2xl font-bold text-center truncate mb-1">{job.title}</h2>
-                  <div className="border-b border-border/60 my-4" />
+                  {/* Job title — smaller, wrapped on stage 2 */}
+                  <h2 className={cn(
+                    "font-bold text-center mb-1",
+                    inlineApplyStage === 2 ? "text-base sm:text-lg text-pretty" : "text-xl sm:text-2xl truncate"
+                  )}>{getDisplayJobTitle(job)}</h2>
 
-                  {/* Participants: company seeking X + slots (empty/filled) + pill-shaped pool, 2-row grid */}
-                  <div className="space-y-1.5 mb-4">
-                    <div className="flex items-center justify-between gap-2">
-                      <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide flex items-center gap-1.5">
-                        <Users className="w-4 h-4" />
-                        {workersNeeded === 1
-                          ? (t("participantsSeekingOne") || "1 participant")
-                          : (t("participantsSeeking", { count: workersNeeded }) || `${workersNeeded} participants`)}
-                      </p>
-                      <span className="text-[10px] text-muted-foreground/80 uppercase tracking-wider">
-                        {t("companySeeking") || "Company seeking"} · {selectedApplicants.size}/{workersNeeded} {t("selected") || "selected"}
-                      </span>
-                    </div>
+                  {/* Participants: company seeking X + slots (empty/filled) + pill-shaped pool — collapsible; hidden on stage 2 (participants step) of inline apply */}
+                  {showParticipantsSection && !(inlineApplyMode && inlineApplyStage === 2) && (
+                  <Collapsible defaultOpen className="mb-4 group/participants">
+                    <CollapsibleTrigger asChild>
+                      <button
+                        type="button"
+                        className="w-full flex items-center justify-between gap-2 py-1 text-left rounded-md hover:bg-muted/50 transition-colors"
+                      >
+                        <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide flex items-center gap-1.5">
+                          <Users className="w-4 h-4" />
+                          {workersNeeded === 1
+                            ? (t("participantsSeekingOne") || "1 participant")
+                            : (t("participantsSeeking", { count: workersNeeded }) || `${workersNeeded} participants`)}
+                        </p>
+                        <span className="text-[10px] text-muted-foreground/80 uppercase tracking-wider flex items-center gap-1">
+                          {t("companySeeking") || "Company seeking"} · {selectedApplicants.size}/{workersNeeded} {t("selected") || "selected"}
+                          <ChevronDown className="w-4 h-4 text-muted-foreground shrink-0 transition-transform duration-200 group-data-[state=closed]/participants:rotate-[-90deg]" />
+                        </span>
+                      </button>
+                    </CollapsibleTrigger>
+                    <CollapsibleContent>
+                  <div className="space-y-1.5 pt-1">
                     <div className="flex flex-wrap gap-1.5 items-center">
                       {Array.from({ length: workersNeeded }, (_, i) => slotOrder[i] ?? null).map((key, idx) => {
                         if (key === null) {
@@ -2409,11 +2823,7 @@ export function JobContent({
                         const filled = selectedApplicants.has(key);
                         const isSelf = key === "self";
                         const person = isSelf ? profile : acceptedTeamMembers.find((m) => m.id === key);
-                        const avatarUrl = (person as { avatarUrl?: string | null })?.avatarUrl
-                          ? (String((person as { avatarUrl: string }).avatarUrl).startsWith("http") || String((person as { avatarUrl: string }).avatarUrl).startsWith("/")
-                            ? (person as { avatarUrl: string }).avatarUrl
-                            : `/objects/avatar/${(person as { avatarUrl: string }).avatarUrl}`)
-                          : undefined;
+                        const avatarUrl = normalizeAvatarUrl((person as { avatarUrl?: string | null })?.avatarUrl ?? undefined);
                         const initials = isSelf
                           ? `${(profile?.firstName ?? "")[0] || ""}${(profile?.lastName ?? "")[0] || ""}`.trim() || "?"
                           : (person as TeamMemberBasic)?.firstName?.[0] && (person as TeamMemberBasic)?.lastName?.[0]
@@ -2458,9 +2868,47 @@ export function JobContent({
                     <p className="text-[10px] text-muted-foreground">
                       {t("participantsAssignHint") || "Tap a person below to fill a slot, or tap a filled slot to clear."}
                     </p>
+                    {acceptedTeamMembers.length === 0 && (
+                      <div className="rounded-lg border border-primary/30 bg-primary/5 px-3 py-2 text-xs text-muted-foreground flex flex-col gap-1.5 min-w-0 overflow-hidden">
+                        <p className="flex items-start gap-2 min-w-0">
+                          <Info className="w-4 h-4 flex-shrink-0 mt-0.5 text-primary" />
+                          <span className="break-words text-pretty">{t("addTeammateToGetPaidHint") || "If you're contracting this job to someone else you must add them as a teammate, else you cannot get paid."}</span>
+                        </p>
+                        <a
+                          href="/dashboard/business-operator"
+                          onClick={(e) => { e.preventDefault(); setLocation("/dashboard/business-operator"); onClose(); }}
+                          className="text-primary font-medium hover:underline inline-flex items-center gap-1 w-fit"
+                        >
+                          {t("addTeammatesLink") || "Add teammates"}
+                          <ChevronRight className="w-3.5 h-3.5" />
+                        </a>
+                      </div>
+                    )}
                     {/* Legend/Key for icons + Settings Gear */}
                     <div className="flex items-center justify-between gap-2">
                       <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[10px] text-muted-foreground border border-border/50 bg-muted/30 rounded-lg px-2 py-1.5 flex-1">
+                        <div className="flex items-center gap-1">
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <div className="flex items-center gap-1">
+                                <MapPin className="w-3 h-3 text-green-600" />
+                                <span>Within territory</span>
+                              </div>
+                            </TooltipTrigger>
+                            <TooltipContent>Within job location radius</TooltipContent>
+                          </Tooltip>
+                        </div>
+                        <div className="flex items-center gap-1">
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <div className="flex items-center gap-1">
+                                <MapPin className="w-3 h-3 text-muted-foreground" />
+                                <span>Not within</span>
+                              </div>
+                            </TooltipTrigger>
+                            <TooltipContent>Outside job location radius</TooltipContent>
+                          </Tooltip>
+                        </div>
                         <div className="flex items-center gap-1">
                           <Tooltip>
                             <TooltipTrigger asChild>
@@ -2470,17 +2918,6 @@ export function JobContent({
                               </div>
                             </TooltipTrigger>
                             <TooltipContent>Worker has required skills for this job</TooltipContent>
-                          </Tooltip>
-                        </div>
-                        <div className="flex items-center gap-1">
-                          <Tooltip>
-                            <TooltipTrigger asChild>
-                              <div className="flex items-center gap-1">
-                                <Wrench className="w-3 h-3 text-red-500" />
-                                <span>Skills mismatch</span>
-                              </div>
-                            </TooltipTrigger>
-                            <TooltipContent>Worker missing some required skills</TooltipContent>
                           </Tooltip>
                         </div>
                         <div className="flex items-center gap-1">
@@ -2521,16 +2958,14 @@ export function JobContent({
                       </Tooltip>
                     </div>
                     <div className="grid grid-cols-2 gap-x-2 gap-y-1.5 py-0.5">
-                      {orderedTeammatesForScroll.map(({ p, skillMatch, available }) => {
+                      {orderedTeammatesForScroll.map(({ p, skillMatch, available, inTerritory }) => {
                         const pr = p as TeamMemberBasic & { id?: number; firstName?: string; lastName?: string; avatarUrl?: string | null };
                         const poolKey: "self" | number = profile && p === profile ? "self" : (pr as TeamMemberBasic).id;
                         const selected = selectedApplicants.has(poolKey);
                         const atCapacity = selectedApplicants.size >= workersNeeded && !selected;
                         const initials = (pr.firstName?.[0] && pr.lastName?.[0]) ? `${pr.firstName[0]}${pr.lastName[0]}` : "?";
                         const name = poolKey === "self" ? (t("myself") || "Myself") : (pr.firstName && pr.lastName) ? `${pr.firstName} ${pr.lastName}`.trim() : "?";
-                        const avatarSrc = pr.avatarUrl
-                          ? (String(pr.avatarUrl).startsWith("http") || String(pr.avatarUrl).startsWith("/") ? pr.avatarUrl : `/objects/avatar/${pr.avatarUrl}`)
-                          : undefined;
+                        const avatarSrc = normalizeAvatarUrl(pr.avatarUrl ?? undefined);
                         return (
                           <button
                             key={String(poolKey)}
@@ -2553,7 +2988,8 @@ export function JobContent({
                             className={cn(
                               "inline-flex items-center gap-1.5 rounded-full py-0.5 pl-0.5 pr-2 border-2 transition-all text-left min-w-0",
                               selected ? "border-primary bg-primary/10" : "border-border hover:border-primary/50 hover:bg-muted/50",
-                              atCapacity && !selected && "opacity-50"
+                              atCapacity && !selected && "opacity-50",
+                              !inTerritory && "opacity-60"
                             )}
                             title={name}
                           >
@@ -2565,11 +3001,21 @@ export function JobContent({
                             <Tooltip>
                               <TooltipTrigger asChild>
                                 <div className="flex-shrink-0">
-                                  <Wrench className={cn("w-3 h-3", skillMatch ? "text-green-600" : "text-red-500")} />
+                                  <MapPin className={cn("w-3 h-3", inTerritory ? "text-green-600" : "text-muted-foreground")} />
                                 </div>
                               </TooltipTrigger>
-                              <TooltipContent>{skillMatch ? "Has required skills" : "Missing some skills"}</TooltipContent>
+                              <TooltipContent>{inTerritory ? "Within job territory" : "Not within job territory"}</TooltipContent>
                             </Tooltip>
+                            {skillMatch && (
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <div className="flex-shrink-0">
+                                    <Wrench className="w-3 h-3 text-green-600" />
+                                  </div>
+                                </TooltipTrigger>
+                                <TooltipContent>Has required skills</TooltipContent>
+                              </Tooltip>
+                            )}
                             <Tooltip>
                               <TooltipTrigger asChild>
                                 <div className="flex-shrink-0">
@@ -2583,6 +3029,9 @@ export function JobContent({
                       })}
                     </div>
                   </div>
+                    </CollapsibleContent>
+                  </Collapsible>
+                  )}
                   <div className="border-b border-border/60 my-4" />
 
                   {/* Estimated Payout — sticky top on mobile, full width */}
@@ -2620,18 +3069,16 @@ export function JobContent({
                         )}
                       </div>
                       <div className="space-y-3">
-                        <div className="grid grid-cols-2 gap-2">
-                          {availableWorkers.map(({ key, p, skillMatch, matchingSkills }) => {
+                        {(() => {
+                          const inTerritory = availableWorkers.filter((w) => w.inTerritory);
+                          const outsideTerritory = availableWorkers.filter((w) => !w.inTerritory);
+                          const renderWorkerCard = ({ key, p, skillMatch, matchingSkills, inTerritory: inT }: { key: "self" | number; p: TeamMemberBasic | Profile; skillMatch: boolean; matchingSkills: string[]; inTerritory: boolean }, index: number) => {
                             const isSelf = key === "self";
                             const name = isSelf ? (t("myself") || "Myself") : `${(p as TeamMemberBasic).firstName ?? ""} ${(p as TeamMemberBasic).lastName ?? ""}`.trim();
                             const rate = (p as { hourlyRate?: number | null }).hourlyRate != null
                               ? ((p as { hourlyRate: number }).hourlyRate > 100 ? (p as { hourlyRate: number }).hourlyRate / 100 : (p as { hourlyRate: number }).hourlyRate)
                               : 30;
-                            const avatarUrl = (p as { avatarUrl?: string | null }).avatarUrl
-                              ? (String((p as { avatarUrl: string }).avatarUrl).startsWith("http") || String((p as { avatarUrl: string }).avatarUrl).startsWith("/")
-                                ? (p as { avatarUrl: string }).avatarUrl
-                                : `/objects/avatar/${(p as { avatarUrl: string }).avatarUrl}`)
-                              : undefined;
+                            const avatarUrl = normalizeAvatarUrl((p as { avatarUrl?: string | null }).avatarUrl ?? undefined);
                             const initials = (p as { firstName?: string; lastName?: string }).firstName?.[0] && (p as { lastName?: string }).lastName?.[0]
                               ? `${(p as { firstName: string }).firstName[0]}${(p as { lastName: string }).lastName[0]}`
                               : "?";
@@ -2640,7 +3087,7 @@ export function JobContent({
                             const driveLabel = closestDriveTimeLoading ? "…" : dt?.duration ?? "—";
                             return (
                               <button
-                                key={`available-${isSelf ? "self" : key}-${idx}`}
+                                key={`available-${isSelf ? "self" : key}-${index}`}
                                 type="button"
                                 onClick={() => {
                                   setSelectedApplicants(prev => {
@@ -2656,47 +3103,91 @@ export function JobContent({
                                     return next;
                                   });
                                 }}
-                                className={`w-full flex flex-col items-stretch gap-2 p-3 rounded-xl border-2 transition-all text-left ${
-                                  selected ? "border-primary bg-primary/5" : "border-border hover:border-primary/50"
-                                }`}
+                                className={cn(
+                                  "w-full flex items-center gap-2 py-1.5 px-2 rounded-lg border-2 transition-all text-left min-w-0",
+                                  selected ? "border-primary bg-primary/5" : "border-border hover:border-primary/50",
+                                  !inT && "opacity-60"
+                                )}
                                 data-testid={isSelf ? "inline-select-self" : `inline-select-member-${key}`}
                               >
-                                <div className="flex items-center justify-between gap-2 w-full">
-                                  <div className="relative flex-shrink-0">
-                                    <Avatar className={cn("w-12 h-12 border-2", isSelf ? "border-primary/20" : "border-secondary")}>
-                                      <AvatarImage src={avatarUrl} />
-                                      <AvatarFallback className="text-xs">{initials}</AvatarFallback>
-                                    </Avatar>
-                                    <div className={`absolute -bottom-0.5 -right-0.5 w-5 h-5 rounded-full border-2 flex items-center justify-center transition-colors ${
-                                      selected ? "border-primary bg-primary" : "border-muted-foreground bg-muted"
-                                    }`}>
-                                      {selected && <Check className="w-3 h-3 text-primary-foreground" />}
-                                    </div>
+                                <div className="relative flex-shrink-0">
+                                  <Avatar className={cn("w-7 h-7 border-2 flex-shrink-0", isSelf ? "border-primary/20" : "border-secondary")}>
+                                    <AvatarImage src={avatarUrl} className="object-cover" />
+                                    <AvatarFallback className="text-[9px]">{initials}</AvatarFallback>
+                                  </Avatar>
+                                  <div className={cn("absolute -bottom-0.5 -right-0.5 w-3 h-3 rounded-full border-2 flex items-center justify-center", selected ? "border-primary bg-primary" : "border-muted-foreground bg-muted")}>
+                                    {selected && <Check className="w-1.5 h-1.5 text-primary-foreground" />}
                                   </div>
-                                  <span className="flex items-center gap-1 text-xs text-muted-foreground shrink-0">
-                                    <Car className="w-3.5 h-3.5" />
-                                    {driveLabel}
-                                  </span>
                                 </div>
-                                <div className="flex items-center justify-between gap-2 w-full min-w-0">
-                                  <p className="font-medium text-sm truncate">{name}</p>
-                                  <p className="text-xs text-muted-foreground shrink-0">${Math.round(rate)}/hr</p>
-                                </div>
-                                <div className="flex flex-wrap gap-1 min-h-[1.25rem]">
-                                  {skillMatch && matchingSkills.length > 0 ? (
-                                    matchingSkills.slice(0, 3).map((s) => (
-                                      <Badge key={s} variant="secondary" className="text-[10px] px-1.5 py-0 font-medium bg-green-100 text-green-800 dark:bg-green-900/40 dark:text-green-300 border-0">
-                                        {s}
-                                      </Badge>
-                                    ))
-                                  ) : (
-                                    <span className="text-[10px] text-muted-foreground">{t("noSkillMatch") || "No skill match"}</span>
-                                  )}
+                                <div className="flex-1 min-w-0 flex flex-col gap-0.5">
+                                  <div className="flex items-center gap-1.5 min-w-0">
+                                    <p className="font-medium text-xs truncate">{name}</p>
+                                    <span className="text-[10px] text-muted-foreground shrink-0">${Math.round(rate)}/hr</span>
+                                  </div>
+                                  <div className="flex items-center gap-1 flex-wrap">
+                                    <Tooltip>
+                                      <TooltipTrigger asChild>
+                                        <span className="flex items-center shrink-0">
+                                          <MapPin className={cn("w-3 h-3", inT ? "text-green-600" : "text-muted-foreground")} />
+                                        </span>
+                                      </TooltipTrigger>
+                                      <TooltipContent>{inT ? "Within job territory" : "Outside job location"}</TooltipContent>
+                                    </Tooltip>
+                                    <Tooltip>
+                                      <TooltipTrigger asChild>
+                                        <span className="flex items-center shrink-0">
+                                          <Wrench className={cn("w-3 h-3", skillMatch ? "text-green-600" : "text-muted-foreground")} />
+                                        </span>
+                                      </TooltipTrigger>
+                                      <TooltipContent>{skillMatch ? "Skills match" : "No skill match"}</TooltipContent>
+                                    </Tooltip>
+                                    <Tooltip>
+                                      <TooltipTrigger asChild>
+                                        <span className="flex items-center shrink-0">
+                                          <Calendar className="w-3 h-3 text-green-600" />
+                                        </span>
+                                      </TooltipTrigger>
+                                      <TooltipContent>Available</TooltipContent>
+                                    </Tooltip>
+                                    <Tooltip>
+                                      <TooltipTrigger asChild>
+                                        <span className="flex items-center gap-0.5 text-[9px] text-muted-foreground shrink-0">
+                                          <Car className="w-2.5 h-2.5" />
+                                          {driveLabel}
+                                        </span>
+                                      </TooltipTrigger>
+                                      <TooltipContent>Drive time</TooltipContent>
+                                    </Tooltip>
+                                  </div>
                                 </div>
                               </button>
                             );
-                          })}
-                        </div>
+                          };
+                          return (
+                            <>
+                              <div className="space-y-1.5 min-w-0 overflow-hidden">
+                                <p className="text-[10px] font-medium text-muted-foreground uppercase tracking-wide flex items-center gap-1">
+                                  <MapPin className="w-3 h-3 text-green-600" />
+                                  {t("withinJobLocation") || "Within job location"}
+                                </p>
+                                <div className="grid grid-cols-2 gap-1.5 min-w-0">
+                                  {inTerritory.map((w, i) => renderWorkerCard(w, i))}
+                                </div>
+                              </div>
+                              {outsideTerritory.length > 0 && (
+                                <div className="space-y-1.5 pt-1 min-w-0 overflow-hidden">
+                                  <p className="text-[10px] font-medium text-muted-foreground uppercase tracking-wide flex items-center gap-1">
+                                    <MapPin className="w-3 h-3" />
+                                    {t("teammateOutsideJobLocation") || "Outside job location"}
+                                  </p>
+                                  <div className="grid grid-cols-2 gap-1.5 min-w-0">
+                                    {outsideTerritory.map((w, i) => renderWorkerCard(w, i))}
+                                  </div>
+                                </div>
+                              )}
+                            </>
+                          );
+                        })()}
                         {conflictWorkers.length > 0 && (
                           <Accordion type="single" collapsible className="w-full">
                             <AccordionItem value="conflicts" className="border rounded-xl overflow-hidden">
@@ -2707,18 +3198,14 @@ export function JobContent({
                                 </span>
                               </AccordionTrigger>
                               <AccordionContent className="px-2 pb-3 pt-0">
-                                <div className="grid grid-cols-2 gap-2">
-                                  {conflictWorkers.map(({ key, p, skillMatch, matchingSkills }) => {
+                                <div className="grid grid-cols-2 gap-1.5">
+                                  {conflictWorkers.map(({ key, p, skillMatch, matchingSkills }, conflictIndex) => {
                                     const isSelf = key === "self";
                                     const name = isSelf ? (t("myself") || "Myself") : `${(p as TeamMemberBasic).firstName ?? ""} ${(p as TeamMemberBasic).lastName ?? ""}`.trim();
                                     const rate = (p as { hourlyRate?: number | null }).hourlyRate != null
                                       ? ((p as { hourlyRate: number }).hourlyRate > 100 ? (p as { hourlyRate: number }).hourlyRate / 100 : (p as { hourlyRate: number }).hourlyRate)
                                       : 30;
-                                    const avatarUrl = (p as { avatarUrl?: string | null }).avatarUrl
-                                      ? (String((p as { avatarUrl: string }).avatarUrl).startsWith("http") || String((p as { avatarUrl: string }).avatarUrl).startsWith("/")
-                                        ? (p as { avatarUrl: string }).avatarUrl
-                                        : `/objects/avatar/${(p as { avatarUrl: string }).avatarUrl}`)
-                                      : undefined;
+                                    const avatarUrl = normalizeAvatarUrl((p as { avatarUrl?: string | null }).avatarUrl ?? undefined);
                                     const initials = (p as { firstName?: string; lastName?: string }).firstName?.[0] && (p as { lastName?: string }).lastName?.[0]
                                       ? `${(p as { firstName: string }).firstName[0]}${(p as { lastName: string }).lastName[0]}`
                                       : "?";
@@ -2727,7 +3214,7 @@ export function JobContent({
                                     const driveLabel = closestDriveTimeLoading ? "…" : dt?.duration ?? "—";
                                     return (
                                       <button
-                                        key={`conflict-${isSelf ? "self" : key}-${idx}`}
+                                        key={`conflict-${isSelf ? "self" : key}-${conflictIndex}`}
                                         type="button"
                                         onClick={() => {
                                           setSelectedApplicants(prev => {
@@ -2743,44 +3230,44 @@ export function JobContent({
                                             return next;
                                           });
                                         }}
-                                        className={`w-full flex flex-col items-stretch gap-2 p-3 rounded-xl border-2 transition-all text-left ${
+                                        className={`w-full flex flex-col items-stretch gap-1.5 p-2 rounded-lg border-2 transition-all text-left ${
                                           selected ? "border-primary bg-primary/5" : "border-amber-200 dark:border-amber-800 bg-amber-50/50 dark:bg-amber-950/20 hover:border-amber-400 dark:hover:border-amber-600"
                                         }`}
                                         data-testid={isSelf ? "inline-select-self-conflict" : `inline-select-member-conflict-${key}`}
                                       >
-                                        <div className="flex items-center justify-between gap-2 w-full">
+                                        <div className="flex items-center justify-between gap-1.5 w-full">
                                           <div className="relative flex-shrink-0">
-                                            <Avatar className={cn("w-12 h-12 border-2 opacity-90", isSelf ? "border-primary/20" : "border-secondary")}>
-                                              <AvatarImage src={avatarUrl} />
-                                              <AvatarFallback className="text-xs">{initials}</AvatarFallback>
+                                            <Avatar className={cn("w-9 h-9 border-2 opacity-90 flex-shrink-0", isSelf ? "border-primary/20" : "border-secondary")}>
+                                              <AvatarImage src={avatarUrl} className="object-cover" />
+                                              <AvatarFallback className="text-[10px]">{initials}</AvatarFallback>
                                             </Avatar>
                                             <span className="absolute -top-0.5 -right-0.5 rounded-full bg-amber-500 p-0.5" title={tCal("schedulingConflict") || "Conflict"}>
-                                              <AlertTriangle className="w-3 h-3 text-white" />
+                                              <AlertTriangle className="w-2.5 h-2.5 text-white" />
                                             </span>
-                                            <div className={`absolute -bottom-0.5 -right-0.5 w-5 h-5 rounded-full border-2 flex items-center justify-center transition-colors ${
+                                            <div className={`absolute -bottom-0.5 -right-0.5 w-4 h-4 rounded-full border-2 flex items-center justify-center transition-colors ${
                                               selected ? "border-primary bg-primary" : "border-muted-foreground bg-muted"
                                             }`}>
-                                              {selected && <Check className="w-3 h-3 text-primary-foreground" />}
+                                              {selected && <Check className="w-2.5 h-2.5 text-primary-foreground" />}
                                             </div>
                                           </div>
-                                          <span className="flex items-center gap-1 text-xs text-muted-foreground shrink-0">
-                                            <Car className="w-3.5 h-3.5" />
+                                          <span className="flex items-center gap-0.5 text-[10px] text-muted-foreground shrink-0">
+                                            <Car className="w-3 h-3" />
                                             {driveLabel}
                                           </span>
                                         </div>
-                                        <div className="flex items-center justify-between gap-2 w-full min-w-0">
-                                          <p className="font-medium text-sm truncate">{name}</p>
-                                          <p className="text-xs text-muted-foreground shrink-0">${Math.round(rate)}/hr</p>
+                                        <div className="flex items-center justify-between gap-1.5 w-full min-w-0">
+                                          <p className="font-medium text-xs truncate">{name}</p>
+                                          <p className="text-[10px] text-muted-foreground shrink-0">${Math.round(rate)}/hr</p>
                                         </div>
-                                        <div className="flex flex-wrap gap-1 min-h-[1.25rem]">
+                                        <div className="flex flex-wrap gap-0.5 min-h-[1rem]">
                                           {skillMatch && matchingSkills.length > 0 ? (
                                             matchingSkills.slice(0, 3).map((s) => (
-                                              <Badge key={s} variant="secondary" className="text-[10px] px-1.5 py-0 font-medium bg-green-100 text-green-800 dark:bg-green-900/40 dark:text-green-300 border-0">
+                                              <Badge key={s} variant="secondary" className="text-[9px] px-1 py-0 font-medium bg-green-100 text-green-800 dark:bg-green-900/40 dark:text-green-300 border-0">
                                                 {s}
                                               </Badge>
                                             ))
                                           ) : (
-                                            <span className="text-[10px] text-muted-foreground">{t("noSkillMatch") || "No skill match"}</span>
+                                            <span className="text-[9px] text-muted-foreground">{t("noSkillMatch") || "No skill match"}</span>
                                           )}
                                         </div>
                                       </button>
@@ -2809,19 +3296,52 @@ export function JobContent({
                 </div>
                 <div className="flex flex-row items-center justify-between gap-4 p-4 sm:p-6">
                   <div className="flex flex-col min-w-0 text-left flex-1">
-                    <p className="text-lg font-bold tracking-tight">${Math.round(estimatedPayout).toLocaleString()}</p>
-                    <p className="text-sm text-muted-foreground">
-                      {selectedApplicants.size > 0 && selectedApplicants.size !== 1 && (
-                        <>{selectedApplicants.size} {selectedApplicants.size === 1 ? "worker" : "workers"} × </>
-                      )}
-                      {job.estimatedHours ?? 8} hrs
-                      {job.startDate && (
-                        <> · {format(new Date(job.startDate), "MMM d")}
-                          {job.endDate ? ` – ${format(new Date(job.endDate), "MMM d")}` : (job.estimatedHours ?? 8) > 0 ? ` – ${format(addHours(new Date(job.startDate), job.estimatedHours ?? 8), "MMM d")}` : ""}
-                        </>
-                      )}
-                      {` · ${jobTypeInfo.label}`}
-                    </p>
+                    {isMobile ? (
+                      <>
+                        <button
+                          type="button"
+                          onClick={() => setMobileFooterDetailsExpanded((v) => !v)}
+                          className="flex items-center gap-2 text-left w-full rounded-lg -m-1 p-1 hover:bg-muted/50"
+                        >
+                          <p className="text-lg font-bold tracking-tight">${Math.round(livePreSubmitPayout).toLocaleString()}</p>
+                          {mobileFooterDetailsExpanded ? (
+                            <ChevronUp className="w-4 h-4 text-muted-foreground shrink-0" />
+                          ) : (
+                            <ChevronDown className="w-4 h-4 text-muted-foreground shrink-0" />
+                          )}
+                        </button>
+                        {mobileFooterDetailsExpanded && (
+                          <p className="text-sm text-muted-foreground mt-1">
+                            {selectedApplicants.size > 0 && selectedApplicants.size !== 1 && (
+                              <>{selectedApplicants.size} {selectedApplicants.size === 1 ? "worker" : "workers"} × </>
+                            )}
+                            {job.estimatedHours ?? 8} hrs
+                            {job.startDate && (
+                              <> · {format(new Date(job.startDate), "MMM d")}
+                                {job.endDate ? ` – ${format(new Date(job.endDate), "MMM d")}` : (job.estimatedHours ?? 8) > 0 ? ` – ${format(addHours(new Date(job.startDate), job.estimatedHours ?? 8), "MMM d")}` : ""}
+                              </>
+                            )}
+                            {` · ${jobTypeInfo.label}`}
+                          </p>
+                        )}
+                      </>
+                    ) : (
+                      <>
+                        <p className="text-lg font-bold tracking-tight">${Math.round(livePreSubmitPayout).toLocaleString()}</p>
+                        <p className="text-sm text-muted-foreground">
+                          {selectedApplicants.size > 0 && selectedApplicants.size !== 1 && (
+                            <>{selectedApplicants.size} {selectedApplicants.size === 1 ? "worker" : "workers"} × </>
+                          )}
+                          {job.estimatedHours ?? 8} hrs
+                          {job.startDate && (
+                            <> · {format(new Date(job.startDate), "MMM d")}
+                              {job.endDate ? ` – ${format(new Date(job.endDate), "MMM d")}` : (job.estimatedHours ?? 8) > 0 ? ` – ${format(addHours(new Date(job.startDate), job.estimatedHours ?? 8), "MMM d")}` : ""}
+                            </>
+                          )}
+                          {` · ${jobTypeInfo.label}`}
+                        </p>
+                      </>
+                    )}
                   </div>
                   <Button
                     className="h-12 min-w-[140px] text-base font-semibold rounded-xl shadow-lg bg-gradient-to-r from-[#00A86B] to-[#008A57] hover:from-[#008A57] hover:to-[#006B44] text-white border-0 flex-shrink-0"
@@ -2842,7 +3362,7 @@ export function JobContent({
             <>
               <div className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden">
                 <div className="bg-background rounded-t-[28px] rounded-b-2xl shadow-[0_-2px_12px_rgba(0,0,0,0.06)] px-4 sm:px-6 pt-6 pb-6 min-h-full">
-                  <h2 className="text-xl sm:text-2xl font-bold text-center truncate mb-1">{job.title}</h2>
+                  <h2 className="text-xl sm:text-2xl font-bold text-center truncate mb-1">{getDisplayJobTitle(job)}</h2>
                   <div className="border-b border-border/60 my-4" />
                   {/* Location representative (or company) — rep name is primary when set on profile/location */}
                   <div className="flex items-center gap-4 py-2">
@@ -3039,7 +3559,7 @@ export function JobContent({
                 <div className="absolute -left-1.5 top-2 w-3 h-3 rounded-full bg-primary border-2 border-background" />
                 <p className="text-xs text-muted-foreground mb-1">{tCal("thisJob") || "This job"}</p>
                 <div className="bg-primary/10 border border-primary/30 rounded-lg p-3">
-                  <p className="font-medium text-sm">{job.title}</p>
+                  <p className="font-medium text-sm">{getDisplayJobTitle(job)}</p>
                   <p className="text-xs text-muted-foreground">{jobStart && format(jobStart, "h:mm a")} – {jobEnd && format(jobEnd, "h:mm a")}</p>
                 </div>
               </div>
@@ -3049,7 +3569,7 @@ export function JobContent({
                   <div key={ev.id} className={cn("relative border-l-2 ml-3 pl-4 py-2", isConflict ? "border-amber-500" : "border-muted")}>
                     <div className={cn("absolute -left-1.5 top-2 w-3 h-3 rounded-full border-2 border-background", isConflict ? "bg-amber-500" : "bg-muted-foreground/30")} />
                     <div className={cn("rounded-lg p-3", isConflict ? "bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800" : "bg-muted/50")}>
-                      <p className="font-medium text-sm">{ev.title}</p>
+                      <p className="font-medium text-sm">{getDisplayJobTitle(ev)}</p>
                       <p className="text-xs text-muted-foreground">{format(ev.start, "h:mm a")} – {format(ev.end, "h:mm a")}</p>
                       {isConflict && <p className="text-xs text-amber-600 dark:text-amber-400 mt-1">{tCal("overlapsWithThisJob")}</p>}
                     </div>
@@ -3063,58 +3583,29 @@ export function JobContent({
               <Users className="w-4 h-4" />
               {tCal("teamAvailability") || "Team availability"}
             </h4>
-            {profile && (
-              <div className={cn(
-                "rounded-xl p-3 border flex items-center justify-between gap-3",
-                hasConflicts ? "bg-amber-50 dark:bg-amber-950/30 border-amber-200 dark:border-amber-800" : "bg-green-50 dark:bg-green-950/30 border-green-200 dark:border-green-800"
-              )}>
-                <div className="flex items-center gap-3 min-w-0">
-                  <Avatar className="w-10 h-10 flex-shrink-0">
-                    <AvatarImage src={profile?.avatarUrl ? (String(profile.avatarUrl).startsWith("http") || String(profile.avatarUrl).startsWith("/") ? profile.avatarUrl : `/objects/avatar/${profile.avatarUrl}`) : undefined} />
-                    <AvatarFallback>{profile?.firstName?.[0]}{profile?.lastName?.[0]}</AvatarFallback>
-                  </Avatar>
-                  <div className="min-w-0">
-                    <p className="font-medium text-sm truncate">{profile?.firstName} {profile?.lastName} {tCal("yourself") || "(You)"}</p>
-                    <p className="text-xs text-muted-foreground">
-                      {hasConflicts ? (tCal("hasConflicts", { count: scheduledJobsAndConflicts.conflicts.length }) || "Conflict(s)") : (tCal("available") || "Available")}
-                    </p>
-                  </div>
-                </div>
-                {!hasConflicts && (
-                  <Button size="sm" className="rounded-xl flex-shrink-0" onClick={() => onApplyFromCalendar("self")} data-testid="button-apply-self">
-                    {t("apply") || "Apply"}
-                  </Button>
-                )}
-              </div>
-            )}
             {orderedTeammatesForScroll.filter(({ p }) => (profile && p === profile) || acceptedTeamMembers.some((tm) => tm.id === (p as any).id)).map(({ p, available }) => {
-              const m = p as TeamMemberBasic;
+              const m = p as TeamMemberBasic & { firstName?: string; lastName?: string; avatarUrl?: string | null };
+              const isSelf = !!(profile && p === profile);
               const initial = m.firstName?.[0] && m.lastName?.[0] ? `${m.firstName[0]}${m.lastName[0]}` : "?";
+              const displayName = isSelf ? `${m.firstName ?? ""} ${m.lastName ?? ""}`.trim() + ` ${tCal("yourself") || "(You)"}` : `${m.firstName ?? ""} ${m.lastName ?? ""}`.trim();
               return (
                 <div
-                  key={m.id}
+                  key={isSelf ? "self" : m.id}
                   className={cn(
-                    "rounded-xl p-3 border flex items-center justify-between gap-3",
+                    "rounded-xl p-3 border flex items-center gap-3",
                     available ? "bg-green-50 dark:bg-green-950/30 border-green-200 dark:border-green-800" : "bg-amber-50 dark:bg-amber-950/30 border-amber-200 dark:border-amber-800"
                   )}
                 >
-                  <div className="flex items-center gap-3 min-w-0">
-                    <Avatar className="w-10 h-10 flex-shrink-0">
-                      <AvatarImage src={m.avatarUrl ?? undefined} />
-                      <AvatarFallback className="text-xs">{initial}</AvatarFallback>
-                    </Avatar>
-                    <div className="min-w-0">
-                      <p className="font-medium text-sm truncate">{m.firstName} {m.lastName}</p>
-                      <p className="text-xs text-muted-foreground">
-                        {available ? (tCal("available") || "Available") : (tCal("hasConflicts", { count: 1 }) || "Conflict(s)")}
-                      </p>
-                    </div>
+                  <Avatar className="w-10 h-10 flex-shrink-0">
+                    <AvatarImage src={normalizeAvatarUrl(m.avatarUrl ?? (isSelf ? profile?.avatarUrl : undefined) ?? undefined)} />
+                    <AvatarFallback className="text-xs">{initial}</AvatarFallback>
+                  </Avatar>
+                  <div className="min-w-0">
+                    <p className="font-medium text-sm truncate">{displayName}</p>
+                    <p className="text-xs text-muted-foreground">
+                      {available ? (tCal("available") || "Available") : (tCal("hasConflicts", { count: 1 }) || "Conflict(s)")}
+                    </p>
                   </div>
-                  {available && (
-                    <Button size="sm" className="rounded-xl flex-shrink-0" onClick={() => onApplyFromCalendar(m.id)} data-testid={`button-apply-teammate-${m.id}`}>
-                      {t("apply") || "Apply"}
-                    </Button>
-                  )}
                 </div>
               );
             })}
@@ -3125,18 +3616,18 @@ export function JobContent({
       body = (
         <div className="space-y-3">
           <p className="text-sm text-muted-foreground">
-            {partialAddress || [job.city, job.state].filter(Boolean).join(", ")}
+            {displayAddress || [job.city, job.state].filter(Boolean).join(", ")}
           </p>
           <div className="rounded-xl overflow-hidden border border-border bg-muted/30" style={{ minHeight: "50vh" }}>
             <JobLocationMap
-              job={{ id: job.id, lat: parseFloat(job.latitude), lng: parseFloat(job.longitude), title: job.title }}
+              job={{ id: job.id, lat: parseFloat(job.latitude), lng: parseFloat(job.longitude), title: getDisplayJobTitle(job) }}
               userLocation={workerLocation ?? undefined}
               personLocations={personLocationsForMap}
               height="50vh"
               className="w-full"
-              partialAddress={partialAddress || undefined}
+              partialAddress={(application?.status === "accepted" ? displayAddress : partialAddress) || undefined}
               showApproximateRadius
-              approximateNote={t("fullAddressWhenYouWin")}
+              approximateNote={application?.status === "accepted" ? undefined : t("fullAddressWhenYouWin")}
             />
           </div>
         </div>
@@ -3152,7 +3643,7 @@ export function JobContent({
       const dayLabel = isSelf ? (tCal("yourDay") || "Your day") : `${name}'s day`;
       const scheduleLabel = isSelf ? (tCal("jobFitsSchedule") || "Job fits your schedule") : `Job fits ${name}'s schedule`;
       const initials = tp.firstName?.[0] && tp.lastName?.[0] ? `${tp.firstName[0]}${tp.lastName[0]}` : "?";
-      const avatarSrc = tp.avatarUrl ? (String(tp.avatarUrl).startsWith("http") || String(tp.avatarUrl).startsWith("/") ? tp.avatarUrl : `/objects/avatar/${tp.avatarUrl}`) : undefined;
+      const avatarSrc = normalizeAvatarUrl(tp.avatarUrl ?? undefined);
       const rate = tp.hourlyRate != null ? (tp.hourlyRate > 100 ? tp.hourlyRate / 100 : tp.hourlyRate) : 30;
       body = (
         <div className="space-y-4 rounded-t-[28px] overflow-hidden">
@@ -3206,7 +3697,7 @@ export function JobContent({
               <div className="absolute -left-1.5 top-2 w-3 h-3 rounded-full bg-primary border-2 border-background" />
               <p className="text-xs text-muted-foreground mb-1">{tCal("thisJob") || "This job"}</p>
               <div className="bg-primary/10 border border-primary/30 rounded-lg p-3">
-                <p className="font-medium text-sm">{job.title}</p>
+                <p className="font-medium text-sm">{getDisplayJobTitle(job)}</p>
                 <p className="text-xs text-muted-foreground">{jobStart && format(jobStart, "h:mm a")} – {jobEnd && format(jobEnd, "h:mm a")}</p>
               </div>
             </div>
@@ -3216,7 +3707,7 @@ export function JobContent({
                 <div key={ev.id} className={cn("relative border-l-2 ml-3 pl-4 py-2", isConflict ? "border-amber-500" : "border-muted")}>
                   <div className={cn("absolute -left-1.5 top-2 w-3 h-3 rounded-full border-2 border-background", isConflict ? "bg-amber-500" : "bg-muted-foreground/30")} />
                   <div className={cn("rounded-lg p-3", isConflict ? "bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800" : "bg-muted/50")}>
-                    <p className="font-medium text-sm">{ev.title}</p>
+                    <p className="font-medium text-sm">{getDisplayJobTitle(ev)}</p>
                     <p className="text-xs text-muted-foreground">{format(ev.start, "h:mm a")} – {format(ev.end, "h:mm a")}</p>
                     {isConflict && <p className="text-xs text-amber-600 dark:text-amber-400 mt-1">{tCal("overlapsWithThisJob")}</p>}
                   </div>
@@ -3260,19 +3751,68 @@ export function JobContent({
             </div>
             <div className="flex flex-row items-center justify-between gap-4 p-4 sm:p-6">
               <div className="flex flex-col min-w-0 text-left flex-1">
-                <p className="text-lg font-bold tracking-tight">${Math.round(estimatedPayout).toLocaleString()}</p>
-                <p className="text-sm text-muted-foreground">
-                  {selectedApplicants.size > 0 && selectedApplicants.size !== 1 && (
-                    <>{selectedApplicants.size} {selectedApplicants.size === 1 ? "worker" : "workers"} × </>
-                  )}
-                  {job.estimatedHours ?? 8} hrs
-                  {job.startDate && (
-                    <> · {format(new Date(job.startDate), "MMM d")}
-                      {job.endDate ? ` – ${format(new Date(job.endDate), "MMM d")}` : (job.estimatedHours ?? 8) > 0 ? ` – ${format(addHours(new Date(job.startDate), job.estimatedHours ?? 8), "MMM d")}` : ""}
-                    </>
-                  )}
-                  {` · ${jobTypeInfo.label}`}
-                </p>
+                {isMobile ? (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => setMobileFooterDetailsExpanded((v) => !v)}
+                      className="flex items-center gap-2 text-left w-full rounded-lg -m-1 p-1 hover:bg-muted/50"
+                    >
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <p className="text-lg font-bold tracking-tight">${Math.round(livePreSubmitPayout).toLocaleString()}</p>
+                        {stage === 1 && onDismiss && (
+                          <button type="button" onClick={(e) => { e.stopPropagation(); onDismiss(job); }} className="flex-shrink-0 flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground" data-testid="enhanced-dismiss-button-map">
+                            <X className="w-4 h-4" />
+                            {t("skip")}
+                          </button>
+                        )}
+                      </div>
+                      {mobileFooterDetailsExpanded ? (
+                        <ChevronUp className="w-4 h-4 text-muted-foreground shrink-0" />
+                      ) : (
+                        <ChevronDown className="w-4 h-4 text-muted-foreground shrink-0" />
+                      )}
+                    </button>
+                    {mobileFooterDetailsExpanded && (
+                      <p className="text-sm text-muted-foreground mt-1">
+                        {selectedApplicants.size > 0 && selectedApplicants.size !== 1 && (
+                          <>{selectedApplicants.size} {selectedApplicants.size === 1 ? "worker" : "workers"} × </>
+                        )}
+                        {job.estimatedHours ?? 8} hrs
+                        {job.startDate && (
+                          <> · {format(new Date(job.startDate), "MMM d")}
+                            {job.endDate ? ` – ${format(new Date(job.endDate), "MMM d")}` : (job.estimatedHours ?? 8) > 0 ? ` – ${format(addHours(new Date(job.startDate), job.estimatedHours ?? 8), "MMM d")}` : ""}
+                          </>
+                        )}
+                        {` · ${jobTypeInfo.label}`}
+                      </p>
+                    )}
+                  </>
+                ) : (
+                  <>
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <p className="text-lg font-bold tracking-tight">${Math.round(livePreSubmitPayout).toLocaleString()}</p>
+                      {stage === 1 && onDismiss && (
+                        <button type="button" onClick={() => onDismiss(job)} className="flex-shrink-0 flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground" data-testid="enhanced-dismiss-button-map">
+                          <X className="w-4 h-4" />
+                          {t("skip")}
+                        </button>
+                      )}
+                    </div>
+                    <p className="text-sm text-muted-foreground">
+                      {selectedApplicants.size > 0 && selectedApplicants.size !== 1 && (
+                        <>{selectedApplicants.size} {selectedApplicants.size === 1 ? "worker" : "workers"} × </>
+                      )}
+                      {job.estimatedHours ?? 8} hrs
+                      {job.startDate && (
+                        <> · {format(new Date(job.startDate), "MMM d")}
+                          {job.endDate ? ` – ${format(new Date(job.endDate), "MMM d")}` : (job.estimatedHours ?? 8) > 0 ? ` – ${format(addHours(new Date(job.startDate), job.estimatedHours ?? 8), "MMM d")}` : ""}
+                        </>
+                      )}
+                      {` · ${jobTypeInfo.label}`}
+                    </p>
+                  </>
+                )}
               </div>
               <Button
                 className="h-12 min-w-[140px] text-base font-semibold rounded-xl shadow-lg bg-gradient-to-r from-[#00A86B] to-[#008A57] hover:from-[#008A57] hover:to-[#006B44] text-white border-0 flex-shrink-0"
@@ -3299,18 +3839,367 @@ export function JobContent({
     );
   }
 
+  // Breadcrumbed step: withdraw application (reason + confirm) inside same dialog/drawer
+  const WITHDRAW_REASON_KEYS = ["withdrawReasonFoundAnotherJob", "withdrawReasonScheduleChanged", "withdrawReasonNoLongerInterested", "withdrawReasonOther"] as const;
+  if (application && (onWithdraw || onWithdrawAll) && showWithdrawStep) {
+    const onBackWithdraw = () => {
+      if (withdrawStep === "confirm") {
+        setWithdrawStep("reason");
+      } else {
+        setShowWithdrawStep(false);
+        setWithdrawReason(null);
+        setWithdrawStep("reason");
+      }
+    };
+    const handleConfirmWithdraw = () => {
+      if (allApps.length > 1 && onWithdrawAll) onWithdrawAll(allApps.map(app => app.id));
+      else if (onWithdraw) onWithdraw(application.id);
+      setShowWithdrawStep(false);
+      setWithdrawReason(null);
+      setWithdrawStep("reason");
+    };
+    const reasonLabel = (key: string) => t(key as any);
+    return (
+      <div className={cn("flex flex-col min-h-0", isMobile ? "h-full" : "max-h-[85vh]")}>
+        <div className="flex items-center gap-2 px-4 py-3 border-b flex-shrink-0 bg-background rounded-t-[28px] -mt-0">
+          <button
+            onClick={onBackWithdraw}
+            className="flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground"
+            data-testid="button-back-from-withdraw"
+          >
+            <ChevronLeft className="w-4 h-4" />
+            <span>{tCommon("back")}</span>
+          </button>
+          <span className="text-muted-foreground">/</span>
+          <span className="font-medium text-sm">
+            {withdrawStep === "reason" ? t("withdrawApplication") : t("confirmWithdrawTitle")}
+          </span>
+        </div>
+        <div className="flex-1 min-h-0 overflow-y-auto p-4 pl-4 pr-4">
+          {withdrawStep === "reason" ? (
+            <>
+              <p className="text-sm font-medium mb-3">{t("withdrawReasonTitle")}</p>
+              <div className="space-y-2" role="radiogroup" aria-label={t("withdrawReasonTitle")}>
+                {WITHDRAW_REASON_KEYS.map((key) => (
+                  <button
+                    key={key}
+                    type="button"
+                    onClick={() => setWithdrawReason(key)}
+                    className={cn(
+                      "w-full flex items-center gap-3 p-3 rounded-xl border text-left transition-colors",
+                      withdrawReason === key
+                        ? "bg-primary/10 border-primary"
+                        : "bg-card border-border hover:bg-muted/50"
+                    )}
+                    data-testid={`withdraw-reason-${key}`}
+                  >
+                    <span className={cn("w-4 h-4 rounded-full border-2 flex-shrink-0", withdrawReason === key ? "border-primary bg-primary" : "border-muted-foreground")} />
+                    <span className="text-sm">{reasonLabel(key)}</span>
+                  </button>
+                ))}
+              </div>
+            </>
+          ) : (
+            <>
+              <p className="text-sm text-muted-foreground">
+                {t("confirmWithdrawMessage", { reason: withdrawReason ? reasonLabel(withdrawReason) : "" })}
+              </p>
+            </>
+          )}
+        </div>
+        <div className="flex-shrink-0 p-4 border-t bg-background shadow-[0_-2px_12px_rgba(0,0,0,0.06)] flex flex-col gap-2">
+          {withdrawStep === "reason" ? (
+            <>
+              <Button
+                className="w-full"
+                disabled={!withdrawReason}
+                onClick={() => setWithdrawStep("confirm")}
+                data-testid="button-withdraw-continue"
+              >
+                {t("withdrawContinue")}
+              </Button>
+              <Button variant="outline" className="w-full" onClick={onBackWithdraw} data-testid="button-withdraw-cancel">
+                {tCommon("cancel")}
+              </Button>
+            </>
+          ) : (
+            <>
+              <Button
+                variant="destructive"
+                className="w-full"
+                disabled={isWithdrawing}
+                onClick={handleConfirmWithdraw}
+                data-testid="button-withdraw-confirm"
+              >
+                {isWithdrawing ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : <XCircle className="w-4 h-4 mr-2" />}
+                {t("confirmWithdrawButton")}
+              </Button>
+              <Button variant="outline" className="w-full" onClick={onBackWithdraw} data-testid="button-withdraw-back">
+                {tCommon("back")}
+              </Button>
+            </>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  // Breadcrumbed step: team member picker (reassign) — same 1:1 as main team availability: grouped by within/outside location, skill + calendar icons
+  if (application && onAssignTeamMember && showApplicationTeamPicker) {
+    const appToReassign = selectedAppForReassign || application;
+    const currentMember = appToReassign.teamMember;
+    const assignedTeamMemberIds = allApps
+      .filter(app => app.id !== appToReassign.id)
+      .map(app => app.teamMember?.id ?? "self")
+      .filter(id => id !== undefined);
+    const isSelfAssignedElsewhere = assignedTeamMemberIds.includes("self");
+    const assignedMemberIds = assignedTeamMemberIds.filter((id): id is number => typeof id === "number");
+    const hasMultipleWorkers = allApps.length > 1;
+    const onBack = () => {
+      setShowApplicationTeamPicker(false);
+      setSelectedAppForReassign(null);
+    };
+    const assignableKeys = new Set<number | "self">();
+    if (!hasMultipleWorkers || !isSelfAssignedElsewhere || currentMember) assignableKeys.add("self");
+    activeTeamMembers.forEach(m => {
+      if (!hasMultipleWorkers || !assignedMemberIds.includes(m.id) || currentMember?.id === m.id) assignableKeys.add(m.id);
+    });
+    const assignableAvailable = availableWorkers.filter((w) => assignableKeys.has(w.key));
+    const assignableConflict = conflictWorkers.filter((w) => assignableKeys.has(w.key));
+    const inTerritory = assignableAvailable.filter((w) => w.inTerritory);
+    const outsideTerritory = assignableAvailable.filter((w) => !w.inTerritory);
+    type ReassignRow = { key: "self" | number; p: TeamMemberBasic | Profile; skillMatch: boolean; available: boolean; inTerritory: boolean; matchingSkills: string[] };
+    const renderReassignCard = (w: ReassignRow) => {
+      const isSelf = w.key === "self";
+      const m = w.p as TeamMemberBasic & { firstName?: string; lastName?: string; avatarUrl?: string | null };
+      const displayName = isSelf ? `${m.firstName ?? ""} ${m.lastName ?? ""}`.trim() + ` ${tCal("yourself") || "(You)"}` : `${m.firstName ?? ""} ${m.lastName ?? ""}`.trim();
+      const initial = m.firstName?.[0] && m.lastName?.[0] ? `${m.firstName[0]}${m.lastName[0]}` : "?";
+      const isCurrent = (isSelf && !currentMember) || (!isSelf && currentMember?.id === w.key);
+      const cardContent = (
+        <>
+          <Avatar className={cn("w-10 h-10 flex-shrink-0", !w.available && "opacity-90")}>
+            <AvatarImage src={normalizeAvatarUrl(m.avatarUrl ?? (isSelf ? profile?.avatarUrl : operatorAvatarUrl) ?? undefined)} />
+            <AvatarFallback className="text-xs">{initial}</AvatarFallback>
+          </Avatar>
+          <div className="min-w-0 flex-1 flex flex-col gap-1">
+            <div className="flex items-center justify-between gap-2">
+              <p className="font-medium text-sm truncate">{displayName}</p>
+              {isCurrent && <Badge variant="secondary" className="text-xs shrink-0">{t("current")}</Badge>}
+            </div>
+            <p className="text-xs text-muted-foreground">
+              {w.available ? (tCal("available") || "Available") : (tCal("hasConflicts", { count: 1 }) || "Conflict(s)")}
+            </p>
+            <div className="flex items-center gap-1.5 flex-wrap">
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <span className="flex items-center shrink-0">
+                    <MapPin className={cn("w-3 h-3", w.inTerritory ? "text-green-600" : "text-muted-foreground")} />
+                  </span>
+                </TooltipTrigger>
+                <TooltipContent>{w.inTerritory ? (t("withinJobLocation") || "Within job location") : (t("teammateOutsideJobLocation") || "Outside job location")}</TooltipContent>
+              </Tooltip>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <span className="flex items-center shrink-0">
+                    <Wrench className={cn("w-3 h-3", w.skillMatch ? "text-green-600" : "text-muted-foreground")} />
+                  </span>
+                </TooltipTrigger>
+                <TooltipContent>{w.skillMatch ? (t("skillsMatch") || "Skills match") : (t("noSkillMatch") || "No skill match")}</TooltipContent>
+              </Tooltip>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <span className="flex items-center shrink-0">
+                    <Calendar className={cn("w-3 h-3", w.available ? "text-green-600" : "text-amber-500")} />
+                  </span>
+                </TooltipTrigger>
+                <TooltipContent>{w.available ? (tCal("available") || "Available") : (tCal("hasConflicts", { count: 1 }) || "Conflict(s)")}</TooltipContent>
+              </Tooltip>
+            </div>
+          </div>
+        </>
+      );
+      const cardClass = cn(
+        "rounded-xl p-3 border flex items-center gap-3 w-full text-left transition-colors",
+        w.available ? "bg-green-50 dark:bg-green-950/30 border-green-200 dark:border-green-800" : "bg-amber-50 dark:bg-amber-950/30 border-amber-200 dark:border-amber-800",
+        "hover:ring-2 hover:ring-primary/30 cursor-pointer"
+      );
+      return (
+        <button
+          key={isSelf ? "self" : w.key}
+          type="button"
+          onClick={() => {
+            onAssignTeamMember(appToReassign.id, isSelf ? null : (w.key as number));
+            onBack();
+          }}
+          className={cardClass}
+          data-testid={isSelf ? "select-team-member-self" : `select-team-member-${w.key}`}
+        >
+          {cardContent}
+        </button>
+      );
+    };
+    return (
+      <div className={cn("flex flex-col min-h-0", isMobile ? "h-full" : "max-h-[85vh]")}>
+        <div className="flex items-center gap-2 px-4 py-3 border-b flex-shrink-0 bg-background rounded-t-[28px] -mt-0">
+          <button
+            onClick={onBack}
+            className="flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground"
+            data-testid="button-back-to-job"
+          >
+            <ChevronLeft className="w-4 h-4" />
+            <span>{tCommon("back")}</span>
+          </button>
+          <span className="text-muted-foreground">/</span>
+          <span className="font-medium text-sm">
+            {hasMultipleWorkers ? t("reassignWorker") : t("selectTeamMember")}
+          </span>
+        </div>
+        <div className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden p-4 sm:p-6 min-w-0">
+          <div className="bg-blue-50 dark:bg-blue-950/30 border border-blue-200 dark:border-blue-800/50 rounded-lg p-3 mb-4">
+            <div className="flex items-start gap-2">
+              <Info className="w-4 h-4 text-blue-600 dark:text-blue-400 mt-0.5 flex-shrink-0" />
+              <p className="text-sm text-blue-700 dark:text-blue-300">
+                {hasMultipleWorkers
+                  ? t("reassigningWorkerRateUnchanged", { name: currentMember ? `${currentMember.firstName} ${currentMember.lastName}` : `${profile?.firstName} ${profile?.lastName}` })
+                  : t("appliedRateWillRemainUnchanged", { rate: Math.round(rateToDollars(appToReassign.proposedRate ?? profile?.hourlyRate ?? 0)) })
+                }
+              </p>
+            </div>
+          </div>
+          <div className="space-y-2">
+            {jobStart && (
+              <>
+                <div className="p-3 rounded-xl bg-muted/50">
+                  <p className="text-[10px] text-muted-foreground uppercase tracking-wide mb-0.5">{tCal("jobScheduledFor") || "Job scheduled for"}</p>
+                  <p className="font-semibold text-sm">{format(jobStart, "EEEE, MMM d")}</p>
+                  {jobEnd && (
+                    <p className="text-xs text-muted-foreground">
+                      {format(jobStart, "h:mm a")} – {format(jobEnd, "h:mm a")}
+                      {job.estimatedHours && ` · ${tCal("hours", { count: job.estimatedHours })}`}
+                    </p>
+                  )}
+                </div>
+                <div className={cn(
+                  "p-3 rounded-xl border flex items-center gap-2 flex-wrap",
+                  scheduledJobsAndConflicts.conflicts.length > 0 ? "bg-amber-50 dark:bg-amber-950/30 border-amber-200 dark:border-amber-800" : "bg-green-50 dark:bg-green-950/30 border-green-200 dark:border-green-800"
+                )}>
+                  <div className="flex items-center gap-2 min-w-0">
+                    {scheduledJobsAndConflicts.conflicts.length > 0 ? (
+                      <>
+                        <div className="w-8 h-8 rounded-full bg-amber-500/20 flex items-center justify-center flex-shrink-0">
+                          <AlertTriangle className="w-4 h-4 text-amber-600 dark:text-amber-400" />
+                        </div>
+                        <div className="min-w-0">
+                          <p className="font-medium text-sm text-amber-800 dark:text-amber-200">{tCal("schedulingConflict") || "Scheduling conflict"}</p>
+                          <p className="text-xs text-amber-600 dark:text-amber-400">{tCal("jobsOverlap", { count: scheduledJobsAndConflicts.conflicts.length }) || `${scheduledJobsAndConflicts.conflicts.length} overlap`}</p>
+                        </div>
+                      </>
+                    ) : (
+                      <>
+                        <div className="w-8 h-8 rounded-full bg-green-500/20 flex items-center justify-center flex-shrink-0">
+                          <CheckCircle2 className="w-4 h-4 text-green-600 dark:text-green-400" />
+                        </div>
+                        <div className="min-w-0">
+                          <p className="font-medium text-sm text-green-800 dark:text-green-200">{tCal("noConflicts") || "No conflicts"}</p>
+                          <p className="text-xs text-green-600 dark:text-green-400">{tCal("jobFitsSchedule") || "Job fits your schedule"}</p>
+                        </div>
+                      </>
+                    )}
+                  </div>
+                </div>
+                {scheduledJobsAndConflicts.scheduled.length > 0 && (
+                  <div className="space-y-1">
+                    <div className="relative border-l-2 border-primary/30 ml-2.5 pl-3 py-1.5">
+                      <div className="absolute -left-1.5 top-1.5 w-2.5 h-2.5 rounded-full bg-primary border-2 border-background" />
+                      <p className="text-[10px] text-muted-foreground mb-0.5">{tCal("thisJob") || "This job"}</p>
+                      <div className="bg-primary/10 border border-primary/30 rounded-lg px-2.5 py-2">
+                        <p className="font-medium text-xs truncate">{getDisplayJobTitle(job)}</p>
+                        <p className="text-[10px] text-muted-foreground">{jobStart && format(jobStart, "h:mm a")} – {jobEnd && format(jobEnd, "h:mm a")}</p>
+                      </div>
+                    </div>
+                    {scheduledJobsAndConflicts.scheduled.filter((ev) => ev.id !== job.id).map((ev) => {
+                      const isConflict = scheduledJobsAndConflicts.conflicts.some((c) => c.id === ev.id);
+                      return (
+                        <div key={ev.id} className={cn("relative border-l-2 ml-2.5 pl-3 py-1.5", isConflict ? "border-amber-500" : "border-muted")}>
+                          <div className={cn("absolute -left-1.5 top-1.5 w-2.5 h-2.5 rounded-full border-2 border-background", isConflict ? "bg-amber-500" : "bg-muted-foreground/30")} />
+                          <div className={cn("rounded-lg px-2.5 py-2", isConflict ? "bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800" : "bg-muted/50")}>
+                            <p className="font-medium text-xs truncate">{getDisplayJobTitle(ev)}</p>
+                            <p className="text-[10px] text-muted-foreground">{format(ev.start, "h:mm a")} – {format(ev.end, "h:mm a")}</p>
+                            {isConflict && <p className="text-[10px] text-amber-600 dark:text-amber-400 mt-0.5">{tCal("overlapsWithThisJob") || "Overlaps"}</p>}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+                <div className="space-y-2">
+                  <h4 className="font-semibold text-sm text-muted-foreground flex items-center gap-2">
+                    <Users className="w-4 h-4" />
+                    {tCal("teamAvailability") || "Team availability"}
+                  </h4>
+                  <div className="space-y-2">
+                    <p className="text-[10px] font-medium text-muted-foreground uppercase tracking-wide flex items-center gap-1">
+                      <MapPin className="w-3 h-3 text-green-600" />
+                      {t("withinJobLocation") || "Within job location"}
+                    </p>
+                    <div className="space-y-2">
+                      {inTerritory.map((w) => renderReassignCard(w))}
+                    </div>
+                  </div>
+                  {outsideTerritory.length > 0 && (
+                    <div className="space-y-2 pt-1">
+                      <p className="text-[10px] font-medium text-muted-foreground uppercase tracking-wide flex items-center gap-1">
+                        <MapPin className="w-3 h-3" />
+                        {t("teammateOutsideJobLocation") || "Outside job location"}
+                      </p>
+                      <div className="space-y-2">
+                        {outsideTerritory.map((w) => renderReassignCard(w))}
+                      </div>
+                    </div>
+                  )}
+                  {assignableConflict.length > 0 && (
+                    <Accordion type="single" collapsible className="w-full pt-1">
+                      <AccordionItem value="conflicts" className="border rounded-xl overflow-hidden">
+                        <AccordionTrigger className="px-4 py-3 hover:no-underline text-left">
+                          <span className="flex items-center gap-2">
+                            <AlertTriangle className="w-4 h-4 text-amber-500 flex-shrink-0" />
+                            {t("teammatesWithSchedulingConflicts") || "Teammates with scheduling conflicts"} ({assignableConflict.length})
+                          </span>
+                        </AccordionTrigger>
+                        <AccordionContent className="px-2 pb-3 pt-0">
+                          <div className="space-y-2">
+                            {assignableConflict.map((w) => renderReassignCard(w))}
+                          </div>
+                        </AccordionContent>
+                      </AccordionItem>
+                    </Accordion>
+                  )}
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+        <div className="flex-shrink-0 p-4 border-t bg-background shadow-[0_-2px_12px_rgba(0,0,0,0.06)]">
+          <Button variant="outline" className="w-full" onClick={onBack} data-testid="button-cancel-team-selection">
+            {tCommon("cancel")}
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <>
       <div className={cn(
-        "flex flex-col",
-        isMobile ? "h-full" : inlineApplyMode ? "flex-1 min-h-0" : "max-h-[85vh]"
+        "flex flex-col w-full min-h-0",
+        isMobile ? "h-full" : inlineApplyMode ? "flex-1" : "flex-1 max-h-[85vh]"
       )}>
         {/* Scrollable: gallery (not sticky) + details card with rounded top — Airbnb-style */}
-        <div className="flex-1 min-h-0 min-w-0 overflow-y-auto overflow-x-hidden">
+        <div className="flex-1 min-h-0 min-w-0 w-full overflow-y-auto overflow-x-hidden">
           {/* Gallery: full-bleed, overlayed back + title + close. On mobile: 1/3 viewport at top. */}
           <div
             className={cn(
-              "relative w-full bg-muted overflow-hidden flex-shrink-0",
+              "relative w-full min-w-0 bg-muted overflow-hidden flex-shrink-0",
               isMobile ? "h-[33.33vh] min-h-[180px]" : "aspect-video"
             )}
           >
@@ -3324,7 +4213,7 @@ export function JobContent({
                 <ArrowLeft className="w-5 h-5" />
               </button>
               <h2 className="font-semibold text-lg truncate flex-1 text-white [text-shadow:0_1px_3px_rgba(0,0,0,0.5)] px-2">
-                {job.title}
+                {getDisplayJobTitle(job)}
               </h2>
               <button
                 onClick={onClose}
@@ -3341,14 +4230,25 @@ export function JobContent({
               </div>
             )}
             {allMedia[currentMediaIndex].type === "image" ? (
-              <img 
-                src={allMedia[currentMediaIndex].url!} 
-                alt="Job media"
-                className={`w-full h-full object-cover transition-opacity ${imageLoaded ? 'opacity-100' : 'opacity-0'}`}
-                onLoad={() => setImageLoaded(true)}
-              />
+              <button
+                type="button"
+                onClick={() => {
+                  setFullPageGalleryStartIndex(currentMediaIndex);
+                  setShowFullPageGallery(true);
+                }}
+                className="absolute inset-0 w-full h-full cursor-pointer flex items-center justify-center focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+                data-testid="job-media-open-gallery"
+                aria-label={t("viewFullScreen") || "View full screen"}
+              >
+                <img
+                  src={allMedia[currentMediaIndex].url!}
+                  alt="Job media"
+                  className={`w-full h-full object-cover transition-opacity ${imageLoaded ? "opacity-100" : "opacity-0"}`}
+                  onLoad={() => setImageLoaded(true)}
+                />
+              </button>
             ) : allMedia[currentMediaIndex].type === "video" ? (
-              <video 
+              <video
                 src={allMedia[currentMediaIndex].url}
                 className="w-full h-full object-cover"
                 controls
@@ -3369,13 +4269,13 @@ export function JobContent({
                     <img src={(job as any).mapThumbnailUrl} alt="Job location" className="w-full h-full object-cover" />
                   ) : (allMedia.length === 1 && !job.images?.length && !job.videos?.length) ? (
                     <JobLocationMap
-                      job={{ id: job.id, lat: parseFloat(job.latitude!), lng: parseFloat(job.longitude!), title: job.title }}
+                      job={{ id: job.id, lat: parseFloat(job.latitude!), lng: parseFloat(job.longitude!), title: getDisplayJobTitle(job) }}
                       userLocation={workerLocation ?? undefined}
                       height="100%"
                       className="h-full w-full rounded-none overflow-hidden"
-                      partialAddress={partialAddress || undefined}
+                      partialAddress={(application?.status === "accepted" ? displayAddress : partialAddress) || undefined}
                       showApproximateRadius
-                      approximateNote={t("fullAddressWhenYouWin")}
+                      approximateNote={application?.status === "accepted" ? undefined : t("fullAddressWhenYouWin")}
                       onClick={() => {
                         const mapIdx = allMedia.findIndex((m) => m.type === "map");
                         setFullPageGalleryStartIndex(mapIdx >= 0 ? mapIdx : 0);
@@ -3388,17 +4288,17 @@ export function JobContent({
                         id: job.id,
                         lat: parseFloat(job.latitude!),
                         lng: parseFloat(job.longitude!),
-                        title: job.title,
+                        title: getDisplayJobTitle(job),
                       }}
-                      partialAddress={partialAddress || undefined}
+                      partialAddress={(application?.status === "accepted" ? displayAddress : partialAddress) || undefined}
                       showApproximateRadius
-                      approximateNote={t("fullAddressWhenYouWin")}
+                      approximateNote={application?.status === "accepted" ? undefined : t("fullAddressWhenYouWin")}
                     />
                   )}
                 </div>
                 {allMedia.length === 1 && !job.images?.length && !job.videos?.length && (
                   <div className="flex-shrink-0 flex flex-col gap-0.5 py-2 px-4 bg-background/80">
-                    <p className="text-center text-xs text-muted-foreground">{partialAddress || t("generalArea")}</p>
+                    <p className="text-center text-xs text-muted-foreground">{displayAddress || t("generalArea")}</p>
                     {closestDriveTimeLoading ? (
                       <p className="text-center text-xs text-primary flex items-center justify-center gap-1">
                         <Loader2 className="w-3 h-3 animate-spin" />
@@ -3455,18 +4355,34 @@ export function JobContent({
             )}
           </div>
 
-          {/* Details card: rounded top overlapping gallery; gallery extends behind */}
-          <div className="relative bg-background rounded-t-[28px] -mt-16 flex-shrink-0 px-4 sm:px-6 pt-6 pb-4 shadow-[0_-2px_12px_rgba(0,0,0,0.06)] overflow-hidden min-w-0">
-            {/* 1. Title row: Skip left (stage 1) | Title centered */}
-            <div className="flex items-center gap-2 w-full">
-              {stage === 1 && onDismiss && (
-                <button type="button" onClick={() => onDismiss(job)} className="flex-shrink-0 flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground" data-testid="enhanced-dismiss-button">
-                  <X className="w-4 h-4" />
-                  {t("skip")}
-                </button>
-              )}
-              <h2 className="text-xl sm:text-2xl font-bold text-center flex-1 min-w-0 truncate">{job.title}</h2>
-              <div className="w-14 flex-shrink-0" />
+          {/* Details card: flex + wrap so content stays inside popup; min-w-0 to allow shrink; no horizontal overflow */}
+          <div className="relative bg-background rounded-t-[28px] -mt-16 flex-shrink-0 flex flex-col flex-wrap pl-4 sm:pl-6 pr-4 sm:pr-6 pt-6 pb-6 shadow-[0_-2px_12px_rgba(0,0,0,0.06)] overflow-hidden min-w-0 w-full max-w-full box-border">
+            {/* Application status: full-width sticky banner at top when in application view */}
+            {application && (
+              <div
+                className={cn(
+                  "sticky top-0 z-10 -mx-4 sm:-mx-6 mb-4 px-4 sm:px-6 py-3 flex items-center justify-center gap-2 flex-wrap",
+                  application.status === "pending" && "bg-yellow-50 dark:bg-yellow-900/30 text-yellow-800 dark:text-yellow-200 border-y border-yellow-200 dark:border-yellow-800",
+                  application.status === "accepted" && "bg-green-50 dark:bg-green-900/30 text-green-800 dark:text-green-200 border-y border-green-200 dark:border-green-800",
+                  application.status === "rejected" && "bg-red-50 dark:bg-red-900/30 text-red-800 dark:text-red-200 border-y border-red-200 dark:border-red-800"
+                )}
+              >
+                <span className="text-sm font-semibold">
+                  {application.status === "pending" && (t("pendingReview") || "Pending Review")}
+                  {application.status === "accepted" && (t("accepted") || "Accepted")}
+                  {application.status === "rejected" && (t("notSelected") || "Not selected")}
+                </span>
+                {allApps.length > 1 && (
+                  <Badge variant="outline" className="bg-background/80 text-xs">
+                    <Users className="w-3 h-3 mr-1" /> {t("workers", { count: allApps.length })}
+                  </Badge>
+                )}
+              </div>
+            )}
+
+            {/* 1. Title row: title only (status in banner above when application) */}
+            <div className="flex items-center justify-center w-full min-w-0">
+              <h2 className="text-lg font-bold text-center min-w-0 max-w-full text-pretty break-words">{getDisplayJobTitle(job)}</h2>
             </div>
 
             {/* 2. Skill set related tags */}
@@ -3475,7 +4391,7 @@ export function JobContent({
               const seen = new Set<string>();
               const unique = tags.filter(tag => { const k = tag.toLowerCase(); if (seen.has(k)) return false; seen.add(k); return true; });
               return unique.length > 0 ? (
-                <div className="flex flex-wrap justify-center gap-2 mt-3">
+                <div className="flex flex-wrap justify-center gap-2 mt-3 min-w-0">
                   {unique.map((skill) => (
                     <Badge key={skill} variant="secondary" className="rounded-full cursor-pointer hover:bg-secondary/80" onClick={() => setShowSkillInfo(skill)} data-testid={`skill-badge-${skill}`}>
                       {skill}
@@ -3486,8 +4402,15 @@ export function JobContent({
               ) : null;
             })()}
 
-            {/* 3. Full address minus street number */}
-            {partialAddress && <p className="text-sm text-muted-foreground text-center mt-2">{partialAddress}</p>}
+            {/* 3. Address — full when accepted, partial otherwise */}
+            {displayAddress && (
+              <p className="text-sm text-muted-foreground text-center mt-2">
+                {displayAddress}
+                {application?.status !== "accepted" && (
+                  <span className="block mt-1 text-xs">{(t("fullAddressWhenSelected") || "You'll get the full address when you're selected for this project.")}</span>
+                )}
+              </p>
+            )}
 
             {/* 4. Line separator */}
             <div className="border-b border-border/60 my-4" />
@@ -3501,33 +4424,52 @@ export function JobContent({
             <div className="border-b border-border/60 my-4" />
 
             {/* 7. 3-row icon list: A) Time/date/type; B) Participants; C) Est. profit */}
-            <div className="space-y-4">
+            <div className="space-y-4 min-w-0">
               <div className="flex items-start gap-3 min-w-0">
                 <Calendar className="w-5 h-5 text-muted-foreground flex-shrink-0 mt-0.5" />
                 <div className="min-w-0 flex-1 overflow-hidden">
-                  <p className="font-semibold truncate">
-                    {(() => {
-                      const ti = formatJobTime(job, t);
-                      return ti.scheduleDaysDisplay ? `${ti.scheduleDaysDisplay}${ti.timeRange ? ` · ${ti.timeRange}` : ""}` : `${ti.relative}${ti.timeRange ? ` · ${ti.timeRange}` : ""}`;
-                    })()}
-                  </p>
-                  <p className="text-sm text-muted-foreground">{jobTypeInfo.label}</p>
+                  {(() => {
+                    const ti = formatJobTime(job, t);
+                    const dayLabel = ti.relative === t("past") ? ti.fullDate : ti.relative;
+                    const headline = ti.scheduleDaysDisplay
+                      ? `${ti.scheduleDaysDisplay}${ti.timeRange ? ` · ${ti.timeRange}` : ""}`
+                      : `${dayLabel}${ti.timeRange ? ` · ${ti.timeRange}` : ""}`;
+                    const subline =
+                      job.jobType === "recurring"
+                        ? (ti.schedulePeriodDisplay || ti.fullDate)
+                        : jobTypeInfo.label;
+                    return (
+                      <>
+                        <p className="font-semibold truncate">{headline}</p>
+                        <p className="text-sm text-muted-foreground">{subline}</p>
+                      </>
+                    );
+                  })()}
                 </div>
               </div>
-              {/* Participants: company seeking X + slots (empty/filled) + pill-shaped pool, 2-row wrap */}
-              <div className="space-y-1.5">
-                <div className="flex items-center justify-between gap-2">
-                  <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide flex items-center gap-1.5">
-                    <Users className="w-4 h-4" />
-                    {workersNeeded === 1
-                      ? (t("participantsSeekingOne") || "1 participant")
-                      : (t("participantsSeeking", { count: workersNeeded }) || `${workersNeeded} participants`)}
-                  </p>
-                  <span className="text-[10px] text-muted-foreground/80 uppercase tracking-wider">
-                    {t("companySeeking") || "Company seeking"} · {selectedApplicants.size}/{workersNeeded} {t("selected") || "selected"}
-                  </span>
-                </div>
-                <div className="flex flex-wrap gap-1.5 items-center">
+              {/* Participants: company seeking X + slots (empty/filled) + pill-shaped pool — collapsible; hidden on stage 2 (participants step) of inline apply; hidden in application view */}
+              {showParticipantsSection && !application && !(inlineApplyMode && inlineApplyStage === 2) && (
+              <Collapsible defaultOpen className="group/participants-details min-w-0 overflow-hidden">
+                <CollapsibleTrigger asChild>
+                  <button
+                    type="button"
+                    className="w-full flex items-center justify-between gap-2 py-1 text-left rounded-md hover:bg-muted/50 transition-colors"
+                  >
+                    <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide flex items-center gap-1.5">
+                      <Users className="w-4 h-4" />
+                      {workersNeeded === 1
+                        ? (t("participantsSeekingOne") || "1 participant")
+                        : (t("participantsSeeking", { count: workersNeeded }) || `${workersNeeded} participants`)}
+                    </p>
+                    <span className="text-[10px] text-muted-foreground/80 uppercase tracking-wider flex items-center gap-1">
+                      {t("companySeeking") || "Company seeking"} · {selectedApplicants.size}/{workersNeeded} {t("selected") || "selected"}
+                      <ChevronDown className="w-4 h-4 text-muted-foreground shrink-0 transition-transform duration-200 group-data-[state=closed]/participants-details:rotate-[-90deg]" />
+                    </span>
+                  </button>
+                </CollapsibleTrigger>
+                <CollapsibleContent>
+              <div className="space-y-1.5 pt-1 min-w-0 overflow-hidden">
+                <div className="flex flex-wrap gap-1.5 items-center min-w-0">
                   {Array.from({ length: workersNeeded }, (_, i) => slotOrder[i] ?? null).map((key, idx) => {
                     if (key === null) {
                       return (
@@ -3542,11 +4484,7 @@ export function JobContent({
                     const filled = selectedApplicants.has(key);
                     const isSelf = key === "self";
                     const person = isSelf ? profile : acceptedTeamMembers.find((m) => m.id === key);
-                    const avatarUrl = (person as { avatarUrl?: string | null })?.avatarUrl
-                      ? (String((person as { avatarUrl: string }).avatarUrl).startsWith("http") || String((person as { avatarUrl: string }).avatarUrl).startsWith("/")
-                        ? (person as { avatarUrl: string }).avatarUrl
-                        : `/objects/avatar/${(person as { avatarUrl: string }).avatarUrl}`)
-                      : undefined;
+                    const avatarUrl = normalizeAvatarUrl((person as { avatarUrl?: string | null })?.avatarUrl ?? undefined);
                     const initials = isSelf
                       ? `${(profile?.firstName ?? "")[0] || ""}${(profile?.lastName ?? "")[0] || ""}`.trim() || "?"
                       : (person as TeamMemberBasic)?.firstName?.[0] && (person as TeamMemberBasic)?.lastName?.[0]
@@ -3591,9 +4529,47 @@ export function JobContent({
                 <p className="text-[10px] text-muted-foreground">
                   {t("participantsAssignHint") || "Tap a person below to fill a slot, or tap a filled slot to clear."}
                 </p>
+                {acceptedTeamMembers.length === 0 && (
+                  <div className="rounded-lg border border-primary/30 bg-primary/5 px-3 py-2 text-xs text-muted-foreground flex flex-col gap-1.5 min-w-0 overflow-hidden">
+                    <p className="flex items-start gap-2 min-w-0">
+                      <Info className="w-4 h-4 flex-shrink-0 mt-0.5 text-primary" />
+                      <span className="break-words text-pretty">{t("addTeammateToGetPaidHint") || "If you're contracting this job to someone else you must add them as a teammate, else you cannot get paid."}</span>
+                    </p>
+                    <a
+                      href="/dashboard/business-operator"
+                      onClick={(e) => { e.preventDefault(); setLocation("/dashboard/business-operator"); onClose(); }}
+                      className="text-primary font-medium hover:underline inline-flex items-center gap-1 w-fit"
+                    >
+                      {t("addTeammatesLink") || "Add teammates"}
+                      <ChevronRight className="w-3.5 h-3.5" />
+                    </a>
+                  </div>
+                )}
                 {/* Legend/Key for icons + Settings Gear */}
                 <div className="flex items-center justify-between gap-2">
                   <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[10px] text-muted-foreground border border-border/50 bg-muted/30 rounded-lg px-2 py-1.5 flex-1">
+                    <div className="flex items-center gap-1">
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <div className="flex items-center gap-1">
+                            <MapPin className="w-3 h-3 text-green-600" />
+                            <span>Within territory</span>
+                          </div>
+                        </TooltipTrigger>
+                        <TooltipContent>Within job location radius</TooltipContent>
+                      </Tooltip>
+                    </div>
+                    <div className="flex items-center gap-1">
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <div className="flex items-center gap-1">
+                            <MapPin className="w-3 h-3 text-muted-foreground" />
+                            <span>Not within</span>
+                          </div>
+                        </TooltipTrigger>
+                        <TooltipContent>Outside job location radius</TooltipContent>
+                      </Tooltip>
+                    </div>
                     <div className="flex items-center gap-1">
                       <Tooltip>
                         <TooltipTrigger asChild>
@@ -3603,17 +4579,6 @@ export function JobContent({
                           </div>
                         </TooltipTrigger>
                         <TooltipContent>Worker has required skills for this job</TooltipContent>
-                      </Tooltip>
-                    </div>
-                    <div className="flex items-center gap-1">
-                      <Tooltip>
-                        <TooltipTrigger asChild>
-                          <div className="flex items-center gap-1">
-                            <Wrench className="w-3 h-3 text-red-500" />
-                            <span>Skills mismatch</span>
-                          </div>
-                        </TooltipTrigger>
-                        <TooltipContent>Worker missing some required skills</TooltipContent>
                       </Tooltip>
                     </div>
                     <div className="flex items-center gap-1">
@@ -3653,17 +4618,18 @@ export function JobContent({
                     <TooltipContent>Manage teammate details</TooltipContent>
                   </Tooltip>
                 </div>
-                <div className="grid grid-cols-2 gap-x-2 gap-y-1.5 py-0.5">
-                  {orderedTeammatesForScroll.map(({ p, skillMatch, available }) => {
+                {(() => {
+                  // Same 1:1 grouping as card layout: available workers by territory, then conflicts separate
+                  const inTerritoryPills = availableWorkers.filter((w) => w.inTerritory);
+                  const outsideTerritoryPills = availableWorkers.filter((w) => !w.inTerritory);
+                  const renderPill = ({ p, skillMatch, available, inTerritory }: { p: TeamMemberBasic | Profile; skillMatch: boolean; available: boolean; inTerritory: boolean }) => {
                     const pr = p as TeamMemberBasic & { id?: number; firstName?: string; lastName?: string; avatarUrl?: string | null };
                     const poolKey: "self" | number = profile && p === profile ? "self" : (pr as TeamMemberBasic).id;
                     const selected = selectedApplicants.has(poolKey);
                     const atCapacity = selectedApplicants.size >= workersNeeded && !selected;
                     const initials = (pr.firstName?.[0] && pr.lastName?.[0]) ? `${pr.firstName[0]}${pr.lastName[0]}` : "?";
                     const name = (pr.firstName && pr.lastName) ? `${pr.firstName} ${pr.lastName}`.trim() : (t("myself") || "Myself");
-                    const avatarSrc = pr.avatarUrl
-                      ? (String(pr.avatarUrl).startsWith("http") || String(pr.avatarUrl).startsWith("/") ? pr.avatarUrl : `/objects/avatar/${pr.avatarUrl}`)
-                      : undefined;
+                    const avatarSrc = normalizeAvatarUrl(pr.avatarUrl ?? undefined);
                     return (
                       <button
                         key={String(poolKey)}
@@ -3672,13 +4638,9 @@ export function JobContent({
                           setSelectedApplicants((prev) => {
                             const next = new Set(prev);
                             if (next.has(poolKey)) {
-                              // Remove if already selected
                               next.delete(poolKey);
                             } else {
-                              // Add if not at capacity
-                              if (next.size < workersNeeded) {
-                                next.add(poolKey);
-                              }
+                              if (next.size < workersNeeded) next.add(poolKey);
                             }
                             return next;
                           });
@@ -3686,7 +4648,8 @@ export function JobContent({
                         className={cn(
                           "inline-flex items-center gap-1.5 rounded-full py-0.5 pl-0.5 pr-2 border-2 transition-all text-left min-w-0",
                           selected ? "border-primary bg-primary/10" : "border-border hover:border-primary/50 hover:bg-muted/50",
-                          atCapacity && !selected && "opacity-50"
+                          atCapacity && !selected && "opacity-50",
+                          !inTerritory && "opacity-60"
                         )}
                         title={name}
                       >
@@ -3698,11 +4661,21 @@ export function JobContent({
                         <Tooltip>
                           <TooltipTrigger asChild>
                             <div className="flex-shrink-0">
-                              <Wrench className={cn("w-3 h-3", skillMatch ? "text-green-600" : "text-red-500")} />
+                              <MapPin className={cn("w-3 h-3", inTerritory ? "text-green-600" : "text-muted-foreground")} />
                             </div>
                           </TooltipTrigger>
-                          <TooltipContent>{skillMatch ? "Has required skills" : "Missing some skills"}</TooltipContent>
+                          <TooltipContent>{inTerritory ? "Within job territory" : "Not within job territory"}</TooltipContent>
                         </Tooltip>
+                        {skillMatch && (
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <div className="flex-shrink-0">
+                                <Wrench className="w-3 h-3 text-green-600" />
+                              </div>
+                            </TooltipTrigger>
+                            <TooltipContent>Has required skills</TooltipContent>
+                          </Tooltip>
+                        )}
                         <Tooltip>
                           <TooltipTrigger asChild>
                             <div className="flex-shrink-0">
@@ -3713,20 +4686,252 @@ export function JobContent({
                         </Tooltip>
                       </button>
                     );
-                  })}
-                </div>
+                  };
+                  return (
+                    <>
+                      <div className="space-y-1.5 min-w-0 overflow-hidden">
+                        <p className="text-[10px] font-medium text-muted-foreground uppercase tracking-wide flex items-center gap-1">
+                          <MapPin className="w-3 h-3 text-green-600" />
+                          {t("withinJobLocation") || "Within job location"}
+                        </p>
+                        <div className="grid grid-cols-2 gap-x-2 gap-y-1.5 py-0.5 min-w-0">
+                          {inTerritoryPills.map((item) => renderPill(item))}
+                        </div>
+                      </div>
+                      {outsideTerritoryPills.length > 0 && (
+                        <div className="space-y-1.5 pt-1 min-w-0 overflow-hidden">
+                          <p className="text-[10px] font-medium text-muted-foreground uppercase tracking-wide flex items-center gap-1">
+                            <MapPin className="w-3 h-3" />
+                            {t("teammateOutsideJobLocation") || "Outside job location"}
+                          </p>
+                          <div className="grid grid-cols-2 gap-x-2 gap-y-1.5 py-0.5 min-w-0">
+                            {outsideTerritoryPills.map((item) => renderPill(item))}
+                          </div>
+                        </div>
+                      )}
+                      {conflictWorkers.length > 0 && (
+                        <div className="space-y-1.5 pt-1 min-w-0 overflow-hidden">
+                          <p className="text-[10px] font-medium text-muted-foreground uppercase tracking-wide flex items-center gap-1">
+                            <AlertTriangle className="w-3 h-3" />
+                            {t("teammatesWithSchedulingConflicts") || "Teammates with scheduling conflicts"}
+                          </p>
+                          <div className="grid grid-cols-2 gap-x-2 gap-y-1.5 py-0.5 min-w-0">
+                            {conflictWorkers.map((item) => renderPill(item))}
+                          </div>
+                        </div>
+                      )}
+                    </>
+                  );
+                })()}
               </div>
-              <div className="flex items-start gap-3">
+                </CollapsibleContent>
+              </Collapsible>
+              )}
+              <div className="flex items-start gap-3 min-w-0">
                 <DollarSign className="w-5 h-5 text-muted-foreground flex-shrink-0 mt-0.5" />
-                <div>
-                  <p className="font-semibold">{t("estimatedPayout") || "Estimated payout"}</p>
-                  <p className="text-sm text-muted-foreground">
-                    ${Math.round(estimatedPayout).toLocaleString()} ({(job.estimatedHours ?? 8)} hrs × ${profile?.hourlyRate ? (profile.hourlyRate / 100) : 30}/hr)
+                <div className="min-w-0 flex-1 overflow-hidden">
+                  <p className="font-semibold">
+                    {application
+                      ? (allApps.length > 1 ? t("combinedPayout") : (t("amountSubmitted") || "Amount submitted"))
+                      : (t("estimatedPayout") || "Estimated payout")}
                   </p>
+                  {!application && (
+                    <div className="text-sm text-muted-foreground break-words">
+                      ${Math.round(livePreSubmitPayout).toLocaleString()}
+                      {" — "}
+                      {(() => {
+                        const rateForFormula =
+                          getSelectedRateInline ?? getWorkerHourlyRate(profile?.hourlyRate ?? undefined, job.hourlyRate ?? 0);
+                        const pieces = getPayoutBreakdownPieces(
+                          payoutBreakdown.totalHours,
+                          payoutBreakdown.days,
+                          rateForFormula,
+                          livePreSubmitPayout
+                        );
+                        return (
+                          <>
+                            {pieces.prefix}
+                            <Popover open={rateEditorOpen} onOpenChange={setRateEditorOpen}>
+                              <PopoverTrigger asChild>
+                                <button
+                                  type="button"
+                                  className="inline-flex items-center rounded-md border border-primary/40 bg-primary/10 px-1.5 py-0.5 text-xs font-semibold text-primary hover:bg-primary/15"
+                                  onClick={() => {
+                                    const seed = Math.round(rateForFormula || 0);
+                                    setRateEditorDraft(seed > 0 ? String(seed) : "");
+                                  }}
+                                  data-testid="edit-inline-rate-tag"
+                                >
+                                  {pieces.rateLabel}
+                                </button>
+                              </PopoverTrigger>
+                              <PopoverContent align="start" sideOffset={6} className="w-44 p-2">
+                                <Label className="text-[11px] text-muted-foreground">{t("hourlyRate") || "Hourly rate"}</Label>
+                                <Input
+                                  type="number"
+                                  min={1}
+                                  step={1}
+                                  value={rateEditorDraft}
+                                  onChange={(e) => setRateEditorDraft(e.target.value)}
+                                  onKeyDown={(e) => {
+                                    if (e.key === "Enter") {
+                                      const n = Number(rateEditorDraft);
+                                      if (Number.isFinite(n) && n > 0) {
+                                        setCustomInlineRate(n);
+                                        setUseSmartRateInline(false);
+                                        setRateEditorOpen(false);
+                                      }
+                                    }
+                                    if (e.key === "Escape") setRateEditorOpen(false);
+                                  }}
+                                  className="mt-1 h-8"
+                                  data-testid="edit-inline-rate-input"
+                                />
+                                <div className="mt-2 flex items-center justify-between gap-2">
+                                  <button
+                                    type="button"
+                                    className="text-xs text-muted-foreground hover:text-foreground"
+                                    onClick={() => {
+                                      setCustomInlineRate(null);
+                                      setRateEditorOpen(false);
+                                    }}
+                                  >
+                                    {tCommon("reset") || "Reset"}
+                                  </button>
+                                  <Button
+                                    type="button"
+                                    size="sm"
+                                    className="h-7 px-2 text-xs"
+                                    onClick={() => {
+                                      const n = Number(rateEditorDraft);
+                                      if (Number.isFinite(n) && n > 0) {
+                                        setCustomInlineRate(n);
+                                        setUseSmartRateInline(false);
+                                        setRateEditorOpen(false);
+                                      }
+                                    }}
+                                  >
+                                    {tCommon("apply") || "Apply"}
+                                  </Button>
+                                </div>
+                              </PopoverContent>
+                            </Popover>
+                            {pieces.suffix}
+                          </>
+                        );
+                      })()}
+                    </div>
+                  )}
+                </div>
+                {!application && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setCustomInlineRate(null);
+                      setRateEditorOpen(false);
+                      setUseSmartRateInline((prev) => !prev);
+                    }}
+                    className="flex-shrink-0 text-sm text-primary hover:underline font-medium"
+                    data-testid="toggle-use-my-rate"
+                  >
+                    {useSmartRateInline ? (t("useMyRate") || "Use my rate") : (t("useSuggestedRate") || "Use suggested rate")}
+                  </button>
+                )}
+                  {application && (
+                    <div className="text-sm text-muted-foreground space-y-2">
+                      <p className="break-words">
+                        ${Math.round(livePreSubmitPayout).toLocaleString()}
+                        {allApps.length === 1 && (
+                          <> {" — "}{formatPayoutBreakdown(
+                            payoutBreakdown.totalHours,
+                            payoutBreakdown.hoursPerDay,
+                            payoutBreakdown.days,
+                            rateToDollars(application.proposedRate ?? profile?.hourlyRate ?? (job.hourlyRate ? job.hourlyRate / 100 : 0)),
+                            displayPayout
+                          )}</>
+                        )}
+                      </p>
+                      {(() => {
+                        const jobCoordsApp = jobLatLngOrGeocoded;
+                        const radiusMilesApp = territoryRadiusMiles ?? DEFAULT_JOB_TERRITORY_RADIUS_MILES;
+                        const inTerritoryForApp = (app: typeof allApps[0]) => {
+                          if (!jobCoordsApp || !Number.isFinite(jobCoordsApp.lat) || !Number.isFinite(jobCoordsApp.lng)) return true;
+                          const member = app.teamMember;
+                          const lat = member != null && (member as any).latitude != null ? parseFloat(String((member as any).latitude)) : (workerLocation?.lat ?? (profile && (profile as any).latitude != null ? parseFloat(String((profile as any).latitude)) : null));
+                          const lng = member != null && (member as any).longitude != null ? parseFloat(String((member as any).longitude)) : (workerLocation?.lng ?? (profile && (profile as any).longitude != null ? parseFloat(String((profile as any).longitude)) : null));
+                          if (lat == null || lng == null || !Number.isFinite(lat) || !Number.isFinite(lng)) return false;
+                          return calculateDistance(jobCoordsApp.lat, jobCoordsApp.lng, lat, lng) <= radiusMilesApp;
+                        };
+                        const inTerritoryApps = allApps.filter(inTerritoryForApp);
+                        const outsideTerritoryApps = allApps.filter((app) => !inTerritoryForApp(app));
+                        const renderAppPill = (app: typeof allApps[0]) => {
+                          const member = app.teamMember;
+                          const displayName = member ? `${member.firstName ?? ""} ${member.lastName ?? ""}`.trim() : (t("myself") || "Myself");
+                          const appliedRate = rateToDollars(app.proposedRate ?? profile?.hourlyRate ?? (job.hourlyRate ? job.hourlyRate / 100 : 0));
+                          const canReassign = (application.status === "pending" || application.status === "accepted") && onAssignTeamMember && (activeTeamMembers.length > 0 || allApps.length > 1);
+                          const pillContent = (
+                            <>
+                              <Avatar className="w-6 h-6 rounded-full border border-border flex-shrink-0">
+                                <AvatarImage src={normalizeAvatarUrl((member?.avatarUrl ?? operatorAvatarUrl) ?? profile?.avatarUrl) ?? undefined} />
+                                <AvatarFallback className="text-[10px]">{member ? `${member.firstName?.[0] ?? ""}${member.lastName?.[0] ?? ""}` : `${profile?.firstName?.[0] ?? ""}${profile?.lastName?.[0] ?? ""}`}</AvatarFallback>
+                              </Avatar>
+                              <span className="font-medium text-foreground/90">{displayName}</span>
+                              <span className="text-muted-foreground">${Math.round(appliedRate)}/hr</span>
+                            </>
+                          );
+                          return canReassign ? (
+                            <button
+                              key={app.id}
+                              type="button"
+                              onClick={() => {
+                                setSelectedAppForReassign(app);
+                                setShowApplicationTeamPicker(true);
+                              }}
+                              className="inline-flex items-center gap-1.5 rounded-full border border-border bg-muted/50 px-2.5 py-1 text-xs hover:bg-muted transition-colors"
+                              data-testid={`application-pill-${app.id}`}
+                            >
+                              {pillContent}
+                              <ChevronRight className="w-3 h-3 text-muted-foreground" />
+                            </button>
+                          ) : (
+                            <div key={app.id} className="inline-flex items-center gap-1.5 rounded-full border border-border bg-muted/30 px-2.5 py-1 text-xs" data-testid={`application-pill-${app.id}`}>
+                              {pillContent}
+                            </div>
+                          );
+                        };
+                        return (
+                          <div className="space-y-2">
+                            <div className="space-y-1.5 min-w-0">
+                              <p className="text-[10px] font-medium text-muted-foreground uppercase tracking-wide flex items-center gap-1">
+                                <MapPin className="w-3 h-3 text-green-600" />
+                                {t("withinJobLocation") || "Within job location"}
+                              </p>
+                              <div className="flex flex-wrap gap-2">
+                                {inTerritoryApps.map(renderAppPill)}
+                              </div>
+                            </div>
+                            {outsideTerritoryApps.length > 0 && (
+                              <div className="space-y-1.5 min-w-0">
+                                <p className="text-[10px] font-medium text-muted-foreground uppercase tracking-wide flex items-center gap-1">
+                                  <MapPin className="w-3 h-3" />
+                                  {t("teammateOutsideJobLocation") || "Outside job location"}
+                                </p>
+                                <div className="flex flex-wrap gap-2">
+                                  {outsideTerritoryApps.map(renderAppPill)}
+                                </div>
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })()}
+                    </div>
+                  )}
                 </div>
               </div>
             </div>
 
+            {/* Content below estimated payout — consistent padding (pt-6 pb-6 px-6) */}
+            <div className="pt-6 pb-6 px-6">
             {/* 8. Line separator */}
             <div className="border-b border-border/60 my-4" />
 
@@ -3743,7 +4948,7 @@ export function JobContent({
                   <MapPin className="w-5 h-5 text-muted-foreground flex-shrink-0 mt-0.5" />
                   <div>
                     <p className="font-semibold">{t("whereYoullBe") || "Where you'll be"}</p>
-                    <p className="text-sm text-muted-foreground">{partialAddress || [job.city, job.state].filter(Boolean).join(", ")}</p>
+                    <p className="text-sm text-muted-foreground">{displayAddress || [job.city, job.state].filter(Boolean).join(", ")}</p>
                   </div>
                 </div>
                 <button
@@ -3753,12 +4958,12 @@ export function JobContent({
                   data-testid="job-map-button-where-youll-be"
                 >
                   <MiniJobMap
-                    job={{ id: job.id, lat: parseFloat(job.latitude), lng: parseFloat(job.longitude), title: job.title }}
+                    job={{ id: job.id, lat: parseFloat(job.latitude), lng: parseFloat(job.longitude), title: getDisplayJobTitle(job) }}
                     height="288px"
                     className="w-full"
-                    partialAddress={partialAddress || undefined}
+                    partialAddress={(application?.status === "accepted" ? displayAddress : partialAddress) || undefined}
                     showApproximateRadius
-                    approximateNote={t("fullAddressWhenYouWin")}
+                    approximateNote={application?.status === "accepted" ? undefined : t("fullAddressWhenYouWin")}
                     personLocations={personLocationsForMap}
                   />
                 </button>
@@ -3787,59 +4992,76 @@ export function JobContent({
                     )}
                   </div>
                   <div className={cn(
-                    "p-3 rounded-xl border flex items-center gap-2",
+                    "p-3 rounded-xl border flex items-center justify-between gap-2 flex-wrap",
                     scheduledJobsAndConflicts.conflicts.length > 0 ? "bg-amber-50 dark:bg-amber-950/30 border-amber-200 dark:border-amber-800" : "bg-green-50 dark:bg-green-950/30 border-green-200 dark:border-green-800"
                   )}>
-                    {scheduledJobsAndConflicts.conflicts.length > 0 ? (
-                      <>
-                        <div className="w-8 h-8 rounded-full bg-amber-500/20 flex items-center justify-center flex-shrink-0">
-                          <AlertTriangle className="w-4 h-4 text-amber-600 dark:text-amber-400" />
-                        </div>
-                        <div className="min-w-0">
-                          <p className="font-medium text-sm text-amber-800 dark:text-amber-200">{tCal("schedulingConflict") || "Scheduling conflict"}</p>
-                          <p className="text-xs text-amber-600 dark:text-amber-400">{tCal("jobsOverlap", { count: scheduledJobsAndConflicts.conflicts.length }) || `${scheduledJobsAndConflicts.conflicts.length} overlap`}</p>
-                        </div>
-                      </>
-                    ) : (
-                      <>
-                        <div className="w-8 h-8 rounded-full bg-green-500/20 flex items-center justify-center flex-shrink-0">
-                          <CheckCircle2 className="w-4 h-4 text-green-600 dark:text-green-400" />
-                        </div>
-                        <div className="min-w-0">
-                          <p className="font-medium text-sm text-green-800 dark:text-green-200">{tCal("noConflicts") || "No conflicts"}</p>
-                          <p className="text-xs text-green-600 dark:text-green-400">{tCal("jobFitsSchedule") || "Job fits your schedule"}</p>
-                        </div>
-                      </>
-                    )}
-                  </div>
-                  {/* Teammates with availability — compact horizontal row */}
-                  {orderedTeammatesForScroll.length > 0 && (
-                    <div className="flex items-center gap-2 flex-wrap">
-                      <span className="text-xs text-muted-foreground">{tCal("teamAvailability") || "Team availability"}:</span>
-                      <div className="flex gap-1.5 flex-wrap">
-                        {orderedTeammatesForScroll.map(({ p, available }, i) => {
-                          const pr = p as TeamMemberBasic & { firstName?: string; lastName?: string; avatarUrl?: string };
-                          const initials = pr.firstName?.[0] && pr.lastName?.[0] ? `${pr.firstName[0]}${pr.lastName[0]}` : "?";
-                          return (
-                            <div key={pr.id ?? i} className="flex items-center gap-1 px-2 py-1 rounded-lg bg-muted/50">
-                              <Avatar className={cn("w-6 h-6", !available && "opacity-60")}>
-                                <AvatarImage src={pr.avatarUrl ?? undefined} />
+                    <div className="flex items-center gap-2 min-w-0">
+                      {scheduledJobsAndConflicts.conflicts.length > 0 ? (
+                        <>
+                          <div className="w-8 h-8 rounded-full bg-amber-500/20 flex items-center justify-center flex-shrink-0">
+                            <AlertTriangle className="w-4 h-4 text-amber-600 dark:text-amber-400" />
+                          </div>
+                          <div className="min-w-0">
+                            <p className="font-medium text-sm text-amber-800 dark:text-amber-200">{tCal("schedulingConflict") || "Scheduling conflict"}</p>
+                            <p className="text-xs text-amber-600 dark:text-amber-400">{tCal("jobsOverlap", { count: scheduledJobsAndConflicts.conflicts.length }) || `${scheduledJobsAndConflicts.conflicts.length} overlap`}</p>
+                          </div>
+                        </>
+                      ) : (
+                        <>
+                          <div className="w-8 h-8 rounded-full bg-green-500/20 flex items-center justify-center flex-shrink-0">
+                            <CheckCircle2 className="w-4 h-4 text-green-600 dark:text-green-400" />
+                          </div>
+                          <div className="min-w-0">
+                            <p className="font-medium text-sm text-green-800 dark:text-green-200">{tCal("noConflicts") || "No conflicts"}</p>
+                            <p className="text-xs text-green-600 dark:text-green-400">{tCal("jobFitsSchedule") || "Job fits your schedule"}</p>
+                          </div>
+                        </>
+                      )}
+                    </div>
+                    {/* Selected user(s) on the right */}
+                    <div className="flex items-center gap-1.5 flex-shrink-0 flex-wrap justify-end">
+                      {application
+                        ? allApps.map((app) => {
+                            const member = app.teamMember;
+                            const pr = member ?? profile;
+                            if (!pr) return null;
+                            const p = pr as { firstName?: string | null; lastName?: string | null; avatarUrl?: string | null };
+                            const initials = p.firstName?.[0] && p.lastName?.[0] ? `${p.firstName[0]}${p.lastName[0]}` : "?";
+                            const avatarSrc = normalizeAvatarUrl(member ? (p.avatarUrl ?? operatorAvatarUrl ?? undefined) : p.avatarUrl ?? undefined);
+                            return (
+                              <Avatar key={app.id} className="w-7 h-7 border-2 border-background">
+                                <AvatarImage src={avatarSrc ?? undefined} />
                                 <AvatarFallback className="text-[10px]">{initials}</AvatarFallback>
                               </Avatar>
-                              {!available && <AlertTriangle className="w-3.5 h-3.5 text-amber-500 flex-shrink-0" />}
-                            </div>
-                          );
-                        })}
-                      </div>
+                            );
+                          })
+                        : Array.from({ length: workersNeeded }, (_, i) => slotOrder[i] ?? null).map((key, idx) => {
+                            if (key === null) return null;
+                            const filled = selectedApplicants.has(key);
+                            if (!filled) return null;
+                            const isSelf = key === "self";
+                            const person = isSelf ? profile : acceptedTeamMembers.find((m) => m.id === key);
+                            const initials = isSelf
+                              ? `${(profile?.firstName ?? "")[0] || ""}${(profile?.lastName ?? "")[0] || ""}`.trim() || "?"
+                              : (person as TeamMemberBasic)?.firstName?.[0] && (person as TeamMemberBasic)?.lastName?.[0]
+                                ? `${(person as TeamMemberBasic).firstName![0]}${(person as TeamMemberBasic).lastName![0]}`
+                                : "?";
+                            return (
+                              <Avatar key={`slot-${idx}-${key}`} className="w-7 h-7 border-2 border-background">
+                                <AvatarImage src={normalizeAvatarUrl((person as { avatarUrl?: string | null })?.avatarUrl ?? undefined)} />
+                                <AvatarFallback className="text-[10px]">{initials}</AvatarFallback>
+                              </Avatar>
+                            );
+                          })}
                     </div>
-                  )}
+                  </div>
                   {scheduledJobsAndConflicts.scheduled.length > 0 && (
                     <div className="space-y-1">
                       <div className="relative border-l-2 border-primary/30 ml-2.5 pl-3 py-1.5">
                         <div className="absolute -left-1.5 top-1.5 w-2.5 h-2.5 rounded-full bg-primary border-2 border-background" />
                         <p className="text-[10px] text-muted-foreground mb-0.5">{tCal("thisJob") || "This job"}</p>
                         <div className="bg-primary/10 border border-primary/30 rounded-lg px-2.5 py-2">
-                          <p className="font-medium text-xs truncate">{job.title}</p>
+                          <p className="font-medium text-xs truncate">{getDisplayJobTitle(job)}</p>
                           <p className="text-[10px] text-muted-foreground">{jobStart && format(jobStart, "h:mm a")} – {jobEnd && format(jobEnd, "h:mm a")}</p>
                         </div>
                       </div>
@@ -3849,7 +5071,7 @@ export function JobContent({
                           <div key={ev.id} className={cn("relative border-l-2 ml-2.5 pl-3 py-1.5", isConflict ? "border-amber-500" : "border-muted")}>
                             <div className={cn("absolute -left-1.5 top-1.5 w-2.5 h-2.5 rounded-full border-2 border-background", isConflict ? "bg-amber-500" : "bg-muted-foreground/30")} />
                             <div className={cn("rounded-lg px-2.5 py-2", isConflict ? "bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800" : "bg-muted/50")}>
-                              <p className="font-medium text-xs truncate">{ev.title}</p>
+                              <p className="font-medium text-xs truncate">{getDisplayJobTitle(ev)}</p>
                               <p className="text-[10px] text-muted-foreground">{format(ev.start, "h:mm a")} – {format(ev.end, "h:mm a")}</p>
                               {isConflict && <p className="text-[10px] text-amber-600 dark:text-amber-400 mt-0.5">{tCal("overlapsWithThisJob") || "Overlaps"}</p>}
                             </div>
@@ -3869,9 +5091,9 @@ export function JobContent({
             {/* 14. Line separator */}
             <div className="border-b border-border/60 my-4" />
 
-            {/* 15. Meet the company card (second) + Message company */}
+            {/* 15. Meet the company card (second) + Message company (hidden in application view) */}
             {job.companyId && (
-              <MeetCompanyCard company={companyProfileInline} job={job} companyJobsCount={companyJobsCount?.count} companyLocationsCount={companyLocationsCount?.count} t={t} format={format} showMessageButton onMessageCompany={() => { setStage(2); setShowInlineApply(true); }} onViewAllJobs={() => setShowCompanyJobsPopup(true)} />
+              <MeetCompanyCard company={companyProfileInline} job={job} companyJobsCount={companyJobsCount?.count} companyLocationsCount={companyLocationsCount?.count} t={t} format={format} showMessageButton={!application} onMessageCompany={() => { setStage(2); setShowInlineApply(true); }} />
             )}
 
             {/* 16. Line separator */}
@@ -3888,59 +5110,265 @@ export function JobContent({
                 {t("reportThisListing") || "Report this listing"}
               </button>
             </div>
+
+            {/* 19. Timesheet accordion — accepted application only */}
+            {application?.status === "accepted" && (
+              <div className="bg-card rounded-xl shadow-sm border overflow-hidden mt-4" data-testid="timesheet-section">
+                <Accordion type="single" collapsible className="w-full">
+                  <AccordionItem value="timesheets" className="border-0">
+                    <AccordionTrigger className="px-4 py-3 hover:no-underline" data-testid="accordion-timesheets">
+                      <div className="flex items-center gap-2">
+                        <DollarSign className="w-4 h-4 text-green-600 dark:text-green-400" />
+                        <span className="font-semibold">{t("timeAndEarnings")}</span>
+                        {timesheets.length > 0 && (
+                          <Badge variant="secondary" className="ml-2">{t("entries", { count: timesheets.length })}</Badge>
+                        )}
+                      </div>
+                    </AccordionTrigger>
+                    <AccordionContent className="px-4 pb-4">
+                      {timesheetsLoading ? (
+                        <div className="flex items-center justify-center py-4">
+                          <Loader2 className="w-5 h-5 animate-spin text-muted-foreground" />
+                        </div>
+                      ) : timesheets.length === 0 ? (
+                        <div className="text-center py-4 text-muted-foreground">
+                          <Clock className="w-8 h-8 mx-auto mb-2 opacity-50" />
+                          <p className="text-sm">{t("noTimeEntriesYet")}</p>
+                          <p className="text-xs">{t("clockInToStartTracking")}</p>
+                        </div>
+                      ) : (
+                        <div className="space-y-4">
+                          <div className="space-y-3">
+                            {timesheets.map((ts) => {
+                              const hours = parseFloat(ts.adjustedHours || ts.totalHours || "0");
+                              const rateInDollars = (ts.hourlyRate || 0) / 100;
+                              const payout = hours * rateInDollars;
+                              const clockIn = ts.clockInTime ? new Date(ts.clockInTime) : null;
+                              const clockOut = ts.clockOutTime ? new Date(ts.clockOutTime) : null;
+                              return (
+                                <div key={ts.id} className="bg-secondary/30 rounded-lg p-3 space-y-2" data-testid={`timesheet-entry-${ts.id}`}>
+                                  <div className="flex items-center justify-between">
+                                    <div className="text-sm font-medium">{clockIn ? format(clockIn, "EEE, MMM d, yyyy") : t("unknownDate")}</div>
+                                    {getPaymentStatusBadge(ts)}
+                                  </div>
+                                  <div className="flex items-center gap-4 text-sm text-muted-foreground">
+                                    <div className="flex items-center gap-1">
+                                      <Play className="w-3 h-3" />
+                                      <span>{clockIn ? format(clockIn, "h:mm a") : "--:--"}</span>
+                                    </div>
+                                    <span>-</span>
+                                    <div className="flex items-center gap-1">
+                                      <X className="w-3 h-3" />
+                                      <span>{clockOut ? format(clockOut, "h:mm a") : t("active")}</span>
+                                    </div>
+                                  </div>
+                                  <div className="flex items-center justify-between pt-1 border-t border-border/50">
+                                    <div className="text-sm">
+                                      <span className="text-muted-foreground">{t("hours", { hours: hours.toFixed(2) })}</span>
+                                      <span className="text-muted-foreground/70"> @ ${rateInDollars.toFixed(0)}/hr</span>
+                                    </div>
+                                    <div className="font-semibold text-green-600 dark:text-green-400">${payout.toFixed(2)}</div>
+                                  </div>
+                                </div>
+                              );
+                            })}
+                          </div>
+                          {timesheetSummary && (
+                            <div className="bg-gradient-to-r from-green-50 to-emerald-50 dark:from-green-950/30 dark:to-emerald-950/30 rounded-lg p-4 border border-green-100 dark:border-green-900/50" data-testid="timesheet-summary">
+                              <h4 className="text-sm font-semibold text-muted-foreground mb-3">{t("summary")}</h4>
+                              <div className="flex items-center justify-between mb-3">
+                                <div>
+                                  <p className="text-2xl font-bold text-green-600 dark:text-green-400">${timesheetSummary.totalPayout}</p>
+                                  <p className="text-xs text-muted-foreground">{t("hoursWorked", { hours: timesheetSummary.totalHours })}</p>
+                                </div>
+                              </div>
+                              <div className="flex flex-wrap gap-2 pt-2 border-t border-green-200 dark:border-green-800/50">
+                                {timesheetSummary.paidCount > 0 && (
+                                  <div className="flex items-center gap-1 text-xs">
+                                    <CheckCircle2 className="w-3 h-3 text-green-600" />
+                                    <span className="text-muted-foreground">{t("paidCount", { count: timesheetSummary.paidCount })}</span>
+                                  </div>
+                                )}
+                                {timesheetSummary.processingCount > 0 && (
+                                  <div className="flex items-center gap-1 text-xs">
+                                    <Loader2 className="w-3 h-3 text-blue-600 animate-spin" />
+                                    <span className="text-muted-foreground">{t("transferringCount", { count: timesheetSummary.processingCount })}</span>
+                                  </div>
+                                )}
+                                {timesheetSummary.approvedCount > 0 && (
+                                  <div className="flex items-center gap-1 text-xs">
+                                    <Check className="w-3 h-3 text-purple-600" />
+                                    <span className="text-muted-foreground">{t("submittedCount", { count: timesheetSummary.approvedCount })}</span>
+                                  </div>
+                                )}
+                                {timesheetSummary.pendingCount > 0 && (
+                                  <div className="flex items-center gap-1 text-xs">
+                                    <Clock className="w-3 h-3 text-yellow-600" />
+                                    <span className="text-muted-foreground">{t("pendingCount", { count: timesheetSummary.pendingCount })}</span>
+                                  </div>
+                                )}
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </AccordionContent>
+                  </AccordionItem>
+                </Accordion>
+              </div>
+            )}
+            </div>
           </div>
           
           {isMobile && <div className="h-24" />}
         </div>
         
-        {/* Sticky footer: progress bar at top, details left, Apply Now right */}
+        {/* Sticky footer: application view = Withdraw / Get Directions / Assign; else Apply */}
         <div className={`flex-shrink-0 border-t bg-background ${isMobile ? 'fixed bottom-0 left-0 right-0 z-50 shadow-[0_-4px_12px_rgba(0,0,0,0.1)]' : ''}`}>
-          <div className="flex h-1 w-full bg-muted overflow-hidden" aria-hidden>
-            <div className={cn("h-full flex-1 transition-all", stage >= 1 && "bg-primary")} />
-            <div className={cn("h-full flex-1 transition-all", stage >= 2 && "bg-primary")} />
-          </div>
+          {!application && (
+            <div className="flex h-1 w-full bg-muted overflow-hidden" aria-hidden>
+              <div className={cn("h-full flex-1 transition-all", stage >= 1 && "bg-primary")} />
+              <div className={cn("h-full flex-1 transition-all", stage >= 2 && "bg-primary")} />
+            </div>
+          )}
           <div className="flex flex-row items-center justify-between gap-4 p-4 sm:p-6">
-            <div className="flex flex-col min-w-0 text-left flex-1">
-              <p className="text-lg font-bold tracking-tight">${Math.round(estimatedPayout).toLocaleString()}</p>
-              <p className="text-sm text-muted-foreground">
-                {selectedApplicants.size > 0 && selectedApplicants.size !== 1 && (
-                  <>{selectedApplicants.size} {selectedApplicants.size === 1 ? "worker" : "workers"} × </>
-                )}
-                {job.estimatedHours ?? 8} hrs
-                {job.startDate && (
-                  <> · {format(new Date(job.startDate), "MMM d")}
-                    {job.endDate ? ` – ${format(new Date(job.endDate), "MMM d")}` : (job.estimatedHours ?? 8) > 0 ? ` – ${format(addHours(new Date(job.startDate), job.estimatedHours ?? 8), "MMM d")}` : ""}
+            {application?.status !== "accepted" && (
+              <div className="flex flex-col min-w-0 text-left flex-1">
+                {isMobile ? (
+                  <button
+                    type="button"
+                    onClick={() => setMobileFooterDetailsExpanded((v) => !v)}
+                    className="flex items-center gap-2 flex-wrap text-left w-full rounded-lg -m-1 p-1 hover:bg-muted/50"
+                    data-testid="mobile-footer-details-toggle"
+                  >
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <p className="text-lg font-bold tracking-tight">${Math.round(livePreSubmitPayout).toLocaleString()}</p>
+                      {!application && stage === 1 && onDismiss && (
+                        <button type="button" onClick={(e) => { e.stopPropagation(); onDismiss(job); }} className="flex-shrink-0 flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground" data-testid="enhanced-dismiss-button">
+                          <X className="w-4 h-4" />
+                          {t("skip")}
+                        </button>
+                      )}
+                    </div>
+                    {mobileFooterDetailsExpanded ? (
+                      <ChevronUp className="w-4 h-4 text-muted-foreground shrink-0" />
+                    ) : (
+                      <ChevronDown className="w-4 h-4 text-muted-foreground shrink-0" />
+                    )}
+                  </button>
+                ) : (
+                  <>
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <p className="text-lg font-bold tracking-tight">${Math.round(livePreSubmitPayout).toLocaleString()}</p>
+                      {!application && stage === 1 && onDismiss && (
+                        <button type="button" onClick={() => onDismiss(job)} className="flex-shrink-0 flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground" data-testid="enhanced-dismiss-button">
+                          <X className="w-4 h-4" />
+                          {t("skip")}
+                        </button>
+                      )}
+                    </div>
+                    <p className="text-sm text-muted-foreground">
+                      {application ? (
+                        <>{job.estimatedHours ?? 8} hrs{allApps.length > 1 ? ` · ${allApps.length} ${t("workers", { count: allApps.length })}` : ""} · {jobTypeInfo.label}</>
+                      ) : (
+                        <>
+                          {selectedApplicants.size > 0 && selectedApplicants.size !== 1 && (
+                            <>{selectedApplicants.size} {selectedApplicants.size === 1 ? "worker" : "workers"} × </>
+                          )}
+                          {job.estimatedHours ?? 8} hrs
+                          {job.startDate && (
+                            <> · {format(new Date(job.startDate), "MMM d")}
+                              {job.endDate ? ` – ${format(new Date(job.endDate), "MMM d")}` : (job.estimatedHours ?? 8) > 0 ? ` – ${format(addHours(new Date(job.startDate), job.estimatedHours ?? 8), "MMM d")}` : ""}
+                            </>
+                          )}
+                          {` · ${jobTypeInfo.label}`}
+                        </>
+                      )}
+                    </p>
                   </>
                 )}
-                {` · ${jobTypeInfo.label}`}
-              </p>
-            </div>
-            <Button
-              className="h-12 min-w-[140px] text-base font-semibold rounded-xl shadow-lg bg-gradient-to-r from-[#00A86B] to-[#008A57] hover:from-[#008A57] hover:to-[#006B44] text-white border-0 flex-shrink-0"
-              onClick={() => {
-                // If participants are already selected (matching or exceeding needed workers), skip to message stage
-                if (selectedApplicants.size >= workersNeeded) {
-                  setUseSmartRateInline(true); // Always use smart rates when applying
-                  setInlineApplyStage(3); // Skip to message stage (step 3)
-                  setStage(2);
-                  setShowInlineApply(true);
-                } else {
-                  // Go to participant selection stage (step 2)
-                  setInlineApplyStage(2);
-                  setStage(2);
-                  setShowInlineApply(true);
-                }
-              }}
-              data-testid="enhanced-apply-button"
-            >
-              {selectedApplicants.size >= workersNeeded 
-                ? (t("applyNow") || "Apply Now")
-                : (tCommon("next") || "Next")
-              }
-            </Button>
+                {isMobile && mobileFooterDetailsExpanded && (
+                  <p className="text-sm text-muted-foreground mt-1">
+                    {application ? (
+                      <>{job.estimatedHours ?? 8} hrs{allApps.length > 1 ? ` · ${allApps.length} ${t("workers", { count: allApps.length })}` : ""} · {jobTypeInfo.label}</>
+                    ) : (
+                      <>
+                        {selectedApplicants.size > 0 && selectedApplicants.size !== 1 && (
+                          <>{selectedApplicants.size} {selectedApplicants.size === 1 ? "worker" : "workers"} × </>
+                        )}
+                        {job.estimatedHours ?? 8} hrs
+                        {job.startDate && (
+                          <> · {format(new Date(job.startDate), "MMM d")}
+                            {job.endDate ? ` – ${format(new Date(job.endDate), "MMM d")}` : (job.estimatedHours ?? 8) > 0 ? ` – ${format(addHours(new Date(job.startDate), job.estimatedHours ?? 8), "MMM d")}` : ""}
+                          </>
+                        )}
+                        {` · ${jobTypeInfo.label}`}
+                      </>
+                    )}
+                  </p>
+                )}
+              </div>
+            )}
+            {application ? (
+              <div className="flex flex-col gap-2 flex-shrink-0 w-full sm:w-auto sm:min-w-[140px]">
+                {application.status === "accepted" && (
+                  <div className="flex flex-wrap gap-2">
+                    {onGetDirections && (
+                      <Button className="flex-1 min-w-0" onClick={() => onGetDirections(job)} data-testid="button-get-directions">
+                        <Navigation className="w-4 h-4 mr-2" />
+                        {t("getDirections")}
+                      </Button>
+                    )}
+                    <Button variant="outline" className="flex-1 min-w-0" asChild data-testid="button-message-job">
+                      <a href={`/accepted-job/${job.id}`}>
+                        <MessageSquare className="w-4 h-4 mr-2" />
+                        {t("message")}
+                      </a>
+                    </Button>
+                    <Button variant="outline" className="flex-1 min-w-0" onClick={() => setMaterialInvoiceOpen(true)} data-testid="button-material-invoice">
+                      <Receipt className="w-4 h-4 mr-2" />
+                      Material Invoice
+                    </Button>
+                  </div>
+                )}
+                {application.status === "pending" && (allApps.length > 1 ? onWithdrawAll : onWithdraw) && (
+                  <Button
+                    variant="destructive"
+                    className="w-full mt-[11px] mb-[11px]"
+                    onClick={() => {
+                      setWithdrawReason(null);
+                      setWithdrawStep("reason");
+                      setShowWithdrawStep(true);
+                    }}
+                    disabled={isWithdrawing}
+                    data-testid="button-withdraw-application"
+                  >
+                    {allApps.length > 1 ? t("withdrawAllWorkers", { count: allApps.length }) : t("withdrawApplication")}
+                  </Button>
+                )}
+              </div>
+            ) : (
+              <Button
+                className="h-12 min-w-[140px] text-base font-semibold rounded-xl shadow-lg bg-gradient-to-r from-[#00A86B] to-[#008A57] hover:from-[#008A57] hover:to-[#006B44] text-white border-0 flex-shrink-0"
+                onClick={() => {
+                  if (selectedApplicants.size >= workersNeeded) {
+                    setUseSmartRateInline(true);
+                    setInlineApplyStage(3);
+                    setStage(2);
+                    setShowInlineApply(true);
+                  } else {
+                    setInlineApplyStage(2);
+                    setStage(2);
+                    setShowInlineApply(true);
+                  }
+                }}
+                data-testid="enhanced-apply-button"
+              >
+                {selectedApplicants.size >= workersNeeded ? (t("applyNow") || "Apply Now") : (tCommon("next") || "Next")}
+              </Button>
+            )}
           </div>
         </div>
-      </div>
       
       {/* Drive Time Popup */}
       {job.latitude && job.longitude && (
@@ -3949,7 +5377,7 @@ export function JobContent({
           onOpenChange={setShowDriveTime}
           job={{
             id: job.id,
-            title: job.title,
+            title: getDisplayJobTitle(job),
             address: job.address || "",
             city: job.city || "",
             state: job.state || "",
@@ -3962,10 +5390,20 @@ export function JobContent({
         />
       )}
 
+      {/* Material Invoice (accepted job only) */}
+      {application?.status === "accepted" && (
+        <MaterialInvoiceDialog
+          open={materialInvoiceOpen}
+          onOpenChange={setMaterialInvoiceOpen}
+          jobId={job.id}
+          jobTitle={getDisplayJobTitle(job) || "Job"}
+        />
+      )}
+
       {/* Full-page gallery slider (map click opens this instead of drive-time popup) */}
       <Dialog open={showFullPageGallery} onOpenChange={setShowFullPageGallery}>
         <DialogContent className="max-w-none w-[100vw] h-[100dvh] h-screen p-0 gap-0 rounded-none border-0 bg-black overflow-hidden [&>button]:hidden">
-          <DialogTitle className="sr-only">{t("gallery")} – {job.title}</DialogTitle>
+          <DialogTitle className="sr-only">{t("gallery")} – {getDisplayJobTitle(job)}</DialogTitle>
           <DialogDescription className="sr-only">{allMedia.length} {t("gallery")} slides</DialogDescription>
           <FullPageGallerySlider
             allMedia={allMedia}
@@ -3975,8 +5413,8 @@ export function JobContent({
             onClose={() => setShowFullPageGallery(false)}
             t={t}
             tCommon={tCommon}
-            partialAddress={partialAddress}
-            approximateNote={t("fullAddressWhenYouWin")}
+            partialAddress={(application?.status === "accepted" ? displayAddress : partialAddress) ?? undefined}
+            approximateNote={application?.status === "accepted" ? undefined : t("fullAddressWhenYouWin")}
           />
         </DialogContent>
       </Dialog>
@@ -3992,22 +5430,22 @@ export function JobContent({
           <div className="space-y-4 pt-2">
             <p className="text-muted-foreground">{jobTypeInfo.tooltip}</p>
             <div className="bg-secondary/50 rounded-xl p-4 space-y-2">
-              {job.isOnDemand || job.jobType === "on_demand" ? (
-                <>
-                  <p className="font-medium">{t("whatThisMeansForYou")}</p>
-                  <ul className="text-sm text-muted-foreground space-y-1">
-                    <li>• {t("workWhenAvailable")}</li>
-                    <li>• {t("clockInAnytimeDuringJobPeriod")}</li>
-                    <li>• {t("flexibleScheduling")}</li>
-                  </ul>
-                </>
-              ) : job.jobType === "recurring" ? (
+              {job.jobType === "recurring" ? (
                 <>
                   <p className="font-medium">{t("whatThisMeansForYou")}</p>
                   <ul className="text-sm text-muted-foreground space-y-1">
                     <li>• {t("regularScheduledShifts")}</li>
                     <li>• {t("consistentIncomeOpportunity")}</li>
                     <li>• {t("setScheduleEachWeek")}</li>
+                  </ul>
+                </>
+              ) : job.jobType === "on_demand" || job.isOnDemand ? (
+                <>
+                  <p className="font-medium">{t("whatThisMeansForYou")}</p>
+                  <ul className="text-sm text-muted-foreground space-y-1">
+                    <li>• {t("workWhenAvailable")}</li>
+                    <li>• {t("clockInAnytimeDuringJobPeriod")}</li>
+                    <li>• {t("flexibleScheduling")}</li>
                   </ul>
                 </>
               ) : (
@@ -4116,7 +5554,7 @@ export function JobContent({
                       >
                         <div className="flex items-start justify-between gap-3">
                           <div className="flex-1 min-w-0">
-                            <h3 className="font-semibold text-base truncate">{companyJob.title}</h3>
+                            <h3 className="font-semibold text-base truncate">{getDisplayJobTitle(companyJob)}</h3>
                             {companyJob.address && (
                               <p className="text-sm text-muted-foreground truncate mt-1">
                                 {[companyJob.city, companyJob.state].filter(Boolean).join(", ")}
@@ -4152,7 +5590,7 @@ export function JobContent({
                       >
                         <div className="flex items-start justify-between gap-3">
                           <div className="flex-1 min-w-0">
-                            <h3 className="font-semibold text-base truncate">{companyJob.title}</h3>
+                            <h3 className="font-semibold text-base truncate">{getDisplayJobTitle(companyJob)}</h3>
                             {companyJob.address && (
                               <p className="text-sm text-muted-foreground truncate mt-1">
                                 {[companyJob.city, companyJob.state].filter(Boolean).join(", ")}
@@ -4188,7 +5626,9 @@ export function JobContent({
         onSelectTeammate={setSelectedTeammateForSettings}
         settingsSection={settingsSection}
         onSectionChange={setSettingsSection}
+        workerLocation={workerLocation ?? null}
       />
+
     </>
   );
 }
@@ -4198,6 +5638,7 @@ function ApplicationViewDialog({
   onOpenChange,
   job,
   profile,
+  operatorAvatarUrl,
   activeTeamMembers,
   application,
   groupedApplications,
@@ -4213,6 +5654,7 @@ function ApplicationViewDialog({
   onOpenChange: (open: boolean) => void;
   job: Job;
   profile: Profile | null | undefined;
+  operatorAvatarUrl?: string | null;
   activeTeamMembers: TeamMemberBasic[];
   application: ApplicationData;
   groupedApplications?: GroupedApplications | null;
@@ -4228,10 +5670,54 @@ function ApplicationViewDialog({
   const { t: tCommon } = useTranslation("common");
   const [showTeamMemberPicker, setShowTeamMemberPicker] = useState(false);
   const [selectedAppForReassign, setSelectedAppForReassign] = useState<ApplicationData | null>(null);
+  const [showWithdrawStep, setShowWithdrawStep] = useState(false);
+  const [withdrawStep, setWithdrawStep] = useState<"reason" | "confirm">("reason");
+  const [withdrawReason, setWithdrawReason] = useState<string | null>(null);
   const [showDriveTime, setShowDriveTime] = useState(false);
   const jobTypeInfo = getJobTypeInfo(job, t);
   const timeInfo = formatJobTime(job, t);
   const teamMember = application.teamMember;
+
+  const jobLatLngApp = useMemo(() => {
+    const lat = job.latitude != null ? parseFloat(String(job.latitude)) : NaN;
+    const lng = job.longitude != null ? parseFloat(String(job.longitude)) : NaN;
+    return Number.isFinite(lat) && Number.isFinite(lng) ? { lat, lng } : null;
+  }, [job.latitude, job.longitude]);
+  const [geocodedJobLatLngApp, setGeocodedJobLatLngApp] = useState<{ lat: number; lng: number } | null>(null);
+  const jobAddressKeyApp = [job.id, (job as any).address, (job as any).city, (job as any).state, (job as any).zipCode].filter(Boolean).join("|");
+  useEffect(() => {
+    if (jobLatLngApp) {
+      setGeocodedJobLatLngApp(null);
+      return;
+    }
+    const parts = [(job as any).address, (job as any).city, (job as any).state, (job as any).zipCode].filter(Boolean);
+    if (parts.length === 0) {
+      setGeocodedJobLatLngApp(null);
+      return;
+    }
+    const apiKey = import.meta.env.VITE_GOOGLE_API_KEY;
+    if (!apiKey) return;
+    const addressQuery = parts.join(", ");
+    let cancelled = false;
+    fetch(
+      `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(addressQuery)}&key=${apiKey}`
+    )
+      .then((res) => res.json())
+      .then((data) => {
+        if (cancelled) return;
+        const loc = data.results?.[0]?.geometry?.location;
+        if (loc && typeof loc.lat === "number" && typeof loc.lng === "number") {
+          setGeocodedJobLatLngApp({ lat: loc.lat, lng: loc.lng });
+        } else {
+          setGeocodedJobLatLngApp(null);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setGeocodedJobLatLngApp(null);
+      });
+    return () => { cancelled = true; };
+  }, [jobAddressKeyApp, jobLatLngApp]);
+  const jobLatLngOrGeocodedApp = jobLatLngApp ?? geocodedJobLatLngApp;
   
   const allApps = groupedApplications?.applications || [application];
   const minWorkerCount = groupedApplications?.minWorkerCount || 1;
@@ -4354,11 +5840,10 @@ function ApplicationViewDialog({
   
   const estimatedHours = job.estimatedHours || 8;
   
-  // Calculate combined payout for all workers using proposedRate (rate at time of application)
+  // Pending/accepted application: payout and rate must never change when swapping teammates — use only submitted proposedRate
   const combinedPayout = allApps.reduce((total, app) => {
-    // Always use proposedRate first (the rate at time of application), not current team member rate
-    const rate = app.proposedRate || app.teamMember?.hourlyRate || profile?.hourlyRate || (job.hourlyRate / 100);
-    return total + (rate * estimatedHours);
+    const rateDollars = rateToDollars(app.proposedRate ?? profile?.hourlyRate ?? (job.hourlyRate ? job.hourlyRate / 100 : 0));
+    return total + (rateDollars * estimatedHours);
   }, 0);
   
   const scrollContainerRef = React.useRef<HTMLDivElement>(null);
@@ -4373,7 +5858,7 @@ function ApplicationViewDialog({
         <h2 className={cn(
           "font-semibold truncate pr-4 transition-all duration-200",
           isScrolled ? "text-base" : "text-lg"
-        )}>{job.title}</h2>
+        )}>{getDisplayJobTitle(job)}</h2>
         <button
           onClick={() => onOpenChange(false)}
           className={cn(
@@ -4394,7 +5879,7 @@ function ApplicationViewDialog({
         className="flex-1 min-h-0 min-w-0 overflow-y-auto overflow-x-hidden px-4 sm:px-6 py-4 space-y-5"
       >
         <div>
-          <h2 className="text-xl sm:text-2xl font-bold">{job.title}</h2>
+          <h2 className="text-xl sm:text-2xl font-bold">{getDisplayJobTitle(job)}</h2>
           <div className="flex flex-wrap items-center gap-2 mt-2">
             <Badge className={`${jobTypeInfo.color} text-white`}>
               {jobTypeInfo.label}
@@ -4421,7 +5906,7 @@ function ApplicationViewDialog({
                       className="w-12 h-12 border-2 border-card ring-2 ring-primary/20"
                       style={{ zIndex: allApps.length - i }}
                     >
-                      <AvatarImage src={member?.avatarUrl || (!member ? profile?.avatarUrl : undefined) || undefined} />
+                      <AvatarImage src={normalizeAvatarUrl(member?.avatarUrl || (member ? (operatorAvatarUrl ?? profile?.avatarUrl) : profile?.avatarUrl)) ?? undefined} />
                       <AvatarFallback className="text-sm">
                         {member ? `${member.firstName?.[0] || ''}${member.lastName?.[0] || ''}` : `${profile?.firstName?.[0] || ''}${profile?.lastName?.[0] || ''}`}
                       </AvatarFallback>
@@ -4444,7 +5929,7 @@ function ApplicationViewDialog({
           ) : (
             <>
               <Avatar className="w-12 h-12 border-2 border-primary/20">
-                <AvatarImage src={teamMember?.avatarUrl || profile?.avatarUrl || undefined} />
+                <AvatarImage src={normalizeAvatarUrl((teamMember?.avatarUrl || operatorAvatarUrl) ?? profile?.avatarUrl) ?? undefined} />
                 <AvatarFallback>
                   {teamMember ? `${teamMember.firstName?.[0] || ''}${teamMember.lastName?.[0] || ''}` : `${profile?.firstName?.[0] || ''}${profile?.lastName?.[0] || ''}`}
                 </AvatarFallback>
@@ -4470,15 +5955,14 @@ function ApplicationViewDialog({
           </p>
           <p className="text-sm text-muted-foreground mt-1">
             {hasMultipleWorkers ? (() => {
-              // Get unique rates from all applications
-              const rates = allApps.map(app => app.proposedRate || app.teamMember?.hourlyRate || profile?.hourlyRate || (job.hourlyRate / 100));
-              const uniqueRates = Array.from(new Set(rates));
+              const rates = allApps.map(app => rateToDollars(app.proposedRate ?? profile?.hourlyRate ?? (job.hourlyRate ? job.hourlyRate / 100 : 0)));
+              const uniqueRates = Array.from(new Set(rates.map(r => Math.round(r))));
               if (uniqueRates.length === 1) {
                 return t("workersHoursRate", { workers: allApps.length, hours: estimatedHours, rate: uniqueRates[0] });
               } else {
                 return t("workersHoursRatesVary", { workers: allApps.length, hours: estimatedHours });
               }
-            })() : t("hoursAtRate", { hours: estimatedHours, rate: (application.proposedRate || teamMember?.hourlyRate || profile?.hourlyRate || (job.hourlyRate / 100)) })}
+            })() : t("hoursAtRate", { hours: estimatedHours, rate: Math.round(rateToDollars(application.proposedRate ?? profile?.hourlyRate ?? (job.hourlyRate ? job.hourlyRate / 100 : 0))) })}
           </p>
         </div>
         
@@ -4546,7 +6030,7 @@ function ApplicationViewDialog({
                   id: job.id,
                   lat: parseFloat(job.latitude!),
                   lng: parseFloat(job.longitude!),
-                  title: job.title,
+                  title: getDisplayJobTitle(job),
                 }}
               />
             )}
@@ -4695,7 +6179,7 @@ function ApplicationViewDialog({
           </div>
         )}
         
-        {application.status === "pending" && activeTeamMembers.length > 0 && onAssignTeamMember && (
+        {(application.status === "pending" || application.status === "accepted") && activeTeamMembers.length > 0 && onAssignTeamMember && (
           <div className="space-y-3">
             <div className="flex items-center justify-between">
               <h4 className="text-sm font-medium text-muted-foreground">
@@ -4709,13 +6193,23 @@ function ApplicationViewDialog({
             </div>
             
             {hasMultipleWorkers ? (
-              <div className="space-y-2">
-                {allApps.map((app) => {
+              (() => {
+                const jobCoordsList = jobLatLngOrGeocodedApp;
+                const radiusMilesApp = DEFAULT_JOB_TERRITORY_RADIUS_MILES;
+                const inTerritoryForApp = (app: typeof allApps[0]) => {
+                  if (!jobCoordsList || !Number.isFinite(jobCoordsList.lat) || !Number.isFinite(jobCoordsList.lng)) return true;
                   const member = app.teamMember;
-                  const displayName = member 
-                    ? `${member.firstName} ${member.lastName}` 
-                    : `${profile?.firstName} ${profile?.lastName} (${t("myself")})`;
-                  
+                  const lat = member != null && (member as any).latitude != null ? parseFloat(String((member as any).latitude)) : (workerLocation?.lat ?? (profile && (profile as any).latitude != null ? parseFloat(String((profile as any).latitude)) : null));
+                  const lng = member != null && (member as any).longitude != null ? parseFloat(String((member as any).longitude)) : (workerLocation?.lng ?? (profile && (profile as any).longitude != null ? parseFloat(String((profile as any).longitude)) : null));
+                  if (lat == null || lng == null || !Number.isFinite(lat) || !Number.isFinite(lng)) return false;
+                  return calculateDistance(jobCoordsList.lat, jobCoordsList.lng, lat, lng) <= radiusMilesApp;
+                };
+                const inTerritoryApps = allApps.filter(inTerritoryForApp);
+                const outsideTerritoryApps = allApps.filter((app) => !inTerritoryForApp(app));
+                const renderAppRow = (app: typeof allApps[0]) => {
+                  const member = app.teamMember;
+                  const displayName = member ? `${member.firstName} ${member.lastName}` : `${profile?.firstName} ${profile?.lastName} (${t("myself")})`;
+                  const appliedRateDollars = rateToDollars(app.proposedRate ?? profile?.hourlyRate ?? (job.hourlyRate ? job.hourlyRate / 100 : 0));
                   return (
                     <button
                       key={app.id}
@@ -4728,7 +6222,7 @@ function ApplicationViewDialog({
                     >
                       <div className="flex items-center gap-3">
                         <Avatar className="w-10 h-10 border-2 border-primary/20">
-                          <AvatarImage src={member?.avatarUrl || profile?.avatarUrl || undefined} />
+                          <AvatarImage src={normalizeAvatarUrl((member?.avatarUrl || operatorAvatarUrl) ?? profile?.avatarUrl) ?? undefined} />
                           <AvatarFallback>
                             {member ? `${member.firstName?.[0]}${member.lastName?.[0]}` : `${profile?.firstName?.[0]}${profile?.lastName?.[0]}`}
                           </AvatarFallback>
@@ -4736,7 +6230,7 @@ function ApplicationViewDialog({
                         <div className="text-left">
                           <p className="font-medium">{displayName}</p>
                           <p className="text-xs text-muted-foreground">
-                            ${app.proposedRate || app.teamMember?.hourlyRate || profile?.hourlyRate}/hr
+                            ${Math.round(appliedRateDollars)}/hr
                           </p>
                         </div>
                       </div>
@@ -4746,8 +6240,32 @@ function ApplicationViewDialog({
                       </div>
                     </button>
                   );
-                })}
-              </div>
+                };
+                return (
+                  <div className="space-y-3">
+                    <div className="space-y-1.5 min-w-0">
+                      <p className="text-[10px] font-medium text-muted-foreground uppercase tracking-wide flex items-center gap-1">
+                        <MapPin className="w-3 h-3 text-green-600" />
+                        {t("withinJobLocation") || "Within job location"}
+                      </p>
+                      <div className="space-y-2">
+                        {inTerritoryApps.map(renderAppRow)}
+                      </div>
+                    </div>
+                    {outsideTerritoryApps.length > 0 && (
+                      <div className="space-y-1.5 min-w-0">
+                        <p className="text-[10px] font-medium text-muted-foreground uppercase tracking-wide flex items-center gap-1">
+                          <MapPin className="w-3 h-3" />
+                          {t("teammateOutsideJobLocation") || "Outside job location"}
+                        </p>
+                        <div className="space-y-2">
+                          {outsideTerritoryApps.map(renderAppRow)}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                );
+              })()
             ) : isMobile ? (
               <button
                 onClick={() => {
@@ -4759,7 +6277,7 @@ function ApplicationViewDialog({
               >
                 <div className="flex items-center gap-3">
                   <Avatar className="w-10 h-10 border-2 border-primary/20">
-                    <AvatarImage src={teamMember?.avatarUrl || profile?.avatarUrl || undefined} />
+                    <AvatarImage src={normalizeAvatarUrl((teamMember?.avatarUrl || operatorAvatarUrl) ?? profile?.avatarUrl) ?? undefined} />
                     <AvatarFallback>
                       {teamMember ? `${teamMember.firstName?.[0]}${teamMember.lastName?.[0]}` : `${profile?.firstName?.[0]}${profile?.lastName?.[0]}`}
                     </AvatarFallback>
@@ -4798,7 +6316,7 @@ function ApplicationViewDialog({
                     <SelectItem key={member.id} value={member.id.toString()}>
                       <div className="flex items-center gap-2">
                         <Avatar className="w-6 h-6">
-                          <AvatarImage src={member.avatarUrl || undefined} />
+                          <AvatarImage src={normalizeAvatarUrl(member.avatarUrl || operatorAvatarUrl) ?? undefined} />
                           <AvatarFallback>{member.firstName?.[0]}{member.lastName?.[0]}</AvatarFallback>
                         </Avatar>
                         <span>{member.firstName} {member.lastName}</span>
@@ -4845,20 +6363,13 @@ function ApplicationViewDialog({
               variant="destructive" 
               className="w-full mt-[11px] mb-[11px]"
               onClick={() => {
-                if (hasMultipleWorkers && onWithdrawAll) {
-                  onWithdrawAll(allApps.map(app => app.id));
-                } else if (onWithdraw) {
-                  onWithdraw(application.id);
-                }
+                setWithdrawReason(null);
+                setWithdrawStep("reason");
+                setShowWithdrawStep(true);
               }}
               disabled={isWithdrawing}
               data-testid="button-withdraw-application"
             >
-              {isWithdrawing ? (
-                <Loader2 className="w-4 h-4 mr-2 animate-spin" />
-              ) : (
-                <XCircle className="w-4 h-4 mr-2" />
-              )}
               {hasMultipleWorkers ? t("withdrawAllWorkers", { count: allApps.length }) : t("withdrawApplication")}
             </Button>
           )}
@@ -4913,7 +6424,7 @@ function ApplicationViewDialog({
                 <p className="text-sm text-blue-700 dark:text-blue-300">
                   {hasMultipleWorkers 
                     ? t("reassigningWorkerRateUnchanged", { name: currentMember ? `${currentMember.firstName} ${currentMember.lastName}` : `${profile?.firstName} ${profile?.lastName}` })
-                    : t("appliedRateWillRemainUnchanged", { rate: appToReassign.proposedRate || profile?.hourlyRate })
+                    : t("appliedRateWillRemainUnchanged", { rate: Math.round(rateToDollars(appToReassign.proposedRate ?? profile?.hourlyRate ?? 0)) })
                   }
                 </p>
               </div>
@@ -4973,7 +6484,7 @@ function ApplicationViewDialog({
                     data-testid={`select-team-member-${member.id}`}
                   >
                     <Avatar className="w-12 h-12 border-2 border-primary/20">
-                      <AvatarImage src={member.avatarUrl || undefined} />
+                      <AvatarImage src={normalizeAvatarUrl(member.avatarUrl || operatorAvatarUrl) ?? undefined} />
                       <AvatarFallback>{member.firstName?.[0]}{member.lastName?.[0]}</AvatarFallback>
                     </Avatar>
                     <div className="flex-1 text-left">
@@ -5022,14 +6533,84 @@ function ApplicationViewDialog({
     />
   );
 
+  const WITHDRAW_REASON_KEYS_AV = ["withdrawReasonFoundAnotherJob", "withdrawReasonScheduleChanged", "withdrawReasonNoLongerInterested", "withdrawReasonOther"] as const;
+  const withdrawContent = (application.status === "pending" && (onWithdraw || onWithdrawAll) && showWithdrawStep) ? (() => {
+    const onBackWithdraw = () => {
+      if (withdrawStep === "confirm") setWithdrawStep("reason");
+      else {
+        setShowWithdrawStep(false);
+        setWithdrawReason(null);
+        setWithdrawStep("reason");
+      }
+    };
+    const handleConfirmWithdraw = () => {
+      if (allApps.length > 1 && onWithdrawAll) onWithdrawAll(allApps.map(app => app.id));
+      else if (onWithdraw) onWithdraw(application.id);
+      setShowWithdrawStep(false);
+      setWithdrawReason(null);
+      setWithdrawStep("reason");
+    };
+    const reasonLabel = (key: string) => t(key as any);
+    return (
+      <div className={cn("flex flex-col min-h-0", isMobile ? "h-full" : "max-h-[85vh]")}>
+        <div className="flex items-center gap-2 px-4 py-3 border-b flex-shrink-0 bg-background">
+          <button type="button" onClick={onBackWithdraw} className="flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground" data-testid="button-back-from-withdraw">
+            <ChevronLeft className="w-4 h-4" /><span>{tCommon("back")}</span>
+          </button>
+          <span className="text-muted-foreground">/</span>
+          <span className="font-medium text-sm">{withdrawStep === "reason" ? t("withdrawApplication") : t("confirmWithdrawTitle")}</span>
+        </div>
+        <div className="flex-1 min-h-0 overflow-y-auto p-4">
+          {withdrawStep === "reason" ? (
+            <>
+              <p className="text-sm font-medium mb-3">{t("withdrawReasonTitle")}</p>
+              <div className="space-y-2" role="radiogroup" aria-label={t("withdrawReasonTitle")}>
+                {WITHDRAW_REASON_KEYS_AV.map((key) => (
+                  <button
+                    key={key}
+                    type="button"
+                    onClick={() => setWithdrawReason(key)}
+                    className={cn("w-full flex items-center gap-3 p-3 rounded-xl border text-left transition-colors", withdrawReason === key ? "bg-primary/10 border-primary" : "bg-card border-border hover:bg-muted/50")}
+                    data-testid={`withdraw-reason-${key}`}
+                  >
+                    <span className={cn("w-4 h-4 rounded-full border-2 flex-shrink-0", withdrawReason === key ? "border-primary bg-primary" : "border-muted-foreground")} />
+                    <span className="text-sm">{reasonLabel(key)}</span>
+                  </button>
+                ))}
+              </div>
+            </>
+          ) : (
+            <p className="text-sm text-muted-foreground">{t("confirmWithdrawMessage", { reason: withdrawReason ? reasonLabel(withdrawReason) : "" })}</p>
+          )}
+        </div>
+        <div className="flex-shrink-0 p-4 border-t bg-background shadow-[0_-2px_12px_rgba(0,0,0,0.06)] flex flex-col gap-2">
+          {withdrawStep === "reason" ? (
+            <>
+              <Button className="w-full" disabled={!withdrawReason} onClick={() => setWithdrawStep("confirm")} data-testid="button-withdraw-continue">{t("withdrawContinue")}</Button>
+              <Button variant="outline" className="w-full" onClick={onBackWithdraw} data-testid="button-withdraw-cancel">{tCommon("cancel")}</Button>
+            </>
+          ) : (
+            <>
+              <Button variant="destructive" className="w-full" disabled={isWithdrawing} onClick={handleConfirmWithdraw} data-testid="button-withdraw-confirm">
+                {isWithdrawing ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : <XCircle className="w-4 h-4 mr-2" />}
+                {t("confirmWithdrawButton")}
+              </Button>
+              <Button variant="outline" className="w-full" onClick={onBackWithdraw} data-testid="button-withdraw-back">{tCommon("back")}</Button>
+            </>
+          )}
+        </div>
+      </div>
+    );
+  })() : null;
+
   if (isMobile) {
     return (
       <>
         <Drawer open={open} onOpenChange={onOpenChange}>
           <DrawerContent className="h-[100dvh] max-h-[100dvh] rounded-t-none">
-            <DrawerTitle className="sr-only">{job.title}</DrawerTitle>
+            <DrawerTitle className="sr-only">{getDisplayJobTitle(job)}</DrawerTitle>
             <DrawerDescription className="sr-only">View job application details</DrawerDescription>
-            {content}
+            {withdrawContent ?? content}
           </DrawerContent>
         </Drawer>
         {teamMemberPickerDrawer}
@@ -5046,6 +6627,7 @@ function ApplicationViewDialog({
           onSelectTeammate={setSelectedTeammateForSettings}
           settingsSection={settingsSection}
           onSectionChange={setSettingsSection}
+          workerLocation={workerLocation ?? null}
         />
       </>
     );
@@ -5055,9 +6637,9 @@ function ApplicationViewDialog({
     <>
       <Dialog open={open} onOpenChange={onOpenChange}>
         <DialogContent className="max-w-2xl p-0 rounded-2xl overflow-hidden shadow-2xl border-0">
-          <DialogTitle className="sr-only">{job.title}</DialogTitle>
+          <DialogTitle className="sr-only">{getDisplayJobTitle(job)}</DialogTitle>
           <DialogDescription className="sr-only">View job application details</DialogDescription>
-          {content}
+          {withdrawContent ?? content}
         </DialogContent>
       </Dialog>
       {teamMemberPickerDrawer}
@@ -5077,6 +6659,7 @@ function TeammateSettingsPopup({
   onSelectTeammate,
   settingsSection,
   onSectionChange,
+  workerLocation,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -5087,6 +6670,7 @@ function TeammateSettingsPopup({
   onSelectTeammate: (teammate: TeamMemberBasic | null) => void;
   settingsSection: "list" | "edit";
   onSectionChange: (section: "list" | "edit") => void;
+  workerLocation?: { lat: number; lng: number } | null;
 }) {
   const { t } = useTranslation("enhancedJobDialog");
   const { toast } = useToast();
@@ -5097,29 +6681,43 @@ function TeammateSettingsPopup({
   const [editHourlyRate, setEditHourlyRate] = useState<number>(30);
   const [isSaving, setIsSaving] = useState(false);
 
-  const allSkills = useMemo(() => getAllRoles(), []);
+  const toggleSkillset = (roleId: string) => {
+    setEditSkillsets((prev) => {
+      if (prev.includes(roleId)) return prev.filter((s) => s !== roleId);
+      const partner = getLiteElitePartner(roleId);
+      const withoutPartner = partner ? prev.filter((s) => s !== partner) : prev;
+      return [...withoutPartner, roleId];
+    });
+  };
 
-  // Initialize edit data when teammate is selected
+  // Initialize edit data when teammate is selected (hourlyRate: DB is whole dollars; legacy may be cents - normalize with rateToDollars)
   useEffect(() => {
     if (selectedTeammate) {
       setEditSkillsets(selectedTeammate.skillsets || []);
-      setEditAddress("");
+      const addr = [
+        (selectedTeammate as any).address,
+        (selectedTeammate as any).city,
+        (selectedTeammate as any).state,
+        (selectedTeammate as any).zipCode,
+      ].filter(Boolean).join(", ");
+      setEditAddress(addr || "");
       setEditLatitude(selectedTeammate.latitude || "");
       setEditLongitude(selectedTeammate.longitude || "");
-      setEditHourlyRate(selectedTeammate.hourlyRate ? selectedTeammate.hourlyRate / 100 : 30);
+      setEditHourlyRate(rateToDollars(selectedTeammate.hourlyRate) || 30);
     }
   }, [selectedTeammate]);
 
-  // Combined save function that updates all fields at once
+  // Combined save function that updates all fields at once (hourlyRate sent as whole dollars; server stores whole dollars)
   const handleSaveAll = async () => {
     if (!selectedTeammate) return;
     setIsSaving(true);
     try {
       await apiRequest("PATCH", `/api/team-members/${selectedTeammate.id}`, {
         skillsets: editSkillsets,
-        latitude: editLatitude,
-        longitude: editLongitude,
-        hourlyRate: Math.round(editHourlyRate * 100),
+        address: editAddress || undefined,
+        latitude: editLatitude || undefined,
+        longitude: editLongitude || undefined,
+        hourlyRate: Math.round(editHourlyRate),
       });
       toast({ title: "Teammate updated successfully" });
       queryClient.invalidateQueries({ queryKey: ["/api/team-members/worker", profile?.id] });
@@ -5222,11 +6820,7 @@ function TeammateSettingsPopup({
                 ? `${person.firstName} ${person.lastName} (You)` 
                 : `${person.firstName} ${person.lastName}`;
               const initials = `${person.firstName?.[0] || ''}${person.lastName?.[0] || ''}`;
-              const avatarUrl = person.avatarUrl
-                ? (String(person.avatarUrl).startsWith("http") || String(person.avatarUrl).startsWith("/") 
-                  ? person.avatarUrl 
-                  : `/objects/avatar/${person.avatarUrl}`)
-                : undefined;
+              const avatarUrl = normalizeAvatarUrl(person.avatarUrl ?? undefined);
 
               return (
                 <div
@@ -5290,15 +6884,7 @@ function TeammateSettingsPopup({
           {/* User Header with Avatar and Name */}
           <div className="flex items-center gap-3 pb-4 border-b border-border">
             <Avatar className="w-12 h-12 border-2 border-border">
-              <AvatarImage 
-                src={
-                  selectedTeammate.avatarUrl
-                    ? (String(selectedTeammate.avatarUrl).startsWith("http") || String(selectedTeammate.avatarUrl).startsWith("/")
-                      ? selectedTeammate.avatarUrl
-                      : `/objects/avatar/${selectedTeammate.avatarUrl}`)
-                    : undefined
-                }
-              />
+              <AvatarImage src={normalizeAvatarUrl(selectedTeammate.avatarUrl ?? undefined)} />
               <AvatarFallback className="text-base">
                 {selectedTeammate.firstName?.[0] || ''}{selectedTeammate.lastName?.[0] || ''}
               </AvatarFallback>
@@ -5328,7 +6914,7 @@ function TeammateSettingsPopup({
               </TabsTrigger>
             </TabsList>
 
-            {/* Skills Tab */}
+            {/* Skills Tab – 1:1 with WorkerDashboard/BusinessOperator (INDUSTRY_CATEGORIES) */}
             <TabsContent value="skills" className="space-y-4 mt-0">
               <div className="bg-muted/30 rounded-lg p-3 border border-border/50">
                 <p className="text-xs text-muted-foreground mb-2">
@@ -5339,28 +6925,59 @@ function TeammateSettingsPopup({
 
               <div className="space-y-2">
                 <Label className="text-sm font-semibold">Select Skills</Label>
-                <div className="grid grid-cols-2 gap-2 max-h-[400px] overflow-y-auto overflow-x-hidden scrollbar-pill-on-scroll p-2 border border-border rounded-lg">
-                  {allSkills.map((skill) => (
-                    <div key={skill.id} className="flex items-center space-x-2">
-                      <Checkbox
-                        id={`skill-${skill.id}`}
-                        checked={editSkillsets.includes(skill.id)}
-                        onCheckedChange={(checked) => {
-                          if (checked) {
-                            setEditSkillsets([...editSkillsets, skill.id]);
-                          } else {
-                            setEditSkillsets(editSkillsets.filter(s => s !== skill.id));
-                          }
-                        }}
-                      />
-                      <label
-                        htmlFor={`skill-${skill.id}`}
-                        className="text-sm cursor-pointer"
-                      >
-                        {skill.label}
-                      </label>
-                    </div>
-                  ))}
+                <div className="space-y-3 max-h-[400px] overflow-y-auto overflow-x-hidden scrollbar-pill-on-scroll pr-2">
+                  {INDUSTRY_CATEGORIES.map((industry) => {
+                    const Icon = industry.icon;
+                    const selectedCount = industry.roles.filter((r) => editSkillsets.includes(r.id)).length;
+                    return (
+                      <Collapsible key={industry.id} defaultOpen={selectedCount > 0} className="group">
+                        <div className="border rounded-lg overflow-hidden">
+                          <CollapsibleTrigger className="w-full flex items-center justify-between p-3 hover:bg-muted/50 transition-colors text-left">
+                            <div className="flex items-center gap-3">
+                              <div className="w-8 h-8 rounded-full bg-primary/10 flex items-center justify-center flex-shrink-0">
+                                <Icon className="w-4 h-4 text-primary" />
+                              </div>
+                              <span className="font-medium">{industry.label}</span>
+                              {selectedCount > 0 && (
+                                <Badge variant="default" className="text-xs">{selectedCount} selected</Badge>
+                              )}
+                            </div>
+                            <ChevronDown className="w-4 h-4 text-muted-foreground shrink-0 transition-transform duration-200 group-data-[state=open]:rotate-180" />
+                          </CollapsibleTrigger>
+                          <CollapsibleContent>
+                            <div className="border-t bg-muted/20 p-2 space-y-1">
+                              {industry.roles.map((role) => {
+                                const checked = editSkillsets.includes(role.id);
+                                return (
+                                  <div
+                                    key={role.id}
+                                    className={cn(
+                                      "flex items-start space-x-3 p-2 rounded-md transition-colors cursor-pointer",
+                                      checked ? "bg-primary/10" : "hover:bg-muted/50"
+                                    )}
+                                    onClick={() => toggleSkillset(role.id)}
+                                  >
+                                    <Checkbox
+                                      id={`skill-${role.id}`}
+                                      checked={checked}
+                                      onCheckedChange={() => toggleSkillset(role.id)}
+                                      className="mt-0.5"
+                                    />
+                                    <label htmlFor={`skill-${role.id}`} className="flex-1 cursor-pointer text-sm font-medium">
+                                      {role.label}
+                                      {role.isElite && (
+                                        <Badge variant="secondary" className="text-xs ml-2">Certified</Badge>
+                                      )}
+                                    </label>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          </CollapsibleContent>
+                        </div>
+                      </Collapsible>
+                    );
+                  })}
                 </div>
               </div>
 
@@ -5371,35 +6988,17 @@ function TeammateSettingsPopup({
               </div>
             </TabsContent>
 
-            {/* Location Tab */}
+            {/* Location Tab — worker's home/address (editable) + map with address pin and current geolocation pin when available */}
             <TabsContent value="location" className="space-y-4 mt-0">
-              <div className="bg-muted/30 rounded-lg p-3 border border-border/50">
-                <p className="text-xs text-muted-foreground">
-                  Job location: <strong>{job.city}, {job.state}</strong>
-                  {job.latitude && job.longitude && selectedTeammate?.latitude && selectedTeammate?.longitude && (() => {
-                    const distance = calculateDistance(
-                      parseFloat(selectedTeammate.latitude),
-                      parseFloat(selectedTeammate.longitude),
-                      parseFloat(job.latitude),
-                      parseFloat(job.longitude)
-                    );
-                    return (
-                      <span className="ml-2 font-semibold text-primary">
-                        ({distance.toFixed(1)} mi away)
-                      </span>
-                    );
-                  })()}
-                </p>
-              </div>
-
               <div className="space-y-3">
                 <div>
-                  <Label className="text-sm font-semibold">Address</Label>
+                  <Label className="text-sm font-semibold">{selectedTeammate ? `${selectedTeammate.firstName}'s address` : "Address"}</Label>
+                  <p className="text-xs text-muted-foreground mt-0.5">
+                    Used for distance to jobs and the map pin. Save to update.
+                  </p>
                   <GooglePlacesAutocomplete
                     value={editAddress}
-                    onChange={(address, components) => {
-                      setEditAddress(address);
-                    }}
+                    onChange={(address) => setEditAddress(address)}
                     onPlaceSelect={(place) => {
                       setEditAddress(place.formattedAddress || place.displayName?.text || editAddress);
                       if (place.location?.latitude && place.location?.longitude) {
@@ -5407,25 +7006,46 @@ function TeammateSettingsPopup({
                         setEditLongitude(place.location.longitude.toString());
                       }
                     }}
-                    placeholder="Enter address..."
+                    placeholder="Enter home or work address..."
                     className="mt-1.5"
                   />
-                  <p className="text-xs text-muted-foreground mt-1.5">
-                    Used to calculate drive time to jobs
-                  </p>
                 </div>
 
-                {editLatitude && editLongitude && (
+                {(() => {
+                  const cityState = selectedTeammate
+                    ? `${(selectedTeammate as any).city || ""}, ${(selectedTeammate as any).state || ""}`.replace(new RegExp("^, |, $", "g"), "")
+                    : "";
+                  const mapPartialAddress = editAddress || (cityState || undefined);
+                  return (editLatitude && editLongitude) || (workerLocation?.lat != null && workerLocation?.lng != null) ? (
                   <div className="rounded-lg overflow-hidden border border-border">
                     <MiniJobMap
                       job={{
                         id: 0,
-                        lat: parseFloat(editLatitude),
-                        lng: parseFloat(editLongitude),
-                        title: `${selectedTeammate?.firstName}'s Location`,
+                        lat: editLatitude && editLongitude ? parseFloat(editLatitude) : workerLocation!.lat,
+                        lng: editLatitude && editLongitude ? parseFloat(editLongitude) : workerLocation!.lng,
+                        title: selectedTeammate ? `${selectedTeammate.firstName}'s address` : "Address",
                       }}
                       height="200px"
+                      partialAddress={mapPartialAddress}
+                      personLocations={
+                        editLatitude && editLongitude && workerLocation?.lat != null && workerLocation?.lng != null
+                          ? [{ id: "current", lat: workerLocation.lat, lng: workerLocation.lng, name: t("currentLocation") || "Current location", type: "worker" as const }]
+                          : []
+                      }
                     />
+                  </div>
+                ) : (
+                  <div className="rounded-lg border border-dashed border-border bg-muted/30 flex items-center justify-center text-muted-foreground text-sm" style={{ height: "200px" }}>
+                    <span>Enter an address above or enable location to see the map</span>
+                  </div>
+                );
+                })()}
+
+                {job.latitude && job.longitude && editLatitude && editLongitude && (
+                  <div className="bg-muted/30 rounded-lg p-3 border border-border/50">
+                    <p className="text-xs text-muted-foreground">
+                      Distance to this job: <strong className="text-primary">{calculateDistance(parseFloat(editLatitude), parseFloat(editLongitude), parseFloat(job.latitude), parseFloat(job.longitude)).toFixed(1)} mi</strong>
+                    </p>
                   </div>
                 )}
               </div>
@@ -5453,18 +7073,15 @@ function TeammateSettingsPopup({
                   </div>
                 </div>
 
-                <Slider
-                  value={[editHourlyRate]}
-                  onValueChange={([value]) => setEditHourlyRate(value)}
-                  min={15}
-                  max={150}
-                  step={0.50}
+                <RateSlider
+                  value={Math.round(editHourlyRate)}
+                  onValueChange={(value) => setEditHourlyRate(value)}
                   className="mt-2"
                 />
 
                 <div className="flex items-center justify-between text-xs text-muted-foreground">
-                  <span>$15/hr</span>
-                  <span>$150/hr</span>
+                  <span>$1/hr</span>
+                  <span>$200/hr</span>
                 </div>
               </div>
 
@@ -5486,6 +7103,7 @@ export function EnhancedJobDialog({
   onOpenChange,
   job,
   profile,
+  operatorAvatarUrl,
   activeTeamMembers = [],
   workerLocation,
   onOpenApply,
@@ -5497,53 +7115,43 @@ export function EnhancedJobDialog({
   onGetDirections,
   onAssignTeamMember,
   isWithdrawing = false,
+  initialApplyStage,
+  territoryRadiusMiles,
 }: EnhancedJobDialogProps) {
   const isMobile = useIsMobile();
   
   if (!job) return null;
   
-  // Application view mode - show status-specific content
-  if (application) {
-    return (
-      <ApplicationViewDialog
-        open={open}
-        onOpenChange={onOpenChange}
-        job={job}
-        profile={profile}
-        activeTeamMembers={activeTeamMembers}
-        application={application}
-        groupedApplications={groupedApplications}
-        onWithdraw={onWithdraw}
-        onWithdrawAll={onWithdrawAll}
-        onGetDirections={onGetDirections}
-        onAssignTeamMember={onAssignTeamMember}
-        isWithdrawing={isWithdrawing}
-        isMobile={isMobile}
-        workerLocation={workerLocation}
-      />
-    );
-  }
-  
   const handleOpenApply = (j: Job) => {
     if (onOpenApply) onOpenApply(j);
   };
   
-  // Apply mode - original behavior
+  // Same Dialog/Drawer + JobContent for both opportunity and application view (application view = 1:1 content with Withdraw footer)
   if (isMobile) {
     return (
       <Drawer open={open} onOpenChange={onOpenChange}>
         <DrawerContent className="h-[100dvh] max-h-[100dvh] rounded-t-none">
-          <DrawerTitle className="sr-only">{job.title}</DrawerTitle>
+          <DrawerTitle className="sr-only">{getDisplayJobTitle(job)}</DrawerTitle>
           <DrawerDescription className="sr-only">View job details and apply</DrawerDescription>
           <JobContent
             job={job}
             profile={profile ?? null}
-            activeTeamMembers={activeTeamMembers}
+            activeTeamMembers={activeTeamMembers ?? []}
             workerLocation={workerLocation}
             onOpenApply={handleOpenApply}
             onDismiss={onDismiss}
             onClose={() => onOpenChange(false)}
             isMobile={true}
+            initialApplyStage={initialApplyStage}
+            application={application ?? null}
+            groupedApplications={groupedApplications ?? null}
+            onWithdraw={onWithdraw}
+            onWithdrawAll={onWithdrawAll}
+            isWithdrawing={isWithdrawing}
+            onAssignTeamMember={onAssignTeamMember}
+            onGetDirections={onGetDirections}
+            operatorAvatarUrl={operatorAvatarUrl}
+            territoryRadiusMiles={territoryRadiusMiles}
           />
         </DrawerContent>
       </Drawer>
@@ -5553,18 +7161,28 @@ export function EnhancedJobDialog({
   return (
     <>
       <Dialog open={open} onOpenChange={onOpenChange}>
-        <DialogContent className="max-w-2xl p-0 rounded-2xl overflow-hidden shadow-2xl border-0">
-          <DialogTitle className="sr-only">{job.title}</DialogTitle>
+        <DialogContent className="max-w-2xl p-0 rounded-2xl overflow-hidden shadow-2xl border-0 flex flex-col max-h-[90vh] w-full">
+          <DialogTitle className="sr-only">{getDisplayJobTitle(job)}</DialogTitle>
           <DialogDescription className="sr-only">View job details and apply</DialogDescription>
           <JobContent
             job={job}
             profile={profile ?? null}
-            activeTeamMembers={activeTeamMembers}
+            activeTeamMembers={activeTeamMembers ?? []}
             workerLocation={workerLocation}
             onOpenApply={handleOpenApply}
             onDismiss={onDismiss}
             onClose={() => onOpenChange(false)}
             isMobile={false}
+            initialApplyStage={initialApplyStage}
+            application={application ?? null}
+            groupedApplications={groupedApplications ?? null}
+            onWithdraw={onWithdraw}
+            onWithdrawAll={onWithdrawAll}
+            isWithdrawing={isWithdrawing}
+            onAssignTeamMember={onAssignTeamMember}
+            onGetDirections={onGetDirections}
+            operatorAvatarUrl={operatorAvatarUrl}
+            territoryRadiusMiles={territoryRadiusMiles}
           />
         </DialogContent>
       </Dialog>

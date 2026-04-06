@@ -5,7 +5,6 @@
  */
 
 import { useState, useCallback, useMemo, useEffect } from "react";
-import ReactDOM from "react-dom";
 import { useLocation } from "wouter";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { apiRequest } from "@/lib/queryClient";
@@ -13,6 +12,7 @@ import { Button } from "@/components/ui/button";
 import {
   MapPin,
   Clock,
+  CalendarDays,
   Loader2,
   ChevronDown,
   CheckCircle,
@@ -22,12 +22,20 @@ import {
   ChevronLeft,
   ChevronRight,
   User,
+  Info,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { useToast } from "@/hooks/use-toast";
-import { useIsMobile } from "@/hooks/use-mobile";
 import { cn } from "@/lib/utils";
 import { isWorkerOnboardingComplete } from "@/lib/worker-onboarding";
+import { displayJobTitle } from "@/lib/job-display";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogDescription,
+  DialogTitle,
+} from "@/components/ui/dialog";
 
 // --- Clock-in prompt types and helpers (from ClockInPromptBanner) ---
 interface ClockInPromptJob {
@@ -36,6 +44,7 @@ interface ClockInPromptJob {
   location?: string;
   jobStartTime: string;
 }
+
 function formatElapsed(startIso: string): string {
   const start = new Date(startIso).getTime();
   const now = Date.now();
@@ -48,12 +57,26 @@ function formatElapsed(startIso: string): string {
   return [h, m, s].map((n) => String(n).padStart(2, "0")).join(":");
 }
 
+/** Live-updating elapsed time from startIso (updates every second). */
+function useElapsed(startIso: string | undefined): string {
+  const [elapsed, setElapsed] = useState(() => (startIso ? formatElapsed(startIso) : "00:00:00"));
+  useEffect(() => {
+    if (!startIso) return;
+    setElapsed(formatElapsed(startIso));
+    const t = setInterval(() => setElapsed(formatElapsed(startIso)), 1000);
+    return () => clearInterval(t);
+  }, [startIso]);
+  return elapsed;
+}
+
 // --- Active timesheet (from ClockedInGlobalBanner) ---
 interface ActiveTimesheet {
   id: number;
+  workerId?: number;
   jobId: number;
   clockInTime: string;
   jobTitle?: string;
+  jobTrade?: string;
   jobLocation?: string;
 }
 
@@ -88,7 +111,6 @@ export function CombinedGlobalBanners({
   const { t } = useTranslation();
   const { toast } = useToast();
   const queryClient = useQueryClient();
-  const isMobile = useIsMobile();
   const [popupOpen, setPopupOpen] = useState(false);
   const [stepIndex, setStepIndex] = useState(0);
   const [isClockingIn, setIsClockingIn] = useState(false);
@@ -117,6 +139,7 @@ export function CombinedGlobalBanners({
       const res = await fetch("/api/worker/clock-in-prompt-jobs", {
         credentials: "include",
       });
+      if (res.status === 401) return [];
       if (!res.ok) throw new Error("Failed to fetch");
       return res.json();
     },
@@ -129,6 +152,7 @@ export function CombinedGlobalBanners({
     enabled: enabled && isEmployee,
   });
 
+  const elapsedClockIn = useElapsed(activeTimesheet?.clockInTime);
   const [locationGranted, setLocationGranted] = useState<boolean | null>(null);
   useEffect(() => {
     if (typeof navigator === "undefined" || !navigator.permissions?.query) {
@@ -148,16 +172,18 @@ export function CombinedGlobalBanners({
     profile?.role === "worker" && profile != null && !isWorkerOnboardingComplete(profile as Parameters<typeof isWorkerOnboardingComplete>[0]);
 
   // Location-related steps (clocked-in, clock-in prompt) only after onboarding is complete.
+  // Only show clocked-in for the worker who is actually clocked in (not when a business operator is viewing a teammate's status).
   const steps = useMemo((): { id: GlobalBannerStepId; label: string }[] => {
     const s: { id: GlobalBannerStepId; label: string }[] = [];
     if (workerOnboardingRequired) s.push({ id: "worker-onboarding", label: "Complete your account" });
     if (!workerOnboardingRequired) {
-      if (activeTimesheet) s.push({ id: "clocked-in", label: t("banners.clockedIn") });
+      const isMyClockedIn = activeTimesheet && (activeTimesheet.workerId == null || activeTimesheet.workerId === profileId);
+      if (isMyClockedIn) s.push({ id: "clocked-in", label: t("banners.clockedIn") });
       if (clockInPromptActive) s.push({ id: "clock-in-prompt", label: t("worker.clockIn") });
     }
     if (businessOperatorStatus?.incomplete) s.push({ id: "business-operator", label: "Business operator setup" });
     return s;
-  }, [workerOnboardingRequired, activeTimesheet, clockInPromptActive, businessOperatorStatus?.incomplete, t]);
+  }, [workerOnboardingRequired, activeTimesheet, profileId, clockInPromptActive, businessOperatorStatus?.incomplete, t]);
 
   const singleBannerStep = steps.length === 1 ? steps[0] : null;
   const multiStep = steps.length >= 2;
@@ -283,6 +309,18 @@ export function CombinedGlobalBanners({
     setLocation("/worker-onboarding");
   }, [setLocation]);
 
+  const handleBannerClick = useCallback(() => {
+    if (currentStep.id === "worker-onboarding") {
+      toast({
+        title: "Complete your account",
+        description: "Taking you to account setup.",
+      });
+      openOnboarding();
+    } else {
+      openPopup();
+    }
+  }, [currentStep.id, openOnboarding, toast]);
+
   const renderStepContent = (step: { id: GlobalBannerStepId; label: string }) => {
     if (step.id === "worker-onboarding") {
       return (
@@ -298,14 +336,37 @@ export function CombinedGlobalBanners({
     }
     if (step.id === "clocked-in" && activeTimesheet) {
       const clockInTime = new Date(activeTimesheet.clockInTime).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
-      const jobTitle = activeTimesheet.jobTitle || "Job";
+      const jobTitle = displayJobTitle(activeTimesheet.jobTitle, activeTimesheet.jobTrade);
       return (
         <div className="space-y-4">
+          <div className="flex flex-wrap gap-2">
+            <span className="inline-flex items-center gap-1.5 rounded-md bg-muted/80 px-2.5 py-1 text-xs text-muted-foreground">
+              <Info className="w-3.5 h-3.5 shrink-0" aria-hidden />
+              {t("banners.clockOutAtLocation")}
+            </span>
+            <span className="inline-flex items-center gap-1.5 rounded-md bg-muted/80 px-2.5 py-1 text-xs text-muted-foreground">
+              <Info className="w-3.5 h-3.5 shrink-0" aria-hidden />
+              {t("banners.forBreaks")}
+            </span>
+          </div>
           <p className="text-sm text-muted-foreground">
             {jobTitle}
             {activeTimesheet.jobLocation && <span className="block text-muted-foreground text-sm mt-1">{activeTimesheet.jobLocation}</span>}
           </p>
           <p className="text-sm text-muted-foreground">{t("banners.since", { time: clockInTime })}</p>
+          <p className="text-sm font-medium tabular-nums">Time elapsed: {elapsedClockIn}</p>
+          <Button
+            variant="outline"
+            className="w-full"
+            onClick={() => {
+              setPopupOpen(false);
+              setLocation(`/dashboard/calendar?jobId=${activeTimesheet.jobId}`);
+            }}
+            data-testid="clocked-in-banner-open-calendar"
+          >
+            <CalendarDays className="w-4 h-4 mr-2" />
+            Open in calendar
+          </Button>
           <Button variant="destructive" className="w-full" onClick={clockOut} disabled={isClockingOut} data-testid="clocked-in-banner-clock-out">
             {isClockingOut ? <Loader2 className="w-4 h-4 animate-spin mr-2" /> : <Square className="w-4 h-4 mr-2" />}
             {t("worker.clockOut")}
@@ -322,7 +383,7 @@ export function CombinedGlobalBanners({
           {clockInJobs.map((job) => (
             <div key={job.id} className="flex items-center justify-between gap-3 p-3 rounded-lg border border-border hover:bg-muted/50">
               <div>
-                <p className="font-medium">{job.title}</p>
+                <p className="font-medium">{displayJobTitle(job.title)}</p>
                 {job.location && <p className="text-xs text-muted-foreground truncate">{job.location}</p>}
                 <p className="text-xs text-muted-foreground mt-1 tabular-nums">Elapsed: {formatElapsed(job.jobStartTime)}</p>
               </div>
@@ -359,9 +420,9 @@ export function CombinedGlobalBanners({
   const bannerLabel = currentStep.id === "worker-onboarding"
     ? "Complete your account"
     : currentStep.id === "clocked-in" && activeTimesheet
-    ? activeTimesheet.jobTitle || t("banners.clockedIn")
+    ? displayJobTitle(activeTimesheet.jobTitle, activeTimesheet.jobTrade)
     : currentStep.id === "clock-in-prompt" && clockInJobs.length > 0
-    ? (clockInJobs.length === 1 ? clockInJobs[0].title : `${clockInJobs.length} jobs — tap to clock in`)
+    ? (clockInJobs.length === 1 ? displayJobTitle(clockInJobs[0].title) : `${clockInJobs.length} jobs — tap to clock in`)
     : currentStep.label;
 
   const bannerBg = currentStep.id === "worker-onboarding"
@@ -387,7 +448,7 @@ export function CombinedGlobalBanners({
       <div className="fixed left-0 right-0 top-0 z-[60] shadow-md">
         <button
           type="button"
-          onClick={openPopup}
+          onClick={handleBannerClick}
           className={cn("w-full flex items-center justify-between gap-3 px-4 py-2.5 text-white transition-colors z-[60]", bannerBg)}
           data-testid="combined-global-banner"
           aria-label={multiStep ? `You have ${steps.length} items to address. Tap to open.` : undefined}
@@ -399,7 +460,7 @@ export function CombinedGlobalBanners({
                 {multiStep ? `${steps.length} items to address` : bannerLabel}
               </p>
               <p className="text-xs text-white/90 truncate">
-                {multiStep ? `Step ${stepIndex + 1} of ${steps.length}: ${currentStep.label}` : (currentStep.id === "clocked-in" && activeTimesheet ? t("banners.since", { time: new Date(activeTimesheet.clockInTime).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" }) }) : "Tap to open")}
+                {multiStep ? `Step ${stepIndex + 1} of ${steps.length}: ${currentStep.label}` : (currentStep.id === "clocked-in" && activeTimesheet ? `${t("banners.since", { time: new Date(activeTimesheet.clockInTime).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" }) })} · ${elapsedClockIn}` : "Tap to open")}
               </p>
             </div>
           </div>
@@ -407,11 +468,12 @@ export function CombinedGlobalBanners({
         </button>
       </div>
 
-      {popupOpen &&
-        typeof document !== "undefined" &&
-        ReactDOM.createPortal(
-          <CombinedBannersDrawerPortal
-            isMobile={isMobile}
+      <Dialog open={popupOpen} onOpenChange={setPopupOpen}>
+        <DialogContent className="max-w-lg w-[calc(100vw-2rem)]">
+          <DialogDescription className="sr-only">
+            Global banner details and actions.
+          </DialogDescription>
+          <CombinedBannersModalContent
             multiStep={multiStep}
             stepIndex={stepIndex}
             stepsLength={steps.length}
@@ -419,21 +481,19 @@ export function CombinedGlobalBanners({
             activeTimesheet={activeTimesheet}
             BannerIcon={BannerIcon}
             renderStepContent={renderStepContent}
-            onClose={() => setPopupOpen(false)}
             onBack={() => setStepIndex((i) => Math.max(0, i - 1))}
             onNext={() => setStepIndex((i) => Math.min(steps.length - 1, i + 1))}
-          />,
-          document.getElementById("dialog-container") ?? document.body
-        )}
+          />
+        </DialogContent>
+      </Dialog>
         </>
       )}
     </>
   );
 }
 
-/** Portal-based drawer (no Radix Dialog/Presence) to avoid "Maximum update depth exceeded". */
-function CombinedBannersDrawerPortal({
-  isMobile,
+/** Center-screen modal content for global banners (replaces right-side drawer). */
+function CombinedBannersModalContent({
   multiStep,
   stepIndex,
   stepsLength,
@@ -441,11 +501,9 @@ function CombinedBannersDrawerPortal({
   activeTimesheet,
   BannerIcon,
   renderStepContent,
-  onClose,
   onBack,
   onNext,
 }: {
-  isMobile: boolean;
   multiStep: boolean;
   stepIndex: number;
   stepsLength: number;
@@ -453,67 +511,41 @@ function CombinedBannersDrawerPortal({
   activeTimesheet: ActiveTimesheet | null;
   BannerIcon: typeof User;
   renderStepContent: (step: { id: GlobalBannerStepId; label: string }) => React.ReactNode;
-  onClose: () => void;
   onBack: () => void;
   onNext: () => void;
 }) {
-  useEffect(() => {
-    const prev = document.body.style.overflow;
-    document.body.style.overflow = "hidden";
-    return () => {
-      document.body.style.overflow = prev;
-    };
-  }, []);
+  const clockedInDisplayTitle =
+    currentStep.id === "clocked-in" && activeTimesheet
+      ? displayJobTitle(activeTimesheet.jobTitle, activeTimesheet.jobTrade)
+      : currentStep.label;
 
   return (
-    <div
-      className="fixed inset-0 z-[200] flex items-end sm:items-stretch sm:justify-end"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="combined-banners-drawer-title"
-      data-testid="combined-banners-drawer"
-    >
-      <div
-        className="fixed inset-0 bg-black/80"
-        aria-hidden
-        onClick={onClose}
-      />
-      <div
-        className={cn(
-          "relative z-[201] flex flex-col w-full sm:max-w-sm sm:w-3/4 h-[85vh] sm:h-full bg-background shadow-lg pointer-events-auto",
-          "rounded-t-2xl sm:rounded-none border-t sm:border-l border-border"
+    <>
+      <DialogHeader>
+        <DialogTitle id="combined-banners-modal-title" className="flex items-center gap-2 text-left">
+          <BannerIcon className="w-5 h-5 shrink-0" />
+          {multiStep ? `Step ${stepIndex + 1} of ${stepsLength}` : currentStep.label}
+        </DialogTitle>
+        <p className="text-sm text-muted-foreground text-left">
+          {multiStep ? clockedInDisplayTitle : clockedInDisplayTitle}
+        </p>
+      </DialogHeader>
+      <div className="mt-2">
+        {renderStepContent(currentStep)}
+        {multiStep && (
+          <div className="flex items-center justify-between gap-2 mt-6 pt-4 border-t">
+            <Button variant="outline" size="sm" onClick={onBack} disabled={stepIndex === 0}>
+              <ChevronLeft className="w-4 h-4 mr-1" /> Back
+            </Button>
+            <span className="text-sm text-muted-foreground">
+              {stepIndex + 1} / {stepsLength}
+            </span>
+            <Button variant="outline" size="sm" onClick={onNext} disabled={stepIndex === stepsLength - 1}>
+              Next <ChevronRight className="w-4 h-4 ml-1" />
+            </Button>
+          </div>
         )}
-      >
-          <div className="flex flex-col gap-4 p-4 overflow-y-auto flex-1">
-          <div className="flex items-start justify-between gap-2">
-            <div className="flex flex-col space-y-2 text-left min-w-0">
-              <h2 id="combined-banners-drawer-title" className="text-lg font-semibold leading-none tracking-tight flex items-center gap-2">
-                <BannerIcon className="w-5 h-5 shrink-0" />
-                {multiStep ? `Step ${stepIndex + 1} of ${stepsLength}` : currentStep.label}
-              </h2>
-              <p className="text-sm text-muted-foreground">
-                {multiStep ? currentStep.label : (currentStep.id === "clocked-in" && activeTimesheet ? activeTimesheet.jobTitle : currentStep.label)}
-              </p>
-            </div>
-          </div>
-          <div className="mt-2">
-            {renderStepContent(currentStep)}
-            {multiStep && (
-              <div className="flex items-center justify-between gap-2 mt-6 pt-4 border-t">
-                <Button variant="outline" size="sm" onClick={onBack} disabled={stepIndex === 0}>
-                  <ChevronLeft className="w-4 h-4 mr-1" /> Back
-                </Button>
-                <span className="text-sm text-muted-foreground">
-                  {stepIndex + 1} / {stepsLength}
-                </span>
-                <Button variant="outline" size="sm" onClick={onNext} disabled={stepIndex === stepsLength - 1}>
-                  Next <ChevronRight className="w-4 h-4 ml-1" />
-                </Button>
-              </div>
-            )}
-          </div>
-        </div>
       </div>
-    </div>
+    </>
   );
 }

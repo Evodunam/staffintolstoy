@@ -59,6 +59,7 @@ export enum StorageBucket {
   JOBS = "jobs",
   REVIEWS = "reviews",
   CHAT_ATTACHMENTS = "chats",
+  RECEIPTS = "receipts",
 }
 
 // S3 Object wrapper to maintain compatibility with existing code

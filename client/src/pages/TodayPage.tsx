@@ -1,8 +1,8 @@
-import { useState, useMemo, useEffect } from "react";
+import { useState, useMemo, useEffect, useRef } from "react";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { useLocation } from "wouter";
-import { format, parseISO, isToday, isTomorrow, isThisWeek, isThisMonth, startOfDay, addHours, differenceInMinutes, differenceInDays, isBefore, isAfter, startOfToday, startOfWeek, endOfWeek, endOfMonth, addDays } from "date-fns";
-import { ArrowLeft, Clock, MapPin, Navigation as NavigationIcon, MessageSquare, Play, Square, Loader2, Calendar, ChevronRight, ChevronLeft, User, Users, UserPlus, AlertCircle, CheckCircle2, Car, Search, Briefcase, Menu, Bell, Repeat, Zap, CalendarDays, Building2, Image as ImageIcon, DollarSign, Star, RefreshCw, LogOut } from "lucide-react";
+import { format, parseISO, isToday, isTomorrow, startOfDay, endOfDay, addHours, differenceInMinutes, differenceInDays, isBefore, isAfter, startOfToday, startOfWeek, endOfWeek, startOfMonth, endOfMonth, addDays } from "date-fns";
+import { ArrowLeft, Clock, MapPin, Navigation as NavigationIcon, MessageSquare, Play, Square, Loader2, Calendar, ChevronRight, ChevronLeft, User, Users, UserPlus, AlertCircle, CheckCircle2, Car, Search, Briefcase, Menu, Bell, Repeat, Zap, CalendarDays, Building2, Image as ImageIcon, DollarSign, Star, RefreshCw, LogOut, WifiOff, Wifi, MoreVertical, X } from "lucide-react";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { formatDistanceToNow } from "date-fns";
@@ -17,17 +17,85 @@ import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetDescription } from "
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Accordion, AccordionContent, AccordionItem, AccordionTrigger } from "@/components/ui/accordion";
 import { Separator } from "@/components/ui/separator";
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { TeammateSettingsDialog } from "@/components/TeammateSettingsDialog";
 import { useToast } from "@/hooks/use-toast";
 import { useIsMobile } from "@/hooks/use-mobile";
 import { useAuth } from "@/hooks/use-auth";
 import { useProfile } from "@/hooks/use-profiles";
+import { useOfflineWorker } from "@/hooks/use-offline-worker";
+import { getCachedAssignments } from "@/lib/offline-worker";
 import { apiRequest, queryClient } from "@/lib/queryClient";
-import { MiniJobMap } from "@/components/JobsMap";
+import { formatTime12h } from "@/lib/utils";
+import { fetchIpLocation, obtainLocationFromChain } from "@/lib/nativeLocationTracking";
+import { JobLocationMap, MiniJobMap } from "@/components/JobsMap";
+import type { PersonLocation } from "@/components/JobsMap";
 import type { Profile, Job, Application, Timesheet } from "@shared/schema";
 import { useTranslation } from "react-i18next";
+import { useTimesheetApprovalInvoice } from "@/contexts/TimesheetApprovalInvoiceContext";
+import { tryOpenTimesheetApprovalInvoiceFromNotification } from "@/lib/worker-timesheet-notification";
+import { getDisplayJobTitle } from "@/lib/job-display";
 
 type TimeFrame = "today" | "week" | "month";
+
+/** Lowercase full day name -> 0=Sunday … 6=Saturday */
+const DAY_NAME_TO_INDEX: Record<string, number> = {
+  sunday: 0,
+  monday: 1,
+  tuesday: 2,
+  wednesday: 3,
+  thursday: 4,
+  friday: 5,
+  saturday: 6,
+};
+
+/** Accepts "monday", "MON", "Mon", etc. → lowercase full name or null */
+function normalizeDayNameToken(raw: string): string | null {
+  const t = raw.trim().toLowerCase();
+  if (DAY_NAME_TO_INDEX[t] !== undefined) return t;
+  const abbrevs: Record<string, string> = {
+    sun: "sunday",
+    mon: "monday",
+    tue: "tuesday",
+    wed: "wednesday",
+    thu: "thursday",
+    fri: "friday",
+    sat: "saturday",
+  };
+  return abbrevs[t] ?? null;
+}
+
+/** Calendar key used by groupByDayOfWeek `groups` map */
+function dayTokenToCalendarName(token: string): string | null {
+  const n = normalizeDayNameToken(token);
+  if (!n) return null;
+  return n.charAt(0).toUpperCase() + n.slice(1);
+}
+
+function recurringHasOccurrenceInRange(job: Job, rangeStart: Date, rangeEnd: Date): boolean {
+  if (job.jobType !== "recurring" || !job.scheduleDays?.length) return false;
+  const jobStart = job.startDate ? startOfDay(new Date(job.startDate)) : null;
+  const jobEnd = job.endDate ? endOfDay(new Date(job.endDate)) : null;
+  let d = startOfDay(rangeStart);
+  const end = startOfDay(rangeEnd);
+  while (d <= end) {
+    const key = format(d, "EEEE").toLowerCase();
+    if (job.scheduleDays.some((sd) => normalizeDayNameToken(sd) === key)) {
+      const ds = startOfDay(d);
+      if ((!jobStart || ds >= jobStart) && (!jobEnd || ds <= jobEnd)) return true;
+    }
+    d = addDays(d, 1);
+  }
+  return false;
+}
+
+/** One-time / on_demand with dates: overlaps [rangeStart, rangeEnd] inclusive */
+function jobDateRangeOverlaps(job: Job, rangeStart: Date, rangeEnd: Date): boolean {
+  if (!job.startDate) return false;
+  const s = startOfDay(new Date(job.startDate));
+  const e = job.endDate ? endOfDay(new Date(job.endDate)) : s;
+  return s <= rangeEnd && e >= rangeStart;
+}
 
 interface JobAssignment {
   application: Application & { 
@@ -35,12 +103,14 @@ interface JobAssignment {
     teamMember?: { id: number; firstName: string; lastName: string; avatarUrl?: string | null } | null;
   };
   activeTimesheet?: Timesheet | null;
+  todayCompletedTimesheets?: Timesheet[];
   distanceFromJob?: number | null;
   isWithinGeofence?: boolean;
 }
 
 export default function TodayPage() {
   const [, setLocation] = useLocation();
+  const { openTimesheetApprovalInvoice } = useTimesheetApprovalInvoice();
   const { toast } = useToast();
   const isMobile = useIsMobile();
   const { user, logout, isLoggingOut } = useAuth();
@@ -72,8 +142,19 @@ export default function TodayPage() {
   const [scheduleInfoReturnTo, setScheduleInfoReturnTo] = useState<JobAssignment | null>(null);
   const [geofenceErrorReturnTo, setGeofenceErrorReturnTo] = useState<JobAssignment | null>(null);
   const [directionsReturnTo, setDirectionsReturnTo] = useState<JobAssignment | null>(null);
+  const [fleetMapJob, setFleetMapJob] = useState<Job | null>(null);
+  const [fleetMapReturnTo, setFleetMapReturnTo] = useState<JobAssignment | null>(null);
+  const [jobActionsSheetAssignment, setJobActionsSheetAssignment] = useState<JobAssignment | null>(null);
+  const [jobActionsReturnTo, setJobActionsReturnTo] = useState<JobAssignment | null>(null);
+  const jobActionsTransitionTimerRef = useRef<number | null>(null);
   const [reassignDialogJob, setReassignDialogJob] = useState<JobAssignment | null>(null);
   const [reassignDialogReturnTo, setReassignDialogReturnTo] = useState<JobAssignment | null>(null);
+  const [abandonJobFlowAssignment, setAbandonJobFlowAssignment] = useState<JobAssignment | null>(null);
+  const [showAbandonConfirmDialog, setShowAbandonConfirmDialog] = useState(false);
+  const [showAbandonFinalDialog, setShowAbandonFinalDialog] = useState(false);
+  const [abandonReason, setAbandonReason] = useState("");
+  const [abandonDetails, setAbandonDetails] = useState("");
+  const [abandonRiskAcknowledged, setAbandonRiskAcknowledged] = useState(false);
   const [futureJobDialog, setFutureJobDialog] = useState<Job | null>(null);
   const [locationError, setLocationError] = useState<{
     type: "permission" | "unavailable" | "timeout" | "unsupported";
@@ -90,65 +171,159 @@ export default function TodayPage() {
     return "browser";
   };
 
-  // Get location with fallbacks: high accuracy -> low accuracy -> error
+  // Get location with robust fallbacks:
+  // permission precheck -> high accuracy GPS -> low accuracy GPS -> shared chain utility -> direct IP chain -> cached last known -> error
   const getLocationWithFallback = (
-    onSuccess: (coords: { lat: number; lng: number }) => void,
-    onError: () => void
+    onSuccess: (coords: { lat: number; lng: number; isIpBased?: boolean }) => void,
+    onError: () => void,
+    options?: { showFailureDialog?: boolean }
   ) => {
-      if (!navigator.geolocation) {
-      setLocationError({
-        type: "unsupported",
-        message: t("locationServicesNotAvailable")
-      });
-      onError();
-      return;
-    }
+    const showFailureDialog = options?.showFailureDialog ?? true;
+    const LOCATION_CACHE_KEY = "today:last-known-location";
+    const saveLastKnownLocation = (lat: number, lng: number) => {
+      try {
+        localStorage.setItem(
+          LOCATION_CACHE_KEY,
+          JSON.stringify({ lat, lng, ts: Date.now() })
+        );
+      } catch {
+        // ignore cache write errors
+      }
+    };
+    const readLastKnownLocation = (): { lat: number; lng: number } | null => {
+      try {
+        const raw = localStorage.getItem(LOCATION_CACHE_KEY);
+        if (!raw) return null;
+        const parsed = JSON.parse(raw) as { lat?: number; lng?: number; ts?: number };
+        if (typeof parsed?.lat === "number" && typeof parsed?.lng === "number") {
+          // Keep cache only for 12h to avoid stale geofence checks.
+          if (typeof parsed.ts === "number" && Date.now() - parsed.ts > 12 * 60 * 60 * 1000) return null;
+          return { lat: parsed.lat, lng: parsed.lng };
+        }
+      } catch {
+        return null;
+      }
+      return null;
+    };
 
-    // First try: High accuracy with shorter timeout
-    navigator.geolocation.getCurrentPosition(
-      (position) => {
-        onSuccess({ lat: position.coords.latitude, lng: position.coords.longitude });
-      },
-      (error1) => {
-        console.log("High accuracy location failed, trying fallback...", error1.message);
-        
-        // Second try: Lower accuracy with longer timeout
+    const tryBrowserPosition = (
+      options: PositionOptions,
+      hardTimeoutMs: number
+    ): Promise<{ lat: number; lng: number } | null> => {
+      return new Promise((resolve) => {
+        if (!navigator.geolocation) {
+          resolve(null);
+          return;
+        }
+        let settled = false;
+        const finish = (value: { lat: number; lng: number } | null) => {
+          if (settled) return;
+          settled = true;
+          resolve(value);
+        };
+
+        const timeoutId = window.setTimeout(() => finish(null), hardTimeoutMs);
         navigator.geolocation.getCurrentPosition(
           (position) => {
-            onSuccess({ lat: position.coords.latitude, lng: position.coords.longitude });
+            window.clearTimeout(timeoutId);
+            finish({ lat: position.coords.latitude, lng: position.coords.longitude });
           },
-          (error2) => {
-            console.log("Fallback location also failed", error2.message);
-            
-            // Determine the error type for device-specific guidance
-            if (error2.code === error2.PERMISSION_DENIED) {
-              setLocationError({
-                type: "permission",
-                message: t("locationAccessDenied")
-              });
-            } else if (error2.code === error2.POSITION_UNAVAILABLE) {
-              setLocationError({
-                type: "unavailable",
-                message: t("unableToDetermineLocation")
-              });
-            } else if (error2.code === error2.TIMEOUT) {
-              setLocationError({
-                type: "timeout",
-                message: t("locationRequestTimedOut")
-              });
-            } else {
-              setLocationError({
-                type: "unavailable",
-                message: t("unableToGetLocation")
-              });
-            }
-            onError();
+          () => {
+            window.clearTimeout(timeoutId);
+            finish(null);
           },
-          { enableHighAccuracy: false, timeout: 20000, maximumAge: 60000 }
+          options
         );
-      },
-      { enableHighAccuracy: true, timeout: 10000, maximumAge: 30000 }
-    );
+      });
+    };
+
+    const completeSuccess = (coords: { lat: number; lng: number; isIpBased?: boolean }) => {
+      saveLastKnownLocation(coords.lat, coords.lng);
+      onSuccess(coords);
+    };
+
+    const failWithLocationError = (type: "permission" | "unavailable" | "timeout" | "unsupported", message: string) => {
+      if (showFailureDialog) {
+        setLocationError({ type, message });
+      }
+      onError();
+    };
+
+    void (async () => {
+      // 0) Fast permission pre-check: if denied, skip slow GPS retries and go straight to non-GPS fallbacks.
+      let permissionState: PermissionState | null = null;
+      try {
+        const query = (navigator as Navigator & { permissions?: PermissionStatus["constructor"] extends never ? never : any }).permissions?.query;
+        if (typeof query === "function") {
+          const status = await query({ name: "geolocation" as PermissionName });
+          permissionState = status?.state ?? null;
+        }
+      } catch {
+        // ignore permissions API support issues
+      }
+
+      // 1) Device GPS - high accuracy
+      if (permissionState !== "denied") {
+        const high = await tryBrowserPosition(
+          { enableHighAccuracy: true, timeout: 7000, maximumAge: 15000 },
+          8000
+        );
+        if (high) {
+          completeSuccess({ ...high, isIpBased: false });
+          return;
+        }
+
+        // 2) Device GPS - lower accuracy, larger window
+        const low = await tryBrowserPosition(
+          { enableHighAccuracy: false, timeout: 12000, maximumAge: 120000 },
+          13000
+        );
+        if (low) {
+          completeSuccess({ ...low, isIpBased: false });
+          return;
+        }
+      }
+
+      // 3) Shared chain helper (device hard-timeout + server IP chain: Google -> ipapi -> ip-api)
+      const chain = await obtainLocationFromChain();
+      if (chain) {
+        completeSuccess({
+          lat: chain.latitude,
+          lng: chain.longitude,
+          isIpBased: !chain.source.startsWith("device_"),
+        });
+        return;
+      }
+
+      // 4) Direct server IP fallback (explicit retry)
+      const ip = await fetchIpLocation();
+      if (ip) {
+        completeSuccess({ lat: ip.latitude, lng: ip.longitude, isIpBased: true });
+        return;
+      }
+
+      // 5) Last known location cache
+      const cached = readLastKnownLocation();
+      if (cached) {
+        completeSuccess({ ...cached, isIpBased: true });
+        toast({
+          title: "Using last known location",
+          description: "We could not get live GPS; using your recent saved location.",
+        });
+        return;
+      }
+
+      // 6) Final failure
+      if (!navigator.geolocation) {
+        failWithLocationError("unsupported", t("locationServicesNotAvailable"));
+        return;
+      }
+      if (permissionState === "denied") {
+        failWithLocationError("permission", t("locationAccessDenied"));
+        return;
+      }
+      failWithLocationError("timeout", t("locationRequestTimedOut"));
+    })();
   };
 
   // Reset media state when selected job changes
@@ -159,20 +334,79 @@ export default function TodayPage() {
 
   const { data: profile } = useProfile(user?.id);
 
+  // Offline: cache assignments, queue clock in/out, sync when back online
+  const {
+    isOnline,
+    cachedAssignments,
+    cacheAssignments,
+    pendingClockEvents,
+    addPendingClockIn,
+    addPendingClockOut,
+    syncPending,
+    isSyncing,
+    lastPendingClockInLocalId,
+    hasPendingClockedIn,
+    pendingClockedInJobId,
+    pendingClockInTime,
+    refreshPending,
+  } = useOfflineWorker(profile?.id);
+
+  // Dev only: simulate offline for testing (toggle in sticky bar)
+  const [devForceOffline, setDevForceOffline] = useState(false);
+  const isOnlineEffective = import.meta.env.DEV ? (isOnline && !devForceOffline) : isOnline;
+
   // Check if user is an employee (part of another business operator's team)
   const isEmployee = Boolean(profile?.teamId) || Boolean(user?.impersonation?.isEmployee);
 
-  const { data: assignments = [], isLoading } = useQuery<JobAssignment[]>({
+  const { data: assignmentsFromApi = [], isLoading } = useQuery<JobAssignment[]>({
     queryKey: ["/api/today/assignments"],
     queryFn: async () => {
       const res = await fetch("/api/today/assignments", { credentials: "include" });
       if (!res.ok) throw new Error("Failed to fetch assignments");
       return res.json();
     },
-    enabled: !!profile,
+    enabled: !!profile && isOnlineEffective,
+    staleTime: 30_000,
+    gcTime: 5 * 60_000,
   });
 
-  const { data: activeTimesheet } = useQuery<Timesheet | null>({
+  // When online and we have assignments, cache them for offline use (accepted jobs only)
+  useEffect(() => {
+    if (isOnlineEffective && assignmentsFromApi?.length) {
+      cacheAssignments(assignmentsFromApi);
+    }
+  }, [isOnlineEffective, assignmentsFromApi, cacheAssignments]);
+
+  // When coming back online, sync pending clock in/out to server (run once when transitioning online with pending events)
+  const wasOfflineRef = useRef(false);
+  useEffect(() => {
+    if (!isOnlineEffective) {
+      wasOfflineRef.current = true;
+      return;
+    }
+    if (!wasOfflineRef.current || !profile?.id || isSyncing || pendingClockEvents.length === 0) {
+      wasOfflineRef.current = false;
+      return;
+    }
+    wasOfflineRef.current = false;
+    syncPending().then(({ synced, errors }) => {
+      if (synced > 0) {
+        toast({ title: t("timesheetSynced"), description: t("timesheetSyncedDescription") });
+        queryClient.invalidateQueries({ queryKey: ["/api/today/assignments"] });
+        queryClient.invalidateQueries({ queryKey: ["/api/timesheets/active"] });
+      }
+      errors.forEach((msg) => toast({ title: t("error"), description: msg, variant: "destructive" }));
+    });
+  }, [isOnlineEffective, pendingClockEvents.length, profile?.id, isSyncing, syncPending, t, queryClient]);
+
+  // Offline (or dev simulate): use cache from storage; hook's cachedAssignments is only set when really offline, so read cache directly when effectively offline
+  const assignments = useMemo(() => {
+    if (isOnlineEffective) return assignmentsFromApi;
+    const cached = (getCachedAssignments() ?? cachedAssignments) as JobAssignment[] | null;
+    return cached ?? [];
+  }, [isOnlineEffective, assignmentsFromApi, cachedAssignments]);
+
+  const { data: activeTimesheetFromApi } = useQuery<Timesheet | null>({
     queryKey: ["/api/timesheets/active", profile?.id],
     queryFn: async () => {
       if (!profile?.id) return null;
@@ -200,6 +434,8 @@ export default function TodayPage() {
   const { data: allNotifications } = useQuery<any[]>({
     queryKey: ['/api/notifications', profile?.id],
     enabled: !!profile?.id,
+    staleTime: 60_000,
+    gcTime: 5 * 60_000,
   });
 
   // Filter notifications for team members - only show notifications for this specific team member
@@ -361,6 +597,103 @@ export default function TodayPage() {
     },
   });
 
+  const abandonJobMutation = useMutation({
+    mutationFn: async ({
+      applicationId,
+      reason,
+      details,
+      jobId,
+    }: {
+      applicationId: number;
+      reason: string;
+      details?: string;
+      jobId?: number;
+    }) => {
+      const res = await fetch(`/api/applications/${applicationId}/abandon`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ reason, details }),
+      });
+      if (res.status === 404) {
+        // Backward compatibility when server hot-reload hasn't picked up /abandon yet.
+        try {
+          if (jobId) {
+            const reasonLabelMap: Record<string, string> = {
+              emergency: "Emergency",
+              transportation: "Transportation issue",
+              schedule_conflict: "Schedule conflict",
+              safety_concern: "Safety concern",
+              rate_scope: "Rate/scope mismatch",
+              other: "Other",
+            };
+            const reasonLabel = reasonLabelMap[reason] || reason;
+            await fetch(`/api/jobs/${jobId}/messages`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              credentials: "include",
+              body: JSON.stringify({
+                content: `Worker abandonment notice: ${reasonLabel}${details ? ` — ${details}` : ""}`,
+                metadata: {
+                  type: "job_abandonment",
+                  reason,
+                  reasonLabel,
+                  details: details || null,
+                  abandonedAt: new Date().toISOString(),
+                },
+              }),
+            });
+          }
+        } catch {
+          // best-effort communication in fallback mode
+        }
+        const legacyDelete = await fetch(`/api/applications/${applicationId}`, {
+          method: "DELETE",
+          credentials: "include",
+        });
+        if (!legacyDelete.ok) {
+          const legacyErr = await legacyDelete.json().catch(() => ({}));
+          throw new Error(legacyErr?.message || "Failed to abandon job");
+        }
+        return { success: true, legacyFallback: true };
+      }
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data?.message || "Failed to abandon job");
+      }
+      return res.json();
+    },
+    onSuccess: (data: any) => {
+      queryClient.invalidateQueries({ queryKey: ["/api/today/assignments"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/timesheets/active"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/worker/clock-in-prompt-jobs"] });
+      const summary = data?.timesheetSummary;
+      const summaryText = summary
+        ? `${summary.pendingReviewCount || 0} pending, ${summary.approvedCount || 0} approved, ${summary.disputedCount || 0} disputed timesheets remain unchanged.`
+        : data?.legacyFallback
+          ? "Abandonment completed in compatibility mode."
+          : "Any existing timesheets remain unchanged and in normal review/payment flow.";
+      toast({
+        title: "Job abandoned",
+        description: `You have been removed from this assignment. ${summaryText}`,
+      });
+      setShowAbandonConfirmDialog(false);
+      setShowAbandonFinalDialog(false);
+      setAbandonJobFlowAssignment(null);
+      setAbandonReason("");
+      setAbandonDetails("");
+      setAbandonRiskAcknowledged(false);
+      setSelectedJob(null);
+    },
+    onError: (err: any) => {
+      toast({
+        title: t("error"),
+        description: err?.message || "Could not abandon this job.",
+        variant: "destructive",
+      });
+    },
+  });
+
   // Display name and avatar (for impersonation support)
   const displayAvatarUrl = user?.impersonation?.teamMember?.avatarUrl || profile?.avatarUrl;
   const displayName = {
@@ -368,28 +701,35 @@ export default function TodayPage() {
     lastName: user?.impersonation?.teamMember?.lastName || profile?.lastName,
   };
 
-  // Helper to filter assignments by time frame
-  // "today" includes: jobs with startDate <= today (in-progress), jobs starting today, or no start date
-  // "week" includes: jobs with startDate <= end of this week
-  // "month" includes: jobs with startDate <= end of this month
+  // Helper to filter assignments by time frame (must match groupByDayOfWeek / groupByDate placement)
   const filterByTimeFrame = (a: JobAssignment, frame: TimeFrame) => {
     const job = a.application.job;
-    // Jobs without start date always show in "today" view (on-demand ready to work)
+    // Jobs without start date: only "today" (on-demand / flexible)
     if (!job.startDate) return frame === "today";
-    
+
     const startDate = new Date(job.startDate);
     const today = startOfToday();
-    
+
     switch (frame) {
       case "today":
-        // Show jobs that are in-progress (started before today) OR starting today
+        // In-progress (started before today) OR starting today
         return isBefore(startDate, today) || isToday(startDate);
-      case "week":
-        // Show jobs starting within this week or already in progress
-        return isBefore(startDate, endOfWeek(today, { weekStartsOn: 0 })) || isThisWeek(startDate, { weekStartsOn: 0 });
-      case "month":
-        // Show jobs starting within this month or already in progress
-        return isBefore(startDate, endOfMonth(today)) || isThisMonth(startDate);
+      case "week": {
+        const ws = startOfWeek(today, { weekStartsOn: 0 });
+        const we = endOfWeek(today, { weekStartsOn: 0 });
+        if (job.jobType === "recurring" && job.scheduleDays?.length) {
+          return recurringHasOccurrenceInRange(job, ws, we);
+        }
+        return jobDateRangeOverlaps(job, ws, we);
+      }
+      case "month": {
+        const ms = startOfMonth(today);
+        const me = endOfMonth(today);
+        if (job.jobType === "recurring" && job.scheduleDays?.length) {
+          return recurringHasOccurrenceInRange(job, ms, me);
+        }
+        return jobDateRangeOverlaps(job, ms, me);
+      }
       default:
         return true;
     }
@@ -429,16 +769,27 @@ export default function TodayPage() {
   const weekCount = useMemo(() => roleFilteredAssignments.filter(a => filterByTimeFrame(a, "week")).length, [roleFilteredAssignments]);
   const monthCount = useMemo(() => roleFilteredAssignments.filter(a => filterByTimeFrame(a, "month")).length, [roleFilteredAssignments]);
 
-  // Find the currently clocked-in assignment
+  // Find the currently clocked-in assignment (API) or synthetic when offline with pending clock-in
   const clockedInAssignment = useMemo(() => {
-    return roleFilteredAssignments.find(a => 
+    const fromApi = roleFilteredAssignments.find(a =>
       a.activeTimesheet && !a.activeTimesheet.clockOutTime
-    ) || null;
-  }, [roleFilteredAssignments]);
+    );
+    if (fromApi) return fromApi;
+    if (!isOnlineEffective && hasPendingClockedIn && pendingClockedInJobId && pendingClockInTime) {
+      const assignment = roleFilteredAssignments.find(a => a.application.job.id === pendingClockedInJobId);
+      if (assignment)
+        return { ...assignment, activeTimesheet: { id: -1, clockInTime: pendingClockInTime, clockOutTime: null } as Timesheet };
+    }
+    return null;
+  }, [roleFilteredAssignments, isOnlineEffective, hasPendingClockedIn, pendingClockedInJobId, pendingClockInTime]);
+
+  const activeTimesheet = clockedInAssignment?.activeTimesheet ?? null;
 
   // Live duration timer for clocked-in jobs
   useEffect(() => {
-    if (!clockedInAssignment?.activeTimesheet?.clockInTime) {
+    // Only run the live timer when the clock-out sheet is visible.
+    // Avoids unnecessary full-page rerenders every second while browsing jobs.
+    if (!showClockOutSheet || !clockedInAssignment?.activeTimesheet?.clockInTime) {
       setClockedInDuration("");
       return;
     }
@@ -463,7 +814,7 @@ export default function TodayPage() {
     updateDuration();
     const interval = setInterval(updateDuration, 1000);
     return () => clearInterval(interval);
-  }, [clockedInAssignment?.activeTimesheet?.clockInTime]);
+  }, [showClockOutSheet, clockedInAssignment?.activeTimesheet?.clockInTime]);
 
   const filteredAssignments = useMemo(() => {
     if (!roleFilteredAssignments.length) return [];
@@ -620,8 +971,8 @@ export default function TodayPage() {
 
   // Auto clock-in/out based on geolocation with debouncing
   useEffect(() => {
-    if (!autoClockEnabled || !profile?.id || !navigator.geolocation) return;
-    
+    if (!autoClockEnabled || !profile?.id || !navigator.geolocation || !isOnlineEffective) return;
+
     // Get today's assignments that could be auto-clocked (only jobs with coordinates)
     const todayJobs = roleFilteredAssignments.filter(a => {
       const job = a.application.job;
@@ -700,7 +1051,9 @@ export default function TodayPage() {
 
     const id = navigator.geolocation.watchPosition(
       handlePositionUpdate,
-      (error) => console.log("Geolocation error:", error.message),
+      () => {
+        // Suppress noisy browser geolocation provider errors in production UI.
+      },
       { enableHighAccuracy: true, maximumAge: 30000, timeout: 30000 }
     );
     setWatcherId(id);
@@ -710,21 +1063,65 @@ export default function TodayPage() {
         navigator.geolocation.clearWatch(id);
       }
     };
-  }, [autoClockEnabled, profile?.id, roleFilteredAssignments, activeTimesheet, autoClockingJobId, lastAutoClockAction]);
+  }, [autoClockEnabled, profile?.id, roleFilteredAssignments, activeTimesheet, autoClockingJobId, lastAutoClockAction, isOnlineEffective]);
 
   const handleClockIn = async (assignment: JobAssignment) => {
     const job = assignment.application.job;
-    // For employees, use their own profile ID for clocking in
-    // The server will verify they have access to this job via the application
     const workerId = profile?.id;
     if (!workerId) return;
 
-    setClockingJobId(job.id);
+    // Offline: queue clock-in (with or without location). If GPS doesn't respond in 4s, clock in without location so user isn't stuck.
+    if (!isOnlineEffective) {
+      setClockingJobId(job.id);
+      let resolved = false;
+      const finish = (lat: number | null, lng: number | null, isIpBased?: boolean) => {
+        if (resolved) return;
+        resolved = true;
+        addPendingClockIn({
+          jobId: job.id,
+          workerId,
+          latitude: lat,
+          longitude: lng,
+          teamMemberId: assignment.application.teamMemberId ?? undefined,
+        });
+        refreshPending();
+        let description = lat != null && lng != null 
+          ? t("clockedInOfflineDescription") 
+          : (t("clockedInOfflineNoLocation") || "Location will be required when you're back online to approve this timesheet.");
+        if (isIpBased) {
+          description = (t("clockedInWithIpLocation") || "Clocked in using approximate location. Approval may be delayed until location is verified.");
+        }
+        toast({
+          title: t("clockedInOffline"),
+          description,
+        });
+        setClockingJobId(null);
+      };
+      const timeoutId = window.setTimeout(() => finish(null, null), 4000);
+      getLocationWithFallback(
+        (coords) => {
+          window.clearTimeout(timeoutId);
+          finish(coords.lat, coords.lng, coords.isIpBased);
+        },
+        () => {
+          window.clearTimeout(timeoutId);
+          finish(null, null);
+        }
+      );
+      return;
+    }
 
-    // Use location fallback system with device-specific error handling
+    setClockingJobId(job.id);
     getLocationWithFallback(
       (coords) => {
         setUserLocation(coords);
+        if (coords.isIpBased) {
+          toast({
+            title: t("clockedInWithIpLocationTitle") || "Clocked in with approximate location",
+            description: t("clockedInWithIpLocation") || "Using approximate location. Approval may be delayed until location is verified.",
+            variant: "default",
+          });
+        }
         clockInMutation.mutate({
           jobId: job.id,
           workerId,
@@ -734,31 +1131,35 @@ export default function TodayPage() {
       },
       () => {
         setClockingJobId(null);
-        // LocationError dialog will be shown by getLocationWithFallback
       }
     );
   };
 
   const handleClockOut = async (timesheetId: number) => {
-    setClockingJobId(timesheetId);
-
-    if (navigator.geolocation) {
-      navigator.geolocation.getCurrentPosition(
-        (position) => {
-          clockOutMutation.mutate({
-            timesheetId,
-            latitude: position.coords.latitude,
-            longitude: position.coords.longitude,
-          });
-        },
-        () => {
-          clockOutMutation.mutate({ timesheetId });
-        },
-        { enableHighAccuracy: true, timeout: 10000 }
-      );
-    } else {
-      clockOutMutation.mutate({ timesheetId });
+    // Offline: queue clock-out by pending clock-in localId
+    if (!isOnlineEffective && lastPendingClockInLocalId) {
+      addPendingClockOut(lastPendingClockInLocalId);
+      refreshPending();
+      toast({ title: t("clockedOutOffline"), description: t("clockedOutOfflineDescription") });
+      setShowClockOutSheet(false);
+      return;
     }
+
+    setClockingJobId(timesheetId);
+    getLocationWithFallback(
+      (coords) => {
+        clockOutMutation.mutate({
+          timesheetId,
+          latitude: coords.lat,
+          longitude: coords.lng,
+        });
+      },
+      () => {
+        // Clock-out should still proceed even if location chain fails.
+        clockOutMutation.mutate({ timesheetId });
+      },
+      { showFailureDialog: false }
+    );
   };
 
   // Calculate estimated drive time based on distance (assumes ~30mph average)
@@ -820,6 +1221,22 @@ export default function TodayPage() {
     }
   };
 
+  const openFleetMap = (job: Job, returnTo?: JobAssignment | null) => {
+    if (returnTo) {
+      setFleetMapReturnTo(returnTo);
+      setSelectedJob(null);
+    }
+    setFleetMapJob(job);
+  };
+
+  const closeFleetMap = (reopenParent = true) => {
+    setFleetMapJob(null);
+    if (reopenParent && fleetMapReturnTo) {
+      setSelectedJob(fleetMapReturnTo);
+    }
+    setFleetMapReturnTo(null);
+  };
+
   const openGoogleMaps = (job: Job) => {
     const destination = job.latitude && job.longitude
       ? `${job.latitude},${job.longitude}`
@@ -850,6 +1267,72 @@ export default function TodayPage() {
     setLocation(`/chats?job=${jobId}`);
   };
 
+  const openMobileJobActionsSheet = (assignment: JobAssignment) => {
+    if (jobActionsTransitionTimerRef.current) {
+      window.clearTimeout(jobActionsTransitionTimerRef.current);
+      jobActionsTransitionTimerRef.current = null;
+    }
+    setJobActionsReturnTo(assignment);
+    setSelectedJob(null);
+    // Let the first sheet start closing before opening the actions sheet.
+    jobActionsTransitionTimerRef.current = window.setTimeout(() => {
+      setJobActionsSheetAssignment(assignment);
+      jobActionsTransitionTimerRef.current = null;
+    }, 180);
+  };
+
+  const closeMobileJobActionsSheet = (restoreParent = true) => {
+    if (jobActionsTransitionTimerRef.current) {
+      window.clearTimeout(jobActionsTransitionTimerRef.current);
+      jobActionsTransitionTimerRef.current = null;
+    }
+    setJobActionsSheetAssignment(null);
+    if (restoreParent && jobActionsReturnTo) {
+      const returnTo = jobActionsReturnTo;
+      jobActionsTransitionTimerRef.current = window.setTimeout(() => {
+        setSelectedJob(returnTo);
+        jobActionsTransitionTimerRef.current = null;
+      }, 160);
+    }
+    setJobActionsReturnTo(null);
+  };
+
+  const handleAbandonFromActions = (assignment: JobAssignment) => {
+    const assignmentIsClockedIn = !!(assignment.activeTimesheet && !assignment.activeTimesheet.clockOutTime);
+    if (assignmentIsClockedIn) {
+      toast({
+        title: "Clock out first",
+        description: "You must clock out before abandoning this job.",
+        variant: "destructive",
+      });
+      return;
+    }
+    setAbandonJobFlowAssignment(assignment);
+    setAbandonReason("");
+    setAbandonDetails("");
+    setAbandonRiskAcknowledged(false);
+    const active = document.activeElement as HTMLElement | null;
+    if (active && typeof active.blur === "function") active.blur();
+    setShowAbandonConfirmDialog(true);
+  };
+
+  const handleReassignFromActions = (assignment: JobAssignment) => {
+    const jobToReassign = assignment;
+    const active = document.activeElement as HTMLElement | null;
+    if (active && typeof active.blur === "function") active.blur();
+    setReassignDialogReturnTo(jobToReassign);
+    setSelectedJob(null);
+    setTimeout(() => setReassignDialogJob(jobToReassign), 100);
+  };
+
+  useEffect(() => {
+    return () => {
+      if (jobActionsTransitionTimerRef.current) {
+        window.clearTimeout(jobActionsTransitionTimerRef.current);
+      }
+    };
+  }, []);
+
   // Get relative date label (Today, Tomorrow, or date)
   const getRelativeDateLabel = (date: Date): string => {
     const today = startOfToday();
@@ -865,40 +1348,28 @@ export default function TodayPage() {
     }
   };
 
-  // Format time from 24h string to 12h format (e.g., "17:00" -> "5pm", "08:30" -> "8:30am")
-  // Also handles legacy formats that already contain am/pm
+  // Format time from 24h string to 12h with " AM" / " PM" (e.g. "17:00" -> "5:00 PM", "08:30" -> "8:30 AM")
   const formatTimeString = (time: string | null | undefined): string => {
     if (!time) return "";
-    
-    // If already contains am/pm, it's a legacy format - return as-is
-    if (time.toLowerCase().includes('am') || time.toLowerCase().includes('pm')) {
-      return time;
+    const t = time.trim();
+    if (!t) return "";
+    if (t.toLowerCase().includes("am") || t.toLowerCase().includes("pm")) return t;
+    if (t.includes(" - ")) {
+      const [start, end] = t.split(" - ").map((s) => s.trim());
+      const start12 = start ? formatTime12h(start) : "";
+      const end12 = end ? formatTime12h(end) : "";
+      if (start12 && end12) return `${start12} - ${end12}`;
+      if (start12) return start12;
+      if (end12) return end12;
+      return t;
     }
-    
-    // If it contains " - ", it's a legacy time range - return as-is
-    if (time.includes(' - ')) {
-      return time;
-    }
-    
-    // Standard 24h format (HH:MM)
-    const parts = time.split(":").map(Number);
-    if (parts.length < 2 || isNaN(parts[0])) return time;
-    
-    const hours = parts[0];
-    const minutes = parts[1];
-    const ampm = hours >= 12 ? 'pm' : 'am';
-    const hour12 = hours % 12 || 12;
-    
-    // Skip minutes if they're :00
-    if (minutes === 0) {
-      return `${hour12}${ampm}`;
-    }
-    return `${hour12}:${minutes.toString().padStart(2, '0')}${ampm}`;
+    return formatTime12h(t);
   };
   
-  // Get time range string - always show actual times, never "Flexible"
+  // Get time range string - always show actual times, never "Flexible". If scheduledTime contains " - ", use only the start part to avoid duplicating end time.
   const getTimeRange = (job: Job): { startTime: string | null; endTime: string | null } => {
-    const startTime = job.scheduledTime ? formatTimeString(job.scheduledTime) : null;
+    const rawStart = job.scheduledTime ? formatTimeString(job.scheduledTime) : null;
+    const startTime = rawStart && rawStart.includes(" - ") ? rawStart.split(" - ").map((s) => s.trim())[0] || rawStart : rawStart;
     const endTime = job.endTime ? formatTimeString(job.endTime) : null;
     return { startTime, endTime };
   };
@@ -959,46 +1430,48 @@ export default function TodayPage() {
     return format(date, "EEE, MMM d");
   };
 
-  // Format job time info matching EnhancedJobDialog style exactly
-  const formatJobTime = (job: Job): { relative: string; timeRange: string; fullDate: string; scheduleDaysDisplay?: string } => {
+  // Format job time info - matches WorkerDashboard accepted card: "Feb 12 (in 6 days) Start 8am - 5pm"
+  const formatJobTime = (job: Job): { relative: string; timeRange: string; fullDate: string; scheduleDaysDisplay?: string; dateTimeLine?: string } => {
     if (!job.startDate) {
-      return { relative: t("onDemand"), timeRange: t("flexibleHours"), fullDate: t("flexibleSchedule") };
+      return { relative: t("onDemand"), timeRange: t("flexibleHours"), fullDate: t("flexibleSchedule"), dateTimeLine: t("onDemand") };
     }
     
     const startDate = parseISO(job.startDate.toString());
     const relative = getRelativeDay(startDate);
     const fullDate = format(startDate, "EEEE, MMMM d, yyyy");
+    const dateStr = format(startDate, "MMM d");
+    const datePart = relative ? `${dateStr} (${relative})` : dateStr;
     
     let timeRange = "";
     let scheduleDaysDisplay: string | undefined;
+    let dateTimeLine: string = datePart;
     
     const isOnDemand = job.isOnDemand || job.jobType === "on_demand";
     const isRecurring = job.jobType === "recurring";
     
-    // Helper to format time from date
+    // Helper to format time from date (12h with " AM" / " PM")
     const formatTimeFromDate = (d: Date) => {
-      const hours = d.getHours();
-      const minutes = d.getMinutes();
-      const ampm = hours >= 12 ? 'pm' : 'am';
-      const hour12 = hours % 12 || 12;
-      if (minutes === 0) {
-        return `${hour12}${ampm}`;
-      }
-      return `${hour12}:${minutes.toString().padStart(2, '0')}${ampm}`;
+      const h = d.getHours();
+      const m = d.getMinutes();
+      if (h === 0) return `12:${String(m).padStart(2, "0")} AM`;
+      if (h === 12) return `12:${String(m).padStart(2, "0")} PM`;
+      if (h < 12) return `${h}:${String(m).padStart(2, "0")} AM`;
+      return `${h - 12}:${String(m).padStart(2, "0")} PM`;
     };
     
     if (isOnDemand) {
       const startTime = job.scheduledTime ? formatTimeString(job.scheduledTime) : null;
       if (startTime) {
         timeRange = `Starting ${startTime}`;
+        dateTimeLine = `${datePart} Start ${startTime}`;
       } else if (startDate.getHours() !== 0 || startDate.getMinutes() !== 0) {
-        timeRange = `Starting ${formatTimeFromDate(startDate)}`;
+        const time = formatTimeFromDate(startDate);
+        timeRange = `Starting ${time}`;
+        dateTimeLine = `${datePart} Start ${time}`;
       } else {
         timeRange = t("flexibleHours");
       }
     } else if (isRecurring) {
-      // For recurring jobs, always show relative date first
-      // But also set scheduleDaysDisplay for additional context
       if (job.scheduleDays && job.scheduleDays.length > 0) {
         scheduleDaysDisplay = formatScheduleDays(job.scheduleDays);
       }
@@ -1006,33 +1479,38 @@ export default function TodayPage() {
       const endTime = job.endTime ? formatTimeString(job.endTime) : null;
       if (startTime && endTime) {
         timeRange = `${startTime} - ${endTime}`;
+        dateTimeLine = `${datePart} Start ${startTime} - ${endTime}`;
       } else if (startTime) {
         timeRange = startTime;
+        dateTimeLine = `${datePart} Start ${startTime}`;
       }
     } else {
-      // One-day job
       const startTime = job.scheduledTime ? formatTimeString(job.scheduledTime) : null;
       const endTime = job.endTime ? formatTimeString(job.endTime) : null;
       if (startTime && endTime) {
         timeRange = `${startTime} - ${endTime}`;
+        dateTimeLine = `${datePart} Start ${startTime} - ${endTime}`;
       } else if (startTime) {
         timeRange = startTime;
+        dateTimeLine = `${datePart} Start ${startTime}`;
       } else if (startDate.getHours() !== 0 || startDate.getMinutes() !== 0) {
-        // Legacy one-day jobs with start/end timestamps
         const time = formatTimeFromDate(startDate);
         if (job.endDate) {
           const endDate = new Date(job.endDate);
           timeRange = `${time} - ${formatTimeFromDate(endDate)}`;
+          dateTimeLine = `${datePart} Start ${timeRange}`;
         } else if (job.estimatedHours) {
           const endEstimate = new Date(startDate.getTime() + job.estimatedHours * 60 * 60 * 1000);
           timeRange = `${time} - ${formatTimeFromDate(endEstimate)}`;
+          dateTimeLine = `${datePart} Start ${timeRange}`;
         } else {
           timeRange = `Starting ${time}`;
+          dateTimeLine = `${datePart} Start ${time}`;
         }
       }
     }
     
-    return { relative, timeRange, fullDate, scheduleDaysDisplay };
+    return { relative, timeRange, fullDate, scheduleDaysDisplay, dateTimeLine };
   };
 
   const getTimeDisplay = (job: Job): string => {
@@ -1111,10 +1589,10 @@ export default function TodayPage() {
     
     return (
       <div className="space-y-0.5">
-        {/* Line 1: Relative date + time range in parentheses */}
+        {/* Line 1: Same format as WorkerDashboard accepted card — "Feb 12 (in 6 days) Start 8am - 5pm" */}
         <p className="font-semibold text-sm">
-          {timeInfo.relative}
-          {timeInfo.timeRange && (
+          {timeInfo.dateTimeLine ?? timeInfo.relative}
+          {!timeInfo.dateTimeLine && timeInfo.timeRange && (
             <span className="text-sm font-medium text-muted-foreground ml-1">
               ({timeInfo.timeRange})
             </span>
@@ -1316,7 +1794,10 @@ export default function TodayPage() {
   // Get full address string
   const getFullAddress = (job: Job): string => {
     const parts = [job.address, job.city, job.state, job.zipCode].filter(Boolean);
-    return parts.join(", ");
+    const address = parts.join(", ").trim();
+    if (address) return address;
+    const fallback = (job.location || (job as any).locationName || "").toString().trim();
+    return fallback || "Location to be provided";
   };
 
   const isAdmin = profile?.teamId === null && profile?.role === "worker";
@@ -1339,6 +1820,30 @@ export default function TodayPage() {
       if (isPM && hour !== 12) hour += 12;
       if (!isPM && hour === 12) hour = 0;
       return hour;
+    }
+    return null;
+  };
+
+  const parseTimeToMinutes = (timeStr: string | null | undefined): number | null => {
+    if (!timeStr) return null;
+    const s = timeStr.trim();
+    if (!s) return null;
+    if (!s.toLowerCase().includes("am") && !s.toLowerCase().includes("pm")) {
+      const parts = s.split(":").map((p) => parseInt(p, 10));
+      if (parts.length >= 1 && !Number.isNaN(parts[0])) {
+        const h = parts[0];
+        const m = !Number.isNaN(parts[1]) ? parts[1] : 0;
+        return h * 60 + m;
+      }
+    }
+    const m = s.match(/(\d+)(?::(\d+))?\s*(am|pm)/i);
+    if (m) {
+      let hour = parseInt(m[1], 10);
+      const min = parseInt(m[2] || "0", 10);
+      const isPM = m[3].toLowerCase() === "pm";
+      if (isPM && hour !== 12) hour += 12;
+      if (!isPM && hour === 12) hour = 0;
+      return hour * 60 + min;
     }
     return null;
   };
@@ -1372,58 +1877,50 @@ export default function TodayPage() {
   };
 
   // Group assignments by day of week (expands recurring jobs across scheduled days)
-  // Respects job.startDate - recurring jobs only appear on/after their start date
-  // For "This Week" view: shows jobs that will occur this week, including future starts
+  // Aligns with filterByTimeFrame("week"): overlap current week + recurring occurrences
   const groupByDayOfWeek = (assignments: JobAssignment[]): { days: Record<string, JobAssignment[]>; onDemand: JobAssignment[] } => {
     const groups: Record<string, JobAssignment[]> = {};
     const onDemand: JobAssignment[] = [];
     const dayOrder = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
-    dayOrder.forEach(day => { groups[day] = []; });
-    
+    dayOrder.forEach((day) => {
+      groups[day] = [];
+    });
+
     const today = startOfToday();
     const weekStart = startOfWeek(today, { weekStartsOn: 0 });
     const weekEnd = endOfWeek(today, { weekStartsOn: 0 });
-    
-    // Map day names to indices for date calculations
-    const dayNameToIndex: Record<string, number> = {
-      'sunday': 0, 'monday': 1, 'tuesday': 2, 'wednesday': 3,
-      'thursday': 4, 'friday': 5, 'saturday': 6
-    };
-    
-    assignments.forEach(assignment => {
+
+    assignments.forEach((assignment) => {
       const job = assignment.application.job;
       const isOnDemandJob = job.isOnDemand || job.jobType === "on_demand";
       const isRecurring = job.jobType === "recurring";
-      const jobStartDate = job.startDate ? new Date(job.startDate) : null;
-      
+      const jobStart = job.startDate ? startOfDay(new Date(job.startDate)) : null;
+      const jobEnd = job.endDate ? endOfDay(new Date(job.endDate)) : null;
+
       if (isOnDemandJob && !job.startDate) {
         onDemand.push(assignment);
       } else if (isRecurring && job.scheduleDays && job.scheduleDays.length > 0) {
-        // For recurring jobs, add to each day that:
-        // 1. Matches the schedule
-        // 2. Falls on or after the job's startDate (if specified)
-        // 3. Falls within this week
-        job.scheduleDays.forEach(scheduleDay => {
-          const normalizedDay = scheduleDay.charAt(0).toUpperCase() + scheduleDay.slice(1).toLowerCase();
-          const dayIndex = dayNameToIndex[scheduleDay.toLowerCase()];
-          
-          if (dayIndex !== undefined && groups[normalizedDay]) {
-            // Calculate the actual date for this day of the week
-            const dayDate = addDays(weekStart, dayIndex);
-            
-            // Only add if this day is >= startDate (or no startDate)
-            if (!jobStartDate || dayDate >= jobStartDate) {
-              groups[normalizedDay].push(assignment);
-            }
-          }
+        job.scheduleDays.forEach((scheduleDay) => {
+          const calName = dayTokenToCalendarName(scheduleDay);
+          const n = normalizeDayNameToken(scheduleDay);
+          if (!calName || !n || !groups[calName]) return;
+          const dayIndex = DAY_NAME_TO_INDEX[n];
+          const dayDate = startOfDay(addDays(weekStart, dayIndex));
+          if (dayDate < weekStart || dayDate > weekEnd) return;
+          if (jobStart && dayDate < jobStart) return;
+          if (jobEnd && dayDate > jobEnd) return;
+          groups[calName].push(assignment);
         });
       } else if (job.startDate) {
-        const date = new Date(job.startDate);
-        // Only include if job starts within this week
-        if (date >= weekStart && date <= weekEnd) {
-          const dayName = format(date, "EEEE");
-          if (groups[dayName]) {
-            groups[dayName].push(assignment);
+        const s = startOfDay(new Date(job.startDate));
+        const e = job.endDate ? endOfDay(new Date(job.endDate)) : s;
+        let d = s < weekStart ? weekStart : s;
+        const last = e > weekEnd ? weekEnd : e;
+        if (d <= last) {
+          while (d <= last) {
+            const dayName = format(d, "EEEE");
+            if (groups[dayName]) groups[dayName].push(assignment);
+            d = addDays(d, 1);
           }
         }
       } else {
@@ -1433,50 +1930,55 @@ export default function TodayPage() {
     return { days: groups, onDemand };
   };
 
-  // Group assignments by full date (expands recurring jobs)
+  // Group assignments by full date (expands recurring jobs) — full calendar month, not "from today only"
   const groupByDate = (assignments: JobAssignment[]): { dates: Record<string, JobAssignment[]>; onDemand: JobAssignment[] } => {
     const groups: Record<string, JobAssignment[]> = {};
     const onDemand: JobAssignment[] = [];
-    
+
     const today = startOfToday();
+    const monthStart = startOfMonth(today);
     const monthEnd = endOfMonth(today);
-    
-    assignments.forEach(assignment => {
+
+    assignments.forEach((assignment) => {
       const job = assignment.application.job;
       const isOnDemandJob = job.isOnDemand || job.jobType === "on_demand";
       const isRecurring = job.jobType === "recurring";
-      const jobStartDate = job.startDate ? new Date(job.startDate) : null;
-      
+      const jobStart = job.startDate ? startOfDay(new Date(job.startDate)) : null;
+      const jobEnd = job.endDate ? endOfDay(new Date(job.endDate)) : null;
+
       if (isOnDemandJob && !job.startDate) {
         onDemand.push(assignment);
       } else if (isRecurring && job.scheduleDays && job.scheduleDays.length > 0) {
-        // Expand recurring jobs across matching days in the month
-        // Respects job.startDate - only show from that date onwards
-        let startFrom = today;
-        if (jobStartDate && isAfter(jobStartDate, today)) {
-          startFrom = jobStartDate;
+        let startFrom = monthStart;
+        if (jobStart && isAfter(jobStart, monthStart)) {
+          startFrom = jobStart;
         }
-        
-        let currentDate = startFrom;
-        while (currentDate <= monthEnd) {
+        let currentDate = startOfDay(startFrom);
+        const endAt = monthEnd;
+        while (currentDate <= endAt) {
           const dayName = format(currentDate, "EEEE").toLowerCase();
-          if (job.scheduleDays.some(d => d.toLowerCase() === dayName)) {
-            const dateKey = format(currentDate, "yyyy-MM-dd");
-            if (!groups[dateKey]) {
-              groups[dateKey] = [];
+          if (job.scheduleDays.some((d) => normalizeDayNameToken(d) === dayName)) {
+            const ds = startOfDay(currentDate);
+            if ((!jobEnd || ds <= jobEnd)) {
+              const dateKey = format(currentDate, "yyyy-MM-dd");
+              if (!groups[dateKey]) groups[dateKey] = [];
+              groups[dateKey].push(assignment);
             }
-            groups[dateKey].push(assignment);
           }
-          currentDate = new Date(currentDate.getTime() + 24 * 60 * 60 * 1000);
+          currentDate = addDays(currentDate, 1);
         }
       } else if (job.startDate) {
-        const date = new Date(job.startDate);
-        if (date >= today && date <= monthEnd) {
-          const dateKey = format(date, "yyyy-MM-dd");
-          if (!groups[dateKey]) {
-            groups[dateKey] = [];
+        const s = startOfDay(new Date(job.startDate));
+        const e = job.endDate ? endOfDay(new Date(job.endDate)) : s;
+        let d = s < monthStart ? monthStart : s;
+        const last = e > monthEnd ? monthEnd : e;
+        if (d <= last) {
+          while (d <= last) {
+            const dateKey = format(d, "yyyy-MM-dd");
+            if (!groups[dateKey]) groups[dateKey] = [];
+            groups[dateKey].push(assignment);
+            d = addDays(d, 1);
           }
-          groups[dateKey].push(assignment);
         }
       } else {
         onDemand.push(assignment);
@@ -1486,7 +1988,7 @@ export default function TodayPage() {
   };
 
   // Timeline mini job card - compact version for timeline views (accessible button)
-  const TimelineJobChip = ({ assignment, onClick }: { assignment: JobAssignment; onClick: () => void }) => {
+  const TimelineJobChip = ({ assignment, onClick, className }: { assignment: JobAssignment; onClick: () => void; className?: string }) => {
     const job = assignment.application.job;
     const status = getJobStatus(assignment);
     const isClockedIn = assignment.activeTimesheet && !assignment.activeTimesheet.clockOutTime;
@@ -1520,10 +2022,10 @@ export default function TodayPage() {
             : status.isFuture 
               ? "bg-muted/50 border-muted-foreground/20 opacity-60" 
               : "bg-card border-border"
-        }`}
+        } ${className || ""}`}
         onClick={onClick}
         data-testid={`timeline-job-${job.id}`}
-        aria-label={`${t("viewDetails")} ${job.title}`}
+        aria-label={`${t("viewDetails")} ${getDisplayJobTitle(job)}`}
       >
         <div className="flex items-start gap-2.5">
           {/* Company Avatar with Worker Avatar Overlay */}
@@ -1550,7 +2052,7 @@ export default function TodayPage() {
           <div className="flex-1 min-w-0 space-y-0.5">
             {/* Title and Status */}
             <div className="flex items-center gap-1.5">
-              <span className="font-medium text-xs truncate flex-1">{job.title}</span>
+              <span className="font-medium text-xs truncate flex-1">{getDisplayJobTitle(job)}</span>
               <Badge className={`${status.color} text-white text-[10px] px-1.5 py-0 flex-shrink-0`}>
                 {status.label}
               </Badge>
@@ -1605,15 +2107,22 @@ export default function TodayPage() {
                   }
                   
                   const dateStr = format(startDate, "MMM d");
-                  const timeStr = startTime ? `${startTime}${endTime ? `-${endTime}` : ""}` : "";
-                  
-                  if (timeStr) {
-                    return `${timeStr} • ${dateStr} ${daysText}`;
-                  }
-                  return `${dateStr} ${daysText}`;
+                  const timeStr = startTime && endTime ? `${startTime} - ${endTime}` : (startTime || endTime || "");
+                  const recurringDaysStr = job.jobType === "recurring" && job.scheduleDays && job.scheduleDays.length > 0
+                    ? formatScheduleDays(job.scheduleDays)
+                    : "";
+                  const mainLine = timeStr ? `${timeStr} • ${dateStr} ${daysText}` : `${dateStr} ${daysText}`;
+                  if (recurringDaysStr) return `${recurringDaysStr} • ${mainLine}`;
+                  return mainLine;
                 })()}
               </span>
             </div>
+            {!isClockedIn && startTime && (
+              <div className="flex items-center gap-1 text-[10px] text-primary font-medium mt-0.5">
+                <Clock className="w-2.5 h-2.5 flex-shrink-0" />
+                {t("clockInAvailableAt", { time: startTime })}
+              </div>
+            )}
           </div>
         </div>
       </button>
@@ -1626,13 +2135,24 @@ export default function TodayPage() {
     const now = new Date();
     const currentHour = now.getHours();
     const todayDayName = format(now, "EEEE").toLowerCase();
+    const uniqueAssignments = useMemo(() => {
+      const seen = new Set<string>();
+      const deduped: JobAssignment[] = [];
+      for (const assignment of assignments) {
+        const key = `${assignment.application.id}:${assignment.application.teamMemberId ?? "self"}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        deduped.push(assignment);
+      }
+      return deduped;
+    }, [assignments]);
 
     // Separate active (clocked in), scheduled, and flexible/on-demand jobs
     const activeJobs: JobAssignment[] = [];
     const scheduledJobs: JobAssignment[] = [];
     const flexibleJobs: JobAssignment[] = [];
     
-    assignments.forEach(assignment => {
+    uniqueAssignments.forEach(assignment => {
       const job = assignment.application.job;
       const isOnDemand = job.isOnDemand || job.jobType === "on_demand";
       const isRecurring = job.jobType === "recurring";
@@ -1666,30 +2186,45 @@ export default function TodayPage() {
       }
     });
 
-    // Get jobs for each hour slot
-    const getJobsForHour = (hour: number): JobAssignment[] => {
-      return scheduledJobs.filter(assignment => {
-        const job = assignment.application.job;
-        const startHour = parseTimeToHour(job.scheduledTime);
-        const endHour = job.endTime ? parseTimeToHour(job.endTime) : null;
-        
-        if (startHour === null) return false;
-        
-        // If job spans multiple hours, show in all hours
-        if (endHour !== null && endHour > startHour) {
-          return hour >= startHour && hour < endHour;
-        }
-        return startHour === hour;
-      });
-    };
+    // Today's completed (clocked-out) shifts for "Completed" section
+    const completedTodayList = useMemo(() => {
+      return uniqueAssignments.flatMap(a => (a.todayCompletedTimesheets || []).map(ts => ({ assignment: a, timesheet: ts })))
+        .sort((a, b) => new Date((b.timesheet.clockOutTime as string)).getTime() - new Date((a.timesheet.clockOutTime as string)).getTime());
+    }, [uniqueAssignments]);
 
     // Only show hours that have jobs OR are work hours (6am-10pm) OR current hour
     const relevantHours = hours.filter(hour => {
-      const hasJobs = getJobsForHour(hour).length > 0;
+      const hasJobs = scheduledJobs.some((assignment) => {
+        const startHour = parseTimeToHour(assignment.application.job.scheduledTime);
+        return startHour === hour;
+      });
       const isWorkHour = hour >= 6 && hour <= 22;
       const isCurrent = hour === currentHour;
       return hasJobs || isWorkHour || isCurrent;
     });
+    const HOUR_ROW_HEIGHT = 44;
+
+    const scheduledBlocks = useMemo(() => {
+      return scheduledJobs
+        .map((assignment) => {
+          const job = assignment.application.job;
+          const startHour = parseTimeToHour(job.scheduledTime);
+          if (startHour === null) return null;
+
+          const parsedEnd = job.endTime ? parseTimeToHour(job.endTime) : null;
+          const endHour = parsedEnd != null && parsedEnd > startHour ? parsedEnd : startHour + 1;
+          const startIdx = relevantHours.indexOf(startHour);
+          if (startIdx === -1) return null;
+
+          const spanHours = relevantHours.filter((h) => h >= startHour && h < endHour).length;
+          return {
+            assignment,
+            startIdx,
+            durationSlots: Math.max(1, spanHours),
+          };
+        })
+        .filter((b): b is { assignment: JobAssignment; startIdx: number; durationSlots: number } => b != null);
+    }, [scheduledJobs, relevantHours]);
 
     const formatHourLabel = (hour: number): string => {
       if (hour === 0) return "12am";
@@ -1697,6 +2232,32 @@ export default function TodayPage() {
       if (hour < 12) return `${hour}am`;
       return `${hour - 12}pm`;
     };
+
+    // Next upcoming scheduled shift today (for "Next shift: Clock in at X" hero)
+    const nextScheduled = useMemo(() => {
+      if (scheduledJobs.length === 0) return null;
+      const now = new Date();
+      const currentHour = now.getHours();
+      const currentMinutes = now.getMinutes();
+      const sorted = [...scheduledJobs].sort((a, b) => {
+        const ha = parseTimeToHour(a.application.job.scheduledTime) ?? 24;
+        const hb = parseTimeToHour(b.application.job.scheduledTime) ?? 24;
+        return ha - hb;
+      });
+      const next = sorted.find(a => {
+        const h = parseTimeToHour(a.application.job.scheduledTime);
+        return h !== null && (h > currentHour || (h === currentHour && currentMinutes < 30));
+      });
+      return next ?? null;
+    }, [scheduledJobs]);
+
+    const nextShiftDisplayTime = nextScheduled?.application.job.scheduledTime
+      ? (() => {
+          const raw = nextScheduled.application.job.scheduledTime.split(" - ")[0]?.trim() || nextScheduled.application.job.scheduledTime;
+          if (/^\d{1,2}:\d{2}$/.test(raw)) return formatTime12h(raw);
+          return raw;
+        })()
+      : null;
 
     return (
       <div className="space-y-4">
@@ -1706,7 +2267,12 @@ export default function TodayPage() {
             {format(now, "EEEE, MMMM d")}
           </span>
         </div>
-        
+        {nextShiftDisplayTime && (
+          <div className="rounded-lg border border-primary/30 bg-primary/5 px-3 py-2 flex items-center gap-2">
+            <Clock className="w-4 h-4 text-primary flex-shrink-0" />
+            <span className="text-sm font-medium">{t("nextShiftClockInAt", { time: nextShiftDisplayTime })}</span>
+          </div>
+        )}
         {/* Active/In Progress Jobs Section - Always at top */}
         {activeJobs.length > 0 && (
           <div className="rounded-lg border border-green-300 dark:border-green-700 bg-green-50/50 dark:bg-green-950/30">
@@ -1755,54 +2321,121 @@ export default function TodayPage() {
           </div>
         )}
         
-        {/* Hourly Timeline */}
+        {/* Scheduled Jobs - by time */}
         {scheduledJobs.length > 0 && (
-          <div className="relative">
-            {relevantHours.map(hour => {
-              const jobsThisHour = getJobsForHour(hour);
-              const isCurrent = hour === currentHour;
-              
-              return (
-                <div 
-                  key={hour} 
-                  className={`flex items-stretch border-l-2 ${
-                    isCurrent 
-                      ? "border-primary bg-primary/5" 
-                      : "border-muted-foreground/20"
-                  }`}
-                >
-                  <div className={`w-14 flex-shrink-0 py-2 px-2 text-xs font-medium ${
-                    isCurrent ? "text-primary" : "text-muted-foreground"
-                  }`}>
-                    {formatHourLabel(hour)}
-                    {isCurrent && (
-                      <div className="w-2 h-2 bg-primary rounded-full mt-1" />
-                    )}
-                  </div>
-                  <div className="flex-1 py-1 pl-2 pr-1 min-h-[40px]">
-                    {jobsThisHour.length > 0 ? (
-                      <div className="space-y-1">
-                        {jobsThisHour.map(assignment => (
-                          <TimelineJobChip
-                            key={`hour-${hour}-${assignment.application.id}-${assignment.application.teamMemberId || 'self'}`}
-                            assignment={assignment}
-                            onClick={() => setSelectedJob(assignment)}
-                          />
-                        ))}
-                      </div>
-                    ) : (
+          <>
+            <div className="flex items-center gap-2 px-0 py-2 border-b border-border">
+              <Clock className="w-4 h-4 text-muted-foreground" />
+              <span className="text-xs font-bold uppercase tracking-wide text-muted-foreground">
+                {t("scheduledSection")}
+              </span>
+              <span className="text-xs text-muted-foreground ml-auto">
+                {t("jobCount", { count: scheduledJobs.length })}
+              </span>
+            </div>
+            <div className="relative">
+              {relevantHours.map(hour => {
+                const isCurrent = hour === currentHour;
+                
+                return (
+                  <div 
+                    key={hour} 
+                    className={`flex items-stretch border-l-2 ${
+                      isCurrent 
+                        ? "border-primary bg-primary/5" 
+                        : "border-muted-foreground/20"
+                    }`}
+                  >
+                    <div className={`w-14 flex-shrink-0 py-2 px-2 text-xs font-medium ${
+                      isCurrent ? "text-primary" : "text-muted-foreground"
+                    }`}>
+                      {formatHourLabel(hour)}
+                      {isCurrent && (
+                        <div className="w-2 h-2 bg-primary rounded-full mt-1" />
+                      )}
+                    </div>
+                    <div className="flex-1 py-1 pl-2 pr-1 min-h-[40px]">
                       <div className="h-full flex items-center">
                         <div className="h-px w-full bg-muted-foreground/10" />
                       </div>
-                    )}
+                    </div>
                   </div>
-                </div>
-              );
-            })}
+                );
+              })}
+              <div className="absolute inset-0 pointer-events-none">
+                {scheduledBlocks.map((block) => (
+                  <div
+                    key={`hour-block-${block.assignment.application.id}-${block.assignment.application.teamMemberId || "self"}-${block.startIdx}`}
+                    className="absolute pointer-events-auto"
+                    style={{
+                      top: block.startIdx * HOUR_ROW_HEIGHT + 2,
+                      left: 64,
+                      right: 4,
+                      height: Math.max(40, block.durationSlots * HOUR_ROW_HEIGHT - 4),
+                    }}
+                  >
+                    <TimelineJobChip
+                      assignment={block.assignment}
+                      onClick={() => setSelectedJob(block.assignment)}
+                      className="h-full"
+                    />
+                  </div>
+                ))}
+              </div>
+            </div>
+          </>
+        )}
+
+        {/* Completed today (clocked-out shifts) */}
+        {completedTodayList.length > 0 && (
+          <div className="rounded-lg border border-border bg-muted/30">
+            <div className="flex items-center gap-2 px-3 py-2 border-b border-border">
+              <CheckCircle2 className="w-4 h-4 text-muted-foreground" />
+              <span className="text-xs font-bold uppercase tracking-wide text-muted-foreground">
+                {t("completedSection")}
+              </span>
+              <span className="text-xs text-muted-foreground ml-auto">
+                {t("jobCount", { count: completedTodayList.length })}
+              </span>
+            </div>
+            <div className="p-2 space-y-1">
+              {completedTodayList.map(({ assignment, timesheet }) => {
+                const job = assignment.application.job;
+                const clockIn = timesheet.clockInTime ? format(new Date(timesheet.clockInTime), "h:mm a") : "";
+                const clockOut = timesheet.clockOutTime ? format(new Date(timesheet.clockOutTime), "h:mm a") : "";
+                const mins = timesheet.clockInTime && timesheet.clockOutTime
+                  ? differenceInMinutes(new Date(timesheet.clockOutTime), new Date(timesheet.clockInTime))
+                  : 0;
+                const durationStr = mins >= 60 ? `${Math.floor(mins / 60)}h ${mins % 60}m` : `${mins}m`;
+                const jobCompanyProfile = job.companyId ? companyProfiles[job.companyId] : null;
+                return (
+                  <button
+                    key={`completed-${timesheet.id}`}
+                    type="button"
+                    className="w-full text-left p-2.5 rounded-lg border border-border bg-card hover:bg-muted/50 transition-all flex items-center gap-2.5"
+                    onClick={() => setSelectedJob(assignment)}
+                    data-testid={`completed-timesheet-${timesheet.id}`}
+                  >
+                    <div className="flex-shrink-0 w-9 h-9 rounded-full bg-muted flex items-center justify-center">
+                      <CheckCircle2 className="w-4 h-4 text-muted-foreground" />
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <p className="text-xs font-medium truncate">{job.title}</p>
+                      <p className="text-[10px] text-muted-foreground">
+                        {clockIn && clockOut ? `${clockIn} – ${clockOut} · ${durationStr}` : durationStr}
+                      </p>
+                    </div>
+                    {jobCompanyProfile?.companyName && (
+                      <span className="text-[10px] text-muted-foreground truncate max-w-[80px]">{jobCompanyProfile.companyName}</span>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
           </div>
         )}
         
-        {scheduledJobs.length === 0 && flexibleJobs.length === 0 && (
+        {scheduledJobs.length === 0 && flexibleJobs.length === 0 && activeJobs.length === 0 && completedTodayList.length === 0 && (
           <div className="text-center py-8 text-muted-foreground">
             <Clock className="w-8 h-8 mx-auto mb-2 opacity-50" />
             <p className="text-sm">{t("noJobsScheduledForToday")}</p>
@@ -1822,6 +2455,47 @@ export default function TodayPage() {
     const getShortDay = (day: string): string => {
       return day.slice(0, 3);
     };
+
+    const hasAnyScheduled =
+      onDemand.length > 0 || dayOrder.some((d) => (groupedByDay[d]?.length ?? 0) > 0);
+
+    if (assignments.length === 0) {
+      return (
+        <div className="space-y-3">
+          <div className="flex items-center gap-2 mb-1">
+            <Calendar className="w-4 h-4 text-muted-foreground" />
+            <span className="text-sm font-medium text-muted-foreground">
+              {t("weekOf", { date: format(new Date(), "MMMM d") })}
+            </span>
+          </div>
+          <div className="text-center py-12 px-4 rounded-xl border border-dashed border-border bg-muted/20">
+            <Calendar className="w-10 h-10 mx-auto mb-3 opacity-40 text-muted-foreground" />
+            <p className="text-sm font-medium text-foreground">{t("noJobsScheduledWeek")}</p>
+            <p className="text-xs text-muted-foreground mt-1">{t("noJobsScheduled")}</p>
+          </div>
+        </div>
+      );
+    }
+
+    if (!hasAnyScheduled) {
+      return (
+        <div className="space-y-3">
+          <div className="flex items-center gap-2 mb-1">
+            <Calendar className="w-4 h-4 text-muted-foreground" />
+            <span className="text-sm font-medium text-muted-foreground">
+              {t("weekOf", { date: format(new Date(), "MMMM d") })}
+            </span>
+          </div>
+          <div className="text-center py-10 px-4 rounded-xl border border-dashed border-amber-200/80 dark:border-amber-900/50 bg-amber-50/30 dark:bg-amber-950/20">
+            <AlertCircle className="w-9 h-9 mx-auto mb-2 text-amber-600/80 dark:text-amber-400/80" />
+            <p className="text-sm font-medium">{t("noJobsScheduledWeek")}</p>
+            <p className="text-xs text-muted-foreground mt-1 max-w-sm mx-auto">
+              {t("noJobsScheduled")}
+            </p>
+          </div>
+        </div>
+      );
+    }
 
     return (
       <div className="space-y-3">
@@ -1935,6 +2609,44 @@ export default function TodayPage() {
       if (daysFromNow <= 6) return t("inDays", { days: daysFromNow });
       return null;
     };
+
+    const hasAnyScheduled = sortedDates.length > 0 || onDemand.length > 0;
+
+    if (assignments.length === 0) {
+      return (
+        <div className="space-y-4">
+          <div className="flex items-center gap-2 mb-1">
+            <CalendarDays className="w-4 h-4 text-muted-foreground" />
+            <span className="text-sm font-medium text-muted-foreground">
+              {format(new Date(), "MMMM yyyy")}
+            </span>
+          </div>
+          <div className="text-center py-12 px-4 rounded-xl border border-dashed border-border bg-muted/20">
+            <CalendarDays className="w-10 h-10 mx-auto mb-3 opacity-40 text-muted-foreground" />
+            <p className="text-sm font-medium text-foreground">{t("noJobsScheduledMonth")}</p>
+            <p className="text-xs text-muted-foreground mt-1">{t("noJobsScheduled")}</p>
+          </div>
+        </div>
+      );
+    }
+
+    if (!hasAnyScheduled) {
+      return (
+        <div className="space-y-4">
+          <div className="flex items-center gap-2 mb-1">
+            <CalendarDays className="w-4 h-4 text-muted-foreground" />
+            <span className="text-sm font-medium text-muted-foreground">
+              {format(new Date(), "MMMM yyyy")}
+            </span>
+          </div>
+          <div className="text-center py-10 px-4 rounded-xl border border-dashed border-amber-200/80 dark:border-amber-900/50 bg-amber-50/30 dark:bg-amber-950/20">
+            <AlertCircle className="w-9 h-9 mx-auto mb-2 text-amber-600/80 dark:text-amber-400/80" />
+            <p className="text-sm font-medium">{t("noJobsScheduledMonth")}</p>
+            <p className="text-xs text-muted-foreground mt-1 max-w-sm mx-auto">{t("noJobsScheduled")}</p>
+          </div>
+        </div>
+      );
+    }
 
     return (
       <div className="space-y-4">
@@ -2198,9 +2910,45 @@ export default function TodayPage() {
     const status = getJobStatus(selectedJob);
     const isClockedIn = selectedJob.activeTimesheet && !selectedJob.activeTimesheet.clockOutTime;
     const isClocking = clockingJobId === job.id || clockingJobId === selectedJob.activeTimesheet?.id;
+    // If operator is viewing a teammate's slot, find their own slot on this job so they can clock in
+    const assignmentsForThisJob = assignments.filter((a) => a.application.job.id === job.id);
+    const myClockInAssignment = assignmentsForThisJob.find((a) => canUserClockIn(a));
     const jobTypeInfo = getJobTypeInfo(job);
     const JobTypeIcon = jobTypeInfo.icon;
     const isFutureJob = status.isFuture;
+    const { startTime: detailStartTime, endTime: detailEndTime } = getTimeRange(job);
+
+    const lateClockInInfo = (() => {
+      if (isClockedIn) return null;
+      if (isFutureJob) return null;
+      if (!detailStartTime) return null;
+      if (!job.startDate) return null;
+      const startMinutes = parseTimeToMinutes(detailStartTime);
+      if (startMinutes == null) return null;
+
+      const now = new Date();
+      const startDateRaw = new Date(job.startDate);
+      if (Number.isNaN(startDateRaw.getTime())) return null;
+
+      let scheduledDate = new Date(startDateRaw);
+      if (job.jobType === "recurring" && job.scheduleDays?.length) {
+        const todayName = format(now, "EEEE").toLowerCase();
+        const startsToday = job.scheduleDays.some((d) => d.toLowerCase() === todayName);
+        if (startsToday && now >= startDateRaw) {
+          scheduledDate = new Date(now);
+        }
+      }
+
+      scheduledDate.setHours(0, 0, 0, 0);
+      scheduledDate.setMinutes(startMinutes);
+      if (now <= scheduledDate) return null;
+
+      const lateMinutes = Math.floor((now.getTime() - scheduledDate.getTime()) / (1000 * 60));
+      if (lateMinutes < 5) return null;
+      const hourly = (job.hourlyRate || 0) > 100 ? (job.hourlyRate || 0) / 100 : (job.hourlyRate || 0);
+      const missedPay = hourly > 0 ? (hourly * (lateMinutes / 60)) : 0;
+      return { lateMinutes, missedPay };
+    })();
 
     // Build media array from images and videos
     const allMedia: { type: "image" | "video"; url: string }[] = [];
@@ -2213,6 +2961,7 @@ export default function TodayPage() {
 
     // Check if job has map coordinates
     const hasMapLocation = (job as any).mapThumbnailUrl || (job.latitude && job.longitude);
+    const fullAddress = getFullAddress(job);
     
     // Calculate total hours worked from timesheets
     const totalHoursWorked = jobTimesheets.reduce((acc, ts) => {
@@ -2225,8 +2974,107 @@ export default function TodayPage() {
       return acc;
     }, 0);
     
+    const renderJobActionsMenu = (triggerClassName: string, iconClassName = "h-4 w-4") => {
+      const actionAssignment = selectedJob;
+      if (!actionAssignment) return null;
+      const actionJob = actionAssignment.application.job;
+      const actionIsClockedIn = !!(actionAssignment.activeTimesheet && !actionAssignment.activeTimesheet.clockOutTime);
+
+      if (isMobile) {
+        return (
+          <button
+            type="button"
+            className={triggerClassName}
+            data-testid="button-job-actions-menu"
+            aria-label="Job actions"
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={(e) => {
+              e.stopPropagation();
+              openMobileJobActionsSheet(actionAssignment);
+            }}
+          >
+            <MoreVertical className={iconClassName} />
+          </button>
+        );
+      }
+
+      return (
+      <DropdownMenu modal={false}>
+        <DropdownMenuTrigger asChild>
+          <button
+            type="button"
+            className={triggerClassName}
+            data-testid="button-job-actions-menu"
+            aria-label="Job actions"
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <MoreVertical className={iconClassName} />
+          </button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent
+          align="end"
+          sideOffset={6}
+          className="z-[12050]"
+          onInteractOutside={(e) => {
+            const target = e.target as HTMLElement | null;
+            if (target?.closest?.('[data-testid="button-job-actions-menu"]')) {
+              e.preventDefault();
+            }
+          }}
+        >
+          <DropdownMenuItem
+            onSelect={(e) => {
+              e.preventDefault();
+              if (actionIsClockedIn) {
+                toast({
+                  title: "Clock out first",
+                  description: "You must clock out before abandoning this job.",
+                  variant: "destructive",
+                });
+                return;
+              }
+              handleAbandonFromActions(actionAssignment);
+            }}
+          >
+            Abandon job
+          </DropdownMenuItem>
+          <DropdownMenuItem
+            onSelect={(e) => {
+              e.preventDefault();
+              goToChat(actionJob.id);
+            }}
+          >
+            Chat
+          </DropdownMenuItem>
+          <DropdownMenuItem
+            onSelect={(e) => {
+              e.preventDefault();
+              openDirections(actionJob, actionAssignment);
+            }}
+          >
+            Directions
+          </DropdownMenuItem>
+          {isAdmin && activeTeamMembers.length > 0 && (
+            <>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem
+                onSelect={(e) => {
+                  e.preventDefault();
+                  handleReassignFromActions(actionAssignment);
+                }}
+              >
+                Reassign
+              </DropdownMenuItem>
+            </>
+          )}
+        </DropdownMenuContent>
+      </DropdownMenu>
+      );
+    };
+
     const content = (
-      <>
+      <div className="flex flex-col">
         {/* Media Carousel */}
         {allMedia.length > 0 && (
           <div className="relative w-full aspect-video bg-muted overflow-hidden">
@@ -2286,10 +3134,12 @@ export default function TodayPage() {
           </div>
         )}
         
-        <div className="p-4 space-y-4">
+        <div className="p-4 space-y-4 flex flex-col">
           {/* Title and Status */}
           <div>
-            <h2 className="text-xl font-bold">{job.title}</h2>
+            <div className="flex items-start justify-between gap-2">
+              <h2 className="text-xl font-bold">{getDisplayJobTitle(job)}</h2>
+            </div>
             <div className="flex items-center gap-2 flex-wrap mt-2">
               <Badge className={`${status.color} text-white`}>{status.label}</Badge>
               <button 
@@ -2317,17 +3167,28 @@ export default function TodayPage() {
                   }}
                   data-testid="button-assigned-worker-badge"
                 >
-                  <Avatar className="w-4 h-4 mr-1">
-                    <AvatarImage src={selectedJob.application.teamMember?.avatarUrl || undefined} />
-                    <AvatarFallback className="text-[8px]">
-                      {selectedJob.application.teamMember 
-                        ? selectedJob.application.teamMember.firstName[0]
-                        : "Y"}
-                    </AvatarFallback>
-                  </Avatar>
-                  {selectedJob.application.teamMember 
-                    ? `${selectedJob.application.teamMember.firstName} ${selectedJob.application.teamMember.lastName}`
-                    : "Yourself"}
+                  {(() => {
+                    const assignee = selectedJob.application.teamMember ?? (profile ? {
+                      firstName: profile.firstName || "",
+                      lastName: profile.lastName || "",
+                      avatarUrl: profile.avatarUrl || undefined,
+                    } : null);
+                    const assigneeName = assignee
+                      ? `${assignee.firstName || ""} ${assignee.lastName || ""}`.trim()
+                      : "Assigned Worker";
+                    const assigneeInitial = assigneeName.charAt(0).toUpperCase() || "A";
+                    return (
+                      <>
+                        <Avatar className="w-4 h-4 mr-1">
+                          <AvatarImage src={assignee?.avatarUrl || undefined} />
+                          <AvatarFallback className="text-[8px]">
+                            {assigneeInitial}
+                          </AvatarFallback>
+                        </Avatar>
+                        {assigneeName}
+                      </>
+                    );
+                  })()}
                 </Badge>
               )}
               {!isAdmin && selectedJob.application.teamMember && (
@@ -2343,7 +3204,18 @@ export default function TodayPage() {
           <div className="space-y-3 text-sm">
             <div className="flex items-start gap-3 p-3 bg-secondary/50 rounded-lg">
               <Calendar className="w-5 h-5 text-muted-foreground flex-shrink-0 mt-0.5" />
-              <JobTimeDisplay job={job} showFullDate={true} />
+              <div className="space-y-1">
+                <JobTimeDisplay job={job} showFullDate={true} />
+                {(detailStartTime || detailEndTime) && (
+                  <p className="text-xs text-muted-foreground">
+                    {detailStartTime && detailEndTime
+                      ? `Start ${detailStartTime} - ${detailEndTime}`
+                      : detailStartTime
+                        ? `Start ${detailStartTime}`
+                        : `End ${detailEndTime}`}
+                  </p>
+                )}
+              </div>
             </div>
             <button
               type="button"
@@ -2353,7 +3225,7 @@ export default function TodayPage() {
             >
               <MapPin className="w-5 h-5 text-muted-foreground mt-0.5" />
               <div className="flex-1">
-                <span>{getFullAddress(job)}</span>
+                <span>{fullAddress}</span>
                 {jobDriveTimes[job.id] && (
                   <p className="text-xs text-primary mt-0.5 flex items-center gap-1">
                     <Car className="w-3 h-3" />
@@ -2367,7 +3239,12 @@ export default function TodayPage() {
 
           {/* Map View */}
           {hasMapLocation && (
-            <div className="rounded-xl overflow-hidden border">
+            <button
+              type="button"
+              className="w-full rounded-xl border p-[5px] text-left transition-colors hover:bg-secondary/30"
+              onClick={() => openFleetMap(job, selectedJob)}
+              data-testid="button-open-fleet-map"
+            >
               <MiniJobMap
                 job={{
                   id: job.id,
@@ -2379,9 +3256,9 @@ export default function TodayPage() {
                   city: job.city || undefined,
                   state: job.state || undefined,
                 }}
-                className="w-full h-40"
+                className="w-full h-40 rounded-lg overflow-hidden"
               />
-            </div>
+            </button>
           )}
 
           {/* Company Info Card */}
@@ -2557,8 +3434,8 @@ export default function TodayPage() {
             );
           })()}
 
-          {/* Action Buttons */}
-          <div className="flex flex-col gap-2 pt-2">
+          {/* Action Buttons (sticky footer) */}
+          <div className="sticky bottom-0 z-20 -mx-4 border-t bg-background/95 px-4 py-[5px] backdrop-blur supports-[backdrop-filter]:bg-background/80">
             {status.isFuture ? (
               <Button
                 variant="secondary"
@@ -2590,6 +3467,36 @@ export default function TodayPage() {
                 {isClocking ? <Loader2 className="w-4 h-4 animate-spin mr-2" /> : <Play className="w-4 h-4 mr-2" />}
                 {t("clockIn")}
               </Button>
+            ) : isAdmin && myClockInAssignment ? (
+              <>
+                <Button
+                  onClick={() => handleClockIn(myClockInAssignment)}
+                  disabled={isClocking || !!activeTimesheet}
+                  className="w-full h-12"
+                  data-testid="button-dialog-clock-in"
+                >
+                  {isClocking ? <Loader2 className="w-4 h-4 animate-spin mr-2" /> : <Play className="w-4 h-4 mr-2" />}
+                  {t("clockIn")}
+                </Button>
+                <Button
+                  variant="secondary"
+                  onClick={() => {
+                    const jobToReassign = selectedJob;
+                    setSelectedJob(null);
+                    setTimeout(() => setReassignDialogJob(jobToReassign), 100);
+                  }}
+                  className="w-full h-12"
+                  data-testid="button-dialog-reassign-worker"
+                >
+                  <Users className="w-4 h-4 mr-2" />
+                  {t("reassignToClockIn")}
+                </Button>
+                <p className="text-xs text-muted-foreground text-center">
+                  {selectedJob.application.teamMember 
+                    ? t("workerAssignedReassign", { firstName: selectedJob.application.teamMember.firstName, lastName: selectedJob.application.teamMember.lastName })
+                    : t("selectWorkerToClockIn")}
+                </p>
+              </>
             ) : isAdmin ? (
               <>
                 <Button
@@ -2624,7 +3531,7 @@ export default function TodayPage() {
               </Button>
             )}
 
-            <div className="flex gap-2">
+            <div className="flex gap-2 py-[5px]">
               <Button
                 variant={isFutureJob ? "secondary" : "outline"}
                 onClick={() => { if (!isFutureJob) openDirections(job); }}
@@ -2647,19 +3554,40 @@ export default function TodayPage() {
             </div>
           </div>
         </div>
-      </>
+      </div>
     );
     
     // Mobile: Bottom sheet, Desktop: Dialog
+    const closeSelectedJobDialog = () => {
+      setSelectedJob(null);
+      setCurrentMediaIndex(0);
+      setMediaLoaded(false);
+    };
+
     if (isMobile) {
       return (
-        <Sheet open={!!selectedJob} onOpenChange={() => { setSelectedJob(null); setCurrentMediaIndex(0); setMediaLoaded(false); }}>
-          <SheetContent side="bottom" className="rounded-t-xl p-0 h-[90vh] overflow-hidden">
+        <Sheet open={!!selectedJob} onOpenChange={(open) => { if (!open) closeSelectedJobDialog(); }}>
+          <SheetContent side="bottom" hideCloseButton className="rounded-t-xl p-0 max-h-[90vh] overflow-hidden">
             <SheetHeader className="sr-only">
               <SheetTitle>{job.title}</SheetTitle>
               <SheetDescription>{job.trade} - {getFullAddress(job)}</SheetDescription>
             </SheetHeader>
-            <ScrollArea className="h-full">
+            <div className="absolute right-4 top-4 z-30 flex items-center gap-1">
+              {renderJobActionsMenu(
+                "inline-flex h-8 w-8 items-center justify-center rounded-sm opacity-70 ring-offset-background transition-opacity hover:opacity-100 focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:pointer-events-none data-[state=open]:bg-secondary",
+                "h-4 w-4"
+              )}
+              <button
+                type="button"
+                onClick={closeSelectedJobDialog}
+                className="inline-flex h-8 w-8 items-center justify-center rounded-sm opacity-70 ring-offset-background transition-opacity hover:opacity-100 focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:pointer-events-none"
+                aria-label="Close"
+                data-testid="button-job-details-close-mobile"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+            <ScrollArea className="max-h-[90vh]">
               {content}
             </ScrollArea>
           </SheetContent>
@@ -2670,14 +3598,127 @@ export default function TodayPage() {
     return (
       <ResponsiveDialog
         open={!!selectedJob}
-        onOpenChange={() => { setSelectedJob(null); setCurrentMediaIndex(0); setMediaLoaded(false); }}
-        title={job.title}
+        onOpenChange={(open) => { if (!open) { setSelectedJob(null); setCurrentMediaIndex(0); setMediaLoaded(false); } }}
+        title={
+          <div className="flex min-w-0 items-center gap-2">
+            <span className="truncate">{getDisplayJobTitle(job)}</span>
+            {lateClockInInfo && (
+              <span className="inline-flex items-center rounded-md border border-amber-300 bg-amber-50 px-2 py-0.5 text-[11px] font-medium text-amber-800 dark:border-amber-700 dark:bg-amber-950/30 dark:text-amber-200">
+                Late {lateClockInInfo.lateMinutes}m • -${lateClockInInfo.missedPay.toFixed(2)}
+              </span>
+            )}
+          </div>
+        }
         description={`${job.trade} - ${getFullAddress(job)}`}
         contentClassName="max-w-lg p-0"
-        headerClassName="sr-only"
+        headerTrailing={
+          renderJobActionsMenu(
+            "inline-flex h-8 w-8 items-center justify-center rounded-sm opacity-70 ring-offset-background transition-opacity hover:opacity-100 focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:pointer-events-none data-[state=open]:bg-secondary",
+            "h-4 w-4"
+          )
+        }
       >
         {content}
       </ResponsiveDialog>
+    );
+  };
+
+  const MobileJobActionsSheet = () => {
+    if (!isMobile) return null;
+
+    return (
+      <Sheet open={!!jobActionsSheetAssignment} onOpenChange={(open) => { if (!open) closeMobileJobActionsSheet(false); }}>
+        <SheetContent side="bottom" hideCloseButton className="rounded-t-xl px-4 pb-8">
+          <SheetHeader className="sr-only">
+            <SheetTitle>Job actions</SheetTitle>
+            <SheetDescription>
+              {jobActionsSheetAssignment ? getDisplayJobTitle(jobActionsSheetAssignment.application.job) : ""}
+            </SheetDescription>
+          </SheetHeader>
+          <div className="mb-5 flex items-center justify-between border-b border-border/80 pb-3">
+            <button
+              type="button"
+              onClick={() => closeMobileJobActionsSheet(true)}
+              className="inline-flex h-9 w-9 items-center justify-center rounded-md bg-muted/40 text-foreground opacity-90 ring-offset-background transition-colors hover:bg-muted focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2"
+              aria-label="Back to job details"
+              data-testid="button-job-actions-back"
+            >
+              <ChevronLeft className="h-4 w-4" />
+            </button>
+            <div className="min-w-0 flex-1 px-3 text-center">
+              <div className="flex items-center justify-center gap-2 text-base font-semibold tracking-tight">
+                <span>Job actions</span>
+              </div>
+              <p className="mt-0.5 truncate text-sm text-muted-foreground">
+                {jobActionsSheetAssignment ? getDisplayJobTitle(jobActionsSheetAssignment.application.job) : ""}
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => closeMobileJobActionsSheet(true)}
+              className="inline-flex h-9 w-9 items-center justify-center rounded-md bg-muted/40 text-foreground opacity-90 ring-offset-background transition-colors hover:bg-muted focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2"
+              aria-label="Close and return to job details"
+              data-testid="button-job-actions-close"
+            >
+              <X className="h-4 w-4" />
+            </button>
+          </div>
+          <div className="space-y-2">
+            <Button
+              variant="outline"
+              className="w-full justify-start"
+              onClick={() => {
+                if (!jobActionsSheetAssignment) return;
+                closeMobileJobActionsSheet(false);
+                handleAbandonFromActions(jobActionsSheetAssignment);
+              }}
+            >
+              <AlertCircle className="mr-2 h-4 w-4" />
+              Abandon job
+            </Button>
+            <Button
+              variant="outline"
+              className="w-full justify-start"
+              onClick={() => {
+                const assignment = jobActionsSheetAssignment;
+                if (!assignment) return;
+                closeMobileJobActionsSheet(false);
+                goToChat(assignment.application.job.id);
+              }}
+            >
+              <MessageSquare className="mr-2 h-4 w-4" />
+              {t("chat")}
+            </Button>
+            <Button
+              variant="outline"
+              className="w-full justify-start"
+              onClick={() => {
+                const assignment = jobActionsSheetAssignment;
+                if (!assignment) return;
+                closeMobileJobActionsSheet(false);
+                openDirections(assignment.application.job, assignment);
+              }}
+            >
+              <Car className="mr-2 h-4 w-4" />
+              {t("directions")}
+            </Button>
+            {isAdmin && activeTeamMembers.length > 0 && (
+              <Button
+                variant="outline"
+                className="w-full justify-start"
+                onClick={() => {
+                  if (!jobActionsSheetAssignment) return;
+                  closeMobileJobActionsSheet(false);
+                  handleReassignFromActions(jobActionsSheetAssignment);
+                }}
+              >
+                <Users className="mr-2 h-4 w-4" />
+                Reassign
+              </Button>
+            )}
+          </div>
+        </SheetContent>
+      </Sheet>
     );
   };
 
@@ -2712,7 +3753,8 @@ export default function TodayPage() {
           </div>
         }
         description={t("geofenceErrorDescription", { miles: geofenceError.requiredRadiusMiles })}
-        contentClassName="max-w-md"
+        overlayClassName="!z-[10020]"
+        contentClassName="max-w-md !z-[10021]"
       >
         <div className="space-y-4">
             {/* Distance Info */}
@@ -2804,7 +3846,7 @@ export default function TodayPage() {
     const { startTime } = getTimeRange(job);
     
     return (
-      <Dialog open={!!futureJobDialog} onOpenChange={() => setFutureJobDialog(null)}>
+      <Dialog open={!!futureJobDialog} onOpenChange={(open) => { if (!open) setFutureJobDialog(null); }}>
         <DialogContent className="max-w-sm" data-testid="future-job-dialog">
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
@@ -2965,8 +4007,12 @@ export default function TodayPage() {
     };
     
     return (
-      <Dialog open={!!locationError} onOpenChange={() => setLocationError(null)}>
-        <DialogContent className="max-w-md" data-testid="location-error-dialog">
+      <Dialog open={!!locationError} onOpenChange={(open) => { if (!open) setLocationError(null); }}>
+        <DialogContent
+          className="max-w-md !z-[10031]"
+          overlayClassName="!z-[10030]"
+          data-testid="location-error-dialog"
+        >
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
               {getErrorIcon()}
@@ -3100,11 +4146,15 @@ export default function TodayPage() {
       </div>
     );
 
-    // Mobile: Bottom sheet, Desktop: Centered dialog (z-[60] so it appears above the job-details popup)
+    // Stack above job sheet/dialog (defaults z-50 / dialog z-[201])
     if (isMobile) {
       return (
         <Sheet open={!!directionsJob} onOpenChange={closeDirections}>
-          <SheetContent side="bottom" className="z-[60] rounded-t-xl px-4 pb-8" overlayClassName="z-[60]">
+          <SheetContent
+            side="bottom"
+            className="z-[211] rounded-t-xl px-4 pb-8"
+            overlayClassName="z-[210]"
+          >
             <SheetHeader className="text-left mb-4">
               <SheetTitle>{t("chooseNavigationApp")}</SheetTitle>
               <SheetDescription>
@@ -3119,11 +4169,160 @@ export default function TodayPage() {
 
     return (
       <Dialog open={!!directionsJob} onOpenChange={closeDirections}>
-        <DialogContent className="z-[60] max-w-sm" overlayClassName="z-[60]">
+        <DialogContent className="z-[211] max-w-sm" overlayClassName="z-[210]">
           <DialogHeader>
             <DialogTitle>{t("chooseNavigationApp")}</DialogTitle>
             <DialogDescription>
               {driveTime ? t("driveTimeToJob", { time: driveTime, title: directionsJob.title }) : t("getDirectionsToJob", { title: directionsJob.title })}
+            </DialogDescription>
+          </DialogHeader>
+          {content}
+        </DialogContent>
+      </Dialog>
+    );
+  };
+
+  const FleetMapSheet = () => {
+    if (!fleetMapJob) return null;
+
+    const job = fleetMapJob;
+    const hasCoordinates = !!(job.latitude && job.longitude);
+    const people: PersonLocation[] = [];
+    const seen = new Set<string>();
+
+    roleFilteredAssignments
+      .filter((assignment) => assignment.application.job.id === job.id)
+      .forEach((assignment) => {
+        const teammate = assignment.application.teamMember as
+          | (NonNullable<JobAssignment["application"]["teamMember"]> & {
+              latitude?: string | number | null;
+              longitude?: string | number | null;
+              liveLatitude?: string | number | null;
+              liveLongitude?: string | number | null;
+            })
+          | null
+          | undefined;
+        if (!teammate) return;
+        const rawLat = teammate.liveLatitude ?? teammate.latitude;
+        const rawLng = teammate.liveLongitude ?? teammate.longitude;
+        const lat = Number(rawLat);
+        const lng = Number(rawLng);
+        if (!Number.isFinite(lat) || !Number.isFinite(lng)) return;
+        const id = `tm-${teammate.id}`;
+        if (seen.has(id)) return;
+        seen.add(id);
+        people.push({
+          id,
+          lat,
+          lng,
+          name: `${teammate.firstName} ${teammate.lastName}`.trim(),
+          avatarUrl: teammate.avatarUrl ?? undefined,
+          type: "teammate",
+        });
+      });
+
+    if (userLocation) {
+      const selfId = `self-${profile?.id ?? user?.id ?? "me"}`;
+      if (!seen.has(selfId)) {
+        people.push({
+          id: selfId,
+          lat: userLocation.lat,
+          lng: userLocation.lng,
+          name: `${profile?.firstName || "You"} ${profile?.lastName || ""}`.trim(),
+          avatarUrl: profile?.avatarUrl || undefined,
+          type: "worker",
+        });
+      }
+    }
+
+    const content = (
+      <div className="space-y-4">
+        <div className="rounded-xl border p-[5px]">
+          <div className="rounded-lg overflow-hidden py-[5px]">
+            {hasCoordinates ? (
+              <JobLocationMap
+                job={{
+                  id: job.id,
+                  lat: parseFloat(job.latitude!),
+                  lng: parseFloat(job.longitude!),
+                  title: getDisplayJobTitle(job),
+                }}
+                userLocation={userLocation}
+                personLocations={people}
+                className="w-full h-[45vh] rounded-lg overflow-hidden"
+              />
+            ) : (
+              <div className="w-full rounded-lg bg-secondary/50 p-4 text-sm text-muted-foreground">
+                Location not available for this job.
+              </div>
+            )}
+          </div>
+          {hasCoordinates && people.length === 0 && (
+            <p className="px-2 pb-1 pt-2 text-xs text-muted-foreground">
+              Fleet member live pings are unavailable; showing your route to the job.
+            </p>
+          )}
+        </div>
+        <Button
+          variant="outline"
+          className="w-full"
+          onClick={() => openDirections(job)}
+          data-testid="button-fleet-map-directions"
+        >
+          <NavigationIcon className="w-4 h-4 mr-2" />
+          {t("directions")}
+        </Button>
+      </div>
+    );
+
+    if (isMobile) {
+      return (
+        <Sheet open={!!fleetMapJob} onOpenChange={(open) => { if (!open) closeFleetMap(false); }}>
+          <SheetContent side="bottom" className="z-[60] rounded-t-xl px-4 pb-6" overlayClassName="z-[60]">
+            <div className="mb-5 border-b border-border/80 pb-3">
+              <div className="flex items-center justify-between gap-2">
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="h-8 w-8"
+                  onClick={() => closeFleetMap(true)}
+                  aria-label="Back to job details"
+                  data-testid="button-fleet-map-back"
+                >
+                  <ChevronLeft className="h-4 w-4" />
+                </Button>
+                <div className="min-w-0 flex-1 px-2 text-center">
+                  <div className="truncate text-base font-semibold tracking-tight">Fleet map</div>
+                  <div className="truncate text-xs text-muted-foreground">
+                    {getDisplayJobTitle(job)}
+                  </div>
+                </div>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="h-8 w-8"
+                  onClick={() => closeFleetMap(false)}
+                  aria-label="Close fleet map"
+                  data-testid="button-fleet-map-close"
+                >
+                  <X className="h-4 w-4" />
+                </Button>
+              </div>
+              <p className="mt-2 truncate px-1 text-xs text-muted-foreground">{getFullAddress(job)}</p>
+            </div>
+            {content}
+          </SheetContent>
+        </Sheet>
+      );
+    }
+
+    return (
+      <Dialog open={!!fleetMapJob} onOpenChange={(open) => { if (!open) closeFleetMap(); }}>
+        <DialogContent className="z-[60] max-w-3xl" overlayClassName="z-[60]">
+          <DialogHeader>
+            <DialogTitle>Fleet map</DialogTitle>
+            <DialogDescription>
+              {getDisplayJobTitle(job)} - {getFullAddress(job)}
             </DialogDescription>
           </DialogHeader>
           {content}
@@ -3299,6 +4498,15 @@ export default function TodayPage() {
     
     const job = reassignDialogJob.application.job;
     const currentAssignee = reassignDialogJob.application.teamMember;
+    const currentAssigneeDisplay = currentAssignee ?? (profile ? {
+      firstName: profile.firstName || "",
+      lastName: profile.lastName || "",
+      avatarUrl: profile.avatarUrl || undefined,
+    } : null);
+    const currentAssigneeName = currentAssigneeDisplay
+      ? `${currentAssigneeDisplay.firstName || ""} ${currentAssigneeDisplay.lastName || ""}`.trim()
+      : "Assigned Worker";
+    const currentAssigneeInitial = currentAssigneeName.charAt(0).toUpperCase() || "A";
     
     const handleReassignToSelf = () => {
       reassignTeamMemberMutation.mutate({
@@ -3326,15 +4534,13 @@ export default function TodayPage() {
           <p className="text-sm text-muted-foreground mb-1">{t("currentlyAssignedTo")}</p>
           <div className="flex items-center gap-2">
             <Avatar className="w-8 h-8">
-              <AvatarImage src={currentAssignee?.avatarUrl || undefined} />
+              <AvatarImage src={currentAssigneeDisplay?.avatarUrl || undefined} />
               <AvatarFallback>
-                {currentAssignee ? currentAssignee.firstName[0] : "Y"}
+                {currentAssigneeInitial}
               </AvatarFallback>
             </Avatar>
             <span className="font-medium">
-              {currentAssignee 
-                ? `${currentAssignee.firstName} ${currentAssignee.lastName}`
-                : "Yourself"}
+              {currentAssigneeName}
             </span>
           </div>
         </div>
@@ -3441,6 +4647,132 @@ export default function TodayPage() {
 
   return (
     <div className="min-h-screen bg-background">
+      {/* Abandon Job - Step 1 */}
+      <Dialog open={showAbandonConfirmDialog} onOpenChange={(open) => { if (!open) setShowAbandonConfirmDialog(false); }}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>Abandon this job?</DialogTitle>
+            <DialogDescription>
+              You are about to leave <span className="font-medium">{abandonJobFlowAssignment ? getDisplayJobTitle(abandonJobFlowAssignment.application.job) : "this job"}</span>.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3">
+            <div className="space-y-2">
+              <p className="text-sm font-medium">Why are you abandoning this job?</p>
+              <div className="grid grid-cols-2 gap-2">
+                {[
+                  { key: "emergency", label: "Emergency" },
+                  { key: "transportation", label: "Transportation issue" },
+                  { key: "schedule_conflict", label: "Schedule conflict" },
+                  { key: "safety_concern", label: "Safety concern" },
+                  { key: "rate_scope", label: "Rate/scope mismatch" },
+                  { key: "other", label: "Other" },
+                ].map((item) => (
+                  <Button
+                    key={item.key}
+                    type="button"
+                    variant={abandonReason === item.key ? "default" : "outline"}
+                    className="h-9"
+                    onClick={() => setAbandonReason(item.key)}
+                  >
+                    {item.label}
+                  </Button>
+                ))}
+              </div>
+              <textarea
+                value={abandonDetails}
+                onChange={(e) => setAbandonDetails(e.target.value)}
+                placeholder="Optional details for the company..."
+                className="w-full min-h-[80px] rounded-md border bg-background px-3 py-2 text-sm"
+                maxLength={600}
+              />
+            </div>
+            <div className="flex gap-2">
+              <Button
+                variant="outline"
+                className="flex-1"
+                onClick={() => {
+                  setShowAbandonConfirmDialog(false);
+                  setAbandonReason("");
+                  setAbandonDetails("");
+                }}
+              >
+                Cancel
+              </Button>
+              <Button
+                className="flex-1"
+                disabled={!abandonReason}
+                onClick={() => {
+                  setShowAbandonConfirmDialog(false);
+                  setShowAbandonFinalDialog(true);
+                }}
+              >
+                Continue
+              </Button>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      {/* Abandon Job - Step 2 */}
+      <Dialog open={showAbandonFinalDialog} onOpenChange={(open) => { if (!open) setShowAbandonFinalDialog(false); }}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>Final confirmation</DialogTitle>
+            <DialogDescription>
+              Abandoning removes this assignment from your active jobs list.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3">
+            <div className="rounded-md border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-700 dark:bg-amber-950/30 dark:text-amber-200">
+              Abandoning this job may make your account liable for a strike and a negative company review.
+            </div>
+            <p className="text-sm text-muted-foreground">
+              If you still want this job later, you may need to re-apply and be re-approved.
+            </p>
+            <label className="flex items-start gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={abandonRiskAcknowledged}
+                onChange={(e) => setAbandonRiskAcknowledged(e.target.checked)}
+                className="mt-1 h-4 w-4 rounded border"
+              />
+              <span>I understand this abandonment can impact my account standing.</span>
+            </label>
+            <div className="flex gap-2">
+              <Button
+                variant="outline"
+                className="flex-1"
+                onClick={() => {
+                  setShowAbandonFinalDialog(false);
+                  setAbandonRiskAcknowledged(false);
+                }}
+                disabled={abandonJobMutation.isPending}
+              >
+                Back
+              </Button>
+              <Button
+                variant="destructive"
+                className="flex-1"
+                disabled={abandonJobMutation.isPending || !abandonJobFlowAssignment || !abandonReason || !abandonRiskAcknowledged}
+                onClick={() => {
+                  if (!abandonJobFlowAssignment) return;
+                  abandonJobMutation.mutate({
+                    applicationId: abandonJobFlowAssignment.application.id,
+                    reason: abandonReason,
+                    details: abandonDetails.trim() || undefined,
+                    jobId: abandonJobFlowAssignment.application.job.id,
+                  });
+                }}
+                data-testid="button-abandon-job-final"
+              >
+                {abandonJobMutation.isPending ? "Abandoning..." : "Abandon job"}
+              </Button>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
+
       {/* Geofence Error Dialog */}
       <GeofenceErrorDialog />
       
@@ -3455,6 +4787,9 @@ export default function TodayPage() {
       
       {/* Directions Navigation Sheet */}
       <DirectionsSheet />
+
+      {/* Fleet Map Sheet */}
+      <FleetMapSheet />
       
       {/* Schedule Info Sheet */}
       <ScheduleInfoSheet />
@@ -3478,7 +4813,7 @@ export default function TodayPage() {
                   <>
                     <Button 
                       variant="ghost" 
-                      onClick={() => setLocation("/dashboard")}
+                      onClick={() => setLocation("/dashboard/find")}
                       className="gap-2 px-3"
                       data-testid="nav-find"
                     >
@@ -3565,6 +4900,9 @@ export default function TodayPage() {
                           onClick={() => {
                             // Use deep linking based on notification type and data
                             const data = notif.data || {};
+                            if (tryOpenTimesheetApprovalInvoiceFromNotification(notif, openTimesheetApprovalInvoice)) {
+                              return;
+                            }
                             if (notif.url) {
                               setLocation(notif.url);
                               return;
@@ -3683,37 +5021,69 @@ export default function TodayPage() {
         </div>
       </header>
 
-      {/* Active Job Banner - Sticky when clocked in */}
-      {clockedInAssignment && (
-        <button
-          type="button"
-          onClick={() => setShowClockOutSheet(true)}
-          className="sticky top-[60px] z-40 w-full bg-green-600 dark:bg-green-700 text-white py-2.5 px-4 flex items-center justify-between gap-3 cursor-pointer hover:bg-green-700 dark:hover:bg-green-800 transition-colors"
-          data-testid="clocked-in-banner"
-          aria-label={t("viewActiveJobDetailsAndClockOut")}
+      {/* Offline banner */}
+      {!isOnlineEffective && (
+        <div
+          className="sticky top-0 z-50 w-full bg-amber-600 dark:bg-amber-800 text-white py-2 px-4 text-center text-sm"
+          role="status"
+          aria-live="polite"
         >
-          <div className="flex items-center gap-3 min-w-0">
-            <div className="relative flex-shrink-0">
-              <div className="w-3 h-3 bg-white rounded-full animate-pulse" />
-            </div>
-            <div className="min-w-0">
-              <p className="text-sm font-semibold truncate">
-                {clockedInAssignment.application.job.title}
-              </p>
-              <p className="text-xs text-green-100 truncate">
-                {t("clockedInAt")} {clockedInAssignment.activeTimesheet?.clockInTime 
-                  ? format(new Date(clockedInAssignment.activeTimesheet.clockInTime), "h:mm a")
-                  : "—"}
-              </p>
-            </div>
-          </div>
-          <div className="flex items-center gap-3 flex-shrink-0">
-            <div className="text-right">
-              <p className="text-lg font-bold font-mono">{clockedInDuration || "0s"}</p>
-            </div>
-            <ChevronRight className="w-5 h-5 text-green-200" />
-          </div>
-        </button>
+          {t("offlineBanner")}
+          {import.meta.env.DEV && devForceOffline && (
+            <span className="ml-2 opacity-90">(simulated)</span>
+          )}
+        </div>
+      )}
+
+      {/* Unvalidated clock-in: ask worker to submit location so timesheet can be approved */}
+      {isOnlineEffective && clockedInAssignment?.activeTimesheet?.id != null && (clockedInAssignment.activeTimesheet as { locationVerified?: boolean })?.locationVerified === false && (
+        <div className="sticky top-[112px] z-40 w-full bg-amber-600 dark:bg-amber-700 text-white py-2.5 px-4 flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-2">
+          <p className="text-sm font-medium">
+            {t("submitClockInLocationRequired") || "Submit your clock-in location so this timesheet can be approved."}
+          </p>
+          <Button
+            size="sm"
+            variant="secondary"
+            className="flex-shrink-0 bg-white text-amber-800 hover:bg-amber-50"
+            onClick={async () => {
+              const tsId = clockedInAssignment!.activeTimesheet!.id;
+              if (typeof tsId !== "number" || tsId < 1) return;
+              getLocationWithFallback(
+                async (coords) => {
+                  try {
+                    const res = await fetch(`/api/timesheets/${tsId}/submit-clock-in-location`, {
+                      method: "POST",
+                      headers: { "Content-Type": "application/json" },
+                      credentials: "include",
+                      body: JSON.stringify({
+                        latitude: coords.lat,
+                        longitude: coords.lng,
+                      }),
+                    });
+                    if (!res.ok) {
+                      const data = await res.json().catch(() => ({}));
+                      if (data?.code === "LOCATION_VALIDATION_FAILED") {
+                        toast({ title: data?.message || "Too far from job site", description: data?.details, variant: "destructive" });
+                        queryClient.invalidateQueries({ queryKey: ["/api/today/assignments"] });
+                        queryClient.invalidateQueries({ queryKey: ["/api/my-strikes"] });
+                        return;
+                      }
+                      throw new Error(data?.message || "Failed to submit location");
+                    }
+                    toast({ title: t("locationSubmitted") || "Location submitted", description: t("locationSubmittedDescription") || "Your timesheet can now be approved." });
+                    queryClient.invalidateQueries({ queryKey: ["/api/today/assignments"] });
+                  } catch (e) {
+                    toast({ title: t("couldNotSubmitLocation") || "Could not submit location", description: e instanceof Error ? e.message : "", variant: "destructive" });
+                  }
+                },
+                () => toast({ title: t("unableToDetermineLocation"), variant: "destructive" }),
+                { showFailureDialog: false }
+              );
+            }}
+          >
+            {t("submitMyLocation") || "Submit my location"}
+          </Button>
+        </div>
       )}
 
       {/* Clock Out Sheet */}
@@ -3825,8 +5195,8 @@ export default function TodayPage() {
       </Sheet>
 
       {/* Time Frame Filter - Sticky pill-shaped slider with counts */}
-      <div className={`sticky z-40 bg-background border-b border-border py-3 ${clockedInAssignment ? "top-[116px]" : "top-[60px]"}`}>
-        <div className="flex gap-2 overflow-x-auto scrollbar-hide px-4">
+      <div className={`sticky z-40 bg-background border-b border-border py-3 ${clockedInAssignment ? (isOnlineEffective && (clockedInAssignment.activeTimesheet as { locationVerified?: boolean })?.locationVerified === false ? "top-[116px]" : "top-[112px]") : "top-[60px]"}`}>
+        <div className="flex items-center gap-2 overflow-x-auto scrollbar-hide px-4">
           <button
             onClick={() => setTimeFrame("today")}
             className={`flex items-center gap-2 px-4 py-2 rounded-full text-sm font-medium whitespace-nowrap transition-colors ${
@@ -3881,6 +5251,36 @@ export default function TodayPage() {
               </span>
             )}
           </button>
+          {import.meta.env.DEV && (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  type="button"
+                  variant={devForceOffline ? "default" : "outline"}
+                  size="sm"
+                  className="ml-auto flex-shrink-0 gap-1.5"
+                  onClick={() => setDevForceOffline((v) => !v)}
+                  aria-pressed={devForceOffline}
+                  data-testid="dev-offline-toggle"
+                >
+                  {devForceOffline ? (
+                    <>
+                      <Wifi className="w-4 h-4" />
+                      Online
+                    </>
+                  ) : (
+                    <>
+                      <WifiOff className="w-4 h-4" />
+                      Offline
+                    </>
+                  )}
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side="bottom">
+                <p>Simulate offline mode (dev only)</p>
+              </TooltipContent>
+            </Tooltip>
+          )}
         </div>
       </div>
 
@@ -3918,6 +5318,7 @@ export default function TodayPage() {
       </ScrollArea>
 
       <JobDetailsDialog />
+      <MobileJobActionsSheet />
 
       {/* Mobile Bottom Navigation */}
       <nav className="md:hidden fixed bottom-0 left-0 right-0 bg-background border-t border-border z-50 h-14">
@@ -3935,7 +5336,7 @@ export default function TodayPage() {
           {!isEmployee && (
             <>
               <button
-                onClick={() => setLocation("/dashboard")}
+                onClick={() => setLocation("/dashboard/find")}
                 className="flex flex-col items-center justify-center gap-0.5 px-3 h-full transition-colors text-muted-foreground"
                 data-testid="mobile-nav-find"
               >

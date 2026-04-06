@@ -334,6 +334,12 @@
   }
 }
 
+/* Global toasts must appear above all dialogs, sheets, and popups */
+[data-toaster] {
+  z-index: 2147483647 !important;
+  isolation: isolate;
+}
+
 /* Thin vertical scrollbar pill (thumb only) — less noticeable */
 .scrollbar-thin-pill {
   scrollbar-width: thin;
@@ -836,12 +842,25 @@
   gap: 0.75rem;
   width: 100%;
   flex-shrink: 0;
-  padding-left: 23px;
-  padding-right: 23px;
+}
+
+/* Multi-step: 40% left (Back) / 60% right (primary action) */
+.footer-actions-container.footer-actions-multi-step {
+  display: grid;
+  grid-template-columns: 2fr 3fr;
+  gap: 1rem;
+}
+
+/* Document and app at farthest back; dialogs/toasts sit above via higher z-index. */
+html, body {
+  position: relative;
+  z-index: 0;
 }
 
 /* App root padding */
 #root {
+  position: relative;
+  z-index: 0;
   padding-left: 0;
   padding-top: 0;
   padding-bottom: 0;

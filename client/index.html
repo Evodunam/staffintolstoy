@@ -2,7 +2,7 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, minimum-scale=1, maximum-scale=1" />
     <meta name="description" content="Tolstoy Staffing - Connect skilled workers with businesses" />
     <meta name="theme-color" content="#000000" />
     
@@ -138,6 +138,12 @@
               message.includes('google.maps.places.Autocomplete is not scheduled to be discontinued')) {
             return; // Suppress this specific warning
           }
+
+          // Suppress Google Maps Marker deprecation warning (non-blocking; migration tracked separately)
+          if (message.includes('google.maps.Marker is deprecated') ||
+              message.includes('AdvancedMarkerElement') && message.includes('migration guide')) {
+            return;
+          }
           
           // Suppress Permissions-Policy header warnings from Google services
           if (message.includes('Permissions-Policy header') ||
@@ -238,6 +244,16 @@
               originalWarn('⚠️ Development server appears to be offline. Please run "npm run dev" to start the server.');
             }
             return false; // Prevent default error handling
+          }
+
+          // Suppress browser geolocation provider noise (not Maps Geocoding auth)
+          if (
+            message.includes('Network location provider') &&
+            message.includes('www.googleapis.com') &&
+            message.includes('error code 403')
+          ) {
+            event.preventDefault();
+            return false;
           }
         }, true); // Use capture phase to catch errors early
       }

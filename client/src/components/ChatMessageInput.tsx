@@ -3,8 +3,9 @@ import { Textarea } from "@/components/ui/textarea";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetTrigger } from "@/components/ui/sheet";
-import { ImagePlus, Mic, MicOff, Send, X, Plus, Paperclip, Video } from "lucide-react";
+import { ImagePlus, Mic, MicOff, Send, X, Plus, Paperclip, Video, CalendarClock } from "lucide-react";
 import { apiRequest } from "@/lib/queryClient";
+import { Button } from "@/components/ui/button";
 import type { Profile } from "@shared/schema";
 import { useTranslation } from "react-i18next";
 import { cn, normalizeAvatarUrl } from "@/lib/utils";
@@ -30,6 +31,14 @@ interface ChatMessageInputProps {
   hasActiveCall?: boolean;
   /** Called when user starts a call: roomUrl to open, and optional message to send in chat so participants can join */
   onStartCall?: (roomUrl: string) => void;
+  /** Job with startDate – when provided with isWorker and onRequestStartJobNow, shows "Request to start job now" if job has not started */
+  job?: { startDate: string | null } | null;
+  /** Current user is a worker (so they can request to start job now) */
+  isWorker?: boolean;
+  /** Called when worker taps "Request to start job now"; parent should send the special message */
+  onRequestStartJobNow?: () => void;
+  /** When true, a start-now request is already pending (hide the button) */
+  hasPendingStartNowRequest?: boolean;
 }
 
 const PEERCALLS_BASE_URL = (() => {
@@ -40,6 +49,15 @@ const PEERCALLS_BASE_URL = (() => {
   return "";
 })();
 
+function isJobNotStarted(startDate: string | null | undefined): boolean {
+  if (!startDate) return false;
+  const start = new Date(startDate);
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  start.setHours(0, 0, 0, 0);
+  return start > today;
+}
+
 export function ChatMessageInput({
   onSubmit,
   participants,
@@ -49,8 +67,19 @@ export function ChatMessageInput({
   jobId = null,
   hasActiveCall = false,
   onStartCall,
+  job = null,
+  isWorker = false,
+  onRequestStartJobNow,
+  hasPendingStartNowRequest = false,
 }: ChatMessageInputProps) {
   const { t } = useTranslation("chat");
+  const showStartNowBanner = Boolean(
+    isWorker &&
+    job?.startDate &&
+    isJobNotStarted(job.startDate) &&
+    onRequestStartJobNow &&
+    !hasPendingStartNowRequest
+  );
   const [value, setValue] = useState("");
   const [attachmentUrls, setAttachmentUrls] = useState<string[]>([]);
   const [mentionQuery, setMentionQuery] = useState("");
@@ -425,10 +454,27 @@ export function ChatMessageInput({
     </form>
   );
 
+  const startNowBanner = showStartNowBanner ? (
+    <div className="mb-2 px-2 py-2 rounded-lg bg-primary/10 border border-primary/20">
+      <Button
+        type="button"
+        variant="outline"
+        size="sm"
+        className="w-full justify-start gap-2 text-primary border-primary/30 hover:bg-primary/15"
+        onClick={onRequestStartJobNow}
+        disabled={disabled}
+      >
+        <CalendarClock className="h-4 w-4" />
+        {t("requestToStartJobNow") ?? "Request to start job now"}
+      </Button>
+    </div>
+  ) : null;
+
   if (fixedAtBottom) {
     return (
       <div className="fixed bottom-0 left-0 right-0 z-50 p-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] bg-background border-t border-border">
         <div className="relative w-full">
+          {startNowBanner}
           {formContent}
         </div>
       </div>
@@ -438,6 +484,7 @@ export function ChatMessageInput({
   return (
     <div className="p-4 border-t border-border bg-background">
       <div className="relative w-full">
+        {startNowBanner}
         {formContent}
       </div>
     </div>

@@ -7,7 +7,7 @@ import { users } from "./models/auth";
 
 // === ENUMS ===
 export const userRoles = ["worker", "company"] as const;
-export const jobStatuses = ["open", "in_progress", "completed", "cancelled"] as const;
+export const jobStatuses = ["draft", "open", "in_progress", "completed", "cancelled"] as const;
 export const applicationStatuses = ["pending", "accepted", "rejected", "withdrawn"] as const;
 export const onboardingStatuses = ["incomplete", "complete"] as const;
 export const skillLevels = ["lite", "elite"] as const;
@@ -242,6 +242,11 @@ export const profiles = pgTable("profiles", {
   hiringIndustries: text("hiring_industries").array(), // Industry IDs from INDUSTRY_CATEGORIES (e.g. construction, plumbing)
   depositAmount: integer("deposit_amount").default(0), // In cents
   autoReplenishThreshold: integer("auto_replenish_threshold").default(200000), // In cents, default $2,000
+  // Cached primary payment method (avoids fetching payment methods every time for popup logic)
+  primaryPaymentMethodId: integer("primary_payment_method_id"), // FK to company_payment_methods.id
+  primaryPaymentMethodVerified: boolean("primary_payment_method_verified").default(false), // true = card or verified ACH
+  primaryPaymentMethodVerificationStatus: text("primary_payment_method_verification_status"), // From Stripe: "verified" | "pending" (ACH new) | "verification_failed" | "failed" (charge declined)
+  lastFailedPaymentMethodId: integer("last_failed_payment_method_id"), // Set when a charge fails with this method; triggers global add-payment popup. Cleared when they add a new method or retry succeeds.
   
   // Notification preferences
   emailNotifications: boolean("email_notifications").default(true),
@@ -340,6 +345,7 @@ export const jobs = pgTable("jobs", {
   scheduleDays: text("schedule_days").array(), // Days of week: ["monday", "tuesday", ...]
   endTime: text("end_time"), // Daily end time for recurring jobs (e.g., "17:00")
   recurringWeeks: integer("recurring_weeks").default(1), // Number of weeks for recurring jobs
+  recurringMonths: integer("recurring_months"), // For monthly recurring: 1–12 months from start. Null for weekly recurring.
   
   // Payment tracking
   totalPaid: integer("total_paid").default(0), // In cents
@@ -675,7 +681,7 @@ export const jobSchedules = pgTable("job_schedules", {
 export const companyTransactions = pgTable("company_transactions", {
   id: serial("id").primaryKey(),
   profileId: integer("profile_id").notNull().references(() => profiles.id, { onDelete: "cascade" }),
-  type: text("type", { enum: ["deposit", "charge", "refund", "auto_recharge"] }).notNull(),
+  type: text("type", { enum: ["deposit", "charge", "refund", "auto_recharge", "card_fee"] }).notNull(),
   amount: integer("amount").notNull(), // In cents (base amount added to balance)
   cardFee: integer("card_fee"), // Card processing fee in cents (3.5% for card payments)
   description: text("description"),
@@ -710,6 +716,7 @@ export const companyPaymentMethods = pgTable("company_payment_methods", {
   isPrimary: boolean("is_primary").default(false),
   isVerified: boolean("is_verified").default(false), // Mercury verification status
   locationIds: text("location_ids").array(), // Specific location IDs this payment method is assigned to (null/empty = uses primary for all)
+  stripePaymentMethodJson: jsonb("stripe_payment_method_json").$type<Record<string, unknown>>(), // Stripe payment_method payload + webhook updates (verification status etc.)
   createdAt: timestamp("created_at").defaultNow(),
 }, (table) => [
   index("idx_company_payment_methods_profile").on(table.profileId),
@@ -834,6 +841,10 @@ export const timesheets = pgTable("timesheets", {
   // Auto clock in/out tracking
   autoClockedIn: boolean("auto_clocked_in").default(false),
   autoClockedOut: boolean("auto_clocked_out").default(false),
+  
+  // Material invoice (worker-submitted receipt for materials; appears on company timesheets)
+  timesheetType: text("timesheet_type", { enum: ["labor", "material_invoice"] }).default("labor"),
+  receiptUrl: text("receipt_url"),
   
   createdAt: timestamp("created_at").defaultNow(),
   updatedAt: timestamp("updated_at").defaultNow(),
@@ -1350,6 +1361,7 @@ export const notificationTypes = [
   "application_approved",
   "application_rejected",
   "timesheet_edited",
+  "timesheet_approved",
   "timesheet_reported",
   "strike_issued",
   "payment_received",

@@ -6,6 +6,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { useAuth } from "@/hooks/use-auth";
 import { useProfile } from "@/hooks/use-profiles";
 import { AppLoading } from "@/components/AppLoading";
+import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { redirectToAppSubdomain, getUrlForPath } from "@/lib/subdomain-utils";
 import React, { useState, useEffect, useRef } from "react";
 import '@/lib/i18n';
@@ -41,6 +42,8 @@ import TeamOnboard from "@/pages/TeamOnboard";
 import AdminDashboard from "@/pages/AdminDashboard";
 import AcceptedJobPage from "@/pages/AcceptedJobPage";
 import ChatsPage from "@/pages/ChatsPage";
+import NotificationsCenter from "@/pages/NotificationsCenter";
+import MyApplicationsPage from "@/pages/MyApplicationsPage";
 import TodayPage from "@/pages/TodayPage";
 import FindWorkPage from "@/pages/FindWorkPage";
 import Login from "@/pages/Login";
@@ -65,15 +68,15 @@ import { IncomingCallPopup } from "@/components/IncomingCallPopup";
 import { DevServerStatus } from "@/components/DevServerStatus";
 import { ImpersonationBanner } from "@/components/ImpersonationBanner";
 import { CombinedGlobalBanners } from "@/components/CombinedGlobalBanners";
+import { TimesheetApprovalInvoiceProvider } from "@/contexts/TimesheetApprovalInvoiceContext";
 
 // Protected Route Wrapper
 function ProtectedRoute({ component: Component }: { component: React.ComponentType }) {
   const [path, setLocation] = useLocation();
   const { user, isAuthenticated, isLoading } = useAuth();
-  const { data: profile, isLoading: profileLoading } = useProfile(user?.id);
+  const { data: profile, isLoading: profileLoading, refetch: refetchProfile } = useProfile(user?.id);
   const redirectingRef = useRef(false);
 
-  // Worker with incomplete onboarding: we no longer redirect to /worker-onboarding. The global WorkerOnboardingRequiredModal shows a multi-step wizard in a pop-up instead; the worker stays on the current page.
   const isWorkerDashboard = path.startsWith("/dashboard") && !path.startsWith("/dashboard/company");
   const isWorkerOnboardingPath = path === "/worker-onboarding" || path.startsWith("/worker-onboarding");
   const isWorkerRoute =
@@ -81,12 +84,21 @@ function ProtectedRoute({ component: Component }: { component: React.ComponentTy
     (path.startsWith("/dashboard") || path.startsWith("/accepted-job"));
   const isWorkerWithIncompleteOnboarding =
     isAuthenticated &&
-    isWorkerDashboard &&
-    !isWorkerOnboardingPath &&
     !profileLoading &&
     profile != null &&
     profile.role === "worker" &&
-    !isWorkerOnboardingComplete(profile);
+    !isWorkerOnboardingComplete(profile) &&
+    (path.startsWith("/dashboard") || path.startsWith("/accepted-job")) &&
+    !isWorkerOnboardingPath;
+
+  // When we would redirect to onboarding, refetch profile first so we don't redirect on stale cache (e.g. after refresh).
+  useEffect(() => {
+    if (!isWorkerWithIncompleteOnboarding) return;
+    refetchProfile().then(({ data }) => {
+      if (data && data.role === "worker" && !isWorkerOnboardingComplete(data))
+        setLocation("/worker-onboarding");
+    });
+  }, [isWorkerWithIncompleteOnboarding, refetchProfile, setLocation]);
 
   if (isLoading) return <AppLoading />;
 
@@ -108,10 +120,9 @@ function ProtectedRoute({ component: Component }: { component: React.ComponentTy
   redirectingRef.current = false;
 
   if (profileLoading && isWorkerDashboard && !isWorkerOnboardingPath) return <AppLoading />;
-  // Workers with incomplete onboarding stay on the current page and see the global modal wizard (no redirect to /worker-onboarding).
 
-  // Don't check subdomain here - let AppSubdomainRedirect handle it
-  // This prevents double redirects and loops
+  // Workers who need onboarding go straight to onboarding; redirect in useEffect to avoid setState-during-render warning.
+  if (isWorkerWithIncompleteOnboarding) return <AppLoading />;
 
   return (
     <>
@@ -190,6 +201,9 @@ function Router() {
       <Route path="/dashboard/calendar">
         {() => <ProtectedRoute component={WorkerDashboard} />}
       </Route>
+      <Route path="/dashboard/menu/bank">
+        {() => <ProtectedRoute component={WorkerDashboard} />}
+      </Route>
       <Route path="/dashboard/menu">
         {() => <ProtectedRoute component={WorkerDashboard} />}
       </Route>
@@ -233,15 +247,25 @@ function Router() {
         {() => <ProtectedRoute component={PaymentHistory} />}
       </Route>
       <Route path="/dashboard/today">
-        {() => <ProtectedRoute component={TodayPage} />}
+        {() => <ErrorBoundary section="Today"><ProtectedRoute component={TodayPage} /></ErrorBoundary>}
       </Route>
       <Route path="/dashboard/chats/:jobId?">
-        {() => <ProtectedRoute component={ChatsPage} />}
+        {() => <ErrorBoundary section="Chats"><ProtectedRoute component={ChatsPage} /></ErrorBoundary>}
+      </Route>
+      <Route path="/dashboard/notifications">
+        {() => <ProtectedRoute component={NotificationsCenter} />}
+      </Route>
+      <Route path="/dashboard/applications">
+        {() => <ProtectedRoute component={MyApplicationsPage} />}
       </Route>
       <Route path="/dashboard">
         {() => <ProtectedRoute component={WorkerDashboard} />}
       </Route>
       
+      {/* Company notification inbox (before catch-all company-dashboard) */}
+      <Route path="/company-dashboard/notifications">
+        {() => <ProtectedRoute component={NotificationsCenter} />}
+      </Route>
       {/* Company Dashboard - Route-based sections (chats is a section, no separate header) */}
       <Route path="/company-dashboard/:section?/:subsection?">
         {() => <ProtectedRoute component={CompanyDashboard} />}
@@ -253,7 +277,7 @@ function Router() {
         {() => <ProtectedRoute component={AcceptedJobPage} />}
       </Route>
       <Route path="/chats/:jobId?">
-        {() => <ProtectedRoute component={ChatsPage} />}
+        {() => <ErrorBoundary section="Chats"><ProtectedRoute component={ChatsPage} /></ErrorBoundary>}
       </Route>
       <Route path="/onboarding">
         {() => <ProtectedRoute component={Onboarding} />}
@@ -305,22 +329,26 @@ function AppContent() {
 
   return (
     <TooltipProvider>
-      <Toaster />
-      <DevServerStatus />
-      <AppSubdomainRedirect />
-      {/* Skip WorkerOnboardingRequiredModal on worker-onboarding to avoid Radix Presence max update depth */}
-      {!isWorkerOnboarding && <WorkerOnboardingRequiredModal />}
-      <WorkerLocationRequiredModal />
-      <Router />
+      <TimesheetApprovalInvoiceProvider>
+        <Toaster />
+        <DevServerStatus />
+        <AppSubdomainRedirect />
+        {/* Skip WorkerOnboardingRequiredModal on worker-onboarding to avoid Radix Presence max update depth */}
+        {!isWorkerOnboarding && <WorkerOnboardingRequiredModal />}
+        <WorkerLocationRequiredModal />
+        <Router />
+      </TimesheetApprovalInvoiceProvider>
     </TooltipProvider>
   );
 }
 
 function App() {
   return (
-    <QueryClientProvider client={queryClient}>
-      <AppContent />
-    </QueryClientProvider>
+    <ErrorBoundary section="App">
+      <QueryClientProvider client={queryClient}>
+        <AppContent />
+      </QueryClientProvider>
+    </ErrorBoundary>
   );
 }
 

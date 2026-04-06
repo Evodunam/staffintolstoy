@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
+import { useQueryClient } from '@tanstack/react-query';
 import { useProfile } from './use-profiles';
 import { useAuth } from './use-auth';
 import { useToast } from './use-toast';
@@ -21,11 +22,51 @@ export function useRealtime(options: UseRealtimeOptions = {}) {
   const { user } = useAuth();
   const { data: profile } = useProfile(user?.id);
   const { toast } = useToast();
+  const queryClient = useQueryClient();
   
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [isConnected, setIsConnected] = useState(false);
   const [notifications, setNotifications] = useState<NotificationPayload[]>([]);
+
+  /** Invalidate the right queries based on the notification type so UI auto-refreshes. */
+  const invalidateForNotification = useCallback((notification: NotificationPayload) => {
+    switch (notification.type) {
+      case 'new_job':
+        // Worker's find-work feed may have a new match
+        queryClient.invalidateQueries({ queryKey: ['/api/jobs/find-work'] });
+        break;
+      case 'application_update':
+        // Worker sees new status (pending→accepted/rejected); company sees new applicant
+        queryClient.invalidateQueries({ queryKey: ['/api/applications/worker'] });
+        queryClient.invalidateQueries({ queryKey: ['/api/company/jobs'] });
+        break;
+      case 'job_update':
+        // Job details or status changed — affects both company list and worker calendar
+        queryClient.invalidateQueries({ queryKey: ['/api/company/jobs'] });
+        queryClient.invalidateQueries({ queryKey: ['/api/jobs/find-work'] });
+        if (notification.data?.jobId) {
+          queryClient.invalidateQueries({ queryKey: ['/api/jobs', notification.data.jobId] });
+        }
+        break;
+      case 'timesheet_update': {
+        // Timesheet approved/rejected/submitted — company timesheets tab updates
+        queryClient.invalidateQueries({ queryKey: ['/api/timesheets/company'] });
+        queryClient.invalidateQueries({ queryKey: ['/api/timesheets/active'] });
+        const tsId = notification.data?.timesheetId;
+        if (tsId != null && Number.isFinite(Number(tsId))) {
+          queryClient.invalidateQueries({ queryKey: ['/api/timesheets', Number(tsId)] });
+        }
+        const jid = notification.data?.jobId;
+        if (jid != null && Number.isFinite(Number(jid))) {
+          queryClient.invalidateQueries({ queryKey: ['/api/jobs', Number(jid)] });
+        }
+        break;
+      }
+      default:
+        break;
+    }
+  }, [queryClient]);
 
   const connect = useCallback(() => {
     if (!profile?.id || wsRef.current?.readyState === WebSocket.OPEN) return;
@@ -58,6 +99,9 @@ export function useRealtime(options: UseRealtimeOptions = {}) {
           const notification = data as NotificationPayload;
           setNotifications((prev) => [notification, ...prev].slice(0, 50));
           
+          // Auto-refresh affected queries so UI stays in sync without manual reload
+          invalidateForNotification(notification);
+
           if (showToasts) {
             toast({
               title: notification.title,
@@ -87,7 +131,7 @@ export function useRealtime(options: UseRealtimeOptions = {}) {
     } catch (err) {
       console.error('[realtime] Failed to connect:', err);
     }
-  }, [profile, user, showToasts, toast, onNotification]);
+  }, [profile, user, showToasts, toast, onNotification, invalidateForNotification]);
 
   const disconnect = useCallback(() => {
     if (reconnectTimeoutRef.current) {

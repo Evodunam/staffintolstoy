@@ -66,6 +66,32 @@ export function ReviewsContent({ embedded = false }: { embedded?: boolean }) {
 
   const main = (
     <div className={embedded ? "space-y-6" : "container mx-auto px-4 py-6 space-y-6 max-w-4xl"}>
+      {/* Google Business card first, above rating and reviews */}
+      {!isEmployee && (
+        <Card className="p-4">
+          <div className="space-y-3">
+            <Label className="text-sm font-medium">Google Business Reviews</Label>
+            {isGoogleConnected ? (
+              <>
+                <div className="flex items-center gap-2 text-sm text-green-600">
+                  <CheckCircle className="w-4 h-4" />
+                  <span>Connected to Google Business</span>
+                </div>
+                <Button onClick={handleSyncGoogleReviews} disabled={syncingGoogleReviews} size="sm" className="w-full">
+                  {syncingGoogleReviews ? <><Loader2 className="w-4 h-4 mr-2 animate-spin" />Syncing...</> : <><ExternalLink className="w-4 h-4 mr-2" />Sync Reviews Now</>}
+                </Button>
+              </>
+            ) : (
+              <>
+                <p className="text-sm text-muted-foreground">Connect your Google Business account to automatically sync reviews</p>
+                <Button onClick={handleConnectGoogle} disabled={isConnectingGoogle} size="sm" className="w-full">
+                  {isConnectingGoogle ? <><Loader2 className="w-4 h-4 mr-2 animate-spin" />Connecting...</> : <><ExternalLink className="w-4 h-4 mr-2" />Connect Google Business</>}
+                </Button>
+              </>
+            )}
+          </div>
+        </Card>
+      )}
       <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
         <div>
           <div className="flex items-center gap-2">
@@ -78,31 +104,6 @@ export function ReviewsContent({ embedded = false }: { embedded?: boolean }) {
             <span className="text-muted-foreground">({totalReviews} {totalReviews === 1 ? "review" : "reviews"})</span>
           </div>
         </div>
-        {!isEmployee && (
-          <Card className="p-4">
-            <div className="space-y-3">
-              <Label className="text-sm font-medium">Google Business Reviews</Label>
-              {isGoogleConnected ? (
-                <>
-                  <div className="flex items-center gap-2 text-sm text-green-600">
-                    <CheckCircle className="w-4 h-4" />
-                    <span>Connected to Google Business</span>
-                  </div>
-                  <Button onClick={handleSyncGoogleReviews} disabled={syncingGoogleReviews} size="sm" className="w-full">
-                    {syncingGoogleReviews ? <><Loader2 className="w-4 h-4 mr-2 animate-spin" />Syncing...</> : <><ExternalLink className="w-4 h-4 mr-2" />Sync Reviews Now</>}
-                  </Button>
-                </>
-              ) : (
-                <>
-                  <p className="text-sm text-muted-foreground">Connect your Google Business account to automatically sync reviews</p>
-                  <Button onClick={handleConnectGoogle} disabled={isConnectingGoogle} size="sm" className="w-full">
-                    {isConnectingGoogle ? <><Loader2 className="w-4 h-4 mr-2 animate-spin" />Connecting...</> : <><ExternalLink className="w-4 h-4 mr-2" />Connect Google Business</>}
-                  </Button>
-                </>
-              )}
-            </div>
-          </Card>
-        )}
       </div>
       {reviewsLoading ? (
         <div className="flex items-center justify-center py-12">

@@ -97,287 +97,25 @@ export async function processAutoApprovals(): Promise<{ processed: number; paid:
         
         console.log(`[AutoApproval] Created invoice ${invoiceNumber} for timesheet ${ts.id}`);
         
-        // Ensure company has a primary payment method (required for catch-all fallback)
-        const methods = await storage.getCompanyPaymentMethods(company.id);
-        const hasPrimary = methods.some((m: any) => m.isPrimary ?? m.is_primary);
-        if (!hasPrimary && methods.length > 0) {
-          const firstUsable = methods.find((m: any) => {
-            const hasStripe = !!(m.stripePaymentMethodId ?? m.stripe_payment_method_id);
-            const isMercury = !!((m.mercuryRecipientId ?? m.mercury_recipient_id) || (m.mercuryExternalAccountId ?? m.mercury_external_account_id));
-            return hasStripe && !isMercury && (m.type === "card" || (m.type === "ach" && (m.isVerified ?? m.is_verified)));
-          }) ?? methods[0];
-          if (firstUsable) await storage.updateCompanyPaymentMethod(firstUsable.id, { isPrimary: true });
-        }
-
-        let paymentCharged = false;
+        // Flow: trigger platform Mercury payment to worker; if successful, reduce company balance (no charging on approve).
+        const hasW9 = worker?.w9UploadedAt != null;
+        const hasBankAccount = !!(worker?.mercuryRecipientId && worker?.mercuryExternalAccountId);
+        let payoutSuccess = false;
         
-        if (job.companyLocationId) {
-          const location = await storage.getCompanyLocation(job.companyLocationId);
-          
-          if (location && location.paymentMethodId) {
-            const paymentMethod = await storage.getCompanyPaymentMethod(location.paymentMethodId);
-            
-            if (paymentMethod) {
-              if (paymentMethod.type === "card" && paymentMethod.stripePaymentMethodId && company.stripeCustomerId) {
-                console.log(`[AutoApproval] Charging location card (${paymentMethod.cardBrand} ...${paymentMethod.lastFour})`);
-                
-                try {
-                  const { chargeCardOffSession, CARD_FEE_PERCENTAGE } = await import("./stripe");
-                  const cardFee = Math.round(totalAmount * (CARD_FEE_PERCENTAGE / 100));
-                  const totalWithFee = totalAmount + cardFee;
-                  
-                  const chargeResult = await chargeCardOffSession({
-                    amount: totalWithFee,
-                    customerId: company.stripeCustomerId,
-                    paymentMethodId: paymentMethod.stripePaymentMethodId,
-                    description: `Auto-approved Timesheet #${ts.id} - ${location.name}`,
-                    metadata: {
-                      companyId: company.id.toString(),
-                      timesheetId: ts.id.toString(),
-                      locationId: location.id.toString(),
-                      type: "auto_approval_charge",
-                    },
-                  });
-                  
-                  if (chargeResult.success && chargeResult.paymentIntentId) {
-                    paymentCharged = true;
-                    
-                    await storage.createCompanyTransaction({
-                      profileId: company.id,
-                      type: "charge",
-                      amount: totalAmount,
-                      description: `Auto-approved Timesheet #${ts.id} - ${workerName} (${hoursWorked} hrs)`,
-                      paymentMethod: "card",
-                      stripePaymentIntentId: chargeResult.paymentIntentId,
-                      cardFee,
-                    });
-                    
-                    await storage.updateInvoice(invoice.id, {
-                      status: "paid",
-                      paidAt: new Date(),
-                    });
-                    
-                    console.log(`[AutoApproval] Card charged successfully for timesheet ${ts.id}`);
-                  } else {
-                    console.warn(`[AutoApproval] Card charge failed for timesheet ${ts.id}: ${chargeResult.error}`);
-                  }
-                } catch (cardErr: any) {
-                  console.error(`[AutoApproval] Card charge error for timesheet ${ts.id}:`, cardErr.message);
-                }
-              }
-              else if (paymentMethod.type === "ach" && paymentMethod.stripePaymentMethodId && company.stripeCustomerId) {
-                console.log(`[AutoApproval] Charging location Stripe ACH (${paymentMethod.bankName} ...${paymentMethod.lastFour})`);
-                
-                try {
-                  const { chargeAchOffSession } = await import("./stripe");
-                  
-                  const chargeResult = await chargeAchOffSession({
-                    amount: totalAmount,
-                    customerId: company.stripeCustomerId,
-                    paymentMethodId: paymentMethod.stripePaymentMethodId,
-                    description: `Auto-approved Timesheet #${ts.id} - ${location.name}`,
-                    metadata: {
-                      companyId: company.id.toString(),
-                      timesheetId: ts.id.toString(),
-                      locationId: location.id.toString(),
-                      type: "auto_approval_charge",
-                    },
-                  });
-                  
-                  if (chargeResult.success && chargeResult.paymentIntentId) {
-                    paymentCharged = true;
-                    await storage.createCompanyTransaction({
-                      profileId: company.id,
-                      type: "charge",
-                      amount: totalAmount,
-                      description: `Auto-approved Timesheet #${ts.id} - ${workerName} (${hoursWorked} hrs) (ACH)`,
-                      paymentMethod: "ach",
-                      stripePaymentIntentId: chargeResult.paymentIntentId,
-                      cardFee: 0,
-                    });
-                    await storage.updateInvoice(invoice.id, { status: "paid", paidAt: new Date() });
-                    console.log(`[AutoApproval] Stripe ACH charged successfully for timesheet ${ts.id}`);
-                  } else {
-                    console.warn(`[AutoApproval] Stripe ACH charge failed: ${chargeResult.error}`);
-                  }
-                } catch (achErr: any) {
-                  console.error(`[AutoApproval] Stripe ACH charge error:`, achErr.message);
-                }
-              }
-              else if (paymentMethod.type === "ach" && paymentMethod.mtCounterpartyId && paymentMethod.mtExternalAccountId) {
-                console.log(`[AutoApproval] Charging location MT ACH (${paymentMethod.bankName} ...${paymentMethod.lastFour})`);
-                
-                try {
-                  const mtModule = await import("./modernTreasury");
-                  const modernTreasuryService = mtModule.default;
-                  const getPlatformInternalAccountId = mtModule.getPlatformInternalAccountId;
-                  const platformAccountId = await getPlatformInternalAccountId();
-                  
-                  const paymentOrder = await modernTreasuryService.createACHDebit({
-                    originatingAccountId: platformAccountId,
-                    counterpartyId: paymentMethod.mtCounterpartyId,
-                    receivingAccountId: paymentMethod.mtExternalAccountId,
-                    amount: totalAmount,
-                    description: `Auto-approved Timesheet #${ts.id} - ${location.name}`,
-                    metadata: {
-                      companyId: company.id.toString(),
-                      timesheetId: ts.id.toString(),
-                      type: "auto_approval_charge",
-                    },
-                  });
-                  
-                  paymentCharged = true;
-                  
-                  await storage.createCompanyTransaction({
-                    profileId: company.id,
-                    type: "charge",
-                    amount: totalAmount,
-                    description: `Auto-approved Timesheet #${ts.id} - ${workerName} (${hoursWorked} hrs) (ACH)`,
-                    paymentMethod: "ach",
-                    mtPaymentOrderId: paymentOrder.id,
-                    mtPaymentStatus: paymentOrder.status,
-                    cardFee: 0,
-                  });
-                  
-                  await storage.updateInvoice(invoice.id, {
-                    status: "sent",
-                  });
-                  
-                  console.log(`[AutoApproval] ACH charge initiated for timesheet ${ts.id} - pending settlement`);
-                } catch (achErr: any) {
-                  console.error(`[AutoApproval] ACH charge error for timesheet ${ts.id}:`, achErr.message);
-                }
-              }
-            }
-          }
-        }
-        
-        if (!paymentCharged) {
-          const primaryPaymentMethod = await storage.getPrimaryPaymentMethod(company.id);
-          
-          if (primaryPaymentMethod && primaryPaymentMethod.type === "card" && primaryPaymentMethod.stripePaymentMethodId && company.stripeCustomerId) {
-            console.log(`[AutoApproval] Charging primary card (${primaryPaymentMethod.cardBrand} ...${primaryPaymentMethod.lastFour})`);
-            
-            try {
-              const { chargeCardOffSession, CARD_FEE_PERCENTAGE } = await import("./stripe");
-              const cardFee = Math.round(totalAmount * (CARD_FEE_PERCENTAGE / 100));
-              const totalWithFee = totalAmount + cardFee;
-              
-              const chargeResult = await chargeCardOffSession({
-                amount: totalWithFee,
-                customerId: company.stripeCustomerId,
-                paymentMethodId: primaryPaymentMethod.stripePaymentMethodId,
-                description: `Auto-approved Timesheet #${ts.id}`,
-                metadata: {
-                  companyId: company.id.toString(),
-                  timesheetId: ts.id.toString(),
-                  type: "auto_approval_charge",
-                },
-              });
-              
-              if (chargeResult.success && chargeResult.paymentIntentId) {
-                paymentCharged = true;
-                
-                await storage.createCompanyTransaction({
-                  profileId: company.id,
-                  type: "charge",
-                  amount: totalAmount,
-                  description: `Auto-approved Timesheet #${ts.id} - ${workerName} (${hoursWorked} hrs)`,
-                  paymentMethod: "card",
-                  stripePaymentIntentId: chargeResult.paymentIntentId,
-                  cardFee,
-                });
-                
-                await storage.updateInvoice(invoice.id, {
-                  status: "paid",
-                  paidAt: new Date(),
-                });
-                
-                console.log(`[AutoApproval] Primary card charged successfully for timesheet ${ts.id}`);
-              }
-            } catch (cardErr: any) {
-              console.error(`[AutoApproval] Primary card charge error:`, cardErr.message);
-            }
-          }
-          
-          if (!paymentCharged) {
-            const currentBalance = company.depositAmount || 0;
-            
-            if (currentBalance >= totalAmount) {
-              const newBalance = currentBalance - totalAmount;
-              await storage.updateProfile(company.id, { depositAmount: newBalance });
-              
-              await storage.createCompanyTransaction({
-                profileId: company.id,
-                type: "charge",
-                amount: totalAmount,
-                description: `Auto-approved Timesheet #${ts.id} - ${workerName} (${hoursWorked} hrs)`,
-                paymentMethod: "balance",
-              });
-              
-              await storage.updateInvoice(invoice.id, {
-                status: "paid",
-                paidAt: new Date(),
-              });
-              
-              paymentCharged = true;
-              console.log(`[AutoApproval] Balance deducted for timesheet ${ts.id}: $${(totalAmount/100).toFixed(2)}`);
-            } else {
-              console.warn(`[AutoApproval] Insufficient balance for timesheet ${ts.id}: $${(currentBalance/100).toFixed(2)} < $${(totalAmount/100).toFixed(2)}`);
-            }
-          }
-        }
-        
-        if (!paymentCharged) {
-          console.warn(`[AutoApproval] All payment methods failed for timesheet ${ts.id} - marking as payment_failed`);
-          await storage.updateTimesheet(ts.id, { 
-            paymentStatus: "failed",
-            companyNotes: 'Auto-approved after 48 hours - payment failed, retry required',
+        if (worker && totalPay > 0 && !hasW9) {
+          await storage.createWorkerPayout({
+            workerId: worker.id,
+            timesheetId: ts.id,
+            jobId: ts.jobId,
+            amount: totalPay,
+            status: "pending_w9",
+            description: `Held pending W-9 upload - ${job.title}`,
+            hoursWorked: hoursWorked.toString(),
+            hourlyRate: ts.hourlyRate,
           });
-          failedCount++;
-          continue;
-        }
-        
-        if (paymentCharged && worker && worker.mtCounterpartyId && worker.mtExternalAccountId && totalPay > 0) {
-          try {
-            const mtModule = await import("./modernTreasury");
-            const modernTreasuryService = mtModule.default;
-            const getPlatformInternalAccountId = mtModule.getPlatformInternalAccountId;
-            const platformAccountId = await getPlatformInternalAccountId();
-            
-            const paymentOrder = await modernTreasuryService.createACHCredit({
-              originatingAccountId: platformAccountId,
-              counterpartyId: worker.mtCounterpartyId,
-              receivingAccountId: worker.mtExternalAccountId,
-              amount: totalPay,
-              description: `Payment for ${job.title} - Auto-approved Timesheet #${ts.id}`,
-              metadata: {
-                workerId: worker.id.toString(),
-                timesheetId: ts.id.toString(),
-                type: "worker_payout",
-              },
-            });
-            
-            await storage.createWorkerPayout({
-              workerId: worker.id,
-              timesheetId: ts.id,
-              amount: totalPay,
-              status: paymentOrder.status === "completed" ? "completed" : "pending",
-              mtPaymentOrderId: paymentOrder.id,
-              mtPaymentStatus: paymentOrder.status,
-            });
-            
-            await storage.updateTimesheet(ts.id, {
-              paymentStatus: paymentOrder.status === "completed" ? "completed" : "pending",
-            });
-            
-            paidCount++;
-            console.log(`[AutoApproval] Worker payout initiated for timesheet ${ts.id}: $${(totalPay/100).toFixed(2)}`);
-          } catch (payoutErr: any) {
-            console.error(`[AutoApproval] Worker payout failed for timesheet ${ts.id}:`, payoutErr.message);
-            await storage.updateTimesheet(ts.id, { paymentStatus: "failed" });
-          }
-        } else if (paymentCharged && worker && (!worker.mtCounterpartyId || !worker.mtExternalAccountId)) {
+          await storage.updateTimesheet(ts.id, { paymentStatus: "pending" });
+          console.log(`[AutoApproval] Worker ${worker.id} has no W-9 - $${(totalPay/100).toFixed(2)} held in escrow`);
+        } else if (worker && totalPay > 0 && hasW9 && !hasBankAccount) {
           await storage.createWorkerPayout({
             workerId: worker.id,
             timesheetId: ts.id,
@@ -388,11 +126,53 @@ export async function processAutoApprovals(): Promise<{ processed: number; paid:
             hoursWorked: hoursWorked.toString(),
             hourlyRate: ts.hourlyRate,
           });
-          
           await storage.updateTimesheet(ts.id, { paymentStatus: "pending" });
-          console.log(`[AutoApproval] Worker ${worker.id} has no bank account - $${(totalPay/100).toFixed(2)} held in escrow`);
+          console.log(`[AutoApproval] Worker ${worker.id} has no Mercury recipient - $${(totalPay/100).toFixed(2)} held in escrow`);
+        } else if (worker && totalPay > 0 && hasW9 && hasBankAccount) {
+          try {
+            const { mercuryService } = await import("./mercury");
+            console.log(`[AutoApproval] [Mercury] Platform paying worker ${worker.id} for timesheet ${ts.id}: $${(totalPay/100).toFixed(2)}`);
+            const payment = await mercuryService.sendPayment({
+              recipientId: worker.mercuryRecipientId!,
+              amount: totalPay,
+              description: `Payment for ${job.title} - Auto-approved Timesheet #${ts.id}`,
+              idempotencyKey: `timesheet-payout-${ts.id}`,
+              note: `Worker: ${worker.id}, Timesheet: ${ts.id}, Company: ${company.id}`,
+            });
+            await storage.createWorkerPayout({
+              workerId: worker.id,
+              timesheetId: ts.id,
+              amount: totalPay,
+              status: payment.status === "completed" ? "completed" : payment.status === "sent" ? "sent" : "pending",
+              mercuryPaymentId: payment.id,
+              mercuryPaymentStatus: payment.status,
+            });
+            await storage.updateTimesheet(ts.id, {
+              paymentStatus: payment.status === "completed" ? "completed" : "pending",
+            });
+            payoutSuccess = true;
+            paidCount++;
+            console.log(`[AutoApproval] [Mercury] Platform payment to worker ${worker.id} completed for timesheet ${ts.id}`);
+            // Reduce company balance by amount we paid the worker
+            const freshCompany = await storage.getProfile(company.id);
+            const currentBalance = Number(freshCompany?.depositAmount ?? company.depositAmount ?? 0);
+            const newBalance = Math.max(0, currentBalance - totalPay);
+            await storage.updateProfile(company.id, { depositAmount: newBalance });
+            await storage.createCompanyTransaction({
+              profileId: company.id,
+              type: "charge",
+              amount: totalPay,
+              description: `Auto-approved Timesheet #${ts.id} - ${workerName} (platform paid worker) - ${hoursWorked} hrs`,
+            });
+            console.log(`[AutoApproval] Reduced company ${company.id} balance by $${(totalPay/100).toFixed(2)}. New balance: $${(newBalance/100).toFixed(2)}`);
+          } catch (payoutErr: any) {
+            console.error(`[AutoApproval] Worker payout failed for timesheet ${ts.id}:`, payoutErr.message);
+            await storage.updateTimesheet(ts.id, { paymentStatus: "failed" });
+            failedCount++;
+          }
         }
-        
+
+        // (Old charge/payout block removed: we now do platform pay worker first, then deduct balance.)
       } catch (tsErr: any) {
         console.error(`[AutoApproval] Error processing timesheet ${ts.id}:`, tsErr.message);
         failedCount++;

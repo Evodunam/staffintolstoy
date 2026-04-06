@@ -5,6 +5,7 @@ import * as DialogPrimitive from "@radix-ui/react-dialog"
 import { ChevronLeft, X } from "lucide-react"
 
 import { cn } from "@/lib/utils"
+import { blurFocusInside, blurFocusInsideRoot } from "@/lib/modal-focus"
 
 const Dialog = DialogPrimitive.Root
 
@@ -41,15 +42,37 @@ type DialogContentProps = React.ComponentPropsWithoutRef<typeof DialogPrimitive.
 const DialogContent = React.forwardRef<
   React.ElementRef<typeof DialogPrimitive.Content>,
   DialogContentProps
->(({ className, overlayClassName, hideCloseButton, onBack, children, "aria-describedby": ariaDescribedBy, ...props }, ref) => {
-  const descriptionId = React.useId();
-  const describedBy = ariaDescribedBy ?? descriptionId;
+>(({ className, overlayClassName, hideCloseButton, onBack, children, "aria-describedby": ariaDescribedBy, onOpenAutoFocus, onCloseAutoFocus, ...props }, ref) => {
+  const contentNodeRef = React.useRef<HTMLDivElement | null>(null);
+  const setContentRef = React.useCallback(
+    (node: HTMLDivElement | null) => {
+      contentNodeRef.current = node;
+      if (typeof ref === "function") ref(node);
+      else if (ref && typeof ref === "object") (ref as React.MutableRefObject<HTMLDivElement | null>).current = node;
+    },
+    [ref]
+  );
+  React.useLayoutEffect(() => {
+    blurFocusInsideRoot();
+  }, []);
   return (
   <DialogPortal container={typeof document !== "undefined" ? (document.getElementById("dialog-container") ?? document.body) : undefined}>
     <DialogOverlay className={cn("data-[state=open]:opacity-100", overlayClassName)} />
     <DialogPrimitive.Content
-      ref={ref}
-      aria-describedby={describedBy}
+      ref={setContentRef}
+      aria-describedby={ariaDescribedBy}
+      onOpenAutoFocus={(e) => {
+        // Radix may set aria-hidden on #root in the same tick; drop focus from root first, then again after paint.
+        blurFocusInsideRoot();
+        onOpenAutoFocus?.(e);
+        queueMicrotask(() => blurFocusInsideRoot());
+        requestAnimationFrame(() => blurFocusInsideRoot());
+      }}
+      onCloseAutoFocus={(e) => {
+        // Closing: dialog content gets aria-hidden while a footer button may still be focused during exit.
+        blurFocusInside(contentNodeRef.current);
+        onCloseAutoFocus?.(e);
+      }}
       className={cn(
         "dialog-content-base fixed left-[50%] top-[50%] z-[201] grid w-full max-w-lg max-h-[90vh] overflow-y-auto translate-x-[-50%] translate-y-[-50%] gap-4 border border-border bg-background p-[21pt] shadow-lg duration-200 data-[state=open]:opacity-100 data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 data-[state=closed]:slide-out-to-left-1/2 data-[state=closed]:slide-out-to-top-[48%] data-[state=open]:slide-in-from-left-1/2 data-[state=open]:slide-in-from-top-[48%] rounded-2xl pointer-events-auto",
         className
@@ -57,9 +80,7 @@ const DialogContent = React.forwardRef<
       {...props}
     >
       <DialogPrimitive.Title className="sr-only">Dialog</DialogPrimitive.Title>
-      {!ariaDescribedBy && (
-        <DialogPrimitive.Description id={descriptionId} className="sr-only">Dialog content</DialogPrimitive.Description>
-      )}
+      <DialogPrimitive.Description className="sr-only">Dialog content</DialogPrimitive.Description>
       {children}
       {onBack && (
         <button

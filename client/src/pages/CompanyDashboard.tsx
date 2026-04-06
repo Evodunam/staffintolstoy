@@ -1,10 +1,10 @@
-import { useState, useMemo, useEffect, useRef, useCallback } from "react";
+import { useState, useMemo, useEffect, useRef, useCallback, type ReactNode } from "react";
 import { usePersistentFilter } from "@/hooks/use-persistent-filter";
 import { useLocation, useRoute } from "wouter";
 import { Navigation } from "@/components/Navigation";
 import { NotificationPopup } from "@/components/NotificationPopup";
 import { useAuth } from "@/hooks/use-auth";
-import { useProfile, useUpdateProfile } from "@/hooks/use-profiles";
+import { useProfile, useUpdateProfile, profileMeQueryKey, invalidateSessionProfileQueries } from "@/hooks/use-profiles";
 import { useAdminCheck } from "@/hooks/use-admin";
 import { useCompanyTimesheets, useApproveTimesheet, useRejectTimesheet, useBulkApproveTimesheets, type TimesheetWithDetails, type TimesheetApprovalResponse, type BulkApprovalResponse } from "@/hooks/use-timesheets";
 import { TimesheetMap } from "@/components/TimesheetMap";
@@ -17,6 +17,7 @@ import { useScrollHeader } from "@/hooks/use-scroll-header";
 import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetDescription, SheetFooter } from "@/components/ui/sheet";
 import { MobilePopup } from "@/components/ui/mobile-popup";
 import { Button } from "@/components/ui/button";
+import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
@@ -49,6 +50,7 @@ import { useTranslation } from "react-i18next";
 import { SUPPORTED_LANGUAGES, changeLanguage, LanguageCode } from "@/lib/i18n";
 import { Accordion, AccordionContent, AccordionItem, AccordionTrigger } from "@/components/ui/accordion";
 import { INDUSTRY_CATEGORIES } from "@shared/industries";
+import { api as sharedApi } from "@shared/routes";
 import { loadStripe } from "@stripe/stripe-js";
 import { GooglePlacesAutocomplete } from "@/components/GooglePlacesAutocomplete";
 import { Elements, CardElement, PaymentElement, useStripe, useElements } from "@stripe/react-stripe-js";
@@ -209,7 +211,7 @@ function VerifyBankMicrodepositsForm({
   clientSecret: string;
   microdepositType: "amounts" | "descriptor_code";
   bankLabel: string;
-  onSuccess: () => void;
+  onSuccess: (data?: { paymentMethodId?: number }) => void;
   onError: (err: string) => void;
   onBack?: () => void;
   compact?: boolean;
@@ -247,11 +249,11 @@ function VerifyBankMicrodepositsForm({
           credentials: "include",
           body: JSON.stringify({ setupIntentId: setupIntent.id }),
         });
-        const data: { message?: string } = await res.json().catch(() => ({}));
+        const data: { message?: string; paymentMethodId?: number } = await res.json().catch(() => ({}));
         const msg = (data.message || "").trim().toLowerCase();
         const alreadySaved = res.status === 400 && (msg.includes("already saved") || msg.includes("already have"));
         if (res.ok || alreadySaved) {
-          onSuccess();
+          onSuccess({ paymentMethodId: data.paymentMethodId });
           return;
         }
         onError(data.message || "Could not save payment method");
@@ -443,7 +445,7 @@ function ConnectStripeBankForm({
   onError,
 }: {
   clientSecret: string;
-  onSuccess: () => void;
+  onSuccess: (data?: { paymentMethodId?: number }) => void;
   onError: (err: string) => void;
 }) {
   const stripe = useStripe();
@@ -457,14 +459,19 @@ function ConnectStripeBankForm({
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!stripe || !elements || !clientSecret) return;
+    if (!stripe || !elements || !clientSecret) {
+      if (import.meta.env.DEV) console.warn("[Stripe] Add payment: missing stripe/elements/clientSecret", { stripe: !!stripe, elements: !!elements, clientSecret: !!clientSecret });
+      return;
+    }
     setIsProcessing(true);
     onError("");
+    if (import.meta.env.DEV) console.log("[Stripe] Add payment: confirming setup with Stripe...");
     try {
       const { setupIntent, error } = await stripe.confirmSetup({
         elements,
         redirect: "if_required",
       });
+      if (import.meta.env.DEV) console.log("[Stripe] Add payment: confirmSetup result", { status: setupIntent?.status, error: error?.message || null });
       if (error) {
         onError(error.message || "Setup failed");
         setIsProcessing(false);
@@ -483,22 +490,28 @@ function ConnectStripeBankForm({
         return;
       }
       if (setupIntent?.status === "succeeded" && setupIntent.id) {
+        if (import.meta.env.DEV) console.log("[Stripe] Add payment: calling /api/stripe/confirm-setup", setupIntent.id);
         const res = await fetch("/api/stripe/confirm-setup", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           credentials: "include",
           body: JSON.stringify({ setupIntentId: setupIntent.id }),
         });
-        const data: { message?: string } = await res.json().catch(() => ({}));
+        const data: { message?: string; paymentMethodId?: number; alreadySaved?: boolean } = await res.json().catch(() => ({}));
         const msg = (data.message || "").trim().toLowerCase();
-        const alreadySaved = res.status === 400 && (msg.includes("already saved") || msg.includes("this card is already") || msg.includes("this bank account is already") || msg.includes("already have"));
-        if (res.ok || alreadySaved) {
-          onSuccess();
+        const alreadySavedByStatus = res.status === 400 && (msg.includes("already saved") || msg.includes("this card is already") || msg.includes("this bank account is already") || msg.includes("already have"));
+        const alreadySaved = data.alreadySaved === true || alreadySavedByStatus;
+        if (import.meta.env.DEV) console.log("[Stripe] Add payment: confirm-setup response", { ok: res.ok, status: res.status, alreadySaved, message: data.message, paymentMethodId: data.paymentMethodId });
+        if (res.ok || alreadySavedByStatus) {
+          onSuccess(alreadySaved ? (data.paymentMethodId != null ? { paymentMethodId: data.paymentMethodId } : undefined) : { paymentMethodId: data.paymentMethodId });
           return;
         }
         onError(data.message || "Could not save payment method");
+      } else if (import.meta.env.DEV) {
+        console.warn("[Stripe] Add payment: unexpected setupIntent state", setupIntent?.status);
       }
     } catch (err: any) {
+      if (import.meta.env.DEV) console.error("[Stripe] Add payment error:", err?.message || err);
       onError(err?.message || "Something went wrong");
     } finally {
       setIsProcessing(false);
@@ -512,7 +525,7 @@ function ConnectStripeBankForm({
         clientSecret={microdepositState.clientSecret}
         microdepositType={microdepositState.microdepositType}
         bankLabel="your bank account"
-        onSuccess={onSuccess}
+        onSuccess={(d) => onSuccess(d)}
         onError={onError}
         onBack={() => setMicrodepositState(null)}
       />
@@ -849,7 +862,7 @@ interface SampleJob {
   hourlyRate: number;
   maxWorkersNeeded: number;
   workersHired: number;
-  status: "open" | "in_progress" | "completed" | "cancelled";
+  status: "draft" | "open" | "in_progress" | "completed" | "cancelled";
   startDate: string;
   endDate?: string;
   estimatedHours: number;
@@ -992,7 +1005,13 @@ function mapRealTimesheet(ts: TimesheetWithDetails): TimesheetDisplay {
     clockInTime: ts.clockInTime instanceof Date ? ts.clockInTime : new Date(ts.clockInTime),
     clockOutTime: ts.clockOutTime ? (ts.clockOutTime instanceof Date ? ts.clockOutTime : new Date(ts.clockOutTime)) : null,
     totalHours,
-    adjustedHours: totalHours,
+    adjustedHours: (() => {
+      const adj =
+        ts.adjustedHours != null && String(ts.adjustedHours).trim() !== ""
+          ? parseFloat(String(ts.adjustedHours))
+          : NaN;
+      return Number.isFinite(adj) ? adj : totalHours;
+    })(),
     hourlyRate: ts.hourlyRate,
     clockInDistanceMeters: clockInDist,
     clockOutDistanceMeters: clockOutDist,
@@ -1023,6 +1042,21 @@ function formatAutoApprovalCountdown(msRemaining: number): string {
   }
   if (hours > 0) return `${hours}h ${minutes}m left`;
   return `${minutes}m left`;
+}
+
+/** Short label for "time until auto-approve" e.g. "24h to respond", "45m to respond". */
+function formatResponseDeadline(msRemaining: number): string {
+  if (msRemaining <= 0) return "Auto-approving...";
+  const hours = Math.floor(msRemaining / (1000 * 60 * 60));
+  const minutes = Math.floor((msRemaining % (1000 * 60 * 60)) / (1000 * 60));
+  if (hours >= 24) {
+    const days = Math.floor(hours / 24);
+    const remainingHours = hours % 24;
+    if (remainingHours === 0) return `${days}d to respond`;
+    return `${days}d ${remainingHours}h to respond`;
+  }
+  if (hours > 0) return `${hours}h to respond`;
+  return `${minutes}m to respond`;
 }
 
 function getCountdownVariant(msRemaining: number): "default" | "secondary" | "destructive" | "outline" {
@@ -1513,6 +1547,245 @@ const sampleTimesheets: SampleTimesheet[] = [
   }
 ];
 
+// Stable component so inputs don't remount on parent re-render (fixes "can only type 1 character" focus loss)
+function CompanyMenuPanelProfileFormView(props: {
+  companyProfileForm: { companyName: string; companyWebsite: string; firstName: string; lastName: string; email: string; phone: string };
+  setCompanyProfileForm: React.Dispatch<React.SetStateAction<{ companyName: string; companyWebsite: string; firstName: string; lastName: string; email: string; phone: string }>>;
+  profile: any;
+  user: any;
+  companyLogoUrl: string | null;
+  handleLogoUpload: (file: File) => Promise<void>;
+  isUploadingLogo: boolean;
+  alternateEmails: string[];
+  setAlternateEmails: React.Dispatch<React.SetStateAction<string[]>>;
+  newAlternateEmail: string;
+  setNewAlternateEmail: (v: string) => void;
+  alternatePhones: string[];
+  setAlternatePhones: React.Dispatch<React.SetStateAction<string[]>>;
+  newAlternatePhone: string;
+  setNewAlternatePhone: (v: string) => void;
+  updateProfile: { isPending: boolean; mutateAsync: (opts: any) => Promise<any> };
+  toast: (opts: { title: string; description?: string }) => void;
+  t: (key: string, fallback?: string) => string;
+}) {
+  const {
+    companyProfileForm,
+    setCompanyProfileForm,
+    profile,
+    user,
+    companyLogoUrl,
+    handleLogoUpload,
+    isUploadingLogo,
+    alternateEmails,
+    setAlternateEmails,
+    newAlternateEmail,
+    setNewAlternateEmail,
+    alternatePhones,
+    setAlternatePhones,
+    newAlternatePhone,
+    setNewAlternatePhone,
+    updateProfile,
+    toast,
+    t,
+  } = props;
+  const logoId = "logo-upload-input-panel";
+  return (
+    <div className="space-y-6 pr-4">
+      <div className="flex items-start gap-4">
+        <div className="w-20 h-20 rounded-lg bg-muted flex items-center justify-center border-2 border-dashed border-muted-foreground/30 overflow-hidden">
+          {companyLogoUrl ? (
+            <img src={companyLogoUrl} alt={t("settings.companyLogo")} className="w-full h-full object-cover" />
+          ) : (
+            <Image className="w-8 h-8 text-muted-foreground" />
+          )}
+        </div>
+        <div className="flex-1">
+          <Label>{t("settings.companyLogo")}</Label>
+          <p className="text-sm text-muted-foreground mb-2">{t("settings.uploadLogoDesc")}</p>
+          <input
+            type="file"
+            accept="image/png,image/jpeg,image/jpg"
+            className="hidden"
+            id={logoId}
+            onChange={(e) => {
+              const file = e.target.files?.[0];
+              if (file) handleLogoUpload(file);
+              e.target.value = "";
+            }}
+            data-testid="input-logo-file-panel"
+          />
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={isUploadingLogo}
+            onClick={() => document.getElementById(logoId)?.click()}
+            data-testid="button-upload-logo-panel"
+          >
+            {isUploadingLogo ? (
+              <><Loader2 className="w-4 h-4 mr-2 animate-spin" /> {t("settings.uploading")}</>
+            ) : (
+              <><Image className="w-4 h-4 mr-2" /> {companyLogoUrl ? t("settings.changeLogo") : t("settings.uploadLogo")}</>
+            )}
+          </Button>
+        </div>
+      </div>
+      <Separator />
+      <div>
+        <Label>{t("settings.companyName")}</Label>
+        <Input value={companyProfileForm.companyName} onChange={(e) => setCompanyProfileForm(prev => ({ ...prev, companyName: e.target.value }))} data-testid="input-company-name" />
+      </div>
+      <div>
+        <Label>{t("settings.website")}</Label>
+        <div className="relative">
+          <Globe className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
+          <Input className="pl-9" placeholder={t("settings.websitePlaceholder")} value={companyProfileForm.companyWebsite} onChange={(e) => setCompanyProfileForm(prev => ({ ...prev, companyWebsite: e.target.value }))} data-testid="input-company-website" />
+        </div>
+      </div>
+      <Separator />
+      <div className="grid grid-cols-2 gap-4">
+        <div>
+          <Label>{t("settings.firstName")}</Label>
+          <Input value={companyProfileForm.firstName} onChange={(e) => setCompanyProfileForm(prev => ({ ...prev, firstName: e.target.value }))} data-testid="input-first-name" />
+        </div>
+        <div>
+          <Label>{t("settings.lastName")}</Label>
+          <Input value={companyProfileForm.lastName} onChange={(e) => setCompanyProfileForm(prev => ({ ...prev, lastName: e.target.value }))} data-testid="input-last-name" />
+        </div>
+      </div>
+      <div>
+        <Label>{t("settings.primaryEmail")}</Label>
+        <Input
+          type="email"
+          readOnly
+          className="bg-muted cursor-not-allowed"
+          value={profile?.email ?? user?.email ?? companyProfileForm.email}
+          data-testid="input-email"
+          aria-label="Primary email (login email, cannot be changed here)"
+        />
+        <p className="text-xs text-muted-foreground mt-1">{t("settings.primaryEmailLoginNote")}</p>
+      </div>
+      <div>
+        <Label>{t("settings.primaryPhone")}</Label>
+        <Input type="tel" value={companyProfileForm.phone} onChange={(e) => setCompanyProfileForm(prev => ({ ...prev, phone: e.target.value }))} data-testid="input-phone" />
+      </div>
+      <Separator />
+      <div>
+        <div className="flex items-center justify-between mb-2">
+          <Label>{t("settings.alternativeEmails")}</Label>
+        </div>
+        <div className="space-y-2">
+          {alternateEmails.map((email, i) => (
+            <div key={i} className="flex items-center gap-2">
+              <Input value={email} readOnly className="flex-1" />
+              <Button variant="ghost" size="icon" aria-label="Remove email" onClick={() => setAlternateEmails(prev => prev.filter((_, idx) => idx !== i))}>
+                <Trash2 className="w-4 h-4" />
+              </Button>
+            </div>
+          ))}
+          <div className="flex items-center gap-2">
+            <div className="relative flex-1">
+              <Mail className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
+              <Input
+                className="pl-9"
+                type="email"
+                placeholder={t("settings.addAlternativeEmail")}
+                value={newAlternateEmail}
+                onChange={(e) => setNewAlternateEmail(e.target.value)}
+                data-testid="input-alternate-email"
+              />
+            </div>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => {
+                if (newAlternateEmail && newAlternateEmail.includes("@")) {
+                  setAlternateEmails(prev => [...prev, newAlternateEmail]);
+                  setNewAlternateEmail("");
+                }
+              }}
+              data-testid="button-add-alternate-email"
+            >
+              <Plus className="w-4 h-4 mr-1" /> {t("settings.add")}
+            </Button>
+          </div>
+        </div>
+      </div>
+      <div>
+        <div className="flex items-center justify-between mb-2">
+          <Label>{t("settings.alternativePhones")}</Label>
+        </div>
+        <div className="space-y-2">
+          {alternatePhones.map((phone, i) => (
+            <div key={i} className="flex items-center gap-2">
+              <Input value={phone} readOnly className="flex-1" />
+              <Button variant="ghost" size="icon" aria-label="Remove phone" onClick={() => setAlternatePhones(prev => prev.filter((_, idx) => idx !== i))}>
+                <Trash2 className="w-4 h-4" />
+              </Button>
+            </div>
+          ))}
+          <div className="flex items-center gap-2">
+            <div className="relative flex-1">
+              <Phone className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
+              <Input
+                className="pl-9"
+                type="tel"
+                placeholder={t("settings.addAlternativePhone")}
+                value={newAlternatePhone}
+                onChange={(e) => setNewAlternatePhone(e.target.value)}
+                data-testid="input-alternate-phone"
+              />
+            </div>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => {
+                if (newAlternatePhone) {
+                  setAlternatePhones(prev => [...prev, newAlternatePhone]);
+                  setNewAlternatePhone("");
+                }
+              }}
+              data-testid="button-add-alternate-phone"
+            >
+              <Plus className="w-4 h-4 mr-1" /> {t("settings.add")}
+            </Button>
+          </div>
+        </div>
+      </div>
+      <div className="flex gap-2 pt-2">
+        <Button
+          data-testid="button-save-profile-panel"
+          disabled={updateProfile.isPending}
+          onClick={async () => {
+            if (!profile) return;
+            try {
+              await updateProfile.mutateAsync({
+                id: profile.id,
+                data: {
+                  companyName: companyProfileForm.companyName.trim() || undefined,
+                  companyWebsite: companyProfileForm.companyWebsite.trim() || undefined,
+                  firstName: companyProfileForm.firstName.trim() || undefined,
+                  lastName: companyProfileForm.lastName.trim() || undefined,
+                  email: (profile?.email ?? user?.email ?? companyProfileForm.email).trim() || undefined,
+                  phone: companyProfileForm.phone.trim() || undefined,
+                  alternateEmails,
+                  alternatePhones,
+                },
+                skipToast: true,
+              });
+              toast({ title: t("settings.profileUpdated"), description: t("settings.profileSavedDesc") });
+            } catch (e) {
+              // Error toast is shown by updateProfile
+            }
+          }}
+        >
+          {updateProfile.isPending ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : null}
+          {t("settings.saveChanges")}
+        </Button>
+      </div>
+    </div>
+  );
+}
+
 export default function CompanyDashboard() {
   const [, setLocation] = useLocation();
   const { user } = useAuth();
@@ -1566,6 +1839,7 @@ export default function CompanyDashboard() {
     chatJobs.forEach((cj) => { map[cj.job.id] = cj.unreadCount ?? 0; });
     return map;
   }, [chatJobs]);
+  const totalUnreadChats = useMemo(() => chatJobs.reduce((sum, cj) => sum + (cj.unreadCount ?? 0), 0), [chatJobs]);
   const jobHasActiveCallSet = useMemo(() => {
     const set = new Set<number>();
     chatJobs.forEach((cj) => { if (cj.hasActiveCall) set.add(cj.job.id); });
@@ -1848,17 +2122,9 @@ export default function CompanyDashboard() {
     }
   }, [subsection, activeTab]);
   
-  // Check for mandatory requirements - agreement and payment method
-  useEffect(() => {
-    if (!profile || profileLoading) return;
-    
-    // Check if company has signed agreement
-    if (profile.role === "company" && !profile.contractSigned) {
-      setShowMandatoryAgreement(true);
-    }
-  }, [profile, profileLoading]);
+  // Check for mandatory requirements - agreement and payment method (uses hasSignedAgreement from below)
   
-  // Fetch Stripe config for card payments
+  // Fetch Stripe config for card payments (uses sandbox/test keys in dev)
   useEffect(() => {
     const fetchStripeConfig = async () => {
       try {
@@ -1866,7 +2132,12 @@ export default function CompanyDashboard() {
         if (res.ok) {
           const config = await res.json();
           if (config.publishableKey) {
+            if (import.meta.env.DEV && config.useSandbox !== false) {
+              console.log("[Stripe] Using sandbox/test keys (mode=" + (config.mode || "test") + "). Card data is not charged.");
+            }
             setStripePromise(loadStripe(config.publishableKey));
+          } else if (import.meta.env.DEV) {
+            console.warn("[Stripe] No publishableKey in config – check server STRIPE_TEST_PUBLISHABLE_KEY");
           }
         }
       } catch (err) {
@@ -1914,6 +2185,7 @@ export default function CompanyDashboard() {
   const [showPaymentMethods, setShowPaymentMethods] = useState(false);
   const [paymentMethodsView, setPaymentMethodsView] = useState<"list" | "assignLocations">("list");
   const [editPaymentMethodLocations, setEditPaymentMethodLocations] = useState<{ id: number; locationIds: string[] | null } | null>(null);
+  const [bankVerificationMethod, setBankVerificationMethod] = useState<any | null>(null);
   const [showTeamAccess, setShowTeamAccess] = useState(false);
   const [inviteWizardStep, setInviteWizardStep] = useState(0); // 0=list (menu only), 1=Details, 2=Permissions, 3=Location (optional)
   const [inviteData, setInviteData] = useState({
@@ -2037,6 +2309,7 @@ export default function CompanyDashboard() {
     dateTo: "",
     type: "all",
     worker: "all",
+    category: "all" as "all" | "funding" | "spend", // Funding = deposit, auto_recharge; Spend = charge, refund
   });
   const [composeReceiptItem, setComposeReceiptItem] = useState<{
     id: string; date: string; type: string; amount: number; paymentMethod?: string; method?: string;
@@ -2098,7 +2371,7 @@ export default function CompanyDashboard() {
   });
   
   // Fetch payment methods from database
-  const { data: paymentMethods = [], refetch: refetchPaymentMethods, isLoading: paymentMethodsLoading, isFetched: paymentMethodsFetched } = useQuery<Array<{
+  const { data: paymentMethods = [], refetch: refetchPaymentMethods, isLoading: paymentMethodsLoading, isFetched: paymentMethodsFetched, isSuccess: paymentMethodsSuccess } = useQuery<Array<{
     id: number;
     profileId: number;
     type: "ach" | "card";
@@ -2114,23 +2387,59 @@ export default function CompanyDashboard() {
     isVerified?: boolean | null;
     stripeBankStatus?: string | null;
   }>>({
-    queryKey: ["/api/company/payment-methods"],
+    queryKey: ["/api/company/payment-methods", profile?.id],
+    queryFn: async () => {
+      const res = await fetch("/api/company/payment-methods", { credentials: "include" });
+      if (!res.ok) throw new Error(await res.text().catch(() => res.statusText));
+      return res.json();
+    },
     enabled: !!profile && profile.role === "company",
     staleTime: 0, // Always refetch to ensure we have latest (avoids modal reappearing when CC was saved)
+    refetchOnWindowFocus: true, // Refetch when user returns to tab so list reflects any server-side removals (e.g. unusable PM removed)
   });
 
-  // Derived: usable = card or verified ACH; pending = ACH awaiting verification
-  // Support both camelCase and snake_case from API
-  const hasUsablePaymentMethod = (paymentMethods || []).some((m: any) => {
+  // When user opens Payment Methods panel, refetch so list reflects current DB (e.g. if server removed an unusable payment method, it disappears here and add-payment popup can trigger)
+  useEffect(() => {
+    if (showPaymentMethods && profile?.role === "company") {
+      refetchPaymentMethods().then(({ data }) => {
+        // If server removed the last payment method, list is empty; invalidate profile so primaryPaymentMethodId is cleared and add-payment popup can show
+        if (Array.isArray(data) && data.length === 0) {
+          queryClient.invalidateQueries({ queryKey: ["/api/profile"] });
+        }
+      });
+    }
+  }, [showPaymentMethods, profile?.role, queryClient, refetchPaymentMethods]);
+
+  // Prefer profile cache (primary payment method id + verification status on company record) so we don't fetch payment methods every time
+  const profilePrimaryId = (profile as any)?.primaryPaymentMethodId ?? (profile as any)?.primary_payment_method_id;
+  const profilePrimaryVerified = (profile as any)?.primaryPaymentMethodVerified ?? (profile as any)?.primary_payment_method_verified;
+  const profileLastFailedId = (profile as any)?.lastFailedPaymentMethodId ?? (profile as any)?.last_failed_payment_method_id;
+  const paymentMethodsList = paymentMethods || [];
+  const hasUsablePaymentMethodFromList = paymentMethodsList.some((m: any) => {
     const type = m.type ?? m.payment_method_type;
     const verified = m.isVerified ?? m.is_verified;
     return type === "card" || (type === "ach" && verified);
   });
-  const hasPendingBank = (paymentMethods || []).some((m: any) => {
+  const hasUsablePaymentMethod = profilePrimaryVerified === true ? true : hasUsablePaymentMethodFromList;
+  const hasAnyPaymentMethod = profilePrimaryId != null ? true : paymentMethodsList.length > 0;
+  const hasPendingBank = paymentMethodsList.some((m: any) => {
     const type = m.type ?? m.payment_method_type;
     const verified = m.isVerified ?? m.is_verified;
     return type === "ach" && !verified;
   });
+
+  // Agreement counts as signed if contractSigned is true OR contractSignedAt is set (server may set only one)
+  const hasSignedAgreement = Boolean(
+    profile && (profile.contractSigned === true || (profile.contractSignedAt != null && profile.contractSignedAt !== ""))
+  );
+
+  // Show mandatory agreement popup when company has not signed (only after profile loaded)
+  useEffect(() => {
+    if (!profile || profileLoading) return;
+    if (profile.role === "company" && !hasSignedAgreement) {
+      setShowMandatoryAgreement(true);
+    }
+  }, [profile, profileLoading, hasSignedAgreement]);
 
   // Approved timesheets with paymentStatus "failed" (payment was attempted, charge declined/failed)
   const hasUnpaidFailedItems = (realTimesheets || []).some(
@@ -2140,7 +2449,9 @@ export default function CompanyDashboard() {
   // When a payment attempt fails (e.g. top-up), show popup so user can add/fix payment method
   const [paymentFailedTrigger, setPaymentFailedTrigger] = useState(false);
   
-  // Check for payment method after agreement is signed - only after query has completed
+  // Check for payment method after agreement is signed - only after query has completed.
+  // When server removes a payment method (e.g. Stripe "may not be used again"), refetch returns updated list;
+  // if no usable methods remain, show global add-payment popup.
   useEffect(() => {
     if (!profile || profileLoading) return;
     // Don't show popup until payment methods query has completed
@@ -2149,14 +2460,14 @@ export default function CompanyDashboard() {
     // User has a usable payment method (card or verified ACH) OR has a positive deposit
     const hasPaymentCapability = hasUsablePaymentMethod || (profile.depositAmount && profile.depositAmount > 0);
     
-    // If agreement is signed but no payment method AND no deposit, show payment popup
-    if (profile.role === "company" && profile.contractSigned && !hasPaymentCapability) {
+    // If agreement is signed but no payment method AND no deposit, show payment popup (e.g. after server removed last PM)
+    if (profile.role === "company" && hasSignedAgreement && !hasPaymentCapability) {
       setShowMandatoryPaymentMethod(true);
     } else if (hasPaymentCapability) {
       // If they have payment methods or a deposit, ensure popup is closed
       setShowMandatoryPaymentMethod(false);
     }
-  }, [profile, profileLoading, hasUsablePaymentMethod, paymentMethodsFetched, paymentMethodsLoading]);
+  }, [profile, profileLoading, hasSignedAgreement, hasUsablePaymentMethod, paymentMethodsFetched, paymentMethodsLoading]);
   
   // Fetch company balance from Modern Treasury
   const { data: balanceData } = useQuery<{
@@ -2365,6 +2676,44 @@ export default function CompanyDashboard() {
     },
   });
 
+  // Trigger auto-draft / auto-replenishment (pending + commitments). For debugging Acme / manual run.
+  const triggerAutoChargeMutation = useMutation({
+    mutationFn: async () => {
+      const clientBalanceCents = accountBalance;
+      const clientTotalNeededCents = totalPendingPay + totalJobCommitments;
+      if (import.meta.env.DEV) {
+        console.log("[TriggerAutoCharge] Calling API with", {
+          clientBalanceCents,
+          clientTotalNeededCents,
+          shortfall: Math.max(0, clientTotalNeededCents - clientBalanceCents),
+          pending: totalPendingPay,
+          commitments: totalJobCommitments,
+        });
+      }
+      const res = await apiRequest("POST", "/api/company/trigger-auto-charge", {
+        clientBalanceCents,
+        clientTotalNeededCents,
+      });
+      const data = await res.json().catch(() => ({}));
+      if (import.meta.env.DEV) {
+        console.log("[TriggerAutoCharge] API response", { ok: res.ok, status: res.status, data });
+      }
+      if (!res.ok) throw new Error(data.message || "Auto-charge failed");
+      return data;
+    },
+    onSuccess: (data) => {
+      queryClient.invalidateQueries({ queryKey: ["/api/profile"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/mt/company/balance"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/mt/company/transactions"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/timesheets/company"] });
+      toast({ title: data.success ? "Auto-charge completed" : "No charge needed", description: data.message || (data.noChargeNeeded ? "Balance is sufficient." : "Check payment methods.") });
+    },
+    onError: (err: any) => {
+      if (import.meta.env.DEV) console.warn("[TriggerAutoCharge] Error", err?.message || err);
+      toast({ title: "Auto-charge failed", description: err?.message || "Try again or top up manually.", variant: "destructive" });
+    },
+  });
+
   // State for add payment method form (mobile popup)
   const [newPaymentMethod, setNewPaymentMethod] = useState({
     routingNumber: "",
@@ -2383,8 +2732,9 @@ export default function CompanyDashboard() {
   const [addPaymentMethodType, setAddPaymentMethodType] = useState<"ach" | "card">("ach");
   const [stripePromise, setStripePromise] = useState<ReturnType<typeof loadStripe> | null>(null);
 
-  // When user just saved a payment method, hide modal immediately (before refetch completes)
+  // When user just saved a payment method, hide modal immediately and suppress re-open for a short period (avoids popup re-rendering while refetch completes)
   const [justAddedPaymentMethod, setJustAddedPaymentMethod] = useState(false);
+  const paymentMethodAddedAtRef = useRef<number>(0);
   useEffect(() => {
     if (hasUsablePaymentMethod) {
       setJustAddedPaymentMethod(false);
@@ -2392,18 +2742,29 @@ export default function CompanyDashboard() {
     }
   }, [hasUsablePaymentMethod]);
 
-  // Show add-payment pop-up when: (1) no usable payment method (CC or verified bank), or (2) payment was attempted and failed
-  // Bank only counts if validated; CC counts immediately when added
+  const suppressPaymentModalMs = 15000;
+  const isSuppressingPaymentModal = paymentMethodAddedAtRef.current > 0 && (Date.now() - paymentMethodAddedAtRef.current < suppressPaymentModalMs);
+
+  // Use profile cache (primaryPaymentMethodId, primaryPaymentMethodVerified, lastFailedPaymentMethodId) when available so we don't need to fetch payment methods every time. When a charge fails, server sets lastFailedPaymentMethodId → popup shows; when they add a new method or retry, server clears it.
+  // Require payment methods to be fetched before showing so we never flash the modal on refresh while data is still loading.
+  const profileHasPaymentCache = profilePrimaryId != null || profilePrimaryVerified === true || profilePrimaryVerified === false;
+  const paymentDataReady = paymentMethodsFetched && !paymentMethodsLoading;
   const showBankVerificationModal = Boolean(
     profile?.role === "company" &&
-    paymentMethodsFetched &&
+    hasSignedAgreement &&
     !justAddedPaymentMethod &&
-    (!hasUsablePaymentMethod || hasUnpaidFailedItems || paymentFailedTrigger)
+    !isSuppressingPaymentModal &&
+    paymentDataReady &&
+    (profileLastFailedId != null || hasUnpaidFailedItems || paymentFailedTrigger || (!hasUsablePaymentMethod && !hasAnyPaymentMethod)) &&
+    (profileHasPaymentCache || paymentMethodsSuccess)
   );
 
   const [showStripeAddPaymentMethod, setShowStripeAddPaymentMethod] = useState(false);
   const [connectStripeClientSecret, setConnectStripeClientSecret] = useState<string | null>(null);
   const [connectStripeError, setConnectStripeError] = useState<string | null>(null);
+  const [addPaymentStep, setAddPaymentStep] = useState<1 | 2>(1);
+  const [addedPaymentMethodId, setAddedPaymentMethodId] = useState<number | null>(null);
+  const [addPaymentLocationIds, setAddPaymentLocationIds] = useState<string[]>([]);
 
   // Global payment modal: 'embed' = Payment Element to add new, 'verify-list' = pending banks with inline cents entry + Add card
   const [globalPaymentModalView, setGlobalPaymentModalView] = useState<"embed" | "verify-list">("embed");
@@ -2536,7 +2897,7 @@ export default function CompanyDashboard() {
     const items: Array<{ id: string; title: string; description: string; action: () => void }> = [];
     
     // Check if agreement is signed
-    if (!profile.contractSigned) {
+    if (!hasSignedAgreement) {
       items.push({
         id: "agreement",
         title: t("company.onboarding.signPlatformAgreement"),
@@ -2567,7 +2928,7 @@ export default function CompanyDashboard() {
     }
     
     return items;
-  }, [profile, hasUsablePaymentMethod, companyLocations]);
+  }, [profile, hasSignedAgreement, hasUsablePaymentMethod, companyLocations]);
   
   // Show blocking onboarding popup when there are incomplete items
   // Wait for ALL required data (profile, paymentMethods, companyLocations) before showing to avoid flash on page load
@@ -2624,7 +2985,7 @@ export default function CompanyDashboard() {
         signedAt: row.signedAt ?? "",
         text: row.agreementText ?? COMPANY_AGREEMENT_TEXT,
       }))
-    : profile?.contractSigned
+    : hasSignedAgreement
       ? [{ id: null, type: "Company Hiring Agreement", version: "1.0", signedName: [profile.firstName, profile.lastName].filter(Boolean).join(" ") || "Client", signedAt: profile.contractSignedAt ? new Date(profile.contractSignedAt).toISOString() : "", text: COMPANY_AGREEMENT_TEXT }]
       : [];
 
@@ -2659,6 +3020,12 @@ export default function CompanyDashboard() {
       if (billingFilters.type !== "all" && item.type !== billingFilters.type) return false;
       if (billingFilters.worker !== "all") {
         if (!item.workerId || item.workerId.toString() !== billingFilters.worker) return false;
+      }
+      // Filter by category: funding (deposit, auto_recharge) or spend (charge, refund)
+      if (billingFilters.category === "funding") {
+        if (item.type !== "deposit" && item.type !== "auto_recharge") return false;
+      } else if (billingFilters.category === "spend") {
+        if (item.type !== "charge" && item.type !== "refund") return false;
       }
       return true;
     });
@@ -2825,7 +3192,7 @@ export default function CompanyDashboard() {
   const [teamRequestStep, setTeamRequestStep] = useState(1);
   const [showPublicFallbackPopup, setShowPublicFallbackPopup] = useState(false);
   
-  const [jobsFilter, setJobsFilter] = usePersistentFilter<"open" | "in_progress" | "done">("company_dashboard_jobs_filter", "open");
+  const [jobsFilter, setJobsFilter] = usePersistentFilter<"open" | "in_progress" | "done" | "draft">("company_dashboard_jobs_filter", "open");
   const [selectedJobDetails, setSelectedJobDetails] = useState<SampleJob | null>(null);
   const [selectedJobLocation, setSelectedJobLocation] = useState<SampleLocation | null>(null);
   const [showJobDetailsFullView, setShowJobDetailsFullView] = useState(false);
@@ -2835,6 +3202,7 @@ export default function CompanyDashboard() {
   
   const [showMarkCompleteDialog, setShowMarkCompleteDialog] = useState<SampleJob | null>(null);
   const [showPendingTimesheetsWarning, setShowPendingTimesheetsWarning] = useState<{ jobId: number; jobTitle: string; pendingCount: number } | null>(null);
+  const [pendingApproveAllJobId, setPendingApproveAllJobId] = useState<number | null>(null);
   const [showHowItWorks, setShowHowItWorks] = useState(false);
   const [howItWorksStep, setHowItWorksStep] = useState(0);
   const [markCompleteStep, setMarkCompleteStep] = useState<"timesheets" | "review">("timesheets");
@@ -2857,12 +3225,16 @@ export default function CompanyDashboard() {
   const [showAdjustTimelineDialog, setShowAdjustTimelineDialog] = useState<SampleJob | null>(null);
   const [showIncreaseWorkersDialog, setShowIncreaseWorkersDialog] = useState<SampleJob | null>(null);
   const [showEditJobDialog, setShowEditJobDialog] = useState<SampleJob | null>(null);
-  
+  const [jobDetailsMediaUploading, setJobDetailsMediaUploading] = useState(false);
+  const jobDetailsMediaInputRef = useRef<HTMLInputElement>(null);
+
+  const MAX_JOB_MEDIA = 6;
+
   const [jobsData, setJobsData] = useState<SampleLocation[]>([]);
   const [hasLoadedJobs, setHasLoadedJobs] = useState(false);
   
   // Fetch real company jobs from API
-  const { data: companyJobs, isLoading: isLoadingJobs, error: jobsError } = useCompanyJobs();
+  const { data: companyJobs, isLoading: isLoadingJobs, isFetching: isFetchingJobs, error: jobsError } = useCompanyJobs();
   
   // Initialize company logo from profile
   useEffect(() => {
@@ -2871,21 +3243,22 @@ export default function CompanyDashboard() {
     }
   }, [profile?.companyLogo]);
 
-  // Sync company profile form when dialog or profile panel is shown
+  // Sync company profile form when dialog or profile panel is shown. Primary email = login email (prefilled, locked).
   useEffect(() => {
     if ((showCompanyProfile || menuSelection === "profile") && profile) {
+      const primaryEmail = profile.email || (user?.email ?? "");
       setCompanyProfileForm({
         companyName: (profile as any).companyName || "",
         companyWebsite: (profile as any).companyWebsite || "",
         firstName: profile.firstName || "",
         lastName: profile.lastName || "",
-        email: profile.email || "",
+        email: primaryEmail,
         phone: profile.phone || "",
       });
       setAlternateEmails((profile as any).alternateEmails || []);
       setAlternatePhones((profile as any).alternatePhones || []);
     }
-  }, [showCompanyProfile, menuSelection, profile]);
+  }, [showCompanyProfile, menuSelection, profile, user?.email]);
   
   // Profile update mutation for logo upload
   const updateProfile = useUpdateProfile();
@@ -3015,7 +3388,7 @@ export default function CompanyDashboard() {
           hourlyRate: job.hourlyRate || 0,
           maxWorkersNeeded: job.maxWorkersNeeded || 1,
           workersHired: job.workersHired || 0,
-          status: job.status as "open" | "in_progress" | "completed" | "cancelled",
+          status: job.status as "draft" | "open" | "in_progress" | "completed" | "cancelled",
           startDate: job.startDate ? new Date(job.startDate).toISOString().split('T')[0] : "",
           endDate: job.endDate ? new Date(job.endDate).toISOString().split('T')[0] : undefined,
           estimatedHours: job.estimatedHours || 8,
@@ -3119,22 +3492,27 @@ export default function CompanyDashboard() {
     return `$${((workerRateCents + PLATFORM_FEE_CENTS) / 100).toFixed(0)}/hr`;
   };
   
-  const [adjustTimelineData, setAdjustTimelineData] = useState<RescheduleScheduleData>({
+  const getTomorrowStr = () => {
+    const d = new Date();
+    d.setDate(d.getDate() + 1);
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  };
+  const [adjustTimelineData, setAdjustTimelineData] = useState<RescheduleScheduleData>(() => ({
     timelineType: "",
     onDemandDate: "",
-    onDemandStartTime: "08:00",
+    onDemandStartTime: "09:00",
     onDemandDoneByDate: "",
     onDemandBudget: null,
     oneDayDate: "",
-    oneDayStartTime: "08:00",
+    oneDayStartTime: "09:00",
     oneDayEndTime: "17:00",
     recurringDays: [],
-    recurringStartDate: "",
+    recurringStartDate: getTomorrowStr(),
     recurringEndDate: "",
-    recurringStartTime: "08:00",
+    recurringStartTime: "09:00",
     recurringEndTime: "17:00",
     recurringWeeks: 1,
-  });
+  }));
   const [adjustRescheduleView, setAdjustRescheduleView] = useState<"type-select" | ShiftType>("type-select");
   const [onDemandFormStep, setOnDemandFormStep] = useState(1);
   const [oneDayFormStep, setOneDayFormStep] = useState(1);
@@ -3168,16 +3546,16 @@ export default function CompanyDashboard() {
   const [actionReqRescheduleData, setActionReqRescheduleData] = useState<RescheduleScheduleData>(() => ({
     timelineType: "",
     onDemandDate: "",
-    onDemandStartTime: "08:00",
+    onDemandStartTime: "09:00",
     onDemandDoneByDate: "",
     onDemandBudget: null,
     oneDayDate: "",
-    oneDayStartTime: "08:00",
+    oneDayStartTime: "09:00",
     oneDayEndTime: "17:00",
     recurringDays: [],
-    recurringStartDate: "",
+    recurringStartDate: getTomorrowStr(),
     recurringEndDate: "",
-    recurringStartTime: "08:00",
+    recurringStartTime: "09:00",
     recurringEndTime: "17:00",
     recurringWeeks: 1,
   }));
@@ -3582,12 +3960,14 @@ export default function CompanyDashboard() {
               setEscrowInfo(response.escrowInfo);
               toast({
                 title: "Timesheet Approved",
-                description: `Payment held - worker needs to add bank account.`,
+                description: response.expectedPayTiming ?? `Payment held - worker needs to add bank account.`,
               });
             } else {
               toast({
                 title: "Timesheet Approved",
-                description: `Timesheet has been approved and payment is being processed.`,
+                description: response.expectedPayTiming
+                  ? `Timesheet approved. ${response.expectedPayTiming}`
+                  : "Timesheet has been approved and payment is being processed.",
               });
             }
           },
@@ -3786,10 +4166,30 @@ export default function CompanyDashboard() {
   }, [realTimesheets, jobsData, profile]);
   
   const pendingTimesheets = normalizedTimesheets.filter(t => t.status === "pending");
+  /** Real DB ids only — used for bulk approve across all pending (per-job buttons only send that job). */
+  const pendingTimesheetRealIds = useMemo(
+    () => pendingTimesheets.map((t) => t.id).filter((id) => id > 0),
+    [pendingTimesheets]
+  );
+
+  /** Worker pay only (matches approve API: hours × hourlyRate). Not platform fee. */
+  const pendingLaborPayTotalCents = useMemo(
+    () =>
+      pendingTimesheets
+        .filter((t) => t.isRealData && t.id > 0)
+        .reduce((sum, t) => {
+          const h = Number(t.adjustedHours ?? t.totalHours ?? 0);
+          return sum + Math.round(h * t.hourlyRate);
+        }, 0),
+    [pendingTimesheets]
+  );
+  const companyBalanceCentsForPreview = profile?.depositAmount ?? 0;
+  const projectedBalanceAfterAllPending = companyBalanceCentsForPreview - pendingLaborPayTotalCents;
   const approvedTimesheets = normalizedTimesheets.filter(t => t.status === "approved");
   const rejectedTimesheets = normalizedTimesheets.filter(t => t.status === "rejected");
-  
-  const totalPendingPay = pendingTimesheets.reduce((sum, t) => 
+  // Pending pay = all timesheets in open status (not approved/rejected): pending + disputed
+  const openTimesheetsForPay = normalizedTimesheets.filter(t => t.status === "pending" || t.status === "disputed");
+  const totalPendingPay = openTimesheetsForPay.reduce((sum, t) =>
     sum + Math.round(t.adjustedHours * t.hourlyRate * 1.52), 0
   );
 
@@ -3826,9 +4226,13 @@ export default function CompanyDashboard() {
         totalSpent: 0,
       }));
     
-    // Jobs with pending timesheets first, then jobs without (sorted by title)
+    // Jobs with pending timesheets first, ordered by nearest response deadline (soonest first); then jobs without (sorted by title)
+    const groupsWithEarliest = groups.map(g => ({
+      ...g,
+      earliestAutoApprovalMs: Math.min(...g.timesheets.map(t => t.autoApprovalMsRemaining ?? Infinity)),
+    }));
     return [
-      ...groups.sort((a, b) => b.timesheets.length - a.timesheets.length),
+      ...groupsWithEarliest.sort((a, b) => a.earliestAutoApprovalMs - b.earliestAutoApprovalMs),
       ...jobsWithoutTimesheets.sort((a, b) => a.jobTitle.localeCompare(b.jobTitle))
     ];
   }, [pendingTimesheets, inProgressJobsForTimesheets]);
@@ -3964,9 +4368,14 @@ export default function CompanyDashboard() {
     let open = 0;
     let inProgress = 0;
     let completed = 0;
-    
+    let draft = 0;
+
     jobsData.forEach(location => {
       location.jobs.forEach(job => {
+        if (job.status === "draft") {
+          draft++;
+          return;
+        }
         const hasApprovedWorkers = job.applications.some(app => app.status === "accepted");
         if (job.status === "completed") {
           completed++;
@@ -3977,8 +4386,8 @@ export default function CompanyDashboard() {
         }
       });
     });
-    
-    return { open, inProgress, completed, total: open + inProgress + completed };
+
+    return { open, inProgress, completed, draft, total: open + inProgress + completed + draft };
   }, [jobsData]);
 
   // When there are no open jobs, switch away from "open" filter so user sees content
@@ -3989,21 +4398,25 @@ export default function CompanyDashboard() {
     }
   }, [jobsFilter, jobCounts.open, jobCounts.inProgress, jobCounts.completed, setJobsFilter]);
 
+  // Job commitments = estimated cost (workers × rate × estimated hours × 1.52) minus approved timesheets (paid down)
   const totalJobCommitments = useMemo(() => {
-    // Only count jobs that have approved (accepted) workers
-    // Use actual job values: estimatedHours × hourlyRate × acceptedWorkers (no markup)
     let total = 0;
     jobsData.forEach(location => {
       location.jobs.forEach(job => {
         const acceptedWorkers = job.applications.filter(a => a.status === "accepted").length;
-        // Only include jobs with at least one approved worker and not completed
-        if (acceptedWorkers > 0 && job.status !== "completed") {
-          total += (job.estimatedHours * job.hourlyRate * acceptedWorkers);
-        }
+        if (acceptedWorkers === 0 || job.status === "completed") return;
+        const estimatedHours = job.estimatedHours ?? 40;
+        const rate = job.hourlyRate ?? 2500;
+        const fullEstimateCents = Math.round(estimatedHours * rate * acceptedWorkers * 1.52);
+        const approvedForJob = normalizedTimesheets
+          .filter(t => t.jobId === job.id && t.status === "approved")
+          .reduce((sum, t) => sum + Math.round(t.adjustedHours * t.hourlyRate * 1.52), 0);
+        const remainingCents = Math.max(0, fullEstimateCents - approvedForJob);
+        total += remainingCents;
       });
     });
-    return Math.round(total);
-  }, [jobsData]);
+    return total;
+  }, [jobsData, normalizedTimesheets]);
 
   const jobsWithCommitments = useMemo(() => {
     return (jobsData || []).flatMap(location =>
@@ -4014,19 +4427,23 @@ export default function CompanyDashboard() {
         })
         .map(job => {
           const acceptedWorkers = job.applications?.filter((a: any) => a.status === "accepted").length || 1;
-          const estimatedCost = job.estimatedHours
-            ? Math.round(job.estimatedHours * job.hourlyRate * acceptedWorkers)
-            : 0;
+          const estimatedHours = job.estimatedHours ?? 40;
+          const rate = job.hourlyRate ?? 2500;
+          const fullEstimateCents = Math.round(estimatedHours * rate * acceptedWorkers * 1.52);
+          const approvedForJob = normalizedTimesheets
+            .filter(t => t.jobId === job.id && t.status === "approved")
+            .reduce((sum, t) => sum + Math.round(t.adjustedHours * t.hourlyRate * 1.52), 0);
+          const remainingCents = Math.max(0, fullEstimateCents - approvedForJob);
           return {
             id: job.id,
             title: job.title,
-            amount: estimatedCost,
+            amount: remainingCents,
             locationData: location,
             fullJob: job,
           };
         })
     ).filter(j => j.amount > 0);
-  }, [jobsData]);
+  }, [jobsData, normalizedTimesheets]);
 
   const autoRechargeNeeded = useMemo(() => {
     const pendingPayments = totalPendingPay;
@@ -4132,197 +4549,6 @@ export default function CompanyDashboard() {
     if (typeof window !== "undefined") window.history.replaceState(null, "", newUrl);
   }, [activeTab, jobsData, navigate]);
 
-  // Desktop menu right-panel detail views (no dialogs; content inline)
-  function CompanyMenuPanelProfileForm() {
-    const logoId = "logo-upload-input-panel";
-    return (
-      <div className="space-y-6 pr-4">
-          <div className="flex items-start gap-4">
-            <div className="w-20 h-20 rounded-lg bg-muted flex items-center justify-center border-2 border-dashed border-muted-foreground/30 overflow-hidden">
-              {companyLogoUrl ? (
-                <img src={companyLogoUrl} alt={t("settings.companyLogo")} className="w-full h-full object-cover" />
-              ) : (
-                <Image className="w-8 h-8 text-muted-foreground" />
-              )}
-            </div>
-            <div className="flex-1">
-              <Label>{t("settings.companyLogo")}</Label>
-              <p className="text-sm text-muted-foreground mb-2">{t("settings.uploadLogoDesc")}</p>
-              <input
-                type="file"
-                accept="image/png,image/jpeg,image/jpg"
-                className="hidden"
-                id={logoId}
-                onChange={(e) => {
-                  const file = e.target.files?.[0];
-                  if (file) handleLogoUpload(file);
-                  e.target.value = "";
-                }}
-                data-testid="input-logo-file-panel"
-              />
-              <Button
-                variant="outline"
-                size="sm"
-                disabled={isUploadingLogo}
-                onClick={() => document.getElementById(logoId)?.click()}
-                data-testid="button-upload-logo-panel"
-              >
-                {isUploadingLogo ? (
-                  <><Loader2 className="w-4 h-4 mr-2 animate-spin" /> {t("settings.uploading")}</>
-                ) : (
-                  <><Image className="w-4 h-4 mr-2" /> {companyLogoUrl ? t("settings.changeLogo") : t("settings.uploadLogo")}</>
-                )}
-              </Button>
-            </div>
-          </div>
-          <Separator />
-          <div>
-            <Label>{t("settings.companyName")}</Label>
-            <Input value={companyProfileForm.companyName} onChange={(e) => setCompanyProfileForm(prev => ({ ...prev, companyName: e.target.value }))} data-testid="input-company-name" />
-          </div>
-          <div>
-            <Label>{t("settings.website")}</Label>
-            <div className="relative">
-              <Globe className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
-              <Input className="pl-9" placeholder={t("settings.websitePlaceholder")} value={companyProfileForm.companyWebsite} onChange={(e) => setCompanyProfileForm(prev => ({ ...prev, companyWebsite: e.target.value }))} data-testid="input-company-website" />
-            </div>
-          </div>
-          <Separator />
-          <div className="grid grid-cols-2 gap-4">
-            <div>
-              <Label>{t("settings.firstName")}</Label>
-              <Input value={companyProfileForm.firstName} onChange={(e) => setCompanyProfileForm(prev => ({ ...prev, firstName: e.target.value }))} data-testid="input-first-name" />
-            </div>
-            <div>
-              <Label>{t("settings.lastName")}</Label>
-              <Input value={companyProfileForm.lastName} onChange={(e) => setCompanyProfileForm(prev => ({ ...prev, lastName: e.target.value }))} data-testid="input-last-name" />
-            </div>
-          </div>
-          <div>
-            <Label>{t("settings.primaryEmail")}</Label>
-            <Input type="email" value={companyProfileForm.email} onChange={(e) => setCompanyProfileForm(prev => ({ ...prev, email: e.target.value }))} data-testid="input-email" />
-          </div>
-          <div>
-            <Label>{t("settings.primaryPhone")}</Label>
-            <Input type="tel" value={companyProfileForm.phone} onChange={(e) => setCompanyProfileForm(prev => ({ ...prev, phone: e.target.value }))} data-testid="input-phone" />
-          </div>
-          <Separator />
-          <div>
-            <div className="flex items-center justify-between mb-2">
-              <Label>{t("settings.alternativeEmails")}</Label>
-            </div>
-            <div className="space-y-2">
-              {alternateEmails.map((email, i) => (
-                <div key={i} className="flex items-center gap-2">
-                  <Input value={email} readOnly className="flex-1" />
-                  <Button variant="ghost" size="icon" onClick={() => setAlternateEmails(prev => prev.filter((_, idx) => idx !== i))}>
-                    <Trash2 className="w-4 h-4" />
-                  </Button>
-                </div>
-              ))}
-              <div className="flex items-center gap-2">
-                <div className="relative flex-1">
-                  <Mail className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
-                  <Input
-                    className="pl-9"
-                    type="email"
-                    placeholder={t("settings.addAlternativeEmail")}
-                    value={newAlternateEmail}
-                    onChange={(e) => setNewAlternateEmail(e.target.value)}
-                    data-testid="input-alternate-email"
-                  />
-                </div>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => {
-                    if (newAlternateEmail && newAlternateEmail.includes("@")) {
-                      setAlternateEmails(prev => [...prev, newAlternateEmail]);
-                      setNewAlternateEmail("");
-                    }
-                  }}
-                  data-testid="button-add-alternate-email"
-                >
-                  <Plus className="w-4 h-4 mr-1" /> {t("settings.add")}
-                </Button>
-              </div>
-            </div>
-          </div>
-          <div>
-            <div className="flex items-center justify-between mb-2">
-              <Label>{t("settings.alternativePhones")}</Label>
-            </div>
-            <div className="space-y-2">
-              {alternatePhones.map((phone, i) => (
-                <div key={i} className="flex items-center gap-2">
-                  <Input value={phone} readOnly className="flex-1" />
-                  <Button variant="ghost" size="icon" onClick={() => setAlternatePhones(prev => prev.filter((_, idx) => idx !== i))}>
-                    <Trash2 className="w-4 h-4" />
-                  </Button>
-                </div>
-              ))}
-              <div className="flex items-center gap-2">
-                <div className="relative flex-1">
-                  <Phone className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
-                  <Input
-                    className="pl-9"
-                    type="tel"
-                    placeholder={t("settings.addAlternativePhone")}
-                    value={newAlternatePhone}
-                    onChange={(e) => setNewAlternatePhone(e.target.value)}
-                    data-testid="input-alternate-phone"
-                  />
-                </div>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => {
-                    if (newAlternatePhone) {
-                      setAlternatePhones(prev => [...prev, newAlternatePhone]);
-                      setNewAlternatePhone("");
-                    }
-                  }}
-                  data-testid="button-add-alternate-phone"
-                >
-                  <Plus className="w-4 h-4 mr-1" /> {t("settings.add")}
-                </Button>
-              </div>
-            </div>
-          </div>
-          <div className="flex gap-2 pt-2">
-            <Button
-              data-testid="button-save-profile-panel"
-              disabled={updateProfile.isPending}
-              onClick={async () => {
-                if (!profile) return;
-                try {
-                  await updateProfile.mutateAsync({
-                    id: profile.id,
-                    data: {
-                      companyName: companyProfileForm.companyName.trim() || undefined,
-                      companyWebsite: companyProfileForm.companyWebsite.trim() || undefined,
-                      firstName: companyProfileForm.firstName.trim() || undefined,
-                      lastName: companyProfileForm.lastName.trim() || undefined,
-                      email: companyProfileForm.email.trim() || undefined,
-                      phone: companyProfileForm.phone.trim() || undefined,
-                      alternateEmails,
-                      alternatePhones,
-                    },
-                    skipToast: true,
-                  });
-                  toast({ title: t("settings.profileUpdated"), description: t("settings.profileSavedDesc") });
-                } catch (e) {
-                  // Error toast is shown by updateProfile
-                }
-              }}
-            >
-              {updateProfile.isPending ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : null}
-              {t("settings.saveChanges")}
-            </Button>
-          </div>
-        </div>
-    );
-  }
 
   function CompanyMenuPanelLocations() {
     return (
@@ -4349,113 +4575,170 @@ export default function CompanyDashboard() {
     );
   }
 
+  // Card brand to datatrans payment-logos URL (https://github.com/datatrans/payment-logos)
+  const CARD_LOGO_BASE = "https://raw.githubusercontent.com/datatrans/payment-logos/master/assets";
+  const cardLogoForBrand = (brand: string | null | undefined): string | null => {
+    if (!brand) return `${CARD_LOGO_BASE}/generic/card-generic.svg`;
+    const b = brand.toLowerCase().replace(/\s+/g, "-");
+    const map: Record<string, string> = {
+      visa: "cards/visa.svg",
+      mastercard: "cards/mastercard.svg",
+      amex: "cards/american-express.svg",
+      "american-express": "cards/american-express.svg",
+      discover: "cards/discover.svg",
+      "diners_club": "cards/diners.svg",
+      "diners-club": "cards/diners.svg",
+      diners: "cards/diners.svg",
+      jcb: "cards/jcb.svg",
+      unionpay: "cards/unionpay.svg",
+      maestro: "cards/maestro.svg",
+    };
+    return map[b] ? `${CARD_LOGO_BASE}/${map[b]}` : `${CARD_LOGO_BASE}/generic/card-generic.svg`;
+  };
+
   function CompanyMenuPanelPaymentMethods() {
+    const methodsWithStripeId = (paymentMethods || []).filter(
+      (m: any) => !!(m.stripePaymentMethodId ?? m.stripe_payment_method_id)
+    );
     return (
-      <div className="space-y-4 pr-4">
-          {paymentMethods.map((method: any) => {
-            const locationIdSet = new Set((method.locationIds || []).map((id: any) => String(id)));
-            const assignedLocations = locationIdSet.size > 0
-              ? companyLocations.filter((l: any) => locationIdSet.has(String(l.id)))
-              : [];
-            const cardBrandDisplay = method.cardBrand ? method.cardBrand.charAt(0).toUpperCase() + method.cardBrand.slice(1) : t("common.card", "Card");
-            return (
-              <Card key={method.id} className={`p-4 ${method.isPrimary ? "ring-2 ring-primary" : ""}`}>
-                <div className="flex items-start justify-between gap-2">
-                  <div className="flex items-start gap-3 min-w-0 flex-1">
-                    {method.type === "card" ? (
-                      <CreditCard className="w-8 h-8 text-muted-foreground shrink-0 mt-0.5" />
-                    ) : (
-                      <Landmark className="w-8 h-8 text-muted-foreground shrink-0 mt-0.5" />
-                    )}
-                    <div className="min-w-0 flex-1">
-                      <div className="flex items-center gap-2 flex-wrap">
-                        <p className="font-medium">
-                          {method.type === "card"
-                            ? t("settings.cardEndingIn", { brand: cardBrandDisplay, lastFour: method.lastFour })
-                            : t("settings.bankEndingIn", { bank: method.bankName || t("settings.bankAccount"), lastFour: method.lastFour })}
-                        </p>
-                        {method.isPrimary && <Badge variant="secondary" className="text-xs">{t("settings.default")}</Badge>}
-                        {method.type === "ach" && (() => {
-                          const stripeStatus = method.stripeBankStatus ?? (method as any).stripe_bank_status;
-                          const verified = method.isVerified ?? (method as any).is_verified;
-                          if (verified || stripeStatus === "verified") return null;
-                          if (stripeStatus === "verification_failed") return (
-                            <Badge variant="outline" className="text-xs text-destructive border-destructive/50">
-                              {t("settings.verificationFailed", "Verification failed")}
-                            </Badge>
-                          );
-                          if (stripeStatus === "new" || (!verified && !stripeStatus)) return (
-                            <Badge variant="outline" className="text-xs text-amber-600 dark:text-amber-400 border-amber-300 dark:border-amber-700">
-                              {t("settings.pendingVerification", "Pending verification")}
-                            </Badge>
-                          );
-                          return null;
-                        })()}
-                      </div>
-                      <p className="text-sm text-muted-foreground">
-                        {method.type === "card"
-                          ? t("settings.creditDebitCardFee")
-                          : (() => {
-                              const stripeStatus = method.stripeBankStatus ?? (method as any).stripe_bank_status;
-                              const verified = method.isVerified ?? (method as any).is_verified;
-                              if (verified || stripeStatus === "verified") return t("settings.achNoFee");
-                              if (stripeStatus === "verification_failed") return t("settings.achVerificationFailedHelp", "Verification failed. Remove and re-add this bank to try again.");
-                              return t("settings.achVerifyInstructions", "Verification in progress. You can use this bank once Stripe confirms it.");
-                            })()}
-                      </p>
-                      {assignedLocations.length > 0 && (
-                        <div className="flex flex-wrap gap-1 mt-2">
-                          {assignedLocations.map((loc: any) => (
-                            <Badge key={loc.id} variant="outline" className="text-xs font-normal">
-                              <MapPin className="w-3 h-3 mr-0.5" />
-                              {loc.name}
-                            </Badge>
-                          ))}
+      <div className="flex flex-col min-h-0 pr-4">
+        <div className="flex-1 min-h-0 overflow-auto">
+          <div className="rounded-md border">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="border-b bg-muted/50">
+                  <th className="text-left font-medium p-3">{t("settings.paymentMethod", "Payment method")}</th>
+                  <th className="text-left font-medium p-3 hidden sm:table-cell">{t("settings.details", "Details")}</th>
+                  <th className="w-10 p-3" aria-label={t("common.actions", "Actions")} />
+                </tr>
+              </thead>
+              <tbody>
+                {methodsWithStripeId.map((method: any) => {
+                  const locationIdSet = new Set((method.locationIds || []).map((id: any) => String(id)));
+                  const assignedLocations = locationIdSet.size > 0
+                    ? companyLocations.filter((l: any) => locationIdSet.has(String(l.id)))
+                    : [];
+                  const cardBrandDisplay = method.cardBrand ? method.cardBrand.charAt(0).toUpperCase() + method.cardBrand.slice(1) : t("common.card", "Card");
+                  const label = method.type === "card"
+                    ? t("settings.cardEndingIn", { brand: cardBrandDisplay, lastFour: method.lastFour })
+                    : t("settings.bankEndingIn", { bank: method.bankName || t("settings.bankAccount"), lastFour: method.lastFour });
+                  const locationLabel = assignedLocations.length === 0
+                    ? (t("settings.primaryAllLocations", "All locations") as string)
+                    : assignedLocations.map((l: any) => l.name).join(", ");
+                  const isAchUnverified = method.type === "ach" && !(method.isVerified ?? (method as any).is_verified) && (method.stripeBankStatus ?? (method as any).stripe_bank_status) !== "verified";
+                  return (
+                    <tr
+                      key={method.id}
+                      className={`border-b last:border-b-0 ${method.isPrimary ? "bg-primary/5" : ""}`}
+                    >
+                      <td className="p-3 align-middle">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          {method.type === "card" ? (
+                            <img
+                              src={cardLogoForBrand(method.cardBrand) ?? ""}
+                              alt=""
+                              className="w-8 h-5 object-contain shrink-0"
+                            />
+                          ) : (
+                            <Landmark className="w-5 h-5 text-muted-foreground shrink-0" />
+                          )}
+                          <span className="font-medium">{label}</span>
+                          {method.isPrimary && <Badge variant="secondary" className="text-xs">{t("settings.default")}</Badge>}
+                          {method.type === "ach" && (() => {
+                            const stripeStatus = method.stripeBankStatus ?? (method as any).stripe_bank_status;
+                            const verified = method.isVerified ?? (method as any).is_verified;
+                            if (verified || stripeStatus === "verified") return null;
+                            if (stripeStatus === "verification_failed") return (
+                              <Badge variant="outline" className="text-xs text-destructive border-destructive/50">
+                                {t("settings.verificationFailed", "Verification failed")}
+                              </Badge>
+                            );
+                            if (stripeStatus === "new" || (!verified && !stripeStatus)) return (
+                              <Badge variant="outline" className="text-xs text-amber-600 dark:text-amber-400 border-amber-300 dark:border-amber-700">
+                                {t("settings.pendingVerification", "Pending verification")}
+                              </Badge>
+                            );
+                            return null;
+                          })()}
                         </div>
-                      )}
-                    </div>
-                  </div>
-                  <DropdownMenu>
-                    <DropdownMenuTrigger asChild>
-                      <Button variant="ghost" size="icon" className="h-8 w-8 shrink-0" data-testid={`button-payment-menu-${method.id}`}>
-                        <MoreVertical className="w-4 h-4" />
-                      </Button>
-                    </DropdownMenuTrigger>
-                    <DropdownMenuContent align="end">
-                      {!method.isPrimary && (
-                        <DropdownMenuItem
-                          onClick={() => setPrimaryPaymentMethodMutation.mutate(method.id)}
-                          disabled={setPrimaryPaymentMethodMutation.isPending}
-                          data-testid={`menu-set-default-${method.id}`}
-                        >
-                          {t("settings.setAsDefault")}
-                        </DropdownMenuItem>
-                      )}
-                      <DropdownMenuItem
-                        onClick={() => setEditPaymentMethodLocations({ id: method.id, locationIds: (method.locationIds || []).map(String) })}
-                        data-testid={`menu-assign-locations-${method.id}`}
-                      >
-                        {t("settings.assignToLocations")}
-                      </DropdownMenuItem>
-                      <DropdownMenuSeparator />
-                      <DropdownMenuItem
-                        className="text-destructive focus:text-destructive"
-                        onClick={() => deletePaymentMethodMutation.mutate(method.id)}
-                        disabled={deletePaymentMethodMutation.isPending || (method.isPrimary && paymentMethods.length === 1)}
-                        data-testid={`menu-remove-${method.id}`}
-                      >
-                        {t("settings.remove")}
-                      </DropdownMenuItem>
-                    </DropdownMenuContent>
-                  </DropdownMenu>
-                </div>
-              </Card>
-            );
-          })}
+                        {isAchUnverified && (
+                          <div className="mt-2 sm:hidden">
+                            <Button variant="outline" size="sm" className="text-xs" onClick={() => setBankVerificationMethod(method)} data-testid={`button-verify-bank-mobile-${method.id}`}>
+                              {t("settings.verifyBank", "Verify bank")}
+                            </Button>
+                          </div>
+                        )}
+                      </td>
+                      <td className="p-3 text-muted-foreground hidden sm:table-cell align-middle">
+                        {isAchUnverified ? (
+                          <Button variant="outline" size="sm" className="text-xs" onClick={() => setBankVerificationMethod(method)} data-testid={`button-verify-bank-${method.id}`}>
+                            {t("settings.verifyBank", "Verify bank")}
+                          </Button>
+                        ) : assignedLocations.length > 0 ? (
+                          <div className="flex flex-wrap gap-1">
+                            {assignedLocations.map((loc: any) => (
+                              <Badge key={loc.id} variant="outline" className="text-xs font-normal">
+                                <MapPin className="w-3 h-3 mr-0.5" />
+                                {loc.name}
+                              </Badge>
+                            ))}
+                          </div>
+                        ) : (
+                          <span className="text-muted-foreground">{locationLabel}</span>
+                        )}
+                      </td>
+                      <td className="p-3 align-middle">
+                        <DropdownMenu>
+                          <DropdownMenuTrigger asChild>
+                            <Button variant="ghost" size="icon" className="h-8 w-8 shrink-0" data-testid={`button-payment-menu-${method.id}`}>
+                              <MoreVertical className="w-4 h-4" />
+                            </Button>
+                          </DropdownMenuTrigger>
+                          <DropdownMenuContent align="end">
+                            {!method.isPrimary && (
+                              <DropdownMenuItem
+                                onClick={() => setPrimaryPaymentMethodMutation.mutate(method.id)}
+                                disabled={setPrimaryPaymentMethodMutation.isPending}
+                                data-testid={`menu-set-default-${method.id}`}
+                              >
+                                {t("settings.setAsDefault")}
+                              </DropdownMenuItem>
+                            )}
+                            <DropdownMenuItem
+                              onClick={() => {
+                                setEditPaymentMethodLocations({ id: method.id, locationIds: (method.locationIds || []).map(String) });
+                                setPaymentMethodsView("assignLocations");
+                                setShowPaymentMethods(true);
+                              }}
+                              data-testid={`menu-assign-locations-${method.id}`}
+                            >
+                              {t("settings.assignToLocations")}
+                            </DropdownMenuItem>
+                            <DropdownMenuSeparator />
+                            <DropdownMenuItem
+                              className="text-destructive focus:text-destructive"
+                              onClick={() => deletePaymentMethodMutation.mutate(method.id)}
+                              disabled={deletePaymentMethodMutation.isPending || (method.isPrimary && methodsWithStripeId.length === 1)}
+                              data-testid={`menu-remove-${method.id}`}
+                            >
+                              {t("settings.remove")}
+                            </DropdownMenuItem>
+                          </DropdownMenuContent>
+                        </DropdownMenu>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+        <div className="sticky bottom-0 left-0 right-0 flex-shrink-0 pt-4 pb-1 bg-background border-t mt-4">
           <Button variant="outline" className="w-full border-dashed" onClick={() => setShowStripeAddPaymentMethod(true)} data-testid="button-add-payment-method-panel">
             <Plus className="w-4 h-4 mr-2" /> {t("settings.addNewPaymentMethod")}
           </Button>
         </div>
+      </div>
     );
   }
 
@@ -4956,11 +5239,12 @@ export default function CompanyDashboard() {
             <div className="flex items-center gap-3 w-full">
               <div className="flex-1 min-w-0 overflow-x-auto scrollbar-hide">
                 <AnimatedNavigationTabs
+                  aria-label="Company dashboard navigation"
                   items={[
                     { id: "jobs", label: t("nav.jobs") },
                     { id: "team", label: t("nav.team") },
-                    { id: "timesheets", label: t("company.timesheets") },
-                    { id: "chats", label: t("nav.messages"), onClick: () => navigate("/company-dashboard/chats") },
+                    { id: "timesheets", label: t("company.timesheets"), badge: pendingTimesheets.length > 0 ? (pendingTimesheets.length > 9 ? "9+" : String(pendingTimesheets.length)) : undefined },
+                    { id: "chats", label: t("nav.messages"), onClick: () => navigate("/company-dashboard/chats"), badge: totalUnreadChats > 0 ? (totalUnreadChats > 9 ? "9+" : String(totalUnreadChats)) : undefined },
                   ]}
                   value={["jobs", "team", "timesheets", "chats"].includes(activeTab) ? activeTab : ""}
                   onValueChange={(id) => { if (id === "chats") navigate("/company-dashboard/chats"); else setActiveTab(id); }}
@@ -4971,7 +5255,7 @@ export default function CompanyDashboard() {
                 size="sm"
                 className="flex-shrink-0"
                 onClick={() => {
-                  if (!profile?.contractSigned) {
+                  if (!hasSignedAgreement) {
                     setShowMandatoryAgreement(true);
                     toast({ title: t("dashboard.agreementRequired"), description: t("dashboard.pleaseSignAgreementBeforePosting"), variant: "destructive" });
                     return;
@@ -5048,7 +5332,7 @@ export default function CompanyDashboard() {
                 size="sm"
                 onClick={() => {
                   if (profile?.role === "company") {
-                    if (!profile.contractSigned) {
+                    if (!hasSignedAgreement) {
                       setShowMandatoryAgreement(true);
                       toast({
                         title: t("dashboard.agreementRequired"),
@@ -5132,6 +5416,7 @@ export default function CompanyDashboard() {
         
         {/* Content holder: horizontal padding only on mobile (desktop style is full-bleed). No padding on chat details so ChatSection header is full width. */}
         <div className={`w-full flex-1 min-h-0 flex flex-col pb-14 md:pb-0 overflow-hidden ${isMobile && !(activeTab === "chats" && subsection) ? "px-0 sm:px-6 lg:px-8" : ""}`}>
+          <ErrorBoundary section={`${activeTab} tab`}>
           {/* Balance banner: own container stacked below header, full width, only on Timesheets tab */}
           {activeTab === "timesheets" && (
             <div className="flex-shrink-0 w-full bg-card border-b border-border shadow-sm p-3">
@@ -5177,6 +5462,24 @@ export default function CompanyDashboard() {
                   >
                     <Plus className="w-4 h-4 mr-1" /> Top Up
                   </Button>
+                  <Button
+                    variant="outline"
+                    size="icon"
+                    className="h-9 w-9 shrink-0"
+                    onClick={() => {
+                      if (import.meta.env.DEV) console.log("[TriggerAutoCharge] Button clicked — triggering auto-draft (pending + commitments)");
+                      triggerAutoChargeMutation.mutate();
+                    }}
+                    disabled={triggerAutoChargeMutation.isPending}
+                    title="Trigger auto-draft (charge for pending + job commitments if balance is low)"
+                    data-testid="button-trigger-auto-charge"
+                  >
+                    {triggerAutoChargeMutation.isPending ? (
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                    ) : (
+                      <DollarSign className="w-4 h-4" />
+                    )}
+                  </Button>
                   {(import.meta.env.DEV || (typeof window !== "undefined" && new URLSearchParams(window.location.search).get("seed") === "1")) && (
                     <Button
                       variant="outline"
@@ -5204,6 +5507,7 @@ export default function CompanyDashboard() {
                     size="icon"
                     onClick={() => setShowTimesheetSettings(true)}
                     data-testid="button-timesheet-settings"
+                    aria-label="Timesheet settings"
                   >
                     <Settings className="w-4 h-4" />
                   </Button>
@@ -5215,6 +5519,7 @@ export default function CompanyDashboard() {
                 const openJobDetails = (job: typeof jobsWithCommitments[0]) => {
                   setSelectedJobDetails(job.fullJob);
                   setSelectedJobLocation(job.locationData);
+                  setShowJobDetailsFullView(true);
                 };
                 return (
                   <div className="mt-3 pt-3 border-t">
@@ -5256,7 +5561,10 @@ export default function CompanyDashboard() {
             </div>
           )}
           <div className={`flex flex-col flex-1 min-h-0 justify-start pt-0 ${activeTab === "chats" ? "px-0" : activeTab === "timesheets" ? "px-0" : !isMobile && activeTab === "menu" ? "px-0" : "px-[23px] md:px-0 lg:px-[23px]"} ${activeTab === "menu" && !isMobile ? "items-stretch w-full overflow-hidden" : activeTab === "chats" ? "items-stretch w-full overflow-hidden" : "items-stretch w-full overflow-y-auto"} ${activeTab !== "menu" ? "space-y-6" : ""}`}>
-          <TabsContent value="jobs" className="w-full max-w-full flex flex-col items-stretch pt-[14px] pb-[14px] space-y-6 mt-0">
+          <TabsContent
+            value="jobs"
+            className="w-full max-w-full flex flex-col items-stretch pt-[14px] pb-[14px] md:px-[14px] space-y-6 mt-0 data-[state=inactive]:h-0 data-[state=inactive]:min-h-0 data-[state=inactive]:overflow-hidden data-[state=inactive]:p-0 data-[state=inactive]:m-0 data-[state=inactive]:mt-0 data-[state=inactive]:space-y-0"
+          >
             {/* Action Hub - Pending Requests & Jobs Needing Attention */}
             {hasActionItems && (
               <div 
@@ -5298,8 +5606,42 @@ export default function CompanyDashboard() {
               </div>
             )}
             
+            {/* Background-refresh indicator */}
+            {!isLoadingJobs && isFetchingJobs && (
+              <div className="flex items-center justify-center gap-1.5 py-2 text-xs text-muted-foreground">
+                <Loader2 className="w-3 h-3 animate-spin" />
+                Refreshing…
+              </div>
+            )}
+
+            {/* Skeleton loading state - first paint before jobs load */}
+            {isLoadingJobs && (
+              <div className="space-y-4">
+                {[1, 2, 3].map((i) => (
+                  <div key={i} className="w-full bg-card rounded-2xl border border-border/60 shadow-sm p-4 space-y-3">
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="space-y-2 flex-1">
+                        <Skeleton className="h-5 w-2/3" />
+                        <Skeleton className="h-4 w-1/3" />
+                      </div>
+                      <Skeleton className="h-6 w-20 rounded-full" />
+                    </div>
+                    <div className="flex gap-3">
+                      <Skeleton className="h-4 w-24" />
+                      <Skeleton className="h-4 w-24" />
+                      <Skeleton className="h-4 w-16" />
+                    </div>
+                    <div className="flex gap-2 pt-1">
+                      <Skeleton className="h-8 w-28 rounded-lg" />
+                      <Skeleton className="h-8 w-8 rounded-lg" />
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+
             {/* Empty State - No Jobs Yet */}
-            {jobCounts.total === 0 && (
+            {!isLoadingJobs && jobCounts.total === 0 && (
               <div className="w-full bg-card rounded-2xl border border-border/60 shadow-sm p-8 md:p-12 text-center">
                 <div className="max-w-md mx-auto">
                   <div className="w-20 h-20 rounded-full bg-gradient-to-br from-blue-100 to-indigo-100 dark:from-blue-900/50 dark:to-indigo-900/50 flex items-center justify-center mx-auto mb-6">
@@ -5313,7 +5655,7 @@ export default function CompanyDashboard() {
                     <Button 
                       onClick={() => {
                         if (profile?.role === "company") {
-                          if (!profile.contractSigned) {
+                          if (!hasSignedAgreement) {
                             setShowMandatoryAgreement(true);
                             toast({
                               title: "Agreement Required",
@@ -5394,8 +5736,55 @@ export default function CompanyDashboard() {
                     {t("dashboard.completed")} <Badge variant="secondary" className="ml-1.5 text-xs">{jobCounts.completed}</Badge>
                   </Button>
                 )}
+                {jobCounts.draft > 0 && (
+                  <Button 
+                    variant={jobsFilter === "draft" ? "default" : "ghost"} 
+                    size="sm"
+                    className="flex-1 rounded-xl"
+                    onClick={() => setJobsFilter("draft")}
+                    data-testid="button-jobs-draft"
+                  >
+                    {t("dashboard.draft", "Draft")} <Badge variant="secondary" className="ml-1.5 text-xs">{jobCounts.draft}</Badge>
+                  </Button>
+                )}
               </div>
             )}
+
+            {/* Draft Tab — list draft jobs with Publish button */}
+            {jobsFilter === "draft" && jobCounts.draft > 0 && (() => {
+              const draftJobs = jobsData.flatMap(location =>
+                location.jobs
+                  .filter(job => job.status === "draft")
+                  .map(job => ({ job, location }))
+              );
+              return (
+                <div className="w-full space-y-4 mt-4">
+                  {draftJobs.map(({ job, location }) => (
+                    <div key={job.id} className="rounded-xl border bg-card p-4 flex flex-wrap items-center justify-between gap-3">
+                      <div className="min-w-0">
+                        <h3 className="font-semibold truncate">{job.title}</h3>
+                        <p className="text-sm text-muted-foreground">{location.name} · {job.trade}</p>
+                      </div>
+                      <Button
+                        size="sm"
+                        onClick={async () => {
+                          try {
+                            await apiRequest("POST", `/api/jobs/${job.id}/publish`, {});
+                            toast({ title: t("dashboard.published", "Published"), description: t("dashboard.jobNowVisible", "Job is now visible to workers.") });
+                            queryClient.invalidateQueries({ queryKey: ["/api/company/jobs"] });
+                          } catch (e: any) {
+                            toast({ title: t("error"), description: e?.message || "Failed to publish", variant: "destructive" });
+                          }
+                        }}
+                        data-testid={`button-publish-job-${job.id}`}
+                      >
+                        {t("dashboard.publish", "Publish")}
+                      </Button>
+                    </div>
+                  ))}
+                </div>
+              );
+            })()}
             
             {/* In-Progress Tab — compact list, no accordion */}
             {jobsFilter === "in_progress" && (() => {
@@ -5425,12 +5814,14 @@ export default function CompanyDashboard() {
                 <div className="w-full space-y-3" id="content-jobs">
                   {inProgressJobs.map(({ job, location }) => {
                     const approvedWorkers = job.applications.filter(app => app.status === "accepted");
+                    const pendingApplicants = job.applications.filter(app => app.status === "pending");
                     const jobTimesheets = normalizedTimesheets.filter(t => t.jobId === job.id);
                     const pendingJobTimesheets = jobTimesheets.filter(t => t.status === "pending");
                     const totalSpent = jobTimesheets.reduce((s, t) => s + Math.round(t.adjustedHours * t.hourlyRate * 1.52), 0) / 100;
                     const openJobDetails = () => {
                       setSelectedJobDetails(job);
                       setSelectedJobLocation(location);
+                      setShowJobDetailsFullView(true);
                     };
                     const unreadCount = jobUnreadMap[job.id] ?? 0;
                     const scheduleStr = formatJobSchedule(job);
@@ -5460,6 +5851,12 @@ export default function CompanyDashboard() {
                                   <span className="flex items-center gap-1 rounded-md bg-green-500/15 text-green-700 dark:text-green-400 px-1.5 py-0.5 text-xs font-medium" title="Call in progress">
                                     <Phone className="w-3.5 h-3.5" />
                                     Call
+                                  </span>
+                                )}
+                                {pendingApplicants.length > 0 && (
+                                  <span className="flex items-center gap-1 rounded-md bg-orange-100 dark:bg-orange-900/30 text-orange-700 dark:text-orange-400 px-1.5 py-0.5 text-xs font-medium" title="Pending applicants">
+                                    <User className="w-3.5 h-3.5" />
+                                    {pendingApplicants.length}
                                   </span>
                                 )}
                                 {unreadCount > 0 && (
@@ -5504,7 +5901,7 @@ export default function CompanyDashboard() {
                             </Button>
                             <DropdownMenu>
                               <DropdownMenuTrigger asChild>
-                                <Button variant="ghost" size="icon" className="rounded-lg h-8 w-8" data-testid={`button-job-actions-${job.id}`}>
+                                <Button variant="ghost" size="icon" className="rounded-lg h-8 w-8" data-testid={`button-job-actions-${job.id}`} aria-label="Job actions">
                                   <MoreVertical className="w-4 h-4" />
                                 </Button>
                               </DropdownMenuTrigger>
@@ -5526,7 +5923,7 @@ export default function CompanyDashboard() {
             })()}
 
             {/* Open and Completed Jobs View */}
-            {jobsFilter !== "in_progress" && (
+            {jobsFilter !== "in_progress" && jobsFilter !== "draft" && (
             <div className="w-full space-y-2 md:space-y-4">
               {[...jobsData]
                 .map(location => {
@@ -5566,7 +5963,15 @@ export default function CompanyDashboard() {
                   const oneDayMs = 24 * 60 * 60 * 1000;
                   return (today.getTime() - start.getTime()) >= oneDayMs;
                 }).length;
-                
+
+                /** Open/completed cards were showing saved site name as the headline; use real job title when one job. */
+                const locationRowPrimaryTitle =
+                  filteredJobs.length === 1
+                    ? (filteredJobs[0].title?.trim() || location.name)
+                    : location.name;
+                const addressLine = [location.city, location.state, location.zipCode].filter(Boolean).join(", ");
+                const locationRowSubtitleSingleJob = [location.name, addressLine].filter(Boolean).join(" · ");
+
                 return (
                 <div 
                   key={location.id} 
@@ -5671,11 +6076,12 @@ export default function CompanyDashboard() {
                         onJobClick={(job) => {
                           const fullJob = filteredJobs.find(j => j.id === job.id);
                           if (fullJob) {
+                            setSelectedJobDetails(fullJob);
+                            setSelectedJobLocation(location);
+                            setShowJobDetailsFullView(true);
                             if (isMobile) {
-                              setMobileJobDrawer({ job: fullJob, location });
-                            } else {
-                              setSelectedJobDetails(fullJob);
-                              setSelectedJobLocation(location);
+                              setMobileLocationPopup(null);
+                              setMobileJobDrawer(null);
                             }
                           }
                         }}
@@ -5944,7 +6350,11 @@ export default function CompanyDashboard() {
                       <div className="space-y-2">
                         <h4 className="text-sm font-medium text-muted-foreground">{t("company.team.workersOnLocation", "Workers on this location's team")}</h4>
                         {loc.savedWorkers?.length === 0 ? (
-                          <p className="text-sm text-muted-foreground py-2">No workers added to this location yet. Add from &quot;Workers You&apos;ve Worked With&quot; below.</p>
+                          <div className="py-6 text-center flex flex-col items-center gap-2 rounded-xl border border-dashed border-border bg-muted/30">
+                            <Users className="w-7 h-7 text-muted-foreground" />
+                            <p className="text-sm font-medium">No workers on this team yet</p>
+                            <p className="text-xs text-muted-foreground max-w-xs">Workers you&apos;ve hired will appear in &ldquo;Workers You&apos;ve Worked With&rdquo; below — add them here to build your team.</p>
+                          </div>
                         ) : (
                     <div className="w-full grid gap-4 md:grid-cols-2 lg:grid-cols-3">
                 {(loc.savedWorkers || []).map((member: any) => (
@@ -6171,7 +6581,29 @@ export default function CompanyDashboard() {
           </TabsContent>
 
           <TabsContent value="timesheets" className="w-full max-w-full flex flex-col items-stretch pt-0 space-y-0 mt-0 overflow-hidden px-4 sm:px-[23px]">
-            <Tabs value={timesheetTab} onValueChange={(v) => setTimesheetTab(v as "pending" | "approved" | "rejected")} className="flex flex-col flex-1 min-h-0 overflow-hidden w-full">
+            {timesheetsLoading && (
+              <div className="space-y-4 pt-4">
+                {[1, 2, 3].map((i) => (
+                  <div key={i} className="bg-card rounded-xl border border-border/60 shadow-sm p-4 space-y-3">
+                    <div className="flex items-center gap-3">
+                      <Skeleton className="h-10 w-10 rounded-full flex-shrink-0" />
+                      <div className="space-y-2 flex-1">
+                        <Skeleton className="h-4 w-1/3" />
+                        <Skeleton className="h-3 w-1/4" />
+                      </div>
+                      <Skeleton className="h-8 w-24 rounded-lg" />
+                      <Skeleton className="h-8 w-8 rounded-lg" />
+                    </div>
+                    <div className="flex gap-4 pl-13">
+                      <Skeleton className="h-3 w-20" />
+                      <Skeleton className="h-3 w-24" />
+                      <Skeleton className="h-3 w-16" />
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+            {!timesheetsLoading && <Tabs value={timesheetTab} onValueChange={(v) => setTimesheetTab(v as "pending" | "approved" | "rejected")} className="flex flex-col flex-1 min-h-0 overflow-hidden w-full">
               <div className="sticky top-0 z-10 flex-shrink-0 w-full py-3 flex justify-center sm:justify-start bg-secondary/20 backdrop-blur-sm border-b border-border/60 mb-4">
                 <TabsList withScrollControls className="w-full sm:w-fit max-w-full justify-center sm:justify-start">
                   <TabsTrigger value="pending" className="flex-shrink-0 gap-2" data-testid="timesheet-tab-pending">
@@ -6193,17 +6625,254 @@ export default function CompanyDashboard() {
               </div>
               
               <TabsContent value="pending" className="w-full space-y-4 mt-0 flex-1 overflow-y-auto">
-                <div className="bg-card rounded-2xl border border-border/60 shadow-sm p-12 text-center">
-                  <div className="w-16 h-16 rounded-full bg-muted flex items-center justify-center mx-auto mb-4">
-                    <Briefcase className="w-8 h-8 text-muted-foreground" />
+                {pendingLaborPayTotalCents > 0 && (
+                  <div
+                    className={`rounded-lg border px-3 py-2 text-sm ${
+                      projectedBalanceAfterAllPending < 0
+                        ? "border-destructive/50 bg-destructive/5"
+                        : "border-border bg-muted/30"
+                    }`}
+                    data-testid="pending-labor-balance-hint"
+                  >
+                    <p className="text-foreground">
+                      {t("dashboard.pendingLaborBalanceHint", {
+                        labor: `$${(pendingLaborPayTotalCents / 100).toFixed(2)}`,
+                        balance: `$${(companyBalanceCentsForPreview / 100).toFixed(2)}`,
+                        after: `$${(projectedBalanceAfterAllPending / 100).toFixed(2)}`,
+                      })}
+                    </p>
+                    {projectedBalanceAfterAllPending < 0 && (
+                      <p className="text-destructive text-xs mt-1 font-medium">
+                        {t("dashboard.pendingLaborInsufficient")}
+                      </p>
+                    )}
                   </div>
-                  <h3 className="font-semibold text-lg mb-2">Manage pending timesheets in job details</h3>
-                  <p className="text-muted-foreground max-w-sm mx-auto">
-                    Go to the <strong>Jobs</strong> tab, open an in-progress job, and use the Timesheets accordion to approve or reject pending entries.
-                  </p>
-                </div>
+                )}
+                {pendingTimesheets.length === 0 ? (
+                  <div className="bg-card rounded-2xl border border-border/60 shadow-sm p-12 text-center">
+                    <div className="w-16 h-16 rounded-full bg-green-100 dark:bg-green-900/30 flex items-center justify-center mx-auto mb-4">
+                      <CheckCircle className="w-8 h-8 text-green-600 dark:text-green-400" />
+                    </div>
+                    <h3 className="font-semibold text-lg mb-2">All caught up!</h3>
+                    <p className="text-muted-foreground max-w-sm mx-auto mb-4">
+                      No pending timesheets to review. New entries appear here when workers clock out.
+                    </p>
+                    <Button variant="outline" size="sm" onClick={() => setActiveTab("jobs")}>
+                      View active jobs
+                    </Button>
+                  </div>
+                ) : (
+                  <div className="space-y-6">
+                    {pendingTimesheetRealIds.length > 1 && (
+                      <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-amber-200/80 dark:border-amber-900/50 bg-amber-50/50 dark:bg-amber-950/20 px-4 py-3">
+                        <p className="text-sm text-muted-foreground max-w-xl">
+                          <span className="font-medium text-foreground">Approve everything:</span> each job card&apos;s{" "}
+                          <span className="whitespace-nowrap">Approve for this job</span> only affects that job. Use this
+                          button to approve all {pendingTimesheetRealIds.length} pending timesheets in one go (may fail
+                          individually if balance is low or a timesheet is disputed).
+                        </p>
+                        <Button
+                          size="sm"
+                          className="shrink-0 bg-green-600 hover:bg-green-700 text-white"
+                          disabled={bulkApproveTimesheets.isPending || pendingTimesheetRealIds.length === 0}
+                          title="Approve every pending timesheet across all jobs"
+                          onClick={() => {
+                            setPendingApproveAllJobId(-1);
+                            bulkApproveTimesheets.mutate(
+                              { timesheetIds: pendingTimesheetRealIds },
+                              {
+                                onSuccess: (res) => {
+                                  if (res.approved > 0) {
+                                    toast({
+                                      title: "Timesheets approved",
+                                      description:
+                                        res.escrowCount > 0
+                                          ? `${res.approved} approved. ${res.escrowCount} payment(s) held until worker adds bank.`
+                                          : `${res.approved} timesheet(s) approved.`,
+                                    });
+                                  }
+                                  if (res.failed > 0) {
+                                    const hints = res.results
+                                      .filter((r) => !r.success)
+                                      .slice(0, 4)
+                                      .map((r) => r.error || `Timesheet #${r.id}`)
+                                      .join(" · ");
+                                    toast({
+                                      title: `${res.failed} could not be approved`,
+                                      description: hints || "Check company balance or dispute status.",
+                                      variant: "destructive",
+                                    });
+                                  }
+                                },
+                                onSettled: () => setPendingApproveAllJobId(null),
+                              }
+                            );
+                          }}
+                          data-testid="button-approve-all-pending-global"
+                        >
+                          {bulkApproveTimesheets.isPending && pendingApproveAllJobId === -1 ? (
+                            <Loader2 className="w-3.5 h-3.5 animate-spin mr-1" />
+                          ) : (
+                            <Check className="w-3.5 h-3.5 mr-1" />
+                          )}
+                          Approve all pending ({pendingTimesheetRealIds.length})
+                        </Button>
+                      </div>
+                    )}
+                    {pendingTimesheetGroups
+                      .filter(g => g.timesheets.length > 0)
+                      .filter((g, i, arr) => arr.findIndex(x => x.jobId === g.jobId) === i)
+                      .map((group) => {
+                        const jobIdsForGroup = group.timesheets.map(t => t.id);
+                        const realIdsForGroup = jobIdsForGroup.filter(id => id > 0);
+                        return (
+                      <div key={group.jobId} className="bg-card rounded-xl border border-border/60 shadow-sm overflow-hidden">
+                        <div className="flex flex-wrap items-center justify-between gap-2 px-4 py-3 bg-muted/40 border-b border-border/60">
+                          <div className="flex flex-wrap items-center gap-2 min-w-0">
+                            <h3
+                              className="font-semibold text-base truncate cursor-pointer hover:text-primary hover:underline"
+                              onClick={() => {
+                                const job = findJobById(group.jobId);
+                                const location = jobsData.find(loc => loc.jobs.some(j => j.id === group.jobId));
+                                if (job && location) {
+                                  setSelectedJobDetails(job);
+                                  setSelectedJobLocation(location);
+                                  setShowJobDetailsFullView(true);
+                                }
+                              }}
+                              title="View job details"
+                            >
+                              {group.jobTitle}
+                            </h3>
+                            {"earliestAutoApprovalMs" in group && group.timesheets.length > 0 && (
+                              <Badge variant={getCountdownVariant((group as { earliestAutoApprovalMs: number }).earliestAutoApprovalMs)} className="shrink-0 text-xs font-normal">
+                                {formatResponseDeadline((group as { earliestAutoApprovalMs: number }).earliestAutoApprovalMs)}
+                              </Badge>
+                            )}
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <span className="text-xs text-muted-foreground">
+                              {group.timesheets.length} pending · {group.totalHours.toFixed(1)}h · ${(group.totalSpent / 100).toFixed(2)}
+                            </span>
+                            <Button
+                              size="sm"
+                              className="bg-green-600 hover:bg-green-700 text-white"
+                              title="Only approves pending timesheets for this job — not other jobs below"
+                              onClick={() => {
+                                if (realIdsForGroup.length === 0) {
+                                  toast({ title: "No timesheets to approve", description: "These are sample timesheets. Use worker clock-in to create real timesheets.", variant: "destructive" });
+                                  return;
+                                }
+                                setPendingApproveAllJobId(group.jobId);
+                                bulkApproveTimesheets.mutate(
+                                  { timesheetIds: realIdsForGroup },
+                                  {
+                                    onSuccess: (res) => {
+                                      if (res.approved > 0) {
+                                        toast({ title: "Timesheets approved", description: res.escrowCount > 0 ? `${res.approved} approved. ${res.escrowCount} payment(s) held until worker adds bank.` : `${res.approved} timesheet(s) approved.` });
+                                      }
+                                      if (res.failed > 0) {
+                                        const hints = res.results
+                                          .filter((r) => !r.success)
+                                          .slice(0, 3)
+                                          .map((r) => r.error || `#${r.id}`)
+                                          .join(" · ");
+                                        toast({
+                                          title: "Some approvals failed",
+                                          description: hints || `${res.failed} could not be approved.`,
+                                          variant: "destructive",
+                                        });
+                                      }
+                                    },
+                                    onSettled: () => setPendingApproveAllJobId(null),
+                                  }
+                                );
+                              }}
+                              disabled={bulkApproveTimesheets.isPending || realIdsForGroup.length === 0}
+                              data-testid={`button-approve-all-pending-${group.jobId}`}
+                            >
+                              {bulkApproveTimesheets.isPending && pendingApproveAllJobId === group.jobId ? <Loader2 className="w-3.5 h-3.5 animate-spin mr-1" /> : <Check className="w-3.5 h-3.5 mr-1" />}
+                              Approve for this job
+                            </Button>
+                          </div>
+                        </div>
+                        <div className="divide-y divide-border/50">
+                          {group.timesheets.map((timesheet) => (
+                            <div key={timesheet.id} className="px-4 py-3 hover:bg-muted/10 transition-colors">
+                              <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+                                <div className="flex items-center gap-2 min-w-0">
+                                  <Avatar className="h-8 w-8 shrink-0 ring-1 ring-orange-200 dark:ring-orange-800">
+                                    <AvatarImage src={timesheet.workerAvatarUrl} />
+                                    <AvatarFallback className="text-xs bg-orange-100 dark:bg-orange-900/50 text-orange-700 dark:text-orange-300">
+                                      {timesheet.workerInitials || timesheet.workerName?.slice(0, 2) || "—"}
+                                    </AvatarFallback>
+                                  </Avatar>
+                                  <div className="min-w-0">
+                                    <p className="text-sm font-medium truncate">{timesheet.workerName}</p>
+                                    <p className="text-xs text-muted-foreground">
+                                      {format(timesheet.clockInTime, "MMM d, yyyy")} · {format(timesheet.clockInTime, "h:mm a")}
+                                      {timesheet.clockOutTime ? ` – ${format(timesheet.clockOutTime, "h:mm a")}` : ""}
+                                    </p>
+                                  </div>
+                                </div>
+                                <div className="flex items-center gap-3 ml-auto">
+                                  <span className="text-sm font-medium tabular-nums">{timesheet.adjustedHours.toFixed(1)}h</span>
+                                  <span className="text-sm font-semibold tabular-nums">${(Math.round(timesheet.adjustedHours * timesheet.hourlyRate * 1.52) / 100).toFixed(2)}</span>
+                                  <Button
+                                    size="sm"
+                                    variant="ghost"
+                                    className="h-8 w-8 p-0 text-green-600 hover:text-green-700 hover:bg-green-50 dark:hover:bg-green-900/20"
+                                    onClick={() => handleApproveTimesheetDisplay(timesheet)}
+                                    disabled={approveTimesheet.isPending}
+                                    title="Approve"
+                                    data-testid={`button-approve-pending-ts-${timesheet.id}`}
+                                  >
+                                    {approveTimesheet.isPending ? <Loader2 className="w-4 h-4 animate-spin" /> : <Check className="w-4 h-4" />}
+                                  </Button>
+                                  <DropdownMenu>
+                                    <DropdownMenuTrigger asChild>
+                                      <Button variant="ghost" size="icon" className="h-8 w-8" data-testid={`button-pending-actions-${timesheet.id}`} aria-label="Timesheet actions">
+                                        <MoreVertical className="w-4 h-4" />
+                                      </Button>
+                                    </DropdownMenuTrigger>
+                                    <DropdownMenuContent align="end">
+                                      <DropdownMenuItem
+                                        onClick={() => {
+                                          setEditTimesheetModal(timesheet);
+                                          setEditHours(timesheet.adjustedHours.toString());
+                                          setEditExplanation("");
+                                          setEditTimesheetStep("form");
+                                        }}
+                                        data-testid={`button-edit-pending-${timesheet.id}`}
+                                      >
+                                        <Edit className="w-4 h-4 mr-2" />
+                                        Edit Hours
+                                      </DropdownMenuItem>
+                                      <DropdownMenuItem
+                                        onClick={() => handleRejectTimesheetDisplay(timesheet)}
+                                        className="text-destructive focus:text-destructive"
+                                        data-testid={`button-reject-pending-ts-${timesheet.id}`}
+                                      >
+                                        <X className="w-4 h-4 mr-2" />
+                                        Reject
+                                      </DropdownMenuItem>
+                                    </DropdownMenuContent>
+                                  </DropdownMenu>
+                                </div>
+                              </div>
+                              {timesheet.workerNotes && (
+                                <p className="mt-2 pl-10 text-xs text-muted-foreground italic">"{timesheet.workerNotes}"</p>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    );
+                      })}
+                  </div>
+                )}
               </TabsContent>
-              
+
               <TabsContent value="approved" className="w-full space-y-4 mt-0 flex-1 overflow-y-auto">
                 {approvedTimesheets.length === 0 ? (
                   <div className="bg-card rounded-2xl border border-border/60 shadow-sm p-12 text-center">
@@ -6386,7 +7055,7 @@ export default function CompanyDashboard() {
                   </div>
                 )}
               </TabsContent>
-              </Tabs>
+              </Tabs>}
           </TabsContent>
 
           {activeTab === "chats" && (
@@ -6473,6 +7142,15 @@ export default function CompanyDashboard() {
                     <Globe className="w-5 h-5 text-muted-foreground flex-shrink-0" />
                     <span className="font-medium flex-1">{t("settings.language")}</span>
                     <ChevronRight className="w-5 h-5 text-muted-foreground flex-shrink-0" />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setShowMenuSignOutConfirm(true)}
+                    className="w-full flex items-center gap-3 py-3 px-2 rounded-lg hover:bg-destructive/10 transition-colors text-left text-destructive"
+                    data-testid="menu-logout"
+                  >
+                    <LogOut className="w-5 h-5 flex-shrink-0" />
+                    <span className="font-medium flex-1">{t("settings.signOut")}</span>
                   </button>
                 </div>
                 {isAdmin && (
@@ -6574,6 +7252,15 @@ export default function CompanyDashboard() {
                         <span>{t("settings.language")}</span>
                         <ChevronRight className="w-5 h-5 text-muted-foreground flex-shrink-0 ml-auto" />
                       </button>
+                      <button
+                        type="button"
+                        onClick={() => setShowMenuSignOutConfirm(true)}
+                        className="w-full flex items-center gap-3 py-3 px-3 rounded-lg hover:bg-destructive/10 transition-colors text-left text-destructive"
+                        data-testid="menu-logout"
+                      >
+                        <LogOut className="w-5 h-5 flex-shrink-0" />
+                        <span className="font-medium">{t("settings.signOut")}</span>
+                      </button>
                     </div>
                   </div>
                   <div className="flex-shrink-0 border-t border-border bg-muted/30 pb-4">
@@ -6617,13 +7304,38 @@ export default function CompanyDashboard() {
                       {menuSelection === "agreements" && t("settings.agreements")}
                       {menuSelection === "language" && t("settings.language")}
                     </h2>
-                    <button type="button" onClick={() => navigate("/company-dashboard")} className="px-4 py-2 rounded-lg bg-muted hover:bg-muted/80 text-sm font-medium">
-                      {t("settings.done")}
-                    </button>
+                    {menuSelection === "payment-methods" ? (
+                      <button type="button" onClick={() => setShowStripeAddPaymentMethod(true)} className="px-4 py-2 rounded-lg bg-primary text-primary-foreground hover:bg-primary/90 text-sm font-medium inline-flex items-center gap-1.5" data-testid="button-payment-methods-new">
+                        <Plus className="w-4 h-4" /> {t("settings.addNewPaymentMethodShort", "New")}
+                      </button>
+                    ) : (
+                      <button type="button" onClick={() => navigate("/company-dashboard")} className="px-4 py-2 rounded-lg bg-muted hover:bg-muted/80 text-sm font-medium">
+                        {t("settings.done")}
+                      </button>
+                    )}
                   </div>
                   <div className="divide-y divide-border">
                     {menuSelection === "profile" && (
-                      <CompanyMenuPanelProfileForm />
+                      <CompanyMenuPanelProfileFormView
+                        companyProfileForm={companyProfileForm}
+                        setCompanyProfileForm={setCompanyProfileForm}
+                        profile={profile}
+                        user={user}
+                        companyLogoUrl={companyLogoUrl}
+                        handleLogoUpload={handleLogoUpload}
+                        isUploadingLogo={isUploadingLogo}
+                        alternateEmails={alternateEmails}
+                        setAlternateEmails={setAlternateEmails}
+                        newAlternateEmail={newAlternateEmail}
+                        setNewAlternateEmail={setNewAlternateEmail}
+                        alternatePhones={alternatePhones}
+                        setAlternatePhones={setAlternatePhones}
+                        newAlternatePhone={newAlternatePhone}
+                        setNewAlternatePhone={setNewAlternatePhone}
+                        updateProfile={updateProfile}
+                        toast={toast}
+                        t={t}
+                      />
                     )}
                     {menuSelection === "locations" && (
                       <CompanyMenuPanelLocations />
@@ -6719,8 +7431,8 @@ export default function CompanyDashboard() {
             </AlertDialog>
           </TabsContent>
           )}
-
           </div>
+          </ErrorBoundary>
         </div>
       </div>
 
@@ -7218,7 +7930,7 @@ export default function CompanyDashboard() {
                                         jobSite={mapProps.jobSite}
                                         clockIn={mapProps.clockIn}
                                         clockOut={mapProps.clockOut}
-                                        height="100px"
+                                        height={isMobile ? "120px" : "min(360px, 42vh)"}
                                         showLines={true}
                                         hideLegend={false}
                                         className="w-full"
@@ -7353,7 +8065,7 @@ export default function CompanyDashboard() {
                     distanceMeters: lastTimesheet.clockOutDistanceMeters || 0,
                   } : undefined}
                   className="rounded-lg overflow-hidden"
-                  height="200px"
+                  height={isMobile ? "200px" : "min(400px, 50vh)"}
                   showLines={true}
                 />
               </div>
@@ -7554,7 +8266,7 @@ export default function CompanyDashboard() {
                           jobSite={ts.jobSiteLat != null && ts.jobSiteLng != null ? { lat: ts.jobSiteLat, lng: ts.jobSiteLng, title: ts.jobTitle } : undefined}
                           clockIn={ts.clockInLat != null && ts.clockInLng != null ? { lat: ts.clockInLat, lng: ts.clockInLng, time: format(ts.clockInTime, "h:mm a"), distanceMeters: ts.clockInDistanceMeters || 0 } : undefined}
                           clockOut={ts.clockOutLat != null && ts.clockOutLng != null && ts.clockOutTime ? { lat: ts.clockOutLat, lng: ts.clockOutLng, time: format(ts.clockOutTime, "h:mm a"), distanceMeters: ts.clockOutDistanceMeters || 0 } : undefined}
-                          height="200px"
+                          height={isMobile ? "200px" : "min(340px, 44vh)"}
                           showLines={true}
                           className="rounded-lg overflow-hidden"
                         />
@@ -8701,9 +9413,9 @@ export default function CompanyDashboard() {
                             .map(a => (a.proposedRate ?? (a as any).proposed_rate ?? a.worker?.hourlyRate ?? (a.worker as any)?.hourly_rate) ?? 0)
                             .filter((r: number) => r > 0);
                           const avg = rates.length > 0 ? Math.round(rates.reduce((s: number, r: number) => s + r, 0) / rates.length) : 0;
-                          return formatRateWithMarkup(avg);
+                          return avg > 0 ? formatRateWithMarkup(avg) : (t("enhancedJobDialog:rateUndetermined") || "Undetermined");
                         })()
-                      : formatRateWithMarkup(selectedJobDetails.hourlyRate ?? 0)
+                      : (t("enhancedJobDialog:rateUndetermined") || "Undetermined")
                   }
                   estimatedHoursDisplay={formatEstimatedHours(selectedJobDetails, hoursClocked)}
                   workersDisplay={`${acceptedWorkers.length}/${selectedJobDetails.maxWorkersNeeded}`}
@@ -8727,19 +9439,69 @@ export default function CompanyDashboard() {
                   description={selectedJobDetails.description ?? undefined}
                 />
 
-                {/* Job Photos & Videos */}
-                {((selectedJobDetails.images && selectedJobDetails.images.length > 0) || (selectedJobDetails.videos && selectedJobDetails.videos.length > 0)) && (() => {
+                {/* Job Photos & Videos — company can add up to 6 total */}
+                {(() => {
                   const allMedia: { type: 'image' | 'video'; url: string }[] = [
                     ...(selectedJobDetails.images || []).map(url => ({ type: 'image' as const, url })),
                     ...(selectedJobDetails.videos || []).map(url => ({ type: 'video' as const, url })),
-                  ];
+                  ].slice(0, MAX_JOB_MEDIA);
+                  const canAddMore = allMedia.length < MAX_JOB_MEDIA;
+                  const handleAddMedia = async (e: React.ChangeEvent<HTMLInputElement>) => {
+                    const files = e.target.files;
+                    e.target.value = "";
+                    if (!files?.length || !selectedJobDetails) return;
+                    setJobDetailsMediaUploading(true);
+                    try {
+                      const existingImages = (selectedJobDetails.images || []) as string[];
+                      const existingVideos = (selectedJobDetails.videos || []) as string[];
+                      let newImages: string[] = [];
+                      let newVideos: string[] = [];
+                      const remaining = MAX_JOB_MEDIA - allMedia.length;
+                      for (let i = 0; i < Math.min(files.length, remaining); i++) {
+                        const file = files[i];
+                        assertMaxUploadSize(file);
+                        const isVideo = (file.type || "").startsWith("video/");
+                        const fileToUpload = !isVideo ? await compressImageIfNeeded(file) : file;
+                        const urlRes = await apiRequest("POST", "/api/uploads/request-url", { name: fileToUpload.name, size: fileToUpload.size, contentType: fileToUpload.type });
+                        const { uploadURL, objectPath } = await urlRes.json();
+                        await fetch(uploadURL, { method: "PUT", body: fileToUpload, headers: { "Content-Type": fileToUpload.type } });
+                        if (!objectPath) throw new Error("No object path");
+                        if (isVideo) newVideos.push(objectPath); else newImages.push(objectPath);
+                      }
+                      const combinedImages = [...existingImages, ...newImages];
+                      const combinedVideos = [...existingVideos, ...newVideos];
+                      const withType = [
+                        ...combinedImages.map((u: string) => ({ t: "i" as const, u })),
+                        ...combinedVideos.map((u: string) => ({ t: "v" as const, u })),
+                      ].slice(0, MAX_JOB_MEDIA);
+                      const payload = {
+                        images: withType.filter((x) => x.t === "i").map((x) => x.u),
+                        videos: withType.filter((x) => x.t === "v").map((x) => x.u),
+                      };
+                      const res = await apiRequest("PATCH", `/api/company/jobs/${selectedJobDetails.id}`, payload);
+                      if (res.ok) {
+                        queryClient.invalidateQueries({ queryKey: ["/api/company/jobs"] });
+                        setSelectedJobDetails(prev => prev?.id === selectedJobDetails.id ? { ...prev, images: payload.images, videos: payload.videos } : prev);
+                        updateJob(selectedJobDetails.id, payload);
+                        if (newImages.length + newVideos.length > 0) toast({ title: "Media added", description: `${newImages.length + newVideos.length} file(s) added.` });
+                      } else {
+                        const data = await res.json().catch(() => ({}));
+                        toast({ title: "Error", description: data.message || "Failed to add media", variant: "destructive" });
+                      }
+                    } catch (err: any) {
+                      toast({ title: "Upload failed", description: err.message || "Could not add media", variant: "destructive" });
+                    } finally {
+                      setJobDetailsMediaUploading(false);
+                    }
+                  };
                   return (
                   <div className="space-y-3">
-                    <h3 className="font-semibold text-sm">Media ({allMedia.length})</h3>
+                    <h3 className="font-semibold text-sm">Media ({allMedia.length}/{MAX_JOB_MEDIA})</h3>
                     <div className="flex gap-2 overflow-x-auto pb-2">
                       {allMedia.map((media, idx) => (
                         <button
                           key={idx}
+                          type="button"
                           onClick={() => setMediaViewer({ items: allMedia, currentIndex: idx })}
                           className="relative flex-shrink-0 rounded-lg overflow-hidden border hover:ring-2 hover:ring-primary transition-all cursor-pointer"
                           data-testid={`button-media-${idx}`}
@@ -8757,10 +9519,40 @@ export default function CompanyDashboard() {
                             </div>
                           )}
                           <div className="absolute bottom-1 right-1 bg-black/60 text-white text-[10px] px-1 rounded">
-                            {`${idx + 1}/${allMedia.length}`}
+                            {`${idx + 1}/${MAX_JOB_MEDIA}`}
                           </div>
                         </button>
                       ))}
+                      {canAddMore && (
+                        <>
+                          <input
+                            ref={jobDetailsMediaInputRef}
+                            type="file"
+                            accept="image/*,video/*"
+                            multiple
+                            className="hidden"
+                            onChange={handleAddMedia}
+                            disabled={jobDetailsMediaUploading}
+                          />
+                          <button
+                            type="button"
+                            onClick={() => jobDetailsMediaInputRef.current?.click()}
+                            disabled={jobDetailsMediaUploading}
+                            className="flex-shrink-0 w-24 h-20 rounded-lg border border-dashed border-muted-foreground/40 bg-muted/30 hover:bg-muted/50 flex flex-col items-center justify-center gap-1 transition-colors cursor-pointer"
+                            data-testid="button-add-job-media"
+                            aria-label="Add photo or video"
+                          >
+                            {jobDetailsMediaUploading ? (
+                              <Loader2 className="w-6 h-6 animate-spin text-muted-foreground" />
+                            ) : (
+                              <>
+                                <Plus className="w-6 h-6 text-muted-foreground" />
+                                <span className="text-[10px] text-muted-foreground">Add</span>
+                              </>
+                            )}
+                          </button>
+                        </>
+                      )}
                     </div>
                   </div>
                   );
@@ -9254,11 +10046,9 @@ export default function CompanyDashboard() {
           })()}
       </ResponsiveDialog>
 
-      {/* Action Required — unique footer (prev/action/next circles) and per-step header; success view when all done */}
-      <ResponsiveDialog
-        open={showPendingRequests}
-        onOpenChange={(open) => { setShowPendingRequests(open); if (!open) setActionReqInlinePanel(null); }}
-        title={actionRequiredItems.length === 0 ? t("dashboard.actionRequiredAllDone", "All done!") : actionRequiredItems.length > 0 ? (() => {
+      {/* Action Required — desktop: full-page onboarding-style; mobile: ResponsiveDialog */}
+      {showPendingRequests ? (() => {
+        const actionReqTitleNode: ReactNode = actionRequiredItems.length === 0 ? t("dashboard.actionRequiredAllDone", "All done!") : actionRequiredItems.length > 0 ? (() => {
           const idx = Math.min(actionRequiredItemIndex, actionRequiredItems.length - 1);
           const item = actionRequiredItems[idx];
           if (!item) return t("dashboard.actionRequired");
@@ -9266,13 +10056,10 @@ export default function CompanyDashboard() {
           if (item.type === "timesheets") return (<div className="space-y-0.5"><span className="block">{t("dashboard.timesheetsToApprove")}</span><p className="text-sm font-normal text-muted-foreground truncate">{t("dashboard.approveOrRejectTimesheets", "Approve or reject pending timesheets")}</p></div>);
           if (item.type === "reschedule") return (<div className="space-y-0.5"><span className="block">{t("dashboard.jobsNeedReschedule")}</span><p className="text-sm font-normal text-muted-foreground truncate">{item.job.title} · {item.location.name}</p></div>);
           return t("dashboard.actionRequired");
-        })() : t("dashboard.actionRequired")}
-        headerTrailing={actionRequiredItems.length > 0 ? `${actionRequiredItemIndex + 1} of ${actionRequiredItems.length}` : undefined}
-        maxWidth="md"
-        contentClassName="max-w-md"
-        progressSteps={actionRequiredItems.length}
-        progressCurrent={actionRequiredItemIndex + 1}
-        footer={actionRequiredItems.length === 0 ? (
+        })() : t("dashboard.actionRequired");
+        const actionReqHeaderTrailing = actionRequiredItems.length > 0 ? `${actionRequiredItemIndex + 1} of ${actionRequiredItems.length}` : undefined;
+        const actionReqOnOpenChange = (open: boolean) => { setShowPendingRequests(open); if (!open) setActionReqInlinePanel(null); };
+        const actionReqFooterNode: ReactNode = actionRequiredItems.length === 0 ? (
           <div className="flex justify-center w-full py-2">
             <Button className="min-w-[120px] h-9 text-sm font-semibold rounded-lg shadow-md bg-neutral-900 hover:bg-neutral-800 text-white border-0" onClick={() => setShowPendingRequests(false)} data-testid="action-required-done">
               {t("common.done", "Done")}
@@ -9341,9 +10128,8 @@ export default function CompanyDashboard() {
             ) : <div className="w-9 shrink-0" />}
             </div>
           </div>
-        ) : undefined}
-      >
-        {actionRequiredItems.length === 0 ? (
+        ) : undefined;
+        const actionReqBody: ReactNode = actionRequiredItems.length === 0 ? (
           <div className="flex flex-col items-center justify-center py-12 px-4 text-center">
             <div className="w-16 h-16 rounded-full bg-green-100 dark:bg-green-900/30 flex items-center justify-center mb-4">
               <CheckCircle className="w-10 h-10 text-green-600 dark:text-green-400" />
@@ -9432,7 +10218,7 @@ export default function CompanyDashboard() {
                     </AccordionContent>
                   </AccordionItem>
                 </Accordion>
-                <div className="space-y-2 max-h-[50vh] overflow-y-auto pr-1">
+                <div className="space-y-2 max-h-[50vh] overflow-y-auto pr-1 md:max-h-none md:overflow-visible">
                   {pg.workerDayGroups.map(workerDay => {
                     const groupKey = `${workerDay.workerId}-${workerDay.date}`;
                     const first = workerDay.timesheets[0];
@@ -9624,7 +10410,7 @@ export default function CompanyDashboard() {
                               jobSite={mapProps.jobSite}
                               clockIn={mapProps.clockIn}
                               clockOut={mapProps.clockOut}
-                              height="100px"
+                              height={isMobile ? "120px" : "min(380px, 45vh)"}
                               showLines={true}
                               hideLegend={false}
                               className="rounded-none w-full"
@@ -9913,8 +10699,137 @@ export default function CompanyDashboard() {
             );
           }
           return null;
-        })() : null}
-      </ResponsiveDialog>
+        })() : null;
+        return (
+          <>
+            {!isMobile && (
+              <div
+                className="fixed inset-0 z-[220] flex flex-col bg-white dark:bg-background"
+                role="dialog"
+                aria-modal="true"
+                aria-labelledby="action-required-desktop-title"
+                data-testid="action-required-desktop-fullpage"
+              >
+                <div className="flex flex-1 min-h-0">
+                  {actionRequiredItems.length > 0 ? (
+                  <aside className="w-80 flex-shrink-0 border-r border-gray-200 bg-gray-50 overflow-y-auto scrollbar-pill-on-scroll dark:bg-muted/30 dark:border-border">
+                    <div className="p-6">
+                      <div className="flex items-center gap-2 mb-6">
+                        <div className="w-8 h-8 rounded bg-gray-900 flex items-center justify-center flex-shrink-0 dark:bg-primary">
+                          <span className="text-white font-bold text-lg">T</span>
+                        </div>
+                        <span className="text-lg font-semibold text-gray-900 dark:text-foreground">{t("dashboard.actionRequired", "Action required")}</span>
+                      </div>
+                      <nav className="space-y-1" aria-label={t("dashboard.actionRequired", "Action required")}>
+                        {actionRequiredItems.map((arItem, i) => {
+                          const isActive = i === actionRequiredItemIndex;
+                          const stepDone = i < actionRequiredItemIndex;
+                          const sideTitle =
+                            arItem.type === "hire"
+                              ? t("dashboard.workersAwaitingPlural")
+                              : arItem.type === "timesheets"
+                                ? t("dashboard.timesheetsToApprove")
+                                : t("dashboard.jobsNeedReschedule");
+                          const sideSub =
+                            arItem.type === "hire"
+                              ? `${arItem.job.title} · ${arItem.location.name}`
+                              : arItem.type === "timesheets"
+                                ? arItem.projectGroup.jobTitle
+                                : `${arItem.job.title} · ${arItem.location.name}`;
+                          return (
+                            <button
+                              key={`action-req-${i}-${arItem.type}`}
+                              type="button"
+                              onClick={() => setActionRequiredItemIndex(i)}
+                              className={cn(
+                                "w-full flex items-center gap-3 py-2.5 px-3 rounded-xl text-left transition-colors",
+                                isActive
+                                  ? "bg-green-50 text-[#00A86B] font-medium dark:bg-green-950/40 dark:text-green-400"
+                                  : stepDone
+                                    ? "bg-white border border-gray-300 text-gray-900 font-medium dark:bg-card dark:border-border dark:text-foreground"
+                                    : "text-gray-400 hover:text-gray-600 dark:text-muted-foreground dark:hover:text-foreground"
+                              )}
+                            >
+                              {stepDone ? (
+                                <div className="w-8 h-8 rounded-full border border-gray-300 bg-white flex items-center justify-center flex-shrink-0 dark:bg-card dark:border-border">
+                                  <Check className="w-4 h-4 text-gray-800 dark:text-foreground" strokeWidth={2.5} />
+                                </div>
+                              ) : isActive ? (
+                                <div className="w-8 h-8 rounded-full bg-[#00A86B] flex items-center justify-center flex-shrink-0">
+                                  <span className="text-white font-bold text-sm">{i + 1}</span>
+                                </div>
+                              ) : (
+                                <div className="w-8 h-8 rounded-full bg-gray-900 flex items-center justify-center flex-shrink-0 dark:bg-muted">
+                                  <span className="text-white font-bold text-sm">{i + 1}</span>
+                                </div>
+                              )}
+                              <div className="min-w-0 flex-1">
+                                <span className="text-sm block truncate">{sideTitle}</span>
+                                <span className="text-xs text-muted-foreground block truncate mt-0.5">{sideSub}</span>
+                              </div>
+                            </button>
+                          );
+                        })}
+                      </nav>
+                    </div>
+                  </aside>
+                  ) : (
+                  <aside className="w-80 flex-shrink-0 border-r border-gray-200 bg-gray-50 dark:bg-muted/30 dark:border-border flex flex-col items-center justify-center p-6">
+                    <div className="w-8 h-8 rounded bg-gray-900 flex items-center justify-center mb-4">
+                      <span className="text-white font-bold text-lg">T</span>
+                    </div>
+                    <p className="text-sm font-medium text-center text-gray-900 dark:text-foreground">{t("dashboard.actionRequiredAllDone", "All done!")}</p>
+                  </aside>
+                  )}
+                  <main className="flex-1 min-w-0 flex flex-col min-h-0 bg-white dark:bg-background">
+                    <header className="border-b border-gray-200 dark:border-border shrink-0 bg-white dark:bg-background">
+                      <div className="max-w-4xl mx-auto px-6 md:px-8 py-4 flex items-start gap-4 justify-between w-full">
+                        <div id="action-required-desktop-title" className="flex-1 min-w-0 text-lg font-semibold text-gray-900 dark:text-foreground [&_span]:text-lg [&_p]:text-sm">
+                          {actionReqTitleNode}
+                        </div>
+                        {actionReqHeaderTrailing ? (
+                          <span className="text-sm text-muted-foreground shrink-0 pt-1 whitespace-nowrap">{actionReqHeaderTrailing}</span>
+                        ) : null}
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon"
+                          className="shrink-0 rounded-full h-9 w-9"
+                          onClick={() => actionReqOnOpenChange(false)}
+                          aria-label={tCommon("close", "Close")}
+                          data-testid="action-required-desktop-close"
+                        >
+                          <X className="w-5 h-5" />
+                        </Button>
+                      </div>
+                    </header>
+                    <div className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden scrollbar-pill-on-scroll">
+                      <div className="max-w-4xl mx-auto w-full px-6 md:px-8 py-6">{actionReqBody}</div>
+                    </div>
+                    <footer className="border-t border-gray-200 dark:border-border bg-gray-50 dark:bg-muted/20 shrink-0 px-6 md:px-8 py-4">
+                      <div className="max-w-4xl mx-auto w-full">{actionReqFooterNode}</div>
+                    </footer>
+                  </main>
+                </div>
+              </div>
+            )}
+            {isMobile ? (
+              <ResponsiveDialog
+                open
+                onOpenChange={actionReqOnOpenChange}
+                title={actionReqTitleNode}
+                headerTrailing={actionReqHeaderTrailing}
+                contentClassName="max-w-md"
+                progressSteps={actionRequiredItems.length}
+                progressCurrent={actionRequiredItemIndex + 1}
+                footer={actionReqFooterNode}
+              >
+                {actionReqBody}
+              </ResponsiveDialog>
+            ) : null}
+          </>
+        );
+      })() : null}
 
       {/* Mobile: Location job list bottom-up popup (when accordion item tapped) */}
       {mobileLocationPopup && (
@@ -11021,7 +11936,7 @@ export default function CompanyDashboard() {
                     companyWebsite: companyProfileForm.companyWebsite.trim() || undefined,
                     firstName: companyProfileForm.firstName.trim() || undefined,
                     lastName: companyProfileForm.lastName.trim() || undefined,
-                    email: companyProfileForm.email.trim() || undefined,
+                    email: (profile?.email ?? user?.email ?? companyProfileForm.email).trim() || undefined,
                     phone: companyProfileForm.phone.trim() || undefined,
                     alternateEmails,
                     alternatePhones,
@@ -11113,7 +12028,15 @@ export default function CompanyDashboard() {
             
             <div>
               <Label>Primary Email</Label>
-              <Input type="email" value={companyProfileForm.email} onChange={(e) => setCompanyProfileForm(prev => ({ ...prev, email: e.target.value }))} data-testid="input-email" />
+              <Input
+                type="email"
+                readOnly
+                className="bg-muted cursor-not-allowed"
+                value={profile?.email ?? user?.email ?? companyProfileForm.email}
+                data-testid="input-email"
+                aria-label="Primary email (login email, cannot be changed here)"
+              />
+              <p className="text-xs text-muted-foreground mt-1">{t("settings.primaryEmailLoginNote")}</p>
             </div>
             
             <div>
@@ -11321,7 +12244,9 @@ export default function CompanyDashboard() {
         ) : (
         <div className="space-y-4">
             <div className="space-y-3">
-              {paymentMethods.map((method) => {
+              {(() => {
+                const paymentMethodsWithStripeId = (paymentMethods || []).filter((m: any) => !!(m.stripePaymentMethodId ?? m.stripe_payment_method_id));
+                return paymentMethodsWithStripeId.map((method) => {
                 const locationIdSet = new Set((method.locationIds || []).map((id: any) => String(id)));
                 const assignedLocations = locationIdSet.size > 0
                   ? companyLocations.filter((loc: any) => locationIdSet.has(String(loc.id)))
@@ -11366,13 +12291,20 @@ export default function CompanyDashboard() {
                           )}
                         </div>
                       </div>
-                      <DropdownMenu>
+                      <DropdownMenu modal={false}>
                         <DropdownMenuTrigger asChild>
                           <Button variant="ghost" size="icon" className="h-8 w-8 shrink-0" data-testid={`button-edit-payment-${method.id}`}>
                             <MoreVertical className="w-4 h-4" />
                           </Button>
                         </DropdownMenuTrigger>
-                        <DropdownMenuContent align="end">
+                        <DropdownMenuContent
+                          align="end"
+                          container={typeof document !== "undefined" ? document.getElementById("dialog-container") ?? undefined : undefined}
+                          onFocusOutside={(e) => {
+                            const dialogEl = document.getElementById("dialog-container");
+                            if (dialogEl && e.target && dialogEl.contains(e.target as Node)) e.preventDefault();
+                          }}
+                        >
                           {!method.isPrimary && (
                             <DropdownMenuItem
                               onClick={() => setPrimaryPaymentMethodMutation.mutate(method.id)}
@@ -11395,7 +12327,7 @@ export default function CompanyDashboard() {
                           <DropdownMenuItem
                             className="text-destructive focus:text-destructive"
                             onClick={() => deletePaymentMethodMutation.mutate(method.id)}
-                            disabled={deletePaymentMethodMutation.isPending || (method.isPrimary && paymentMethods.length === 1)}
+                            disabled={deletePaymentMethodMutation.isPending || (method.isPrimary && paymentMethodsWithStripeId.length === 1)}
                             data-testid={`button-remove-payment-${method.id}`}
                           >
                             Remove
@@ -11405,7 +12337,8 @@ export default function CompanyDashboard() {
                     </div>
                   </Card>
                 );
-              })}
+              });
+              })()}
             </div>
             
             <Button variant="outline" className="w-full border-dashed" onClick={() => setShowStripeAddPaymentMethod(true)} data-testid="button-add-payment-method">
@@ -11421,7 +12354,7 @@ export default function CompanyDashboard() {
         onOpenChange={() => {}}
       >
         <DialogContent
-          className="max-w-2xl max-h-[90vh] flex flex-col p-0 gap-0 overflow-hidden"
+          className="max-w-2xl max-h-[90vh] flex flex-col p-0 gap-0 overflow-hidden px-[14px]"
           hideCloseButton
           onInteractOutside={(e) => e.preventDefault()}
           onEscapeKeyDown={(e) => e.preventDefault()}
@@ -11497,15 +12430,18 @@ export default function CompanyDashboard() {
           </div>
           <DialogFooter className="px-6 pb-6 pt-0 shrink-0">
             <Button
+              className="px-[14px]"
               disabled={!mandatorySignatureName.trim()}
               onClick={async () => {
                 setMandatoryAgreementError(null);
                 try {
+                  // 1. Update profile so company is marked as having signed (persisted to DB)
                   await apiRequest("PUT", `/api/profiles/${profile!.id}`, {
                     contractSigned: true,
                     contractSignedAt: new Date().toISOString(),
                     signatureData: mandatorySignatureName.trim(),
                   });
+                  // 2. Store the signed agreement in company_agreements (Menu → Agreements can show it)
                   await apiRequest("POST", "/api/company-agreements", {
                     agreementType: "hiring_agreement",
                     version: "1.0",
@@ -11513,8 +12449,15 @@ export default function CompanyDashboard() {
                     signatureData: mandatorySignatureName.trim(),
                     agreementText: COMPANY_AGREEMENT_TEXT,
                   });
-                  queryClient.invalidateQueries({ queryKey: ["/api/profile"] });
-                  queryClient.invalidateQueries({ queryKey: ["/api/profiles", user?.id] });
+                  // 3. Refresh profile in cache so hasSignedAgreement is true and popup never shows again
+                  const profileQueryKey = profileMeQueryKey(user?.id);
+                  queryClient.invalidateQueries({ queryKey: profileQueryKey });
+                  queryClient.setQueryData(profileQueryKey, (prev: unknown) => {
+                    if (prev && typeof prev === "object" && "contractSigned" in prev) {
+                      return { ...prev, contractSigned: true, contractSignedAt: new Date().toISOString() };
+                    }
+                    return prev;
+                  });
                   queryClient.invalidateQueries({ queryKey: ["company-agreements"] });
                   setShowMandatoryAgreement(false);
                   setMandatorySignatureName("");
@@ -11524,7 +12467,7 @@ export default function CompanyDashboard() {
                 }
               }}
             >
-              Sign Agreement
+              Acknowledge
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -11692,10 +12635,10 @@ export default function CompanyDashboard() {
         </DialogContent>
       </Dialog>
 
-      {/* Global pop-up: add a payment method. Not exitable — only closes after adding a valid payment method. */}
+      {/* Global pop-up: add a payment method. Shown only when: no stored payment methods at all, or unpaid/failed payment. If company has a valid card (or any verified method), we do not show—they can verify banks in Menu → Payment settings. Not exitable — only closes after adding a valid payment method. */}
       <Dialog open={showBankVerificationModal} onOpenChange={() => {}}>
         <DialogContent
-          className="max-w-md"
+          className="max-w-md px-[14px]"
           hideCloseButton
           onInteractOutside={(e) => e.preventDefault()}
           onEscapeKeyDown={(e) => e.preventDefault()}
@@ -11730,8 +12673,10 @@ export default function CompanyDashboard() {
                         setJustAddedPaymentMethod(true);
                         setPaymentFailedTrigger(false);
                         setConnectStripeError(null);
-                        await queryClient.refetchQueries({ queryKey: ["/api/company/payment-methods"] });
-                        queryClient.invalidateQueries({ queryKey: ["/api/profile"] });
+                        queryClient.invalidateQueries({ queryKey: ["/api/company/payment-methods"] });
+                        await refetchPaymentMethods();
+                        invalidateSessionProfileQueries(queryClient);
+                        await queryClient.refetchQueries({ queryKey: ["/api/profile"] });
                         queryClient.invalidateQueries({ queryKey: ["/api/timesheets/company"] });
                         toast({ title: "Bank verified", description: "Your bank account is now ready to use." });
                       }}
@@ -11760,12 +12705,16 @@ export default function CompanyDashboard() {
                 <ConnectStripeBankForm
                   clientSecret={connectStripeClientSecret}
                   onSuccess={async () => {
+                    paymentMethodAddedAtRef.current = Date.now();
                     setJustAddedPaymentMethod(true);
                     setPaymentFailedTrigger(false);
                     setConnectStripeClientSecret(null);
                     setConnectStripeError(null);
-                    await queryClient.refetchQueries({ queryKey: ["/api/company/payment-methods"] });
-                    queryClient.invalidateQueries({ queryKey: ["/api/profile"] });
+                    // Refetch so payment methods tab and list show the new method; server already set it as primary
+                    queryClient.invalidateQueries({ queryKey: ["/api/company/payment-methods"] });
+                    await refetchPaymentMethods();
+                    invalidateSessionProfileQueries(queryClient);
+                    await queryClient.refetchQueries({ queryKey: ["/api/profile"] });
                     queryClient.invalidateQueries({ queryKey: ["/api/timesheets/company"] });
                     const hadFailed = (realTimesheets || []).some((ts: any) => ts.status === "approved" && (ts.paymentStatus === "failed" || ts.payment_status === "failed"));
                     if (hadFailed) {
@@ -11802,89 +12751,258 @@ export default function CompanyDashboard() {
         open={showStripeAddPaymentMethod}
         onOpenChange={(open) => {
           setShowStripeAddPaymentMethod(open);
-          if (!open) { setConnectStripeClientSecret(null); setConnectStripeError(null); }
+          if (open) {
+            setAddPaymentStep(1);
+            setAddedPaymentMethodId(null);
+            setAddPaymentLocationIds([]);
+          } else {
+            setConnectStripeClientSecret(null);
+            setConnectStripeError(null);
+            setAddPaymentStep(1);
+            setAddedPaymentMethodId(null);
+            setAddPaymentLocationIds([]);
+          }
         }}
-        title={t("settings.addPaymentMethodTitle")}
-        description="Add a bank account or card. Banks can be used once Stripe verifies them. Securely powered by Stripe."
+        title={addPaymentStep === 2 ? (t("company.locations.assignToLocations") || "Assign to locations") : t("settings.addPaymentMethodTitle")}
+        description={addPaymentStep === 2 ? "Optionally assign this payment method to specific locations. Leave unassigned to use as primary for all locations." : "Add a bank account or card. Banks can be used once Stripe verifies them. Securely powered by Stripe."}
         contentClassName="max-w-md min-h-[90dvh] sm:min-h-0"
         showBackButton
         onBack={() => {
-          setShowStripeAddPaymentMethod(false);
-          setConnectStripeClientSecret(null);
-          setConnectStripeError(null);
+          if (addPaymentStep === 2) {
+            setAddPaymentStep(1);
+            setAddedPaymentMethodId(null);
+            setAddPaymentLocationIds([]);
+          } else {
+            setShowStripeAddPaymentMethod(false);
+            setConnectStripeClientSecret(null);
+            setConnectStripeError(null);
+          }
         }}
         backLabel="Back"
       >
         <div className="space-y-4">
-          {connectStripeError && (
-            <div className="p-3 rounded-lg bg-destructive/10 text-destructive text-sm">{connectStripeError}</div>
-          )}
-          {stripePromise && connectStripeClientSecret ? (
-            <Elements stripe={stripePromise} options={{ clientSecret: connectStripeClientSecret, appearance: { theme: "stripe" } }}>
-              <ConnectStripeBankForm
-                clientSecret={connectStripeClientSecret}
-                onSuccess={async () => {
-                  setJustAddedPaymentMethod(true);
-                  setPaymentFailedTrigger(false);
-                  setConnectStripeClientSecret(null);
-                  setConnectStripeError(null);
-                  setShowStripeAddPaymentMethod(false);
-                  await queryClient.refetchQueries({ queryKey: ["/api/company/payment-methods"] });
-                  queryClient.invalidateQueries({ queryKey: ["/api/profile"] });
-                  queryClient.invalidateQueries({ queryKey: ["/api/timesheets/company"] });
-                  if (addPaymentOpenedFromTopUpRef.current) {
-                    addPaymentOpenedFromTopUpRef.current = false;
-                    const prevSet = new Set(previousPaymentMethodIdsRef.current.map((id) => Number(id)));
-                    const newList = (queryClient.getQueryData(["/api/company/payment-methods"]) as any[]) || [];
-                    const addedList = newList.filter((m: any) => !prevSet.has(Number(m.id)));
-                    const added = addedList.length > 0
-                      ? addedList.sort((a: any, b: any) => (b.id ?? 0) - (a.id ?? 0))[0]
-                      : null;
-                    if (added) {
-                      setTimeout(() => setSelectedPaymentMethod(Number(added.id)), 0);
-                    }
-                  }
-                  if (addPaymentOpenedFromAddLocationRef.current) {
-                    addPaymentOpenedFromAddLocationRef.current = false;
-                    const prevSet = new Set(previousPaymentMethodIdsRef.current.map((id) => Number(id)));
-                    const newList = (queryClient.getQueryData(["/api/company/payment-methods"]) as any[]) || [];
-                    const addedList = newList.filter((m: any) => !prevSet.has(Number(m.id)));
-                    const added = addedList.length > 0
-                      ? addedList.sort((a: any, b: any) => (b.id ?? 0) - (a.id ?? 0))[0]
-                      : null;
-                    if (added) {
-                      setTimeout(() => setNewLocation(prev => ({ ...prev, paymentMethodId: Number(added.id) })), 0);
-                    }
-                  }
-                  const hadFailed = (realTimesheets || []).some((ts: any) => ts.status === "approved" && (ts.paymentStatus === "failed" || ts.payment_status === "failed"));
-                  if (hadFailed) {
-                    try {
-                      const res = await apiRequest("POST", "/api/timesheets/retry-failed-payments", {});
-                      const data = await res.json().catch(() => ({}));
-                      if (res.ok && data?.retried > 0) {
-                        queryClient.invalidateQueries({ queryKey: ["/api/timesheets/company"] });
-                        toast({ title: "Payment method added", description: `Retrying ${data.retried} failed payment(s). Workers will be paid once the charge completes.` });
-                      } else {
-                        toast({ title: "Payment method added", description: "Your bank or card has been saved. Go to Timesheets to retry any failed payments." });
-                      }
-                    } catch {
-                      toast({ title: "Payment method added", description: "Your bank or card has been saved. Banks can be used once Stripe verifies them." });
-                    }
-                  } else {
+          {addPaymentStep === 2 ? (
+            <>
+              <p className="text-sm text-muted-foreground">Choose which locations use this payment method for billing. Locations not assigned use the primary method.</p>
+              <div className="space-y-2 max-h-[50vh] overflow-y-auto pr-2">
+                <div
+                  className={`p-3 border rounded-lg cursor-pointer transition-colors ${addPaymentLocationIds.length === 0 ? "ring-2 ring-primary" : "hover:bg-muted/50"}`}
+                  onClick={() => setAddPaymentLocationIds([])}
+                  data-testid="option-all-locations-new-pm"
+                >
+                  <div className="flex items-center gap-3">
+                    <div className={`w-4 h-4 rounded-full border-2 flex items-center justify-center ${addPaymentLocationIds.length === 0 ? "border-primary bg-primary" : "border-muted-foreground"}`}>
+                      {addPaymentLocationIds.length === 0 && <Check className="w-2.5 h-2.5 text-primary-foreground" />}
+                    </div>
+                    <div>
+                      <p className="font-medium">Use as primary (all locations)</p>
+                      <p className="text-xs text-muted-foreground">No specific location assignment</p>
+                    </div>
+                  </div>
+                </div>
+                {companyLocations.length > 0 && (
+                  <>
+                    <div className="pt-2 pb-1">
+                      <p className="text-xs font-medium text-muted-foreground">Or assign to specific locations:</p>
+                    </div>
+                    {companyLocations.map((loc: any) => {
+                      const isSelected = addPaymentLocationIds.includes(loc.id.toString());
+                      return (
+                        <div
+                          key={loc.id}
+                          className={`p-3 border rounded-lg cursor-pointer transition-colors ${isSelected ? "ring-2 ring-primary" : "hover:bg-muted/50"}`}
+                          onClick={() => {
+                            setAddPaymentLocationIds((prev) =>
+                              isSelected ? prev.filter((id) => id !== loc.id.toString()) : [...prev, loc.id.toString()]
+                            );
+                          }}
+                          data-testid={`option-location-new-pm-${loc.id}`}
+                        >
+                          <div className="flex items-center gap-3">
+                            <div className={`w-4 h-4 rounded border-2 flex items-center justify-center ${isSelected ? "border-primary bg-primary" : "border-muted-foreground"}`}>
+                              {isSelected && <Check className="w-2.5 h-2.5 text-primary-foreground" />}
+                            </div>
+                            <div>
+                              <p className="font-medium">{loc.name}</p>
+                              <p className="text-xs text-muted-foreground">{loc.address}, {loc.city}</p>
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </>
+                )}
+              </div>
+              <div className="flex gap-2 pt-2">
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="flex-1"
+                  onClick={async () => {
+                    setJustAddedPaymentMethod(true);
+                    setPaymentFailedTrigger(false);
+                    queryClient.invalidateQueries({ queryKey: ["/api/company/payment-methods"] });
+                    await refetchPaymentMethods();
+                    queryClient.invalidateQueries({ queryKey: ["/api/profile"] });
+                    await queryClient.refetchQueries({ queryKey: ["/api/profile"] });
+                    setShowStripeAddPaymentMethod(false);
+                    setAddPaymentStep(1);
+                    setAddedPaymentMethodId(null);
+                    setAddPaymentLocationIds([]);
                     toast({ title: "Payment method added", description: "Your bank or card has been saved. Banks can be used once Stripe verifies them." });
-                  }
-                }}
-                onError={(err) => setConnectStripeError(err)}
-              />
-            </Elements>
-          ) : !connectStripeError ? (
-            <div className="flex items-center gap-2 text-muted-foreground py-4">
-              <Loader2 className="w-5 h-5 animate-spin" />
-              <span className="text-sm">Loading payment form...</span>
-            </div>
-          ) : null}
+                  }}
+                >
+                  Skip
+                </Button>
+                <Button
+                  className="flex-1"
+                  disabled={updatePaymentMethodLocationsMutation.isPending || addedPaymentMethodId == null}
+                  onClick={async () => {
+                    if (addedPaymentMethodId == null) return;
+                    updatePaymentMethodLocationsMutation.mutate(
+                      { id: addedPaymentMethodId, locationIds: addPaymentLocationIds.length > 0 ? addPaymentLocationIds : null },
+                      {
+                        onSuccess: async () => {
+                          setJustAddedPaymentMethod(true);
+                          setPaymentFailedTrigger(false);
+                          queryClient.invalidateQueries({ queryKey: ["/api/company/payment-methods"] });
+                          await refetchPaymentMethods();
+                          queryClient.invalidateQueries({ queryKey: ["/api/profile"] });
+                          await queryClient.refetchQueries({ queryKey: ["/api/profile"] });
+                          setShowStripeAddPaymentMethod(false);
+                          setAddPaymentStep(1);
+                          setAddedPaymentMethodId(null);
+                          setAddPaymentLocationIds([]);
+                          toast({ title: "Payment method added", description: "Your payment method has been saved and assigned to the selected locations." });
+                        },
+                      }
+                    );
+                  }}
+                  data-testid="button-done-assign-locations"
+                >
+                  {updatePaymentMethodLocationsMutation.isPending ? <><Loader2 className="w-4 h-4 mr-2 animate-spin" /> Saving...</> : "Done"}
+                </Button>
+              </div>
+            </>
+          ) : (
+            <>
+              {connectStripeError && (
+                <div className="p-3 rounded-lg bg-destructive/10 text-destructive text-sm">{connectStripeError}</div>
+              )}
+              {stripePromise && connectStripeClientSecret ? (
+                <Elements stripe={stripePromise} options={{ clientSecret: connectStripeClientSecret, appearance: { theme: "stripe" } }}>
+                  <ConnectStripeBankForm
+                    clientSecret={connectStripeClientSecret}
+                    onSuccess={async (data) => {
+                      // Clear Stripe client secret immediately so Elements don't reuse consumed SetupIntent (avoids 400 from Stripe)
+                      setConnectStripeClientSecret(null);
+                      if (data?.paymentMethodId != null) {
+                        setConnectStripeError(null);
+                        queryClient.invalidateQueries({ queryKey: ["/api/company/payment-methods"] });
+                        const { data: listAfterRefetch } = await refetchPaymentMethods();
+                        queryClient.invalidateQueries({ queryKey: ["/api/profile"] });
+                        await queryClient.refetchQueries({ queryKey: ["/api/profile"] });
+                        // If GET filtered out the new method (e.g. transient Stripe/customer mismatch), retry once so menu panel shows it
+                        const list = Array.isArray(listAfterRefetch) ? listAfterRefetch : [];
+                        const hasNew = list.some((m: any) => Number(m.id) === Number(data.paymentMethodId));
+                        if (!hasNew && list.length >= 0) {
+                          setTimeout(async () => {
+                            const { data: listRetry } = await refetchPaymentMethods();
+                            const retryList = Array.isArray(listRetry) ? listRetry : [];
+                            if (!retryList.some((m: any) => Number(m.id) === Number(data.paymentMethodId))) {
+                              queryClient.invalidateQueries({ queryKey: ["/api/company/payment-methods"] });
+                              await refetchPaymentMethods();
+                            }
+                          }, 1200);
+                        }
+                        setAddPaymentStep(2);
+                        setAddedPaymentMethodId(data.paymentMethodId);
+                        setAddPaymentLocationIds([]);
+                        return;
+                      }
+                      setJustAddedPaymentMethod(true);
+                      setPaymentFailedTrigger(false);
+                      setConnectStripeClientSecret(null);
+                      setConnectStripeError(null);
+                      queryClient.invalidateQueries({ queryKey: ["/api/company/payment-methods"] });
+                      await refetchPaymentMethods();
+                      queryClient.invalidateQueries({ queryKey: ["/api/profile"] });
+                      await queryClient.refetchQueries({ queryKey: ["/api/profile"] });
+                      queryClient.invalidateQueries({ queryKey: ["/api/timesheets/company"] });
+                      setShowStripeAddPaymentMethod(false);
+                      if (addPaymentOpenedFromTopUpRef.current) {
+                        addPaymentOpenedFromTopUpRef.current = false;
+                        const prevSet = new Set(previousPaymentMethodIdsRef.current.map((id) => Number(id)));
+                        const newList = (queryClient.getQueryData(["/api/company/payment-methods"]) as any[]) || [];
+                        const addedList = newList.filter((m: any) => !prevSet.has(Number(m.id)));
+                        const added = addedList.length > 0 ? addedList.sort((a: any, b: any) => (b.id ?? 0) - (a.id ?? 0))[0] : null;
+                        if (added) setTimeout(() => setSelectedPaymentMethod(Number(added.id)), 0);
+                      }
+                      if (addPaymentOpenedFromAddLocationRef.current) {
+                        addPaymentOpenedFromAddLocationRef.current = false;
+                        const prevSet = new Set(previousPaymentMethodIdsRef.current.map((id) => Number(id)));
+                        const newList = (queryClient.getQueryData(["/api/company/payment-methods"]) as any[]) || [];
+                        const addedList = newList.filter((m: any) => !prevSet.has(Number(m.id)));
+                        const added = addedList.length > 0 ? addedList.sort((a: any, b: any) => (b.id ?? 0) - (a.id ?? 0))[0] : null;
+                        if (added) setTimeout(() => setNewLocation(prev => ({ ...prev, paymentMethodId: Number(added.id) })), 0);
+                      }
+                      const hadFailed = (realTimesheets || []).some((ts: any) => ts.status === "approved" && (ts.paymentStatus === "failed" || ts.payment_status === "failed"));
+                      if (hadFailed) {
+                        try {
+                          const res = await apiRequest("POST", "/api/timesheets/retry-failed-payments", {});
+                          const dataRes = await res.json().catch(() => ({}));
+                          if (res.ok && dataRes?.retried > 0) {
+                            queryClient.invalidateQueries({ queryKey: ["/api/timesheets/company"] });
+                            toast({ title: "Payment method added", description: `Retrying ${dataRes.retried} failed payment(s). Workers will be paid once the charge completes.` });
+                          } else {
+                            toast({ title: "Payment method added", description: "Your bank or card has been saved. Go to Timesheets to retry any failed payments." });
+                          }
+                        } catch {
+                          toast({ title: "Payment method added", description: "Your bank or card has been saved. Banks can be used once Stripe verifies them." });
+                        }
+                      } else {
+                        toast({ title: "Payment method added", description: "Your bank or card has been saved. Banks can be used once Stripe verifies them." });
+                      }
+                    }}
+                    onError={(err) => setConnectStripeError(err)}
+                  />
+                </Elements>
+              ) : !connectStripeError ? (
+                <div className="flex items-center gap-2 text-muted-foreground py-4">
+                  <Loader2 className="w-5 h-5 animate-spin" />
+                  <span className="text-sm">Loading payment form...</span>
+                </div>
+              ) : null}
+            </>
+          )}
         </div>
       </ResponsiveDialog>
+
+      <Dialog open={!!bankVerificationMethod} onOpenChange={(open) => { if (!open) setBankVerificationMethod(null); }}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>{t("settings.verifyBankAccount", "Verify bank account")}</DialogTitle>
+            <DialogDescription>
+              {t("settings.verifyBankDescription", "Enter the micro-deposit amounts (in cents) shown on your bank statement to verify this account.")}
+            </DialogDescription>
+          </DialogHeader>
+          {bankVerificationMethod && stripePromise && (
+            <InlineBankVerifyCard
+              paymentMethod={bankVerificationMethod}
+              stripePromise={stripePromise}
+              onSuccess={async () => {
+                setBankVerificationMethod(null);
+                queryClient.invalidateQueries({ queryKey: ["/api/company/payment-methods"] });
+                await refetchPaymentMethods();
+                queryClient.invalidateQueries({ queryKey: ["/api/profile"] });
+                await queryClient.refetchQueries({ queryKey: ["/api/profile"] });
+                toast({ title: t("settings.bankVerified", "Bank verified"), description: t("settings.bankVerifiedDescription", "Your bank account is now ready to use.") });
+              }}
+              onError={(err) => toast({ title: t("common.error", "Error"), description: err, variant: "destructive" })}
+            />
+          )}
+        </DialogContent>
+      </Dialog>
 
       {/* Assign Locations is now a breadcrumb view inside Payment Methods ResponsiveDialog — this Dialog is no longer used */}
       <Dialog open={false} onOpenChange={() => {}}>
@@ -12723,6 +13841,15 @@ export default function CompanyDashboard() {
 
       <ResponsiveDialog open={showBillingHistory} onOpenChange={(open) => { setShowBillingHistory(open); if (!open) navigate("/company-dashboard/menu"); }} title={t("settings.billingHistoryTitle")} description={t("settings.billingHistoryDescription")} contentClassName="max-w-4xl max-h-[90vh]" showBackButton onBack={() => { setShowBillingHistory(false); navigate("/company-dashboard/menu"); }} backLabel={t("settings.menu")} footer={<Button variant="outline" onClick={() => { setShowBillingHistory(false); navigate("/company-dashboard/menu"); }}>{t("settings.close")}</Button>}>
           <div className="space-y-4">
+            {/* Funding/Spend tabs */}
+            <Tabs value={billingFilters.category} onValueChange={(v) => setBillingFilters(prev => ({ ...prev, category: v as "all" | "funding" | "spend" }))}>
+              <TabsList className="grid w-full grid-cols-3">
+                <TabsTrigger value="all">All</TabsTrigger>
+                <TabsTrigger value="funding">Funding</TabsTrigger>
+                <TabsTrigger value="spend">Spend</TabsTrigger>
+              </TabsList>
+            </Tabs>
+            
             <div className="flex flex-wrap items-end gap-4 p-4 bg-muted/50 rounded-lg">
               <div>
                 <Label className="text-xs">From Date</Label>
@@ -12775,7 +13902,7 @@ export default function CompanyDashboard() {
               </div>
               <Button 
                 variant="outline" 
-                onClick={() => setBillingFilters({ dateFrom: "", dateTo: "", type: "all", worker: "all" })}
+                onClick={() => setBillingFilters({ dateFrom: "", dateTo: "", type: "all", worker: "all", category: "all" })}
                 data-testid="button-billing-clear-filters"
               >
                 Clear Filters
@@ -13858,6 +14985,7 @@ export default function CompanyDashboard() {
                 onChange={(address, components) => setNewLocation(prev => ({ ...prev, address, city: components.city || prev.city, state: components.state || prev.state, zipCode: components.zipCode || prev.zipCode }))}
                 placeholder="Start typing an address..."
                 required
+                containerClassName="pt-6 pb-6 px-6"
                 data-testid="input-location-address"
               />
               <div>
@@ -14203,6 +15331,7 @@ export default function CompanyDashboard() {
                     }}
                     placeholder="Start typing an address..."
                     required
+                    containerClassName="pt-6 pb-6 px-6"
                     data-testid="input-edit-location-address"
                   />
                   <div>
@@ -14449,7 +15578,14 @@ export default function CompanyDashboard() {
             }`}
             data-testid="mobile-nav-timesheets"
           >
-            <Clock className="w-5 h-5 shrink-0" />
+            <div className="relative">
+              <Clock className="w-5 h-5 shrink-0" />
+              {pendingTimesheets.length > 0 && (
+                <span className="absolute -top-1.5 -right-1.5 min-w-[16px] h-4 px-0.5 bg-orange-500 text-white text-[10px] font-bold rounded-full flex items-center justify-center leading-none">
+                  {pendingTimesheets.length > 9 ? "9+" : pendingTimesheets.length}
+                </span>
+              )}
+            </div>
             <span className="text-[11px] font-medium truncate">{t("company.timesheets")}</span>
           </button>
           <button
@@ -14459,11 +15595,44 @@ export default function CompanyDashboard() {
             }`}
             data-testid="mobile-nav-chats"
           >
-            <MessageSquare className="w-5 h-5 shrink-0" />
+            <div className="relative">
+              <MessageSquare className="w-5 h-5 shrink-0" />
+              {totalUnreadChats > 0 && (
+                <span className="absolute -top-1.5 -right-1.5 min-w-[16px] h-4 px-0.5 bg-blue-500 text-white text-[10px] font-bold rounded-full flex items-center justify-center leading-none">
+                  {totalUnreadChats > 9 ? "9+" : totalUnreadChats}
+                </span>
+              )}
+            </div>
             <span className="text-[11px] font-medium truncate">{t("nav.messages")}</span>
           </button>
         </div>
       </nav>
+      )}
+
+      {/* Mobile FAB: Post a Job — always visible on Jobs tab on mobile */}
+      {isMobile && activeTab === "jobs" && !(activeTab === "chats" && subsection) && (
+        <button
+          className="md:hidden fixed bottom-16 right-4 z-50 flex items-center gap-2 bg-primary text-primary-foreground rounded-full shadow-lg px-4 py-3 text-sm font-semibold hover:bg-primary/90 active:scale-95 transition-all"
+          onClick={() => {
+            if (!hasSignedAgreement) {
+              setShowMandatoryAgreement(true);
+              toast({ title: t("dashboard.agreementRequired"), description: t("dashboard.pleaseSignAgreementBeforePosting"), variant: "destructive" });
+              return;
+            }
+            const hasPaymentCapability = hasUsablePaymentMethod || (profile?.depositAmount && profile.depositAmount > 0);
+            if (!hasPaymentCapability) {
+              setShowMandatoryPaymentMethod(true);
+              toast({ title: "Payment Method Required", description: "Please add a payment method before posting jobs.", variant: "destructive" });
+              return;
+            }
+            setLocation("/post-job");
+          }}
+          data-testid="fab-post-job"
+          aria-label="Post a new job"
+        >
+          <Plus className="w-4 h-4" />
+          Post a Job
+        </button>
       )}
     </Tabs>
   );
