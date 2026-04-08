@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { useLocation, useNavigate } from "wouter";
+import { useLocation } from "wouter";
 import { useAuth } from "@/hooks/use-auth";
 import { useProfile } from "@/hooks/use-profiles";
 import { useQuery } from "@tanstack/react-query";

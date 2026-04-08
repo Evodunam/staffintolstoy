@@ -5,7 +5,7 @@ import * as DialogPrimitive from "@radix-ui/react-dialog"
 import { ChevronLeft, X } from "lucide-react"
 
 import { cn } from "@/lib/utils"
-import { blurFocusInside, blurFocusInsideRoot } from "@/lib/modal-focus"
+import { blurFocusInside, blurFocusInsideDialogContainer, blurFocusInsideRoot } from "@/lib/modal-focus"
 
 const Dialog = DialogPrimitive.Root
 
@@ -60,18 +60,32 @@ const DialogContent = React.forwardRef<
     <DialogOverlay className={cn("data-[state=open]:opacity-100", overlayClassName)} />
     <DialogPrimitive.Content
       ref={setContentRef}
-      aria-describedby={ariaDescribedBy}
+      {...(typeof ariaDescribedBy === "string" && ariaDescribedBy.length > 0
+        ? { "aria-describedby": ariaDescribedBy }
+        : {})}
       onOpenAutoFocus={(e) => {
         // Radix may set aria-hidden on #root in the same tick; drop focus from root first, then again after paint.
         blurFocusInsideRoot();
+        blurFocusInsideDialogContainer();
         onOpenAutoFocus?.(e);
-        queueMicrotask(() => blurFocusInsideRoot());
-        requestAnimationFrame(() => blurFocusInsideRoot());
+        queueMicrotask(() => {
+          blurFocusInsideRoot();
+          blurFocusInsideDialogContainer();
+        });
+        requestAnimationFrame(() => {
+          blurFocusInsideRoot();
+          blurFocusInsideDialogContainer();
+        });
       }}
       onCloseAutoFocus={(e) => {
-        // Closing: dialog content gets aria-hidden while a footer button may still be focused during exit.
+        // Closing: dialog content gets aria-hidden while a control may still be focused during exit.
         blurFocusInside(contentNodeRef.current);
+        blurFocusInsideDialogContainer();
         onCloseAutoFocus?.(e);
+        requestAnimationFrame(() => {
+          blurFocusInside(contentNodeRef.current);
+          blurFocusInsideDialogContainer();
+        });
       }}
       className={cn(
         "dialog-content-base fixed left-[50%] top-[50%] z-[201] grid w-full max-w-lg max-h-[90vh] overflow-y-auto translate-x-[-50%] translate-y-[-50%] gap-4 border border-border bg-background p-[21pt] shadow-lg duration-200 data-[state=open]:opacity-100 data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 data-[state=closed]:slide-out-to-left-1/2 data-[state=closed]:slide-out-to-top-[48%] data-[state=open]:slide-in-from-left-1/2 data-[state=open]:slide-in-from-top-[48%] rounded-2xl pointer-events-auto",
@@ -79,8 +93,6 @@ const DialogContent = React.forwardRef<
       )}
       {...props}
     >
-      <DialogPrimitive.Title className="sr-only">Dialog</DialogPrimitive.Title>
-      <DialogPrimitive.Description className="sr-only">Dialog content</DialogPrimitive.Description>
       {children}
       {onBack && (
         <button

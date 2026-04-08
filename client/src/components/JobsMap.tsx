@@ -419,10 +419,6 @@ export function JobsMap({
     }, 200);
   }, [handleBoundsChanged]);
 
-  const handleZoomStart = useCallback(() => {
-    isUserInteractingRef.current = true;
-  }, []);
-
   const handleZoomChanged = useCallback(() => {
     // onZoomChanged fires continuously during zoom, so we need to debounce it heavily
     // Only update after user has stopped zooming for a while
@@ -527,7 +523,6 @@ export function JobsMap({
         }}
         onDragStart={handleDragStart}
         onDragEnd={handleDragEnd}
-        onZoomStart={handleZoomStart}
         onZoomChanged={handleZoomChanged}
       >
         {/* Coverage radius circles: use referencePoints (find-work) when provided, else worker/teammate pins; per-point radius when referenceRadiusMilesArray provided */}

@@ -43,7 +43,7 @@ async function sendClockOutReminderIfNotRecently(ts: { id: number; workerId: num
     const result = await sendEmail({
       to: worker.email,
       type: "geolocation_clock_out_reminder",
-      data: { workerName, jobTitle: job.title, jobId: ts.jobId },
+      data: { workerName, jobTitle, jobId: ts.jobId },
     });
     if (result.success) lastClockOutReminderSent.set(key, Date.now());
   }
@@ -184,7 +184,8 @@ export async function checkAutoClockOutFromPings(): Promise<void> {
       }
 
       const lastPing = pings[0];
-      const lastPingTime = new Date(lastPing.createdAt);
+      const lastPingCreated = lastPing.createdAt;
+      const lastPingTime = lastPingCreated != null ? new Date(lastPingCreated) : now;
 
       // Safety: shift exceeds max (e.g. forgot to clock out or device off) → clock out at clockIn + MAX_SHIFT_HOURS (we have pings for coords)
       if (shiftMs > maxShiftMs) {
@@ -247,7 +248,7 @@ export async function checkAutoClockOutFromPings(): Promise<void> {
         const lat = Number(usePing.latitude);
         const lng = Number(usePing.longitude);
         const dist = usePing.distanceFromJob != null ? Number(usePing.distanceFromJob) : null;
-        const clockOutTime = new Date(usePing.createdAt);
+        const clockOutTime = new Date(usePing.createdAt ?? now);
         if (Number.isFinite(lat) && Number.isFinite(lng)) {
           await fn(ts.id, ts.workerId, clockOutTime, lat, lng, dist);
           await sendAutoClockedOutEmail(ts.workerId, ts.jobId, clockOutTime, "Location showed you had left the job site.");

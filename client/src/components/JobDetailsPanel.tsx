@@ -228,7 +228,7 @@ export function JobDetailsPanel({ job, participants, isOpen, onClose, isMobile, 
 
   const offlinePendingForThisJob = !isCompany && !isOnline && hasPendingClockedIn && job != null && pendingClockedInJobId === job.id;
   const syntheticOfflineTimesheet: Timesheet | null = offlinePendingForThisJob && pendingClockInTime
-    ? { id: -1, jobId: job!.id, clockInTime: pendingClockInTime, clockOutTime: null } as Timesheet
+    ? ({ id: -1, jobId: job!.id, clockInTime: pendingClockInTime, clockOutTime: null } as unknown as Timesheet)
     : null;
 
   const activeTimesheet = globalActiveTimesheet?.jobId === job?.id
@@ -245,7 +245,7 @@ export function JobDetailsPanel({ job, participants, isOpen, onClose, isMobile, 
   const applications = applicationsData || [];
   const acceptedWorkers = applications.filter(a => a.status === "accepted");
   /** Worker view: current user's accepted application (for rate display). */
-  const myApplication = !isCompany && profile ? acceptedWorkers.find((a: ApplicationData) => a.workerId === profile.id) : null;
+  const myApplication = !isCompany && profile ? acceptedWorkers.find((a: ApplicationData) => a.worker.id === profile.id) : null;
 
   // Worker (business operator) team for reassign: only when not company and profile has no teamId (owner)
   const { data: workerTeam } = useQuery<{ id: number; ownerId: number; name?: string }>({
@@ -584,7 +584,7 @@ export function JobDetailsPanel({ job, participants, isOpen, onClose, isMobile, 
                     <div className="flex-1 min-w-0">
                       <p className="text-sm font-medium truncate">{app.worker.firstName} {app.worker.lastName}</p>
                       <p className="text-xs text-muted-foreground">
-                        Worker {app.worker.rating ? ` · ${app.worker.rating} ★` : ""} · {formatRateWithMarkup(app.proposedRate)} · {workerHours.toFixed(1)}h · ${workerEarnings.toFixed(0)}
+                        Worker {app.worker.rating ? ` · ${app.worker.rating} ★` : ""} · {formatRateWithMarkup(app.proposedRate ?? 0)} · {workerHours.toFixed(1)}h · ${workerEarnings.toFixed(0)}
                       </p>
                     </div>
                     {onStartCallForParticipant ? (

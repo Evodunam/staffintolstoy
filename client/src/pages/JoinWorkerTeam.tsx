@@ -87,7 +87,7 @@ export default function JoinWorkerTeam() {
 
   const { uploadFile } = useUpload({
     onSuccess: (response) => {
-      setAvatarUrl(response.url);
+      setAvatarUrl(response.objectPath);
       setUploadingAvatar(false);
     },
     onError: () => {
@@ -107,7 +107,16 @@ export default function JoinWorkerTeam() {
       setUploadingAvatar(true);
       try {
         const uploadResponse = await uploadFile(avatarFile, "avatar");
-        uploadedAvatarUrl = uploadResponse.url;
+        if (!uploadResponse?.objectPath) {
+          toast({
+            title: tCommon("error"),
+            description: "Failed to upload avatar",
+            variant: "destructive",
+          });
+          setUploadingAvatar(false);
+          return;
+        }
+        uploadedAvatarUrl = uploadResponse.objectPath;
       } catch (error) {
         toast({
           title: tCommon("error"),
@@ -288,7 +297,11 @@ export default function JoinWorkerTeam() {
       if (avatarFile && !avatarUrl) {
         setUploadingAvatar(true);
         const uploadResponse = await uploadFile(avatarFile, "avatar");
-        uploadedAvatarUrl = uploadResponse.url;
+        if (!uploadResponse?.objectPath) {
+          setUploadingAvatar(false);
+          throw new Error("Avatar upload failed");
+        }
+        uploadedAvatarUrl = uploadResponse.objectPath;
         setUploadingAvatar(false);
       }
 

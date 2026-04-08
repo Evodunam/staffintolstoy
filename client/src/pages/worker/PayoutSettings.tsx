@@ -262,7 +262,7 @@ export function PayoutSettingsContent({ embedded = false, openBankDialogOnMount 
       accountType, 
       bankName, 
       recipientType,
-      email: profile?.email 
+      email: profile?.email ?? undefined,
     });
   };
 
@@ -298,8 +298,12 @@ export function PayoutSettingsContent({ embedded = false, openBankDialogOnMount 
   }
 
   const defaultPayoutAccount = payoutAccounts.find((a) => a.isDefault) || payoutAccounts[0];
-  const hasBankConnected = profile?.bankAccountLinked || (defaultPayoutAccount && (defaultPayoutAccount.provider === "mercury" || defaultPayoutAccount.provider === "modern_treasury"));
-  const hasPendingBankDetails = !hasBankConnected && !!profile?.mtCounterpartyId;
+  const payoutProv = defaultPayoutAccount?.provider as string | undefined;
+  const hasBankConnected =
+    profile?.bankAccountLinked ||
+    (defaultPayoutAccount && (payoutProv === "mercury" || payoutProv === "modern_treasury"));
+  const hasPendingBankDetails =
+    !hasBankConnected && !!(profile as { mtCounterpartyId?: string | null }).mtCounterpartyId;
 
   const main = (
     <div className={embedded ? "space-y-6" : "container mx-auto px-4 py-6 max-w-lg space-y-6"}>

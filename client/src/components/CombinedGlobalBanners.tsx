@@ -478,7 +478,7 @@ export function CombinedGlobalBanners({
             stepIndex={stepIndex}
             stepsLength={steps.length}
             currentStep={currentStep}
-            activeTimesheet={activeTimesheet}
+            activeTimesheet={activeTimesheet ?? null}
             BannerIcon={BannerIcon}
             renderStepContent={renderStepContent}
             onBack={() => setStepIndex((i) => Math.max(0, i - 1))}

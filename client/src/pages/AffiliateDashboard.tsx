@@ -1,7 +1,9 @@
 import React, { useState, useMemo } from "react";
 import { useAuth } from "@/hooks/use-auth";
 import { useLocation, Link } from "wouter";
-import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { useQuery, useMutation, useQueryClient, type UseMutationResult } from "@tanstack/react-query";
+
+type AffiliateAnyMutation = UseMutationResult<any, any, any, any>;
 import { apiRequest, fetchAffiliateMe } from "@/lib/queryClient";
 import { showClientDevTools } from "@/lib/is-local-dev-host";
 import { Button } from "@/components/ui/button";
@@ -1234,7 +1236,7 @@ function LeadsKanbanView({
   copyLink: (id: string, url: string) => void;
   onMoveStage: (id: number, stage: LeadStage) => void;
   onCardClick: (id: number) => void;
-  updateLeadStageMutation: ReturnType<typeof useMutation>;
+  updateLeadStageMutation: AffiliateAnyMutation;
   movableStages: LeadStage[];
   onCopyToast: (message: string) => void;
 }) {
@@ -1378,9 +1380,9 @@ function LeadDetailDialog({
   onClose: () => void;
   onMoveStage: (stage: LeadStage) => void;
   onUpdateAccountType: (accountType: "worker" | "company") => void;
-  addActivityMutation: ReturnType<typeof useMutation>;
+  addActivityMutation: AffiliateAnyMutation;
   movableStages: LeadStage[];
-  updateLeadMutation: ReturnType<typeof useMutation>;
+  updateLeadMutation: AffiliateAnyMutation;
 }) {
   const { toast } = useToast();
   const [activityBody, setActivityBody] = useState("");
@@ -1751,8 +1753,8 @@ function AffiliatePayoutContent({
   w9UploadMutation,
 }: {
   affiliate: any;
-  connectPayoutMutation: ReturnType<typeof useMutation>;
-  w9UploadMutation: ReturnType<typeof useMutation>;
+  connectPayoutMutation: AffiliateAnyMutation;
+  w9UploadMutation: AffiliateAnyMutation;
 }) {
   const [routingNumber, setRoutingNumber] = useState("");
   const [accountNumber, setAccountNumber] = useState("");
@@ -1949,8 +1951,8 @@ function AffiliatePayoutDialog({
   open: boolean;
   onOpenChange: (open: boolean) => void;
   affiliate: any;
-  connectPayoutMutation: ReturnType<typeof useMutation>;
-  w9UploadMutation: ReturnType<typeof useMutation>;
+  connectPayoutMutation: AffiliateAnyMutation;
+  w9UploadMutation: AffiliateAnyMutation;
 }) {
   return (
     <ResponsiveDialog open={open} onOpenChange={onOpenChange} title="Payout method" contentClassName="sm:max-w-lg">

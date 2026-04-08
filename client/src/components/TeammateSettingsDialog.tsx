@@ -34,7 +34,7 @@ export function TeammateSettingsDialog({
 }: TeammateSettingsDialogProps) {
   const { t } = useTranslation("profileSettings");
   const { t: tCommon } = useTranslation("common");
-  const { data: profile, isLoading: profileLoading } = useProfile(profileId);
+  const { data: profile, isLoading: profileLoading } = useProfile(profileId != null ? String(profileId) : undefined);
   const { toast } = useToast();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const updateProfile = useUpdateProfile();
@@ -67,7 +67,7 @@ export function TeammateSettingsDialog({
         phone: profile.phone || "",
       });
       setAvatarUrl(profile.avatarUrl || "");
-      setSelectedSkillsets(profile.skillsets || []);
+      setSelectedSkillsets((profile as { skillsets?: string[] | null }).skillsets || []);
       setFaceVerified(true); // Assume existing avatar is verified
     }
   }, [profile]);
@@ -413,21 +413,21 @@ export function TeammateSettingsDialog({
               <ScrollArea className="max-h-[200px]">
                 <div className="space-y-2">
                   {INDUSTRY_CATEGORIES.map((industry) => (
-                    <div key={industry.name} className="space-y-1">
-                      <div className="font-medium text-sm">{industry.name}</div>
+                    <div key={industry.id} className="space-y-1">
+                      <div className="font-medium text-sm">{industry.label}</div>
                       <div className="flex flex-wrap gap-2 ml-4">
                         {industry.roles.map((role) => (
-                          <div key={role} className="flex items-center space-x-2">
+                          <div key={role.id} className="flex items-center space-x-2">
                             <Checkbox
-                              id={`skill-${role}`}
-                              checked={selectedSkillsets.includes(role)}
-                              onCheckedChange={() => toggleSkillset(role)}
+                              id={`skill-${role.id}`}
+                              checked={selectedSkillsets.includes(role.id)}
+                              onCheckedChange={() => toggleSkillset(role.id)}
                             />
                             <Label
-                              htmlFor={`skill-${role}`}
+                              htmlFor={`skill-${role.id}`}
                               className="text-sm font-normal cursor-pointer"
                             >
-                              {role}
+                              {role.label}
                             </Label>
                           </div>
                         ))}

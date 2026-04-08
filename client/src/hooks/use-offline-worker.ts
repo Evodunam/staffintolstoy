@@ -50,7 +50,7 @@ export function useOfflineWorker(profileId: number | undefined) {
 
   const cacheAcceptedApplications = useCallback((applications: unknown[]) => {
     const accepted = Array.isArray(applications)
-      ? applications.filter((a: { status?: string }) => a.status === "accepted")
+      ? applications.filter((a) => (a as { status?: string }).status === "accepted")
       : [];
     if (!accepted.length) return;
     setCachedAcceptedApplications(accepted);

@@ -49,11 +49,12 @@ async function loadCapacitor() {
     // The stub has __isStub property, real Capacitor doesn't
     if (Capacitor && !(capacitorModule as any).__isStub && typeof Capacitor.isNativePlatform === 'function') {
       isNative = Capacitor.isNativePlatform();
-      isAndroid = Capacitor.getPlatform() === 'android';
+      isAndroid = Capacitor.getPlatform?.() === "android";
       
       // Only register plugin if we're actually native
-      if (isNative && capacitorModule.registerPlugin) {
-        LocationTrackingService = capacitorModule.registerPlugin<LocationTrackingServicePlugin>('LocationTrackingService');
+      const reg = (capacitorModule as { registerPlugin?: <T>(name: string) => T }).registerPlugin;
+      if (isNative && typeof reg === "function") {
+        LocationTrackingService = reg<LocationTrackingServicePlugin>("LocationTrackingService");
       }
     } else {
       // We got the stub, so we're in web

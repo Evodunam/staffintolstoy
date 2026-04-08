@@ -209,7 +209,7 @@ export async function sendAPNsNotification(options: APNsOptions): Promise<{ succ
         const status = responseHeaders[':status'];
         const apnsId = responseHeaders['apns-id'] as string | undefined;
         
-        if (status === 200) {
+        if (Number(status) === 200) {
           console.log('[APNs] Notification sent successfully, apns-id:', apnsId);
           resolve({ success: true, apnsId });
         } else {

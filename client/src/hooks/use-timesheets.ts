@@ -1,4 +1,4 @@
-import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { useQuery, useMutation, useQueryClient, type QueryKey } from "@tanstack/react-query";
 import { apiRequest } from "@/lib/queryClient";
 import type { Timesheet, Profile, Job } from "@shared/schema";
 
@@ -8,6 +8,10 @@ export type TimesheetWithDetails = Timesheet & {
   autoApprovalAt?: Date | string | null;
   autoApprovalMsRemaining?: number;
   willAutoApprove?: boolean;
+};
+
+type TimesheetQueriesRollback = {
+  previous: ReadonlyArray<readonly [QueryKey, TimesheetWithDetails[] | undefined]>;
 };
 
 export function useCompanyTimesheets(companyId: number | undefined, status?: string) {
@@ -60,9 +64,10 @@ export function useApproveTimesheet() {
       );
       return { previous };
     },
-    onError: (_err, _vars, context) => {
-      if (context?.previous) {
-        context.previous.forEach(([queryKey, data]) => {
+    onError: (_err, _vars, context: unknown) => {
+      const ctx = context as TimesheetQueriesRollback | undefined;
+      if (ctx?.previous) {
+        ctx.previous.forEach(([queryKey, data]: readonly [QueryKey, TimesheetWithDetails[] | undefined]) => {
           queryClient.setQueryData(queryKey, data);
         });
       }
@@ -103,9 +108,10 @@ export function useRejectTimesheet() {
       );
       return { previous };
     },
-    onError: (_err, _vars, context) => {
-      if (context?.previous) {
-        context.previous.forEach(([queryKey, data]) => {
+    onError: (_err, _vars, context: unknown) => {
+      const ctx = context as TimesheetQueriesRollback | undefined;
+      if (ctx?.previous) {
+        ctx.previous.forEach(([queryKey, data]: readonly [QueryKey, TimesheetWithDetails[] | undefined]) => {
           queryClient.setQueryData(queryKey, data);
         });
       }
@@ -184,9 +190,10 @@ export function useBulkApproveTimesheets() {
       );
       return { previous };
     },
-    onError: (_err, _vars, context) => {
-      if (context?.previous) {
-        context.previous.forEach(([queryKey, data]) => {
+    onError: (_err, _vars, context: unknown) => {
+      const ctx = context as TimesheetQueriesRollback | undefined;
+      if (ctx?.previous) {
+        ctx.previous.forEach(([queryKey, data]: readonly [QueryKey, TimesheetWithDetails[] | undefined]) => {
           queryClient.setQueryData(queryKey, data);
         });
       }

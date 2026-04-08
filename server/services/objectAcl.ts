@@ -136,7 +136,7 @@ export async function setObjectAclPolicy(
       ContentType: existingMetadata.ContentType,
     });
     
-    await bucketS3Client.send(copyCommand);
+    await s3Client.send(copyCommand);
   } catch (error: any) {
     if (error.name === "NotFound" || error.$metadata?.httpStatusCode === 404) {
       throw new Error(`Object not found: ${objectFile.key}`);

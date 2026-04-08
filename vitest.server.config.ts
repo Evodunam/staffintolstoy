@@ -14,7 +14,7 @@ export default defineConfig({
   },
   test: {
     environment: "node",
-    include: ["server/**/*.test.ts"],
+    include: ["server/**/*.test.ts", "shared/**/*.test.ts"],
     exclude: ["**/node_modules/**", "server/services/mercury.test.ts"],
     globals: true,
   },

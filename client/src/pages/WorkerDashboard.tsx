@@ -305,6 +305,7 @@ function getPendingTimelineDetails(job: Job): { title: string; subtitle: string 
 
 // Embedded Chats Content Component for dashboard integration
 function EmbeddedChatsContent({ profile, isMobile }: { profile: Profile | null | undefined; isMobile: boolean }) {
+  const { t } = useTranslation("workerDashboard");
   const [selectedJobId, setSelectedJobId] = useState<number | null>(null);
   const [messageInput, setMessageInput] = useState("");
   const [participantPopupOpen, setParticipantPopupOpen] = useState(false);
@@ -1842,7 +1843,7 @@ export default function WorkerDashboard() {
     const matches: Array<{ id: number | 'self'; name: string; avatarUrl?: string | null; isAdmin?: boolean }> = [];
     
     // Check if admin (self) matches
-    if (getSkillMatch(profile?.skillsets as string[] | null, job)) {
+    if (getSkillMatch((profile as { skillsets?: string[] | null } | null)?.skillsets, job)) {
       matches.push({ id: 'self', name: 'You', avatarUrl: profile?.avatarUrl, isAdmin: true });
     }
     
@@ -1858,7 +1859,7 @@ export default function WorkerDashboard() {
     });
     
     return matches;
-  }, [profile?.skillsets, profile?.avatarUrl, activeTeamMembers, getSkillMatch]);
+  }, [profile, profile?.avatarUrl, activeTeamMembers, getSkillMatch]);
   
   // `/api/jobs/find-work` already filters by worker + teammate reference points and maxDistanceMiles.
   // Do not re-filter by distance or map bounds on the client — that caused a flash (full list → empty) when map idle / geocode hydrated.
@@ -1933,7 +1934,7 @@ export default function WorkerDashboard() {
       if (!mapsGeocoder) return null;
       return await new Promise((resolve) => {
         mapsGeocoder.geocode({ address: query, region: "us" }, (results, status) => {
-          if (status === "REQUEST_DENIED" || status === "OVER_DAILY_LIMIT") {
+          if (status === "REQUEST_DENIED" || (status as string) === "OVER_DAILY_LIMIT") {
             disableGeocoding();
             resolve(null);
             return;
@@ -2032,7 +2033,7 @@ export default function WorkerDashboard() {
     findWorkJobs.forEach((job) => {
       if (job.trade) fromJobs.add(job.trade);
       if (job.serviceCategory) fromJobs.add(job.serviceCategory);
-      (job.requiredSkills || []).forEach((s) => fromJobs.add(s));
+      (job.requiredSkills || []).forEach((s: string) => fromJobs.add(s));
     });
     return Array.from(new Set([...fromIndustries, ...fromJobs])).sort();
   }, [findWorkJobs]);
@@ -3036,7 +3037,10 @@ export default function WorkerDashboard() {
     try {
       const sanitizedMessage = sanitizeMessage(applicationMessage);
       const workersNeeded = applyJob.maxWorkersNeeded ?? 1;
-      const useMultiSelect = workersNeeded > 1 && activeTeamMembers.length > 0 && profile?.isBusinessOperator;
+      const useMultiSelect =
+        workersNeeded > 1 &&
+        activeTeamMembers.length > 0 &&
+        Boolean((profile as { isBusinessOperator?: boolean | null }).isBusinessOperator);
       
       if (useMultiSelect) {
         // Multi-worker application
@@ -3065,9 +3069,9 @@ export default function WorkerDashboard() {
             if (teamMember) {
               applicationData.teamMemberId = teamMember.id;
               // Use smart rate if enabled, then suggested rate, otherwise use team member's rate
-              applicationData.proposedRate = useSmartRateDashboard 
-                ? smartRateSuggestionDashboard 
-                : (suggestedApplicationRate || teamMember.hourlyRate);
+              applicationData.proposedRate = useSmartRateDashboard
+                ? smartRateSuggestionDashboard
+                : (suggestedApplicationRate ?? teamMember.hourlyRate ?? undefined);
             }
           } else {
             // Use smart rate if enabled, then suggested rate, otherwise use profile rate
@@ -3105,9 +3109,9 @@ export default function WorkerDashboard() {
           if (teamMember) {
             applicationData.teamMemberId = teamMember.id;
             // Use smart rate if enabled, then suggested rate, otherwise use team member's rate
-            applicationData.proposedRate = useSmartRateDashboard 
-              ? smartRateSuggestionDashboard 
-              : (suggestedApplicationRate || teamMember.hourlyRate);
+            applicationData.proposedRate = useSmartRateDashboard
+              ? smartRateSuggestionDashboard
+              : (suggestedApplicationRate ?? teamMember.hourlyRate ?? undefined);
           }
         } else {
           // Use smart rate if enabled, then suggested rate, otherwise use profile rate
@@ -3227,7 +3231,7 @@ export default function WorkerDashboard() {
     if (requiresLiteOrElite) {
       let personSkills: string[] | null | undefined;
       if (workerId === "self") {
-        personSkills = profile?.skillsets as string[] | null | undefined;
+        personSkills = (profile as { skillsets?: string[] | null })?.skillsets;
       } else {
         const member = allTeamMembersForApply.find(m => m.id === workerId);
         personSkills = member?.skillsets as string[] | null | undefined;
@@ -4422,7 +4426,7 @@ export default function WorkerDashboard() {
               open={!!selectedFindJob}
               onOpenChange={(open) => !open && setSelectedFindJob(null)}
               job={selectedFindJob}
-              profile={profile}
+              profile={profile ?? null}
               activeTeamMembers={allTeamMembersForApply}
               workerLocation={workerLocation}
               territoryRadiusMiles={clampedMaxDistanceMiles}
@@ -5047,7 +5051,7 @@ export default function WorkerDashboard() {
                   <div className="w-[420px] flex-shrink-0 bg-background border-l flex flex-col overflow-hidden">
                     <JobContent
                       job={selectedFindJob}
-                      profile={profile}
+                      profile={profile ?? null}
                       activeTeamMembers={allTeamMembersForApply}
                       workerLocation={workerLocation}
                       territoryRadiusMiles={clampedMaxDistanceMiles}
@@ -6527,7 +6531,7 @@ export default function WorkerDashboard() {
               applications={calendarApplications}
               availableJobs={calendarAvailableJobs}
               workerHourlyRate={profile?.hourlyRate || 25}
-              profile={profile}
+              profile={profile ?? null}
               activeTeamMembers={activeTeamMembers}
               onApplyToJob={(job) => {
                 setApplyJob(job);
@@ -6553,9 +6557,17 @@ export default function WorkerDashboard() {
               isWithdrawing={removeApplicationMutation.isPending}
               clockInStatus={{
                 isClockedIn: !!activeTimesheet || (!isOnline && hasPendingClockedIn),
-                activeTimesheet: activeTimesheet || (!isOnline && hasPendingClockedIn && pendingClockedInJobId != null && pendingClockInTime
-                  ? { id: -1, jobId: pendingClockedInJobId, clockInTime: pendingClockInTime, clockOutTime: null } as Timesheet
-                  : null),
+                activeTimesheet: (
+                  activeTimesheet ||
+                  (!isOnline && hasPendingClockedIn && pendingClockedInJobId != null && pendingClockInTime
+                    ? ({
+                        id: -1,
+                        jobId: pendingClockedInJobId,
+                        clockInTime: pendingClockInTime,
+                        clockOutTime: null,
+                      } as unknown as Timesheet)
+                    : null)
+                ) as Timesheet | null,
                 activeJobId: activeTimesheet?.jobId ?? (isOnline ? null : (pendingClockedInJobId ?? null)),
               }}
               clockInError={clockInError}
@@ -6661,7 +6673,7 @@ export default function WorkerDashboard() {
                 </div>
                 {/* Profile completeness banner */}
                 {(() => {
-                  const { missing } = getWorkerOnboardingMissing(profile);
+                  const { missing } = getWorkerOnboardingMissing(profile ?? null);
                   if (missing.length === 0) return null;
                   const total = 7; // name, email, phone, facePhoto, skills, rate, bank
                   const done = total - missing.length;
@@ -7509,7 +7521,7 @@ export default function WorkerDashboard() {
                   {selectedFindJob ? (
                     <JobContent
                       job={selectedFindJob}
-                      profile={profile}
+                      profile={profile ?? null}
                       activeTeamMembers={activeTeamMembers}
                       workerLocation={workerLocation}
                       onOpenApply={(job) => {
@@ -7610,7 +7622,7 @@ export default function WorkerDashboard() {
                   {selectedFindJob && (
                     <JobContent
                       job={selectedFindJob}
-                      profile={profile}
+                      profile={profile ?? null}
                       activeTeamMembers={allTeamMembersForApply}
                       workerLocation={workerLocation}
                       onOpenApply={(job) => {
@@ -8074,7 +8086,7 @@ export default function WorkerDashboard() {
               </Button>
             )}
             {quickSettingsView === "skillset" && (
-              <Button className="flex-1" onClick={saveSkillset} disabled={updateProfileMutation.isPending}>
+              <Button className="flex-1" onClick={() => saveSkillset()} disabled={updateProfileMutation.isPending}>
                 {updateProfileMutation.isPending ? <Loader2 className="w-4 h-4 animate-spin mr-2" /> : <Check className="w-4 h-4 mr-2" />}
                 Save Skills
               </Button>
@@ -8829,7 +8841,7 @@ export default function WorkerDashboard() {
           {/* Reason Selection */}
           <div className="space-y-2">
             <Label className="text-sm font-medium">Help us improve (optional)</Label>
-            <Select modal={false} value={dismissReason} onValueChange={setDismissReason}>
+            <Select value={dismissReason} onValueChange={setDismissReason}>
               <SelectTrigger className="h-12 rounded-xl" data-testid="dismiss-reason">
                 <SelectValue placeholder="Why are you hiding this?" />
               </SelectTrigger>
@@ -9076,7 +9088,9 @@ export default function WorkerDashboard() {
                           className="h-8 w-8 p-0"
                           onClick={(e) => {
                             e.stopPropagation();
-                            setSelectedTeammateForSettings(member);
+                            setSelectedTeammateForSettings(
+                              activeTeamMembers.find((m) => m.id === member.id) ?? null
+                            );
                             const m = member as any;
                             setTeammateEditAddress(m.address || "");
                             setTeammateEditCity(m.city || "");
@@ -9511,7 +9525,7 @@ export default function WorkerDashboard() {
         open={!!selectedJobApp}
         onOpenChange={(open) => !open && setSelectedJobApp(null)}
         job={selectedJobApp ? allJobs.find(j => j.id === selectedJobApp.jobId) || null : null}
-        profile={profile}
+        profile={profile ?? null}
         operatorAvatarUrl={operatorAvatarUrl}
         activeTeamMembers={activeTeamMembers}
         territoryRadiusMiles={clampedMaxDistanceMiles}

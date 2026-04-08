@@ -247,6 +247,10 @@ export const profiles = pgTable("profiles", {
   primaryPaymentMethodVerified: boolean("primary_payment_method_verified").default(false), // true = card or verified ACH
   primaryPaymentMethodVerificationStatus: text("primary_payment_method_verification_status"), // From Stripe: "verified" | "pending" (ACH new) | "verification_failed" | "failed" (charge declined)
   lastFailedPaymentMethodId: integer("last_failed_payment_method_id"), // Set when a charge fails with this method; triggers global add-payment popup. Cleared when they add a new method or retry succeeds.
+  /** Resend: last send of company_payment_action_required; null when no active reminder sequence. */
+  paymentFailureReminderSentAt: timestamp("payment_failure_reminder_sent_at"),
+  /** Emails sent in current incident; reset when payment issue clears. */
+  paymentFailureReminderCount: integer("payment_failure_reminder_count").default(0).notNull(),
   
   // Notification preferences
   emailNotifications: boolean("email_notifications").default(true),
@@ -368,6 +372,12 @@ export const jobs = pgTable("jobs", {
   autoFulfillPolicy: text("auto_fulfill_policy").default("first_match"),
   autoFulfillLegalAckVersion: text("auto_fulfill_legal_ack_version"),
   autoFulfillLegalAckAt: timestamp("auto_fulfill_legal_ack_at"),
+
+  /** Set when Stripe replenishment fails after a hire; blocks new applies and clock-in until solvent. */
+  paymentHoldAt: timestamp("payment_hold_at"),
+
+  /** Last time company used "Send alert to workers" (email/push blast); at most once per 24h per job. */
+  lastWorkerAlertAt: timestamp("last_worker_alert_at"),
   
   createdAt: timestamp("created_at").defaultNow(),
 }, (table) => [
@@ -1209,18 +1219,29 @@ export const insertAffiliateCommissionSchema = createInsertSchema(affiliateCommi
   createdAt: true,
 });
 
+/** JSON bodies often send numbers for decimals; DB / drizzle-zod expect strings for decimal columns. */
+const decimalStringFromApi = z.preprocess(
+  (val) => (val === undefined || val === null ? undefined : String(val)),
+  z.string().optional()
+);
+
 export const insertJobSchema = createInsertSchema(jobs, {
   // Coerce date strings to Date objects for API requests
   startDate: z.coerce.date(),
   endDate: z.coerce.date().optional(),
   autoFulfillWindowStart: z.coerce.date().optional(),
   autoFulfillWindowEnd: z.coerce.date().optional(),
+  latitude: decimalStringFromApi,
+  longitude: decimalStringFromApi,
+  autoFulfillExpectedHours: decimalStringFromApi,
+  autoFulfillMinWorkerRating: decimalStringFromApi,
 }).omit({ 
   id: true, 
   createdAt: true,
   status: true,
   workersHired: true,
   totalPaid: true,
+  lastWorkerAlertAt: true,
 });
 
 export const insertJobSkillSchema = createInsertSchema(jobSkills).omit({ 
@@ -1247,6 +1268,8 @@ export const insertDirectJobInquirySchema = createInsertSchema(directJobInquirie
   startDate: z.coerce.date(),
   endDate: z.coerce.date().optional(),
   expiresAt: z.coerce.date().optional(),
+  latitude: decimalStringFromApi,
+  longitude: decimalStringFromApi,
 }).omit({ 
   id: true, 
   createdAt: true,

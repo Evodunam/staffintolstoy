@@ -19,8 +19,7 @@ import {
 } from "@/components/ui/tooltip";
 import { AlertCircle, ChevronDown, ChevronRight, Info } from "lucide-react";
 import { cn, parseLocalDate } from "@/lib/utils";
-
-type DateRange = { from?: Date; to?: Date };
+import type { DateRange } from "react-day-picker";
 
 const ON_DEMAND_EST_HOURLY = 40;
 const ON_DEMAND_EST_HOURS_PER_DAY = 8;
@@ -191,7 +190,7 @@ export function OnDemandScheduleMultiStep({
             <Calendar
               mode="range"
               selected={rangeSelected}
-              onSelect={handleRangeSelect as (range: DateRange | undefined) => void}
+              onSelect={handleRangeSelect}
               className="p-2 sm:p-4 bg-background w-full max-w-full"
               disabled={{ before: minDateForStart }}
             />

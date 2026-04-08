@@ -45,21 +45,10 @@ export default defineConfig({
       clientPort: parseInt(process.env.PORT || "5000", 10),
       path: "/vite-hmr",
       overlay: false,
-      client: {
-        overlay: false,
-        reconnect: false,
-        timeout: 30000,
-        logging: "none",
-      },
     },
   },
   logLevel: "warn",
   clearScreen: false,
-  test: {
-    environment: "happy-dom",
-    include: ["src/**/*.test.{ts,tsx}"],
-    globals: true,
-  },
   optimizeDeps: {
     include: ["react", "react-dom"],
     exclude: ["@capacitor/core", "@capacitor/geolocation"],

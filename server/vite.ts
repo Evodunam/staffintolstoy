@@ -66,6 +66,7 @@ export async function setupVite(server: Server, app: Express) {
   const vite = await createViteServer({
     ...viteConfig,
     configFile: false,
+    server: serverOptions as import("vite").InlineConfig["server"],
     customLogger: {
       ...viteLogger,
       error: (msg, options) => {
@@ -85,7 +86,6 @@ export async function setupVite(server: Server, app: Express) {
         viteLogger.warnOnce(msg, options);
       },
     },
-    server: serverOptions,
     appType: "custom",
   });
 

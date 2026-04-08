@@ -192,7 +192,7 @@ interface TeamMemberBasic {
   email?: string | null;
   phone?: string | null;
   role?: "admin" | "employee";
-  skillsets?: string[];
+  skillsets?: string[] | null;
   status?: "active" | "pending" | "inactive";
   inviteToken?: string | null;
   latitude?: string | null;
@@ -2611,7 +2611,9 @@ export function JobContent({
 
   const { availableWorkers, conflictWorkers } = useMemo(() => {
     type Row = { key: "self" | number; p: TeamMemberBasic | Profile; skillMatch: boolean; available: boolean; inTerritory: boolean; matchingSkills: string[] };
-    const rows: Row[] = orderedTeammatesForScroll.map(({ p, skillMatch, available, inTerritory }) => {
+    const rows: Row[] = orderedTeammatesForScroll
+      .filter((item): item is typeof item & { p: TeamMemberBasic | Profile } => item.p != null)
+      .map(({ p, skillMatch, available, inTerritory }) => {
       const skills = (p as any).skillsets ?? (p as any).serviceCategories ?? [];
       return {
         key: profile && p === profile ? "self" : (p as TeamMemberBasic).id,
@@ -3649,7 +3651,7 @@ export function JobContent({
       );
     } else if (popupView === "teammate" && selectedTeammateForPopup?.p && jobStart) {
       const tp = selectedTeammateForPopup.p as TeamMemberBasic & { firstName?: string; lastName?: string; avatarUrl?: string | null; skillsets?: string[]; hourlyRate?: number | null };
-      const isSelf = !!profile && tp === profile;
+      const isSelf = !!(profile && (tp as unknown) === (profile as unknown));
       const memberKey: "self" | number = isSelf ? "self" : (tp as TeamMemberBasic).id;
       const data = scheduledByMember[memberKey];
       const sched = data?.scheduled ?? [];
@@ -4432,7 +4434,7 @@ export function JobContent({
 
             {/* 5. First company block — simple, no card: logo, name, tenure */}
             {job.companyId && (
-              <CompanyInlineSimple company={companyProfileInline} t={t} />
+              <CompanyInlineSimple company={companyProfileInline ?? null} t={t} />
             )}
 
             {/* 6. Line separator */}
@@ -5108,7 +5110,7 @@ export function JobContent({
 
             {/* 15. Meet the company card (second) + Message company (hidden in application view) */}
             {job.companyId && (
-              <MeetCompanyCard company={companyProfileInline} job={job} companyJobsCount={companyJobsCount?.count} companyLocationsCount={companyLocationsCount?.count} t={t} format={format} showMessageButton={!application} onMessageCompany={() => { setStage(2); setShowInlineApply(true); }} />
+              <MeetCompanyCard company={companyProfileInline ?? null} job={job} companyJobsCount={companyJobsCount?.count} companyLocationsCount={companyLocationsCount?.count} t={t} format={format} showMessageButton={!application} onMessageCompany={() => { setStage(2); setShowInlineApply(true); }} />
             )}
 
             {/* 16. Line separator */}
@@ -5545,7 +5547,10 @@ export function JobContent({
                   Open ({companyJobs.filter((j) => j.status === "open").length})
                 </TabsTrigger>
                 <TabsTrigger value="closed" className="data-[state=active]:bg-background">
-                  Closed ({companyJobs.filter((j) => j.status === "closed" || j.status === "filled").length})
+                  Closed ({companyJobs.filter((j) => {
+                    const st = j.status as string;
+                    return st === "closed" || st === "filled";
+                  }).length})
                 </TabsTrigger>
               </TabsList>
 
@@ -5591,13 +5596,19 @@ export function JobContent({
               </TabsContent>
 
               <TabsContent value="closed" className="space-y-3 mt-0">
-                {companyJobs.filter((j) => j.status === "closed" || j.status === "filled").length === 0 ? (
+                {companyJobs.filter((j) => {
+                  const st = j.status as string;
+                  return st === "closed" || st === "filled";
+                }).length === 0 ? (
                   <div className="text-center py-12 text-muted-foreground">
                     <p>{t("noClosedJobs") || "No closed jobs"}</p>
                   </div>
                 ) : (
                   companyJobs
-                    .filter((j) => j.status === "closed" || j.status === "filled")
+                    .filter((j) => {
+                      const st = j.status as string;
+                      return st === "closed" || st === "filled";
+                    })
                     .map((companyJob) => (
                       <div
                         key={companyJob.id}
@@ -5689,6 +5700,15 @@ function ApplicationViewDialog({
   const [withdrawStep, setWithdrawStep] = useState<"reason" | "confirm">("reason");
   const [withdrawReason, setWithdrawReason] = useState<string | null>(null);
   const [showDriveTime, setShowDriveTime] = useState(false);
+  const [teammateSettingsOpen, setTeammateSettingsOpen] = useState(false);
+  const [selectedTeammateForSettings, setSelectedTeammateForSettings] = useState<TeamMemberBasic | null>(null);
+  const [settingsSection, setSettingsSection] = useState<"list" | "edit">("list");
+  useEffect(() => {
+    if (!teammateSettingsOpen) {
+      setSelectedTeammateForSettings(null);
+      setSettingsSection("list");
+    }
+  }, [teammateSettingsOpen]);
   const jobTypeInfo = getJobTypeInfo(job, t);
   const timeInfo = formatJobTime(job, t);
   const teamMember = application.teamMember;
@@ -6307,7 +6327,6 @@ function ApplicationViewDialog({
               </button>
             ) : (
               <Select
-                modal={false}
                 value={teamMember?.id?.toString() || "self"}
                 onValueChange={(value) => {
                   const newTeamMemberId = value === "self" ? null : parseInt(value);
@@ -6636,7 +6655,7 @@ function ApplicationViewDialog({
           open={teammateSettingsOpen}
           onOpenChange={setTeammateSettingsOpen}
           job={job}
-          profile={profile}
+          profile={profile ?? null}
           activeTeamMembers={activeTeamMembers}
           selectedTeammate={selectedTeammateForSettings}
           onSelectTeammate={setSelectedTeammateForSettings}
@@ -6659,6 +6678,18 @@ function ApplicationViewDialog({
       </Dialog>
       {teamMemberPickerDrawer}
       {driveTimePopup}
+      <TeammateSettingsPopup
+        open={teammateSettingsOpen}
+        onOpenChange={setTeammateSettingsOpen}
+        job={job}
+        profile={profile ?? null}
+        activeTeamMembers={activeTeamMembers}
+        selectedTeammate={selectedTeammateForSettings}
+        onSelectTeammate={setSelectedTeammateForSettings}
+        settingsSection={settingsSection}
+        onSectionChange={setSettingsSection}
+        workerLocation={workerLocation ?? null}
+      />
     </>
   );
 }
@@ -6770,7 +6801,7 @@ function TeammateSettingsPopup({
     ];
 
     return allPeople.map(p => {
-      const skillsets = (p.skillsets as string[]) || [];
+      const skillsets = (((p as { skillsets?: string[] | null }).skillsets ?? (p as { trades?: string[] | null }).trades ?? (p as { serviceCategories?: string[] | null }).serviceCategories) as string[]) || [];
       const hasSkills = skillsets.some(s => jobSkills.has(s));
       const hasLocation = !!(p.latitude && p.longitude);
       

@@ -477,7 +477,7 @@ export function useLocationTracking() {
   // Native: start OS geofence + foreground service when clocked in (for concrete tracking when app closed)
   const nativeStopRef = useRef<(() => void) | null>(null);
   useEffect(() => {
-    if (!Capacitor.isNativePlatform() || !activeTimesheet || !profile?.id) return;
+    if (!Capacitor.isNativePlatform?.() || !activeTimesheet || !profile?.id) return;
     const job = nearbyJobs.find((j) => j.id === activeTimesheet!.jobId);
     const jobCoords = job?.latitude && job?.longitude
       ? { latitude: parseFloat(job.latitude), longitude: parseFloat(job.longitude) }

@@ -76,7 +76,7 @@ export function useCreateProfile() {
   });
 }
 
-type UpdateProfileVariables = { id: number; data: Partial<InsertProfile>; skipToast?: boolean };
+type UpdateProfileVariables = { id: number; data: Partial<InsertProfile> & Record<string, unknown>; skipToast?: boolean };
 
 export function useUpdateProfile() {
   const queryClient = useQueryClient();

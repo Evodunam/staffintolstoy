@@ -233,6 +233,8 @@ function ChatJobListRow({
 function TimesheetApprovalActions({ timesheetId, onActionComplete }: { timesheetId: number; onActionComplete: () => void }) {
   const queryClient = useQueryClient();
   const { toast } = useToast();
+  const { t } = useTranslation();
+  const { t: tCommon } = useTranslation("common");
   const [rejectDialogOpen, setRejectDialogOpen] = useState(false);
   const [rejectionReason, setRejectionReason] = useState("");
   
@@ -644,7 +646,7 @@ export default function ChatsPage({ embedInDashboard }: ChatsPageProps = {}) {
         visibleToCompanyOnly: false,
         isRead: false,
         readAt: null,
-        createdAt: new Date().toISOString(),
+        createdAt: new Date(),
         sender: profile as Profile,
       };
       queryClient.setQueryData<MessageWithSender[]>(
@@ -1717,7 +1719,16 @@ export default function ChatsPage({ embedInDashboard }: ChatsPageProps = {}) {
           setCallInviteRoomUrl(roomUrl);
           setCallInviteOpen(true);
         }}
-        job={selectedJob?.job ?? null}
+        job={
+          selectedJob?.job
+            ? {
+                startDate:
+                  selectedJob.job.startDate instanceof Date
+                    ? format(selectedJob.job.startDate, "yyyy-MM-dd")
+                    : (selectedJob.job.startDate as string | null),
+              }
+            : null
+        }
         isWorker={profile?.role === "worker"}
         onRequestStartJobNow={() => {
           if (!selectedJobId || sendMessageMutation.isPending) return;

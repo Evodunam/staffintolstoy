@@ -38,7 +38,7 @@ export function useLocationTracking(): LocationTrackingHook {
   const [error, setError] = useState<string | null>(null);
   const [stopFn, setStopFn] = useState<(() => void) | null>(null);
 
-  const isNative = Capacitor.isNativePlatform();
+  const isNative = Capacitor.isNativePlatform?.() ?? false;
 
   useEffect(() => {
     const init = async () => {
@@ -70,7 +70,7 @@ export function useLocationTracking(): LocationTrackingHook {
   useEffect(() => {
     if (permissionStatus === 'granted') {
       getCurrentPosition().then(pos => {
-        if (pos) setCurrentPosition(pos);
+        if (pos) setCurrentPosition(pos as Position);
       });
     }
   }, [permissionStatus]);
@@ -85,7 +85,7 @@ export function useLocationTracking(): LocationTrackingHook {
         setHasBackgroundPermission(result.background);
         
         const pos = await getCurrentPosition();
-        if (pos) setCurrentPosition(pos);
+        if (pos) setCurrentPosition(pos as Position);
         
         return true;
       }

@@ -478,16 +478,20 @@ export function CalendarMapView({
     const params = new URLSearchParams(window.location.search);
     const parsed = parseReplayUrlState(params);
     if (typeof parsed.replayMinute === "number") {
-      setReplayMinute((prev) => (prev === parsed.replayMinute ? prev : parsed.replayMinute));
+      const minute = parsed.replayMinute;
+      setReplayMinute((prev) => (prev === minute ? prev : minute));
     }
     if (typeof parsed.showReplayJobStarts === "boolean") {
-      setShowReplayJobStarts((prev) => (prev === parsed.showReplayJobStarts ? prev : parsed.showReplayJobStarts));
+      const v = parsed.showReplayJobStarts;
+      setShowReplayJobStarts((prev) => (prev === v ? prev : v));
     }
     if (typeof parsed.showReplayJobEnds === "boolean") {
-      setShowReplayJobEnds((prev) => (prev === parsed.showReplayJobEnds ? prev : parsed.showReplayJobEnds));
+      const v = parsed.showReplayJobEnds;
+      setShowReplayJobEnds((prev) => (prev === v ? prev : v));
     }
     if (typeof parsed.showReplayPings === "boolean") {
-      setShowReplayPings((prev) => (prev === parsed.showReplayPings ? prev : parsed.showReplayPings));
+      const v = parsed.showReplayPings;
+      setShowReplayPings((prev) => (prev === v ? prev : v));
     }
     if (Array.isArray(parsed.replayTeammateFilterIds)) {
       setReplayTeammateFilterIds((prev) => {
@@ -498,7 +502,8 @@ export function CalendarMapView({
       });
     }
     if (typeof parsed.replayRailOpen === "boolean") {
-      setReplayRailOpen((prev) => (prev === parsed.replayRailOpen ? prev : parsed.replayRailOpen));
+      const v = parsed.replayRailOpen;
+      setReplayRailOpen((prev) => (prev === v ? prev : v));
     }
   }, [replayEnabled, dateMode, selectedDayStart.getTime()]);
   useEffect(() => {

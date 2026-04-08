@@ -1,4 +1,4 @@
-import { PLATFORM_MIN_BILLABLE_HOURLY_CENTS } from "./platformPayPolicy";
+import { PLATFORM_MIN_JOB_BUDGET_HOURLY_CENTS } from "./platformPayPolicy";
 
 /** Parse "yyyy-MM-dd" as local calendar date */
 function parseLocalDate(str: string): Date {
@@ -66,10 +66,10 @@ export function computeBillableWorkerHours(input: PostJobBillableScheduleInput):
   return 0;
 }
 
-/** Minimum labor budget (cents) so effective pay never implies below minHourlyCents when spread across hours. */
+/** Minimum company labor budget (cents) for scheduled worker-hours at the all-in minimum per worker-hour. */
 export function minimumLaborBudgetCentsForWorkerHours(
   totalWorkerHours: number,
-  minHourlyCents: number = PLATFORM_MIN_BILLABLE_HOURLY_CENTS
+  minHourlyCents: number = PLATFORM_MIN_JOB_BUDGET_HOURLY_CENTS
 ): number {
   if (!Number.isFinite(totalWorkerHours) || totalWorkerHours <= 0) return 0;
   if (!Number.isFinite(minHourlyCents) || minHourlyCents <= 0) return 0;

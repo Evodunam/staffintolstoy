@@ -18,3 +18,12 @@ export function blurFocusInside(container: HTMLElement | null | undefined): void
     active.blur();
   }
 }
+
+/** Drop focus from any control inside `#dialog-container` (avoids aria-hidden + focused descendant warnings). */
+export function blurFocusInsideDialogContainer(): void {
+  const dc = document.getElementById("dialog-container");
+  const active = document.activeElement as HTMLElement | null;
+  if (dc && active && dc.contains(active) && typeof active.blur === "function") {
+    active.blur();
+  }
+}

@@ -37,10 +37,10 @@ export function LocationPermissionFlow({
   const [isRequesting, setIsRequesting] = useState(false);
   const { requestPermissions, permissionStatus, hasBackgroundPermission } = useLocationTracking();
   
-  const isAndroid = Capacitor.getPlatform() === 'android';
+  const isAndroid = Capacitor.getPlatform?.() === "android";
 
   useEffect(() => {
-    if (step === 'background_settings' && Capacitor.isNativePlatform()) {
+    if (step === 'background_settings' && Capacitor.isNativePlatform?.()) {
       const checkOnResume = async () => {
         const perms = await checkNativePermissions();
         if (perms.background) {

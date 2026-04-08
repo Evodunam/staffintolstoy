@@ -19,8 +19,7 @@ export function LocationBanner() {
     dismissClockOutBanner,
     clockIn,
     clockOut,
-    CLOCK_IN_RADIUS_MILES,
-    CLOCK_OUT_RADIUS_MILES,
+    GEOFENCE_RADIUS_MILES,
   } = useLocationTracking();
 
   if (locationError) {
@@ -93,7 +92,7 @@ export function LocationBanner() {
                 </div>
               </div>
               <p className="text-xs text-muted-foreground mt-2 text-center">
-                {t("banners.autoClockInActivates", { radius: CLOCK_IN_RADIUS_MILES })}
+                {t("banners.autoClockInActivates", { radius: GEOFENCE_RADIUS_MILES })}
               </p>
             </CardContent>
           </Card>
@@ -116,7 +115,7 @@ export function LocationBanner() {
                 <div className="flex-1 min-w-0">
                   <p className="font-semibold text-foreground">{t("banners.leftJobSiteQuestion")}</p>
                   <p className="text-sm text-muted-foreground">
-                    {t("banners.moreThanMilesAway", { radius: CLOCK_OUT_RADIUS_MILES })}
+                    {t("banners.moreThanMilesAway", { radius: GEOFENCE_RADIUS_MILES })}
                   </p>
                   <div className="flex gap-2 mt-3">
                     <Button 

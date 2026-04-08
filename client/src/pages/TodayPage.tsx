@@ -2,7 +2,7 @@ import { useState, useMemo, useEffect, useRef } from "react";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { useLocation } from "wouter";
 import { format, parseISO, isToday, isTomorrow, startOfDay, endOfDay, addHours, differenceInMinutes, differenceInDays, isBefore, isAfter, startOfToday, startOfWeek, endOfWeek, startOfMonth, endOfMonth, addDays } from "date-fns";
-import { ArrowLeft, Clock, MapPin, Navigation as NavigationIcon, MessageSquare, Play, Square, Loader2, Calendar, ChevronRight, ChevronLeft, User, Users, UserPlus, AlertCircle, CheckCircle2, Car, Search, Briefcase, Menu, Bell, Repeat, Zap, CalendarDays, Building2, Image as ImageIcon, DollarSign, Star, RefreshCw, LogOut, WifiOff, Wifi, MoreVertical, X } from "lucide-react";
+import { ArrowLeft, Clock, MapPin, Navigation as NavigationIcon, MessageSquare, Play, Square, Loader2, Calendar, ChevronRight, ChevronLeft, User, Users, UserPlus, AlertCircle, CheckCircle2, Car, Search, Briefcase, Menu, Bell, Repeat, Zap, CalendarDays, Building2, Image as ImageIcon, DollarSign, Star, RefreshCw, LogOut, WifiOff, Wifi, MoreVertical, X, Settings } from "lucide-react";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { formatDistanceToNow } from "date-fns";
@@ -163,6 +163,7 @@ export default function TodayPage() {
   } | null>(null);
   const [showClockOutSheet, setShowClockOutSheet] = useState(false);
   const [clockedInDuration, setClockedInDuration] = useState<string>("");
+  const [showTeammateSettings, setShowTeammateSettings] = useState(false);
 
   // Detect user device type for location troubleshooting
   const detectDevice = (): "ios" | "android" | "browser" => {
@@ -779,7 +780,10 @@ export default function TodayPage() {
     if (!isOnlineEffective && hasPendingClockedIn && pendingClockedInJobId && pendingClockInTime) {
       const assignment = roleFilteredAssignments.find(a => a.application.job.id === pendingClockedInJobId);
       if (assignment)
-        return { ...assignment, activeTimesheet: { id: -1, clockInTime: pendingClockInTime, clockOutTime: null } as Timesheet };
+        return {
+          ...assignment,
+          activeTimesheet: { id: -1, clockInTime: pendingClockInTime, clockOutTime: null } as unknown as Timesheet,
+        };
     }
     return null;
   }, [roleFilteredAssignments, isOnlineEffective, hasPendingClockedIn, pendingClockedInJobId, pendingClockInTime]);
@@ -2190,7 +2194,13 @@ export default function TodayPage() {
     // Today's completed (clocked-out) shifts for "Completed" section
     const completedTodayList = useMemo(() => {
       return uniqueAssignments.flatMap(a => (a.todayCompletedTimesheets || []).map(ts => ({ assignment: a, timesheet: ts })))
-        .sort((a, b) => new Date((b.timesheet.clockOutTime as string)).getTime() - new Date((a.timesheet.clockOutTime as string)).getTime());
+        .sort((a, b) => {
+          const outA = a.timesheet.clockOutTime;
+          const outB = b.timesheet.clockOutTime;
+          const ta = outA ? new Date(outA as string | Date).getTime() : 0;
+          const tb = outB ? new Date(outB as string | Date).getTime() : 0;
+          return tb - ta;
+        });
     }, [uniqueAssignments]);
 
     // Only show hours that have jobs OR are work hours (6am-10pm) OR current hour

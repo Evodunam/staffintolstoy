@@ -2665,9 +2665,11 @@ export function BusinessOperatorContent({ embedded = false }: { embedded?: boole
                         city: "",
                         state: "",
                         zipCode: "",
+                        latitude: undefined,
+                        longitude: undefined,
                         role: newInviteMember.role,
                         hourlyRate: newInviteMember.hourlyRate,
-                        skillsets: [],
+                        skillsets: [] as string[],
                         avatarUrl: "",
                       });
                       

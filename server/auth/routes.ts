@@ -138,7 +138,7 @@ export function registerAuthRoutes(app: Express): void {
       if (process.env.NODE_ENV !== "production") {
         console.log("[Google OAuth] redirect_uri (add this to Google Console):", callbackURL);
       }
-      passport.authenticate("google", {
+      (passport.authenticate as any)("google", {
         scope: ["profile", "email"],
         callbackURL,
       })(req, res, next);

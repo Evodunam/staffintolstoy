@@ -1,4 +1,4 @@
-type ProfileLike = {
+export type ProfileLikeRecord = {
   role?: string;
   onboardingStatus?: string | null;
   firstName?: string | null;
@@ -11,7 +11,6 @@ type ProfileLike = {
   hourlyRate?: number | null;
   bankAccountLinked?: boolean | null;
   mercuryRecipientId?: string | null;
-  // Support snake_case in case API returns raw DB shape
   onboarding_status?: string | null;
   first_name?: string | null;
   last_name?: string | null;
@@ -21,9 +20,11 @@ type ProfileLike = {
   hourly_rate?: number | null;
   bank_account_linked?: boolean | null;
   mercury_recipient_id?: string | null;
-} | null;
+};
 
-function val<T>(profile: ProfileLike, camel: keyof ProfileLike, snake: string): T | null | undefined {
+export type ProfileLike = ProfileLikeRecord | null;
+
+function val<T>(profile: ProfileLike, camel: keyof ProfileLikeRecord, snake: string): T | null | undefined {
   if (!profile) return undefined;
   const c = profile[camel as keyof ProfileLike];
   const s = (profile as Record<string, unknown>)[snake];

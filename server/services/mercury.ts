@@ -362,8 +362,10 @@ export interface CreatePaymentParams {
 }
 
 export interface CreateDebitParams {
-  recipientId: string;
-  externalAccountId: string;
+  recipientId?: string;
+  externalAccountId?: string;
+  /** Display / logging name for placeholder debit API */
+  counterpartyName?: string;
   amount: number; // in cents
   description?: string;
   idempotencyKey?: string;
@@ -883,19 +885,18 @@ export const mercuryService = {
         // Get existing recipient to preserve routing info
         try {
           const existing = await this.getRecipient(recipientId);
-          const electronicRoutingInfo: any = {};
+          const electronicRoutingInfo: Record<string, unknown> = {};
           
           // Preserve existing routing info if available
           if (existing.accountNumber) electronicRoutingInfo.accountNumber = existing.accountNumber;
           if (existing.routingNumber) electronicRoutingInfo.routingNumber = existing.routingNumber;
           if (existing.accountType) {
-            // Map account type to electronicAccountType
-            let electronicAccountType = existing.accountType;
-            if (electronicAccountType === 'checking') electronicAccountType = 'businessChecking';
-            else if (electronicAccountType === 'savings') electronicAccountType = 'businessSavings';
+            let electronicAccountType: string = existing.accountType;
+            if (electronicAccountType === "checking") electronicAccountType = "businessChecking";
+            else if (electronicAccountType === "savings") electronicAccountType = "businessSavings";
             electronicRoutingInfo.electronicAccountType = electronicAccountType;
           } else {
-            electronicRoutingInfo.electronicAccountType = 'businessChecking'; // Default
+            electronicRoutingInfo.electronicAccountType = "businessChecking"; // Default
           }
 
           // Build address object with updates

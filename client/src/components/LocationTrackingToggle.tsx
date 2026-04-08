@@ -79,8 +79,8 @@ export function LocationTrackingToggle({ onTrackingChange }: LocationTrackingTog
               <AlertDescription className="text-amber-800 dark:text-amber-200">
                 Background location not enabled. Tracking may stop when the app is closed.
                 <Button 
-                  variant="link" 
-                  className="p-0 h-auto text-amber-600 underline ml-1"
+                  variant="ghost" 
+                  className="p-0 h-auto text-amber-600 underline ml-1 hover:bg-transparent"
                   onClick={() => setShowPermissionFlow(true)}
                   data-testid="button-enable-background"
                 >

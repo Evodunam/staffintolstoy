@@ -93,7 +93,7 @@ export default function MyApplicationsPage() {
                   <div className="py-12 text-center text-muted-foreground" data-testid="applications-empty">
                     <Briefcase className="w-12 h-12 mx-auto mb-3 opacity-50" />
                     <p>{statusFilter === "all" ? t("empty") : t("emptyFiltered")}</p>
-                    <Button variant="link" className="mt-2" onClick={() => setLocation("/dashboard/find")}>
+                    <Button variant="ghost" className="mt-2 h-auto p-0 underline text-primary" onClick={() => setLocation("/dashboard/find")}>
                       {t("browseJobs")}
                     </Button>
                   </div>
@@ -114,9 +114,9 @@ export default function MyApplicationsPage() {
                                 <p className="text-sm text-muted-foreground truncate">{app.company.companyName}</p>
                               )}
                               <p className="text-xs text-muted-foreground mt-1">
-                                {t("appliedAt")} {formatDistanceToNow(new Date(app.createdAt), { addSuffix: true })}
-                                {" · "}
-                                {format(new Date(app.createdAt), "MMM d, yyyy")}
+                                {app.createdAt
+                                  ? `${t("appliedAt")} ${formatDistanceToNow(new Date(app.createdAt), { addSuffix: true })} · ${format(new Date(app.createdAt), "MMM d, yyyy")}`
+                                  : t("appliedAt")}
                               </p>
                             </div>
                             <div className="flex items-center gap-2 flex-shrink-0">

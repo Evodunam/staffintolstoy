@@ -151,13 +151,14 @@ export function PaymentHistoryContent({ embedded = false }: { embedded?: boolean
     if (timesheet.status === "disputed") {
       return { label: t("disputed"), color: "bg-yellow-100 text-yellow-700 dark:bg-yellow-900/30 dark:text-yellow-400", showContact: true };
     }
-    if (timesheet.paymentStatus === "completed") {
+    const paySt = timesheet.paymentStatus as string | null | undefined;
+    if (paySt === "completed") {
       return { label: t("paid"), color: "bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400", showContact: false };
     }
-    if (timesheet.paymentStatus === "processing") {
+    if (paySt === "processing") {
       return { label: t("transferring"), color: "bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400", showContact: false };
     }
-    if (timesheet.status === "approved" && timesheet.paymentStatus !== "completed") {
+    if (timesheet.status === "approved" && paySt !== "completed") {
       return { label: t("submitted"), color: "bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400", showContact: false };
     }
     if (timesheet.status === "pending" && timesheet.clockOutTime && timesheet.submittedAt) {
@@ -318,8 +319,8 @@ export function PaymentHistoryContent({ embedded = false }: { embedded?: boolean
           <p>{t("payWhenW9")}</p>
           <Button
             type="button"
-            variant="link"
-            className="h-auto p-0 text-primary"
+            variant="ghost"
+            className="h-auto p-0 text-primary underline hover:bg-transparent"
             onClick={() => setLocation("/dashboard/settings/payouts")}
           >
             {t("payWhenPayoutLink")}

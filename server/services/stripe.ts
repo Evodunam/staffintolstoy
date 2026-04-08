@@ -26,7 +26,7 @@ if (!secretKey) {
 }
 
 const stripe = secretKey ? new Stripe(secretKey, {
-  apiVersion: "2025-04-30.basil",
+  apiVersion: "2025-12-15.clover",
 }) : null;
 
 if (stripe && publishableKey) {

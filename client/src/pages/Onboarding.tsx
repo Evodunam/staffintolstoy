@@ -183,14 +183,14 @@ export default function Onboarding() {
             )}
 
             {role === "company" && (
-              <FormField
-                control={form.control}
-                name="companyName"
-                render={({ field }) => (
+            <FormField
+              control={form.control}
+              name="companyName"
+              render={({ field }) => (
                   <FormItem>
                     <FormLabel>{t("companyName")}</FormLabel>
                     <FormControl>
-                      <Input {...field} className="input-field" placeholder={t("companyNamePlaceholder")} />
+                      <Input {...field} value={field.value ?? ""} className="input-field" placeholder={t("companyNamePlaceholder")} />
                     </FormControl>
                     <FormMessage />
                   </FormItem>
@@ -200,12 +200,12 @@ export default function Onboarding() {
 
             <FormField
               control={form.control}
-              name="location"
+              name="address"
               render={({ field }) => (
                 <FormItem>
                   <FormLabel>{t("location")}</FormLabel>
                   <FormControl>
-                    <Input {...field} className="input-field" placeholder={t("locationPlaceholder")} />
+                    <Input {...field} value={field.value ?? ""} className="input-field" placeholder={t("locationPlaceholder")} />
                   </FormControl>
                   <FormMessage />
                 </FormItem>
@@ -221,6 +221,7 @@ export default function Onboarding() {
                   <FormControl>
                     <Textarea 
                       {...field} 
+                      value={field.value ?? ""}
                       className="resize-none min-h-[100px] rounded-xl border-input" 
                       placeholder={role === "worker" ? t("bioPlaceholderWorker") : t("bioPlaceholderCompany")} 
                     />

@@ -90,7 +90,7 @@ export function ChatMessageInput({
   const [attachSheetOpen, setAttachSheetOpen] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const recognitionRef = useRef<SpeechRecognition | null>(null);
+  const recognitionRef = useRef<{ stop: () => void; start: () => void } | null>(null);
 
   const getDisplayName = (p: Profile) =>
     p.firstName || p.companyName || p.email || "Unknown";
@@ -230,10 +230,12 @@ export function ChatMessageInput({
     rec.interimResults = true;
     rec.lang = "en-US";
 
-    rec.onresult = (e: SpeechRecognitionEvent) => {
-      const last = e.results.length - 1;
-      const text = (e.results[last] as SpeechRecognitionAlternative)[0].transcript;
-      if (e.results[last].isFinal) {
+    rec.onresult = (e: Event) => {
+      const ev = e as unknown as { results: { length: number; [i: number]: { isFinal: boolean; 0: { transcript: string } } } };
+      const last = ev.results.length - 1;
+      const chunk = ev.results[last];
+      const text = chunk?.[0]?.transcript ?? "";
+      if (chunk?.isFinal) {
         setValue((prev) => (prev ? prev + " " + text : text));
       }
     };

@@ -36,9 +36,10 @@ async function loadSecretsFromGCP(): Promise<void> {
 const isProduction = process.env.NODE_ENV === "production";
 const envFile = isProduction ? ".env.production" : ".env.development";
 
-// Ensure NODE_ENV is set correctly for development
-if (!isProduction && !process.env.NODE_ENV) {
-  process.env.NODE_ENV = "development";
+// Ensure NODE_ENV is set correctly for development (use env alias: esbuild define only rewrites `process.env.NODE_ENV` literals)
+const _env = process.env;
+if (!isProduction && !_env.NODE_ENV) {
+  _env.NODE_ENV = "development";
 }
 
 const envFilePath = resolve(process.cwd(), envFile);

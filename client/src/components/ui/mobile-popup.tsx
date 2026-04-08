@@ -75,6 +75,8 @@ interface MobilePopupProps {
     loading?: boolean;
     icon?: ReactNode;
     testId?: string;
+    /** Passed to the primary `Button` (e.g. `destructive` for confirm dialogs). */
+    variant?: React.ComponentProps<typeof Button>["variant"];
   };
   secondaryAction?: {
     label: string;
@@ -231,9 +233,10 @@ export function MobilePopup({
       )}
       {primaryAction && (
         <Button
+          variant={primaryAction.variant}
           className={cn(
             "flex-1 sm:flex-none sm:min-w-[140px] h-12 text-base font-semibold rounded-xl shadow-lg",
-            SOFT_BLACK
+            primaryAction.variant === "destructive" ? undefined : SOFT_BLACK
           )}
           onClick={primaryAction.onClick}
           disabled={primaryAction.disabled}

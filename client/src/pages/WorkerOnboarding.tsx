@@ -483,10 +483,11 @@ export default function WorkerOnboarding() {
     enabled: !!existingProfile && currentStep === 4,
   });
   const defaultPayoutAccount = payoutAccounts.find((a) => a.isDefault) || payoutAccounts[0];
+  const payoutProvOnboarding = defaultPayoutAccount?.provider as string | undefined;
   const hasBankVerified =
     bankConnected ||
     !!(existingProfile as { bankAccountLinked?: boolean } | null)?.bankAccountLinked ||
-    (!!defaultPayoutAccount && (defaultPayoutAccount.provider === "mercury" || defaultPayoutAccount.provider === "modern_treasury"));
+    (!!defaultPayoutAccount && (payoutProvOnboarding === "mercury" || payoutProvOnboarding === "modern_treasury"));
 
   // Sync bankConnected when profile or payout accounts indicate bank is verified
   useEffect(() => {
@@ -710,6 +711,12 @@ export default function WorkerOnboarding() {
         if (!createRes.ok) throw new Error("Failed to create team");
         team = await createRes.json();
       }
+      const teamId = team?.id;
+      if (!teamId) {
+        safeToast({ title: "Could not load team", variant: "destructive" });
+        setInviteSending(false);
+        return;
+      }
       const hasTeammateAddress = !!(
         workerInviteData.address?.trim() &&
         workerInviteData.city?.trim() &&
@@ -723,7 +730,7 @@ export default function WorkerOnboarding() {
       }
       const lat = typeof workerInviteData.latitude === "number" && Number.isFinite(workerInviteData.latitude) ? workerInviteData.latitude : undefined;
       const lng = typeof workerInviteData.longitude === "number" && Number.isFinite(workerInviteData.longitude) ? workerInviteData.longitude : undefined;
-      const addRes = await apiRequest("POST", `/api/worker-team/${team.id}/members`, {
+      const addRes = await apiRequest("POST", `/api/worker-team/${teamId}/members`, {
         firstName: workerInviteData.firstName?.trim() || "Teammate",
         lastName: workerInviteData.lastName?.trim() || "—",
         email,
@@ -742,7 +749,7 @@ export default function WorkerOnboarding() {
         throw new Error(err?.message || "Failed to send invite");
       }
       await queryClient.invalidateQueries({ queryKey: ["/api/worker-team"] });
-      await queryClient.invalidateQueries({ queryKey: ["/api/worker-team", team.id, "members"] });
+      await queryClient.invalidateQueries({ queryKey: ["/api/worker-team", teamId, "members"] });
       safeToast({ title: "Invitation sent", description: "They can join from the link in their email." });
       setWorkerInviteStep(0);
       setWorkerInviteData({ firstName: "", lastName: "", email: "", phone: "", address: "", city: "", state: "", zipCode: "", latitude: undefined, longitude: undefined, avatarUrl: "" });
@@ -2431,8 +2438,9 @@ export default function WorkerOnboarding() {
   }
 
   // Steps 3-10 removed - simplified to 2 stages
-  // Step 7: Insurance Upload - REMOVED
-  if (false && currentStep === 7) {
+  // Step 7: Insurance Upload - REMOVED (kept behind flag so TS still type-checks the block)
+  const insuranceStepEnabled = false;
+  if (insuranceStepEnabled && currentStep === 7) {
     const handleInsuranceUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
       const file = e.target.files?.[0];
       if (!file) return;
@@ -2509,18 +2517,24 @@ export default function WorkerOnboarding() {
     const today = new Date();
     today.setHours(0, 0, 0, 0);
     
-    const startDate = parseDate(insuranceData.startDate);
-    const endDate = parseDate(insuranceData.endDate);
+    const startDateParsed = parseDate(insuranceData.startDate);
+    const endDateParsed = parseDate(insuranceData.endDate);
     
-    const isInsuranceActive = startDate && endDate && 
-      today >= startDate && today <= endDate;
-    
-    const isInsuranceExpired = endDate && today > endDate;
-    
+    const isInsuranceActive =
+      startDateParsed !== null &&
+      endDateParsed !== null &&
+      today >= startDateParsed &&
+      today <= endDateParsed;
+
+    const isInsuranceExpired = endDateParsed !== null && today > endDateParsed;
+
     // Check if insurance expires within 1-4 months
-    const monthsUntilExpiry = endDate ? 
-      Math.ceil((endDate.getTime() - today.getTime()) / (1000 * 60 * 60 * 24 * 30)) : null;
-    const isExpiringSoon = monthsUntilExpiry !== null && monthsUntilExpiry >= 0 && monthsUntilExpiry <= 4;
+    const monthsUntilExpiry =
+      endDateParsed !== null
+        ? Math.ceil((endDateParsed.getTime() - today.getTime()) / (1000 * 60 * 60 * 24 * 30))
+        : null;
+    const isExpiringSoon =
+      monthsUntilExpiry !== null && monthsUntilExpiry >= 0 && monthsUntilExpiry <= 4;
     
     // Can proceed if document uploaded AND dates are valid (active coverage)
     const canProceed = insuranceData.documentUrl && isInsuranceActive;
@@ -2977,7 +2991,7 @@ export default function WorkerOnboarding() {
 
           {/* CTA Button */}
           <Button 
-            onClick={handleFinalSubmit}
+            onClick={() => void handleCompleteOnboarding()}
             disabled={isCreating || isUpdating}
             size="lg"
             className="h-16 px-12 text-xl gap-4 bg-gradient-to-r from-green-500 to-green-600 hover:from-green-600 hover:to-green-700"
@@ -4146,7 +4160,7 @@ export default function WorkerOnboarding() {
                 {/* Time to First Job - Clean Display */}
                 <div className="text-center mb-8">
                   <p className="text-sm text-muted-foreground">Time to first job</p>
-                  <p className="text-xl font-semibold">{jobTime.days}</p>
+                  <p className="text-xl font-semibold">—</p>
                 </div>
 
                 {/* Thick Color-Coded Slider with Emojis */}

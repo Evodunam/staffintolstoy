@@ -41,7 +41,7 @@ import {
   affiliateCommissions,
   type AffiliateCommission, type InsertAffiliateCommission
 } from "@shared/schema";
-import { eq, and, desc, isNull, sql, or, ne, inArray } from "drizzle-orm";
+import { eq, and, desc, isNull, sql, or, ne, inArray, getTableColumns } from "drizzle-orm";
 
 export interface IStorage {
   // Profiles
@@ -387,31 +387,27 @@ export class DatabaseStorage implements IStorage {
   }
 
   async getJobs(filters?: { trade?: string, location?: string }): Promise<(Job & { companyName: string | null })[]> {
-    // Optimized: Use JOIN to fetch company names in a single query instead of N+1 queries
-    let query = db
+    const conditions = [eq(jobs.status, "open"), isNull(jobs.paymentHoldAt)];
+    if (filters?.trade) {
+      conditions.push(eq(jobs.trade, filters.trade as Job["trade"]));
+    }
+    if (filters?.location) {
+      conditions.push(sql`${jobs.location} ILIKE ${"%" + filters.location + "%"}`);
+    }
+
+    const result = await db
       .select({
-        ...jobs,
+        ...getTableColumns(jobs),
         companyName: profiles.companyName,
       })
       .from(jobs)
       .leftJoin(profiles, eq(jobs.companyId, profiles.id))
-      .where(and(eq(jobs.status, "open"), isNull(jobs.paymentHoldAt)))
+      .where(and(...conditions))
       .orderBy(desc(jobs.createdAt));
-    
-    // Apply filters at database level for better performance
-    if (filters?.trade) {
-      query = query.where(eq(jobs.trade, filters.trade)) as any;
-    }
-    if (filters?.location) {
-      query = query.where(sql`${jobs.location} ILIKE ${`%${filters.location}%`}`) as any;
-    }
-    
-    const result = await query;
-    
-    // Map results to expected format
-    return result.map(row => ({
-      ...row,
-      companyName: row.companyName || null,
+
+    return result.map((row) => ({
+      ...(row as unknown as Job),
+      companyName: row.companyName ?? null,
     }));
   }
 

@@ -98,27 +98,24 @@ const connectionWarnLast = new Map<string, number>();
 const CONNECTION_WARN_THROTTLE_MS = 30_000;
 
 type UnauthorizedBehavior = "returnNull" | "throw";
-export const getQueryFn: <T>(options: {
-  on401: UnauthorizedBehavior;
-}) => QueryFunction<T> =
-  ({ on401: unauthorizedBehavior }) =>
-  async ({ queryKey }) => {
+export function getQueryFn<T>(options: { on401: UnauthorizedBehavior }): QueryFunction<T> {
+  const { on401: unauthorizedBehavior } = options;
+  return async ({ queryKey }) => {
     try {
       const res = await fetch(queryKey.join("/") as string, {
         credentials: "include",
       });
 
       if (unauthorizedBehavior === "returnNull" && res.status === 401) {
-        return null;
+        return null as T;
       }
 
       await throwIfResNotOk(res);
-      return await res.json();
+      return (await res.json()) as T;
     } catch (error: any) {
       if (!isConnectionError(error)) {
         throw error;
       }
-      // Return empty data for connection errors to prevent UI crashes and avoid throwing
       const key = queryKey.join("/");
       if (import.meta.env.DEV) {
         const now = Date.now();
@@ -135,6 +132,7 @@ export const getQueryFn: <T>(options: {
       return null as T;
     }
   };
+}
 
 /** Clears stale session when any default query gets 401 (avoids hammering APIs after cookie expiry). */
 function wrapQueryFnWith401SessionReset<T>(inner: QueryFunction<T>): QueryFunction<T> {

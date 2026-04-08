@@ -1,7 +1,10 @@
 import { createRequire } from "module";
+import { join } from "path";
 import { log } from "../index";
 
-const require = createRequire(import.meta.url);
+// Avoid import.meta.url: server bundle is CJS (esbuild) and import.meta becomes empty there.
+// Resolve optional pdf-parse from the app root (same as runtime cwd for `node dist/index.cjs`).
+const require = createRequire(join(process.cwd(), "package.json"));
 
 function getPdfParse(): ((buffer: Buffer) => Promise<{ text: string; numpages: number; info?: unknown }>) | null {
   try {

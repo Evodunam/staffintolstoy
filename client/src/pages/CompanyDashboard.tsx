@@ -47,6 +47,7 @@ import ChatsPage from "@/pages/ChatsPage";
 import { JobDetailsContent } from "@/components/JobDetailsContent";
 import { JobTimeline } from "@/components/ui/job-timeline";
 import { useTranslation } from "react-i18next";
+import type { TFunction } from "i18next";
 import { SUPPORTED_LANGUAGES, changeLanguage, LanguageCode } from "@/lib/i18n";
 import { Accordion, AccordionContent, AccordionItem, AccordionTrigger } from "@/components/ui/accordion";
 import { INDUSTRY_CATEGORIES } from "@shared/industries";
@@ -819,6 +820,51 @@ function getEstimatedHoursNumeric(job: {
   }
 }
 
+const COMPANY_COST_MARKUP = 1.52;
+
+/**
+ * Remaining company-facing labor commitment (cents): per accepted worker,
+ * hours × (their proposed/agreed rate, else worker profile rate, else job list rate) × markup;
+ * then capped by job budget when set.
+ */
+function getJobCommitmentRemainingCents(
+  job: Parameters<typeof getEstimatedHoursNumeric>[0] & {
+    applications: {
+      status: string;
+      proposedRate?: number | null;
+      worker?: { hourlyRate?: number | null };
+    }[];
+    hourlyRate?: number;
+    budgetCents?: number | null;
+  },
+  approvedCompanyCostCentsForJob: number
+): number {
+  const accepted = job.applications.filter((a) => a.status === "accepted");
+  if (accepted.length === 0) return 0;
+
+  let hours = getEstimatedHoursNumeric(job);
+  if (hours <= 0) hours = job.estimatedHours ?? 0;
+  if (hours <= 0) hours = 8;
+
+  const jobListRateCents = job.hourlyRate ?? 2500;
+  let laborEstimateCents = 0;
+  for (const app of accepted) {
+    const fromProposal =
+      app.proposedRate != null && app.proposedRate > 0 ? app.proposedRate : null;
+    const fromProfile =
+      app.worker?.hourlyRate != null && app.worker.hourlyRate > 0 ? app.worker.hourlyRate : null;
+    const workerPayCents = fromProposal ?? fromProfile ?? jobListRateCents;
+    laborEstimateCents += Math.round(hours * workerPayCents * COMPANY_COST_MARKUP);
+  }
+
+  const cappedEstimateCents =
+    job.budgetCents != null && job.budgetCents > 0
+      ? Math.min(laborEstimateCents, job.budgetCents)
+      : laborEstimateCents;
+
+  return Math.max(0, cappedEstimateCents - approvedCompanyCostCentsForJob);
+}
+
 interface SampleWorker {
   id: number;
   firstName: string;
@@ -867,9 +913,13 @@ interface SampleJob {
   startDate: string;
   endDate?: string;
   estimatedHours: number;
+  /** Mirrors server `budgetCents` when present on company job payload */
+  budgetCents?: number | null;
   applications: SampleApplication[];
   timelineType: "on-demand" | "one-day" | "recurring";
   recurringDays?: string[];
+  /** Alias for UI/recurring display (falls back to recurringDays in places that expect scheduleDays) */
+  scheduleDays?: string[];
   recurringWeeks?: number;
   startTime?: string;
   endTime?: string;
@@ -877,6 +927,17 @@ interface SampleJob {
   videos?: string[];
   timesheets?: SampleJobTimesheet[];
   createdAt?: string;
+  /** Server: last "Send alert to workers" blast; 24h cooldown per job */
+  lastWorkerAlertAt?: string | null;
+}
+
+const WORKER_ALERT_COOLDOWN_MS = 24 * 60 * 60 * 1000;
+
+function isWorkerAlertCooldownActive(lastSentAt: string | Date | null | undefined): boolean {
+  if (!lastSentAt) return false;
+  const t = lastSentAt instanceof Date ? lastSentAt.getTime() : new Date(lastSentAt).getTime();
+  if (!Number.isFinite(t)) return false;
+  return Date.now() - t < WORKER_ALERT_COOLDOWN_MS;
 }
 
 interface SampleLocation {
@@ -946,6 +1007,7 @@ interface TimesheetDisplay {
   autoApprovalAt: Date | null;
   autoApprovalMsRemaining: number;
   budgetCents: number | null;
+  rejectionReason?: string | null;
 }
 
 function mapSampleTimesheet(sample: SampleTimesheet): TimesheetDisplay {
@@ -980,6 +1042,7 @@ function mapSampleTimesheet(sample: SampleTimesheet): TimesheetDisplay {
     autoApprovalAt: sampleAutoApprovalAt,
     autoApprovalMsRemaining: Math.max(0, sampleAutoApprovalAt.getTime() - now),
     budgetCents: 500000,
+    rejectionReason: sample.status === "rejected" ? (sample.workerNotes || "Rejected") : null,
   };
 }
 
@@ -1029,6 +1092,7 @@ function mapRealTimesheet(ts: TimesheetWithDetails): TimesheetDisplay {
     autoApprovalAt,
     autoApprovalMsRemaining: ts.autoApprovalMsRemaining || 0,
     budgetCents: ts.job.budgetCents || null,
+    rejectionReason: ts.rejectionReason ?? null,
   };
 }
 
@@ -1567,7 +1631,7 @@ function CompanyMenuPanelProfileFormView(props: {
   setNewAlternatePhone: (v: string) => void;
   updateProfile: { isPending: boolean; mutateAsync: (opts: any) => Promise<any> };
   toast: (opts: { title: string; description?: string }) => void;
-  t: (key: string, fallback?: string) => string;
+  t: TFunction;
 }) {
   const {
     companyProfileForm,
@@ -1788,7 +1852,7 @@ function CompanyMenuPanelProfileFormView(props: {
 }
 
 export default function CompanyDashboard() {
-  const [, setLocation] = useLocation();
+  const [pathname, setLocation] = useLocation();
   const { user } = useAuth();
   const { t, i18n } = useTranslation();
   const { t: tCommon } = useTranslation("common");
@@ -2034,7 +2098,7 @@ export default function CompanyDashboard() {
   });
   
   // URL-based routing for dashboard sections
-  const [, navigate] = useLocation();
+  const navigate = setLocation;
   const [, params] = useRoute("/company-dashboard/:section?/:subsection?");
   const section = params?.section || "jobs";
   const subsection = params?.subsection || null;
@@ -2262,9 +2326,7 @@ export default function CompanyDashboard() {
   const [reportTimesheetModal, setReportTimesheetModal] = useState<TimesheetDisplay | null>(null);
   const [bulkRejectModal, setBulkRejectModal] = useState<TimesheetDisplay[] | null>(null);
   const [rejectTimesheetStep, setRejectTimesheetStep] = useState<"review" | "form" | "success">("review");
-  const [mobileWorkerDaySheet, setMobileWorkerDaySheet] = useState<{
-    workerDay: { workerId: number; workerName: string; workerAvatarUrl?: string; workerInitials: string; displayDate: string; timesheets: TimesheetDisplay[]; totalHours: number; totalCost: number; earliestAutoApproval: string; hasLocationIssues?: boolean };
-  } | null>(null);
+  const [mobileWorkerDaySheet, setMobileWorkerDaySheet] = useState<{ workerDay: WorkerDayGroup } | null>(null);
   const [bulkRejectReason, setBulkRejectReason] = useState("");
   /** Inline edit/reject panel inside Action Required timesheet card (groupKey + mode + timesheets). When set, Edit/Reject flow runs inside the card below the map. */
   const [actionReqInlinePanel, setActionReqInlinePanel] = useState<{ groupKey: string; mode: "edit" | "reject"; timesheets: TimesheetDisplay[] } | null>(null);
@@ -2431,7 +2493,9 @@ export default function CompanyDashboard() {
 
   // Agreement counts as signed if contractSigned is true OR contractSignedAt is set (server may set only one)
   const hasSignedAgreement = Boolean(
-    profile && (profile.contractSigned === true || (profile.contractSignedAt != null && profile.contractSignedAt !== ""))
+    profile &&
+      (profile.contractSigned === true ||
+        (profile.contractSignedAt != null && String(profile.contractSignedAt).trim() !== ""))
   );
 
   // Show mandatory agreement popup when company has not signed (only after profile loaded)
@@ -2816,7 +2880,22 @@ export default function CompanyDashboard() {
   });
   
   const createLocation = useMutation({
-    mutationFn: async (data: { name: string; address: string; city: string; state: string; zipCode: string; isPrimary?: boolean }) => {
+    mutationFn: async (data: {
+      name: string;
+      address: string;
+      address2?: string;
+      city: string;
+      state: string;
+      zipCode: string;
+      isPrimary?: boolean;
+      useCompanyDefault?: boolean;
+      contactName?: string;
+      contactPhone?: string;
+      contactEmail?: string;
+      contactAltPhone?: string;
+      representativeTeamMemberId?: number;
+      paymentMethodId?: number;
+    }) => {
       const res = await apiRequest("POST", "/api/locations", data);
       return res.json();
     },
@@ -2862,6 +2941,7 @@ export default function CompanyDashboard() {
       representativeTeamMemberId?: number | null;
       assignedTeamMemberIds?: number[];
       paymentMethodId?: number | null;
+      address2?: string;
     }) => {
       const res = await apiRequest("PATCH", `/api/locations/${id}`, data);
       return res.json();
@@ -2974,7 +3054,10 @@ export default function CompanyDashboard() {
 
   const { data: companyAgreementsList = [] } = useQuery<Array<{ id: number; agreementType: string; version: string; signedName: string | null; agreementText: string | null; signedAt: string | null }>>({
     queryKey: ["company-agreements"],
-    queryFn: () => apiRequest("GET", "/api/company-agreements"),
+    queryFn: async () => {
+      const res = await apiRequest("GET", "/api/company-agreements");
+      return res.json();
+    },
   });
 
   const agreementDisplayList: Array<{ id: number | null; type: string; version: string; signedName: string; signedAt: string; text: string }> = companyAgreementsList.length > 0
@@ -2986,8 +3069,8 @@ export default function CompanyDashboard() {
         signedAt: row.signedAt ?? "",
         text: row.agreementText ?? COMPANY_AGREEMENT_TEXT,
       }))
-    : hasSignedAgreement
-      ? [{ id: null, type: "Company Hiring Agreement", version: "1.0", signedName: [profile.firstName, profile.lastName].filter(Boolean).join(" ") || "Client", signedAt: profile.contractSignedAt ? new Date(profile.contractSignedAt).toISOString() : "", text: COMPANY_AGREEMENT_TEXT }]
+    : hasSignedAgreement && profile
+      ? [{ id: null, type: "Company Hiring Agreement", version: "1.0", signedName: [profile.firstName, profile.lastName].filter(Boolean).join(" ") || "Client", signedAt: profile.contractSignedAt ? new Date(profile.contractSignedAt as string | Date).toISOString() : "", text: COMPANY_AGREEMENT_TEXT }]
       : [];
 
   const displayedAgreement = selectedAgreement ?? agreementDisplayList[0] ?? null;
@@ -3006,6 +3089,11 @@ export default function CompanyDashboard() {
       jobId: number | null;
       hours: number | null;
       timesheetId: number | null;
+      paymentMethod?: string | null;
+      cardFee?: number | null;
+      stripePaymentIntentId?: string | null;
+      mtPaymentOrderId?: string | null;
+      initiatedBy?: string | null;
     }>;
     workers: Array<{ id: number; name: string }>;
   }>({
@@ -3198,8 +3286,6 @@ export default function CompanyDashboard() {
   const [selectedJobLocation, setSelectedJobLocation] = useState<SampleLocation | null>(null);
   const [showJobDetailsFullView, setShowJobDetailsFullView] = useState(false);
   const [showTeamRequestPanel, setShowTeamRequestPanel] = useState<SampleTeamMember | null>(null);
-  const [jobAlertCooldowns, setJobAlertCooldowns] = useState<Record<number, Date>>({});
-  const [jobAlertsSent, setJobAlertsSent] = useState<Record<number, boolean>>({});
   
   const [showMarkCompleteDialog, setShowMarkCompleteDialog] = useState<SampleJob | null>(null);
   const [showPendingTimesheetsWarning, setShowPendingTimesheetsWarning] = useState<{ jobId: number; jobTitle: string; pendingCount: number } | null>(null);
@@ -3236,6 +3322,61 @@ export default function CompanyDashboard() {
   
   // Fetch real company jobs from API
   const { data: companyJobs, isLoading: isLoadingJobs, isFetching: isFetchingJobs, error: jobsError } = useCompanyJobs();
+
+  const devFillJobWorkerSlots = useMutation({
+    mutationFn: async (jobId: number) => {
+      const res = await apiRequest("POST", "/api/dev/fill-job-worker-slots", { jobId });
+      return (await res.json()) as { hired: number; remainingSlots: number; maxWorkersNeeded: number };
+    },
+    onSuccess: async (data, jobId) => {
+      await queryClient.refetchQueries({ queryKey: ["/api/company/jobs"] });
+      const list = queryClient.getQueryData<CompanyJob[]>(["/api/company/jobs"]);
+      const cj = list?.find((j) => j.id === jobId);
+      setSelectedJobDetails((prev) => {
+        if (!prev || prev.id !== jobId || !cj) return prev;
+        const applications = (cj.applications || []).map((app) => ({
+          id: app.id,
+          worker: {
+            id: app.worker?.id || 0,
+            firstName: app.worker?.firstName || "Unknown",
+            lastName: app.worker?.lastName || "",
+            avatarUrl: app.worker?.avatarUrl || "",
+            bio: app.worker?.bio || "",
+            skills: [...(app.worker?.trades || []), ...(app.worker?.serviceCategories || [])],
+            hourlyRate: app.worker?.hourlyRate || 0,
+            rating: parseFloat(app.worker?.averageRating || "0") || 0,
+            completedJobs: app.worker?.completedJobs || 0,
+            portfolioImages: [] as string[],
+            phone: app.worker?.phone || undefined,
+            identityVerified: false,
+            insuranceVerified: false,
+            w9DocumentUrl: null,
+            strikeCount: 0,
+          },
+          message: app.message || "",
+          proposedRate: app.proposedRate || 0,
+          status: app.status as "pending" | "accepted" | "rejected",
+          createdAt: app.createdAt ? new Date(app.createdAt as Date).toISOString() : new Date().toISOString(),
+        }));
+        const acceptedN = applications.filter((a) => a.status === "accepted").length;
+        return {
+          ...prev,
+          applications,
+          workersHired: Math.max(prev.workersHired ?? 0, acceptedN),
+        };
+      });
+      toast({
+        title: "Dev: filled worker slots",
+        description:
+          data.hired === 0
+            ? "No changes (already full or no workers available)."
+            : `Accepted ${data.hired}. ${data.remainingSlots} slot(s) still open.`,
+      });
+    },
+    onError: (error: Error) => {
+      toast({ title: "Dev fill failed", description: error.message, variant: "destructive" });
+    },
+  });
   
   // Initialize company logo from profile
   useEffect(() => {
@@ -3401,6 +3542,11 @@ export default function CompanyDashboard() {
             ? parseTimeToHHmm(job.scheduledTime.split(' - ')[1].trim())
             : parseTimeToHHmm((job as any).endTime || "17:00"),
           recurringDays: job.scheduleDays || [],
+          scheduleDays: job.scheduleDays || [],
+          budgetCents: (job as { budgetCents?: number | null }).budgetCents ?? null,
+          lastWorkerAlertAt: job.lastWorkerAlertAt
+            ? new Date(job.lastWorkerAlertAt as string | Date).toISOString()
+            : null,
           recurringWeeks: (job as any).recurringWeeks || 1,
           images: job.images || [],
           videos: job.videos || [],
@@ -3416,12 +3562,12 @@ export default function CompanyDashboard() {
               hourlyRate: app.worker?.hourlyRate || 0,
               rating: parseFloat(app.worker?.averageRating || "0") || 0,
               completedJobs: app.worker?.completedJobs || 0,
-              portfolioImages: app.worker?.portfolioImages || [],
+              portfolioImages: (app.worker as { portfolioImages?: string[] } | null | undefined)?.portfolioImages ?? [],
               phone: app.worker?.phone || undefined,
-              identityVerified: app.worker?.identityVerified || false,
-              insuranceVerified: app.worker?.insuranceVerified || false,
-              w9DocumentUrl: app.worker?.w9DocumentUrl || null,
-              strikeCount: app.worker?.strikeCount || 0,
+              identityVerified: (app.worker as { identityVerified?: boolean } | null | undefined)?.identityVerified ?? false,
+              insuranceVerified: (app.worker as { insuranceVerified?: boolean } | null | undefined)?.insuranceVerified ?? false,
+              w9DocumentUrl: (app.worker as { w9DocumentUrl?: string | null } | null | undefined)?.w9DocumentUrl ?? null,
+              strikeCount: (app.worker as { strikeCount?: number } | null | undefined)?.strikeCount ?? 0,
             },
             message: app.message || "",
             proposedRate: app.proposedRate || 0,
@@ -4250,7 +4396,12 @@ export default function CompanyDashboard() {
   /** Reject dialog description (computed outside JSX to avoid parser confusion with object literal in attribute). */
   const rejectDialogDescription = useMemo(() => {
     if (rejectTimesheetStep === "success") return t("dashboard.timesheetsHaveBeenRejected", "The selected timesheets have been rejected.");
-    if (rejectTimesheetStep === "review" && bulkRejectModal?.length) return t("dashboard.rejectTimesheetsCount", { count: bulkRejectModal.length }, `${bulkRejectModal.length} timesheet(s) will be rejected.`);
+    if (rejectTimesheetStep === "review" && bulkRejectModal?.length) {
+      return t("dashboard.rejectTimesheetsCount", {
+        count: bulkRejectModal.length,
+        defaultValue: `${bulkRejectModal.length} timesheet(s) will be rejected.`,
+      });
+    }
     if (rejectTimesheetStep === "form" && bulkRejectModal?.length) return t("dashboard.rejectionReason", "Reason for rejection");
     return undefined;
   }, [rejectTimesheetStep, bulkRejectModal, t]);
@@ -4350,16 +4501,18 @@ export default function CompanyDashboard() {
 
   // Prefill inline reschedule form with suggested (today+2, 9am–5pm, one-day) when current action item is reschedule
   const actionRequiredCurrentItem = actionRequiredItems.length > 0 ? actionRequiredItems[Math.min(actionRequiredItemIndex, actionRequiredItems.length - 1)] : null;
+  const actionRequiredRescheduleItem =
+    actionRequiredCurrentItem?.type === "reschedule" ? actionRequiredCurrentItem : null;
   useEffect(() => {
-    if (!showPendingRequests || actionRequiredCurrentItem?.type !== "reschedule") return;
+    if (!showPendingRequests || !actionRequiredRescheduleItem) return;
     setActionReqRescheduleData(getSuggestedRescheduleData());
     setActionReqRescheduleView("one-day");
     setActionReqRescheduleOnDemandStep(1);
     setActionReqRescheduleOneDayStep(1);
     setActionReqRescheduleRecurringStep(1);
     setActionReqRescheduleError(null);
-    setActionReqRescheduleWorkersNeeded(actionRequiredCurrentItem.job.maxWorkersNeeded ?? 1);
-  }, [showPendingRequests, actionRequiredCurrentItem?.type, actionRequiredCurrentItem?.job?.id, actionRequiredCurrentItem?.job?.maxWorkersNeeded, getSuggestedRescheduleData]);
+    setActionReqRescheduleWorkersNeeded(actionRequiredRescheduleItem.job.maxWorkersNeeded ?? 1);
+  }, [showPendingRequests, actionRequiredRescheduleItem, getSuggestedRescheduleData]);
 
   // Calculate job counts for each filter category
   const jobCounts = useMemo(() => {
@@ -4377,7 +4530,7 @@ export default function CompanyDashboard() {
         const hasApprovedWorkers = job.applications.some(app => app.status === "accepted");
         if (job.status === "completed") {
           completed++;
-        } else if (hasApprovedWorkers && job.status !== "completed") {
+        } else if (hasApprovedWorkers) {
           inProgress++;
         } else if (job.status === "open" && !hasApprovedWorkers) {
           open++;
@@ -4396,21 +4549,16 @@ export default function CompanyDashboard() {
     }
   }, [jobsFilter, jobCounts.open, jobCounts.inProgress, jobCounts.completed, setJobsFilter]);
 
-  // Job commitments = estimated cost (workers × rate × estimated hours × 1.52) minus approved timesheets (paid down)
+  // Job commitments = schedule-aware hours × hired workers × rate × markup, capped by budget when set, minus approved pay
   const totalJobCommitments = useMemo(() => {
     let total = 0;
     jobsData.forEach(location => {
       location.jobs.forEach(job => {
-        const acceptedWorkers = job.applications.filter(a => a.status === "accepted").length;
-        if (acceptedWorkers === 0 || job.status === "completed") return;
-        const estimatedHours = job.estimatedHours ?? 40;
-        const rate = job.hourlyRate ?? 2500;
-        const fullEstimateCents = Math.round(estimatedHours * rate * acceptedWorkers * 1.52);
+        if (job.status === "completed") return;
         const approvedForJob = normalizedTimesheets
           .filter(t => t.jobId === job.id && t.status === "approved")
-          .reduce((sum, t) => sum + Math.round(t.adjustedHours * t.hourlyRate * 1.52), 0);
-        const remainingCents = Math.max(0, fullEstimateCents - approvedForJob);
-        total += remainingCents;
+          .reduce((sum, t) => sum + Math.round(t.adjustedHours * t.hourlyRate * COMPANY_COST_MARKUP), 0);
+        total += getJobCommitmentRemainingCents(job, approvedForJob);
       });
     });
     return total;
@@ -4424,14 +4572,10 @@ export default function CompanyDashboard() {
           return hasActiveWorkers && job.status !== "completed";
         })
         .map(job => {
-          const acceptedWorkers = job.applications?.filter((a: any) => a.status === "accepted").length || 1;
-          const estimatedHours = job.estimatedHours ?? 40;
-          const rate = job.hourlyRate ?? 2500;
-          const fullEstimateCents = Math.round(estimatedHours * rate * acceptedWorkers * 1.52);
           const approvedForJob = normalizedTimesheets
             .filter(t => t.jobId === job.id && t.status === "approved")
-            .reduce((sum, t) => sum + Math.round(t.adjustedHours * t.hourlyRate * 1.52), 0);
-          const remainingCents = Math.max(0, fullEstimateCents - approvedForJob);
+            .reduce((sum, t) => sum + Math.round(t.adjustedHours * t.hourlyRate * COMPANY_COST_MARKUP), 0);
+          const remainingCents = getJobCommitmentRemainingCents(job, approvedForJob);
           return {
             id: job.id,
             title: job.title,
@@ -5089,7 +5233,7 @@ export default function CompanyDashboard() {
                 </SelectContent>
               </Select>
             </div>
-            <Button variant="outline" onClick={() => setBillingFilters({ dateFrom: "", dateTo: "", type: "all", worker: "all" })}>
+            <Button variant="outline" onClick={() => setBillingFilters({ dateFrom: "", dateTo: "", type: "all", worker: "all", category: "all" })}>
               {t("settings.clearFilters")}
             </Button>
           </div>
@@ -6141,10 +6285,9 @@ export default function CompanyDashboard() {
                         renderActions={(job) => {
                           const fullJob = filteredJobs.find(j => j.id === job.id);
                           if (!fullJob) return null;
-                          const canSendAlert = !jobAlertCooldowns[job.id] || new Date() > jobAlertCooldowns[job.id];
-                          const hasSentAlert = jobAlertsSent[job.id];
                           const isJobFilled = job.workersHired >= job.maxWorkersNeeded;
-                          const showAlertButton = !hasSentAlert && !isJobFilled && job.status === "open";
+                          const showAlertButton =
+                            !isJobFilled && job.status === "open" && !isWorkerAlertCooldownActive(fullJob.lastWorkerAlertAt);
                           return (
                             <DropdownMenu>
                               <DropdownMenuTrigger asChild>
@@ -6156,41 +6299,35 @@ export default function CompanyDashboard() {
                                 {showAlertButton && (
                                   <DropdownMenuItem 
                                     onClick={async () => {
-                                      if (canSendAlert) {
-                                        try {
-                                          const response = await fetch(`/api/jobs/${job.id}/send-alert`, {
-                                            method: "POST",
-                                            headers: { "Content-Type": "application/json" },
-                                            credentials: "include",
-                                          });
-                                          
-                                          if (!response.ok) {
-                                            const data = await response.json();
-                                            throw new Error(data.message || "Failed to send alert");
-                                          }
-                                          
-                                          const data = await response.json();
-                                          const cooldownEnd = new Date();
-                                          cooldownEnd.setHours(cooldownEnd.getHours() + 24);
-                                          setJobAlertCooldowns(prev => ({ ...prev, [job.id]: cooldownEnd }));
-                                          setJobAlertsSent(prev => ({ ...prev, [job.id]: true }));
-                                          toast({ 
-                                            title: "Alert Sent", 
-                                            description: `Matching workers have been notified${data.emailsSent ? ` (${data.emailsSent} emails sent)` : ''}.` 
-                                          });
-                                        } catch (error: any) {
-                                          console.error("Error sending alert:", error);
-                                          toast({ 
-                                            title: "Error", 
-                                            description: error.message || "Failed to send alert to workers",
-                                            variant: "destructive"
-                                          });
+                                      try {
+                                        const response = await fetch(`/api/jobs/${job.id}/send-alert`, {
+                                          method: "POST",
+                                          headers: { "Content-Type": "application/json" },
+                                          credentials: "include",
+                                        });
+
+                                        const data = await response.json().catch(() => ({}));
+                                        if (!response.ok) {
+                                          throw new Error(data.message || "Failed to send alert");
                                         }
-                                      } else {
-                                        toast({ title: "Cooldown Active", description: "You can send another alert in 24 hours.", variant: "destructive" });
+
+                                        if (data.lastWorkerAlertAt) {
+                                          updateJob(job.id, { lastWorkerAlertAt: data.lastWorkerAlertAt });
+                                        }
+                                        queryClient.invalidateQueries({ queryKey: ["/api/company/jobs"] });
+                                        toast({
+                                          title: "Alert Sent",
+                                          description: `Matching workers have been notified${data.emailsSent ? ` (${data.emailsSent} emails sent)` : ""}.`,
+                                        });
+                                      } catch (error: any) {
+                                        console.error("Error sending alert:", error);
+                                        toast({
+                                          title: "Error",
+                                          description: error.message || "Failed to send alert to workers",
+                                          variant: "destructive",
+                                        });
                                       }
                                     }}
-                                    disabled={!canSendAlert}
                                     data-testid={`menu-send-alert-${job.id}`}
                                   >
                                     <Bell className="w-4 h-4 mr-2" /> Send Alert to Workers
@@ -6995,7 +7132,7 @@ export default function CompanyDashboard() {
                         <div key={timesheet.id} className="grid grid-cols-12 gap-2 px-3 py-3 items-center text-sm hover-elevate">
                           <div className="col-span-4 flex items-center gap-2">
                             <Avatar className="w-8 h-8">
-                              <AvatarImage src={timesheet.workerAvatar} />
+                              <AvatarImage src={normalizeAvatarUrl(timesheet.workerAvatarUrl) ?? undefined} />
                               <AvatarFallback>{timesheet.workerName[0]}</AvatarFallback>
                             </Avatar>
                             <div className="min-w-0">
@@ -7004,7 +7141,7 @@ export default function CompanyDashboard() {
                             </div>
                           </div>
                           <div className="col-span-2 text-muted-foreground">
-                            {new Date(timesheet.date).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}
+                            {format(timesheet.clockInTime, "MMM d")}
                           </div>
                           <div className="col-span-2">
                             <div className="font-medium">{timesheet.adjustedHours.toFixed(1)}h</div>
@@ -7025,10 +7162,10 @@ export default function CompanyDashboard() {
                               <DropdownMenuContent align="end">
                                 <DropdownMenuItem 
                                   onClick={() => {
-                                    setEditingTimesheet(timesheet);
-                                    setEditedHours(timesheet.adjustedHours.toString());
+                                    setEditHours(timesheet.adjustedHours.toString());
                                     setEditExplanation("");
-                                    setShowEditHoursDialog(true);
+                                    setEditTimesheetStep("form");
+                                    setTimeout(() => setEditTimesheetModal(timesheet), 0);
                                   }}
                                   data-testid={`button-edit-rejected-${timesheet.id}`}
                                 >
@@ -7036,7 +7173,7 @@ export default function CompanyDashboard() {
                                   Edit Hours
                                 </DropdownMenuItem>
                                 <DropdownMenuItem 
-                                  onClick={() => handleApproveTimesheet(timesheet.id)}
+                                  onClick={() => handleApproveTimesheetDisplay(timesheet)}
                                   className="text-green-600"
                                   data-testid={`button-approve-rejected-${timesheet.id}`}
                                 >
@@ -7174,7 +7311,7 @@ export default function CompanyDashboard() {
                 <div className="border-t border-border my-5" />
                 <div className="flex items-center gap-3 p-3 rounded-xl bg-muted/50 border border-border/50">
                   <Avatar className="h-10 w-10 flex-shrink-0">
-                    <AvatarImage src={profile?.avatarUrl} alt="" />
+                    <AvatarImage src={profile?.avatarUrl ?? undefined} alt="" />
                     <AvatarFallback className="text-sm font-medium bg-primary/10 text-primary">
                       {profile?.companyName?.[0] || profile?.firstName?.[0] || user?.firstName?.[0] || "U"}
                     </AvatarFallback>
@@ -7272,7 +7409,7 @@ export default function CompanyDashboard() {
                   <div className="flex-shrink-0 border-t border-border bg-muted/30 pb-4">
                     <div className="flex items-center gap-3 p-3 rounded-xl bg-background/80 shadow-sm border border-border/50">
                       <Avatar className="h-10 w-10 flex-shrink-0 ring-2 ring-border/50">
-                        <AvatarImage src={profile?.avatarUrl} alt="" />
+                        <AvatarImage src={profile?.avatarUrl ?? undefined} alt="" />
                         <AvatarFallback className="text-sm font-medium bg-primary/10 text-primary">
                           {profile?.companyName?.[0] || profile?.firstName?.[0] || user?.firstName?.[0] || "U"}
                         </AvatarFallback>
@@ -9044,16 +9181,25 @@ export default function CompanyDashboard() {
                 )}
                 {(() => {
                   const hasSufficientWorkers = Math.max(selectedJobDetails.workersHired ?? 0, acceptedCount) >= selectedJobDetails.maxWorkersNeeded;
-                  if (hasSufficientWorkers || selectedJobDetails.status !== "open" || jobAlertsSent[selectedJobDetails.id]) return null;
+                  if (
+                    hasSufficientWorkers ||
+                    selectedJobDetails.status !== "open" ||
+                    isWorkerAlertCooldownActive(selectedJobDetails.lastWorkerAlertAt)
+                  )
+                    return null;
                   return (
                     <Button onClick={async () => {
                       try {
                         const response = await fetch(`/api/jobs/${selectedJobDetails.id}/send-alert`, { method: "POST", headers: { "Content-Type": "application/json" }, credentials: "include" });
-                        if (!response.ok) { const data = await response.json(); throw new Error(data.message || "Failed to send alert"); }
-                        const data = await response.json();
-                        const cooldownEnd = new Date(); cooldownEnd.setHours(cooldownEnd.getHours() + 24);
-                        setJobAlertCooldowns(prev => ({ ...prev, [selectedJobDetails.id]: cooldownEnd }));
-                        setJobAlertsSent(prev => ({ ...prev, [selectedJobDetails.id]: true }));
+                        const data = await response.json().catch(() => ({}));
+                        if (!response.ok) throw new Error(data.message || "Failed to send alert");
+                        if (data.lastWorkerAlertAt) {
+                          updateJob(selectedJobDetails.id, { lastWorkerAlertAt: data.lastWorkerAlertAt });
+                          setSelectedJobDetails((prev) =>
+                            prev && prev.id === selectedJobDetails.id ? { ...prev, lastWorkerAlertAt: data.lastWorkerAlertAt } : prev
+                          );
+                        }
+                        queryClient.invalidateQueries({ queryKey: ["/api/company/jobs"] });
                         toast({ title: "Alert Sent", description: `Matching workers have been notified${data.emailsSent ? ` (${data.emailsSent} emails sent)` : ''}.` });
                       } catch (error: any) {
                         toast({ title: "Error", description: error.message || "Failed to send alert to workers", variant: "destructive" });
@@ -9073,9 +9219,15 @@ export default function CompanyDashboard() {
             const jobTimesheets = normalizedTimesheets.filter(t => t.jobId === selectedJobDetails.id);
             const timesheets = selectedJobDetails.timesheets || [];
             // Cost calculation: 1.52x markup on worker rate (52% covers $13/hr platform fee)
-            const markupMultiplier = 1.52;
+            const markupMultiplier = COMPANY_COST_MARKUP;
             const calculatedHours = getEstimatedHoursNumeric(selectedJobDetails);
-            const estimatedTotalCost = Math.round(selectedJobDetails.hourlyRate * markupMultiplier * calculatedHours * selectedJobDetails.maxWorkersNeeded) / 100;
+            const rawEstimatedTotalCost =
+              Math.round(selectedJobDetails.hourlyRate * markupMultiplier * calculatedHours * selectedJobDetails.maxWorkersNeeded) /
+              100;
+            const estimatedTotalCost =
+              selectedJobDetails.budgetCents != null && selectedJobDetails.budgetCents > 0
+                ? Math.min(rawEstimatedTotalCost, selectedJobDetails.budgetCents / 100)
+                : rawEstimatedTotalCost;
             const hoursClocked = jobTimesheets.reduce((sum, ts) => sum + ts.adjustedHours, 0) || timesheets.reduce((sum, ts) => sum + ts.hoursClocked, 0);
             const hoursRemaining = Math.max(0, (calculatedHours * Math.max(1, acceptedWorkers.length)) - hoursClocked);
             const amountSpent = jobTimesheets.filter(ts => ts.status === "approved").reduce((sum, ts) => sum + Math.round(ts.adjustedHours * ts.hourlyRate * markupMultiplier), 0) / 100;
@@ -9445,11 +9597,12 @@ export default function CompanyDashboard() {
                   }
                   startDateDisplay={selectedJobDetails.startDate ? format(new Date(selectedJobDetails.startDate), "MMM d, yyyy") : undefined}
                   endDateDisplay={selectedJobDetails.endDate ? format(new Date(selectedJobDetails.endDate), "MMM d, yyyy") : undefined}
-                  recurringDaysDisplay={
-                    selectedJobDetails.scheduleDays && Array.isArray(selectedJobDetails.scheduleDays) && selectedJobDetails.scheduleDays.length > 0
-                      ? selectedJobDetails.scheduleDays.map((d: string) => d.charAt(0).toUpperCase() + d.slice(1, 3)).join(", ")
-                      : undefined
-                  }
+                  recurringDaysDisplay={(() => {
+                    const days = selectedJobDetails.scheduleDays ?? selectedJobDetails.recurringDays;
+                    return days && Array.isArray(days) && days.length > 0
+                      ? days.map((d: string) => d.charAt(0).toUpperCase() + d.slice(1, 3)).join(", ")
+                      : undefined;
+                  })()}
                   description={selectedJobDetails.description ?? undefined}
                 />
 
@@ -9811,7 +9964,30 @@ export default function CompanyDashboard() {
                   <div className="space-y-4">
                     {/* Assigned Workers - top of right column */}
                     <div>
-                      <h3 className="font-semibold text-sm mb-2">Assigned Workers ({`${acceptedWorkers.length}/${selectedJobDetails.maxWorkersNeeded}`})</h3>
+                      <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
+                        <h3 className="font-semibold text-sm">Assigned Workers ({`${acceptedWorkers.length}/${selectedJobDetails.maxWorkersNeeded}`})</h3>
+                        {showClientDevTools() && (
+                          <Button
+                            type="button"
+                            variant="outline"
+                            size="sm"
+                            className="text-xs h-7"
+                            disabled={devFillJobWorkerSlots.isPending}
+                            onClick={() => devFillJobWorkerSlots.mutate(selectedJobDetails.id)}
+                            data-testid="dev-fill-job-worker-slots"
+                          >
+                            {devFillJobWorkerSlots.isPending ? (
+                              <>
+                                <Loader2 className="w-3 h-3 mr-1 animate-spin" /> Filling…
+                              </>
+                            ) : (
+                              <>
+                                <UserPlus className="w-3 h-3 mr-1" /> Dev: fill slots
+                              </>
+                            )}
+                          </Button>
+                        )}
+                      </div>
                       {acceptedWorkers.length === 0 ? (
                         <Card className="p-3 text-center">
                           <Users className="w-6 h-6 mx-auto mb-1 text-muted-foreground/50" />
@@ -10973,10 +11149,9 @@ export default function CompanyDashboard() {
                 renderActions={(job) => {
                   const fullJob = filteredJobs.find(j => j.id === job.id);
                   if (!fullJob) return null;
-                  const canSendAlert = !jobAlertCooldowns[job.id] || new Date() > jobAlertCooldowns[job.id];
-                  const hasSentAlert = jobAlertsSent[job.id];
                   const isJobFilled = job.workersHired >= job.maxWorkersNeeded;
-                  const showAlertButton = !hasSentAlert && !isJobFilled && job.status === "open";
+                  const showAlertButton =
+                    !isJobFilled && job.status === "open" && !isWorkerAlertCooldownActive(fullJob.lastWorkerAlertAt);
                   return (
                     <DropdownMenu>
                       <DropdownMenuTrigger asChild>
@@ -10988,29 +11163,21 @@ export default function CompanyDashboard() {
                         {showAlertButton && (
                           <DropdownMenuItem
                             onClick={async () => {
-                              if (canSendAlert) {
-                                try {
-                                  const response = await fetch(`/api/jobs/${job.id}/send-alert`, {
-                                    method: "POST",
-                                    headers: { "Content-Type": "application/json" },
-                                    credentials: "include",
-                                  });
-                                  if (!response.ok) {
-                                    const data = await response.json();
-                                    throw new Error(data.message || "Failed to send alert");
-                                  }
-                                  const data = await response.json();
-                                  const cooldownEnd = new Date();
-                                  cooldownEnd.setHours(cooldownEnd.getHours() + 24);
-                                  setJobAlertCooldowns(prev => ({ ...prev, [job.id]: cooldownEnd }));
-                                  setJobAlertsSent(prev => ({ ...prev, [job.id]: true }));
-                                  toast({ title: "Alert Sent", description: `Matching workers have been notified${data.emailsSent ? ` (${data.emailsSent} emails sent)` : ''}.` });
-                                } catch (error: any) {
-                                  toast({ title: "Error", description: error.message || "Failed to send alert to workers", variant: "destructive" });
-                                }
+                              try {
+                                const response = await fetch(`/api/jobs/${job.id}/send-alert`, {
+                                  method: "POST",
+                                  headers: { "Content-Type": "application/json" },
+                                  credentials: "include",
+                                });
+                                const data = await response.json().catch(() => ({}));
+                                if (!response.ok) throw new Error(data.message || "Failed to send alert");
+                                if (data.lastWorkerAlertAt) updateJob(job.id, { lastWorkerAlertAt: data.lastWorkerAlertAt });
+                                queryClient.invalidateQueries({ queryKey: ["/api/company/jobs"] });
+                                toast({ title: "Alert Sent", description: `Matching workers have been notified${data.emailsSent ? ` (${data.emailsSent} emails sent)` : ''}.` });
+                              } catch (error: any) {
+                                toast({ title: "Error", description: error.message || "Failed to send alert to workers", variant: "destructive" });
                               }
                             }}
-                            disabled={!canSendAlert}
                           >
                             <Bell className="w-4 h-4 mr-2" /> Send Alert to Workers
                           </DropdownMenuItem>
@@ -11096,12 +11263,12 @@ export default function CompanyDashboard() {
         }}
         title={adjustRescheduleView === "type-select"
           ? t("settings.rescheduleJob")
-          : showAdjustTimelineDialog && adjustRescheduleView !== "type-select"
+          : showAdjustTimelineDialog
             ? SHIFT_TYPE_INFO[adjustRescheduleView as ShiftType]?.title ?? t("settings.rescheduleJob")
             : t("settings.rescheduleJob")}
         description={adjustRescheduleView === "type-select"
           ? (showAdjustTimelineDialog ? `Update the schedule for ${showAdjustTimelineDialog.title}. Workers will be notified of the new time.` : undefined)
-          : (adjustRescheduleView !== "type-select" ? SHIFT_TYPE_INFO[adjustRescheduleView as ShiftType]?.description : undefined)}
+          : SHIFT_TYPE_INFO[adjustRescheduleView as ShiftType]?.description}
         contentClassName="max-w-2xl"
         showBackButton
         footerButtonOrder="primaryRight"
@@ -12268,7 +12435,7 @@ export default function CompanyDashboard() {
             <div className="space-y-3">
               {(() => {
                 const paymentMethodsWithStripeId = (paymentMethods || []).filter((m: any) => !!(m.stripePaymentMethodId ?? m.stripe_payment_method_id));
-                return paymentMethodsWithStripeId.map((method) => {
+                return paymentMethodsWithStripeId.map((method: any) => {
                 const locationIdSet = new Set((method.locationIds || []).map((id: any) => String(id)));
                 const assignedLocations = locationIdSet.size > 0
                   ? companyLocations.filter((loc: any) => locationIdSet.has(String(loc.id)))
@@ -12349,7 +12516,7 @@ export default function CompanyDashboard() {
                           <DropdownMenuItem
                             className="text-destructive focus:text-destructive"
                             onClick={() => deletePaymentMethodMutation.mutate(method.id)}
-                            disabled={deletePaymentMethodMutation.isPending || (method.isPrimary && paymentMethodsWithStripeId.length === 1)}
+                            disabled={deletePaymentMethodMutation.isPending || (!!method.isPrimary && paymentMethodsWithStripeId.length === 1)}
                             data-testid={`button-remove-payment-${method.id}`}
                           >
                             Remove
@@ -12627,7 +12794,7 @@ export default function CompanyDashboard() {
               onClick={() => {
                 const amountCents = Math.round(parseFloat(topUpAmount) * 100);
                 if (isNaN(amountCents) || amountCents < 10000) return;
-                const method = paymentMethods.find((m: any) => m.id === selectedPaymentMethod);
+                const method = paymentMethods.find((m: any) => m.id === selectedPaymentMethod) as any;
                 if (!method) return;
                 const type = method.type ?? method.payment_method_type;
                 const stripePmId = method.stripePaymentMethodId ?? method.stripe_payment_method_id;
@@ -13565,7 +13732,7 @@ export default function CompanyDashboard() {
                         <p className="text-sm text-muted-foreground">{t("company.team.noLocationsYet", "No locations yet. You can add locations from the Locations menu.")}</p>
                       ) : (
                         <div className="space-y-2">
-                          {teamByLocation.filter((loc: { id: number | null }) => loc.id != null).map((loc: { id: number; name?: string; address?: string; city?: string; state?: string }) => (
+                          {teamByLocation.filter((loc: { id: number | null }) => loc.id != null).map((loc) => (
                             <div
                               key={loc.id}
                               className={`flex items-center space-x-2 p-3 rounded-lg border cursor-pointer transition-colors ${inviteData.locationIds?.includes(String(loc.id)) ? "border-primary bg-primary/5" : "border-border hover:bg-muted/50"}`}
@@ -13603,13 +13770,16 @@ export default function CompanyDashboard() {
             if (profile) {
               try {
                 await updateProfile.mutateAsync({
-                  emailNotifications: notificationSettings.emailNotifications,
-                  smsNotifications: notificationSettings.smsNotifications,
-                  pushNotifications: notificationSettings.pushNotifications,
-                  notifyNewJobs: notificationSettings.emailNewApplications || notificationSettings.smsNewApplications || notificationSettings.pushNewApplications,
-                  notifyJobUpdates: notificationSettings.emailTimesheets || notificationSettings.smsTimesheets || notificationSettings.pushTimesheets,
-                  notifyPayments: notificationSettings.emailPayments || notificationSettings.smsPayments || notificationSettings.pushPayments,
-                  notifyMessages: notificationSettings.emailMessages || notificationSettings.smsMessages || notificationSettings.pushMessages,
+                  id: profile.id,
+                  data: {
+                    emailNotifications: notificationSettings.emailNotifications,
+                    smsNotifications: notificationSettings.smsNotifications,
+                    pushNotifications: notificationSettings.pushNotifications,
+                    notifyNewJobs: notificationSettings.emailNewApplications || notificationSettings.smsNewApplications || notificationSettings.pushNewApplications,
+                    notifyJobUpdates: notificationSettings.emailTimesheets || notificationSettings.smsTimesheets || notificationSettings.pushTimesheets,
+                    notifyPayments: notificationSettings.emailPayments || notificationSettings.smsPayments || notificationSettings.pushPayments,
+                    notifyMessages: notificationSettings.emailMessages || notificationSettings.smsMessages || notificationSettings.pushMessages,
+                  },
                 });
                 toast({ title: t("notifications.updated"), description: t("notifications.updatedDesc") });
                 setShowNotifications(false);
@@ -13821,7 +13991,7 @@ export default function CompanyDashboard() {
       <ResponsiveDialog open={showHiringPreferences} onOpenChange={(open) => { setShowHiringPreferences(open); if (!open) navigate("/company-dashboard/menu"); }} title={t("settings.hiringPreferences")} description={t("industries.selectIndustries")} contentClassName="max-w-lg max-h-[90vh]" showBackButton onBack={() => { setShowHiringPreferences(false); navigate("/company-dashboard/menu"); }} backLabel="Menu" footer={
         <div className="flex gap-2 justify-end">
           <Button variant="outline" onClick={() => { setShowHiringPreferences(false); navigate("/company-dashboard/menu"); }}>{tCommon("cancel")}</Button>
-          <Button onClick={() => updateProfile.mutate({ selectedIndustries }, { onSuccess: () => { setShowHiringPreferences(false); navigate("/company-dashboard/menu"); toast({ title: t("industries.savedPreferences", "Hiring preferences saved") }); } })} disabled={updateProfile.isPending} data-testid="button-save-hiring-prefs">{tCommon("save")}</Button>
+          <Button onClick={() => { if (!profile) return; updateProfile.mutate({ id: profile.id, data: { hiringIndustries: selectedIndustries } }, { onSuccess: () => { setShowHiringPreferences(false); navigate("/company-dashboard/menu"); toast({ title: t("industries.savedPreferences", "Hiring preferences saved") }); } }); }} disabled={updateProfile.isPending || !profile} data-testid="button-save-hiring-prefs">{tCommon("save")}</Button>
         </div>
       }>
         <div className="space-y-4">
@@ -15041,7 +15211,7 @@ export default function CompanyDashboard() {
                     <p className="text-xs text-muted-foreground mb-3">Messages and calls for this location will go to:</p>
                     <div className="flex items-center gap-4">
                       <Avatar className="h-12 w-12 ring-2 ring-border">
-                        <AvatarImage src={profile?.avatarUrl} alt="" />
+                        <AvatarImage src={profile?.avatarUrl ?? undefined} alt="" />
                         <AvatarFallback className="bg-primary/10 text-primary font-medium">
                           {profile?.firstName?.[0] || profile?.companyName?.[0] || "?"}{profile?.lastName?.[0] || profile?.companyName?.[1] || ""}
                         </AvatarFallback>
@@ -15397,7 +15567,7 @@ export default function CompanyDashboard() {
                       <p className="text-xs text-muted-foreground mb-3">Messages and calls for this location will go to:</p>
                       <div className="flex items-center gap-4">
                         <Avatar className="h-12 w-12 ring-2 ring-border">
-                          <AvatarImage src={profile?.avatarUrl} alt="" />
+                          <AvatarImage src={profile?.avatarUrl ?? undefined} alt="" />
                           <AvatarFallback className="bg-primary/10 text-primary font-medium">
                             {profile?.firstName?.[0] || profile?.companyName?.[0] || "?"}{profile?.lastName?.[0] || profile?.companyName?.[1] || ""}
                           </AvatarFallback>
@@ -15613,7 +15783,7 @@ export default function CompanyDashboard() {
           <button
             onClick={() => navigate("/company-dashboard/chats")}
             className={`flex flex-col items-center justify-center gap-0.5 px-2 min-w-0 flex-1 h-full transition-colors ${
-              location === "/company-dashboard/chats" ? "text-primary" : "text-muted-foreground"
+              pathname === "/company-dashboard/chats" ? "text-primary" : "text-muted-foreground"
             }`}
             data-testid="mobile-nav-chats"
           >
@@ -15632,7 +15802,7 @@ export default function CompanyDashboard() {
       )}
 
       {/* Mobile FAB: Post a Job — always visible on Jobs tab on mobile */}
-      {isMobile && activeTab === "jobs" && !(activeTab === "chats" && subsection) && (
+      {isMobile && activeTab === "jobs" && !(section === "chats" && subsection) && (
         <button
           className="md:hidden fixed bottom-16 right-4 z-50 flex items-center gap-2 bg-primary text-primary-foreground rounded-full shadow-lg px-4 py-3 text-sm font-semibold hover:bg-primary/90 active:scale-95 transition-all"
           onClick={() => {

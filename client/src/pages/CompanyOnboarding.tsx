@@ -66,7 +66,7 @@ import { GooglePlacesAutocomplete } from "@/components/GooglePlacesAutocomplete"
 import confetti from "canvas-confetti";
 import { SiGoogle } from "react-icons/si";
 import { loadStripe } from "@/lib/stripe";
-import { Elements, PaymentElement, useStripe, useElements } from "@stripe/react-stripe-js";
+import { Elements, PaymentElement, CardElement, useStripe, useElements } from "@stripe/react-stripe-js";
 
 const TOTAL_STEPS = 5;
 const DEPOSIT_AMOUNT = 200000; // Kept for legacy/dead code block
@@ -728,7 +728,7 @@ export default function CompanyOnboarding() {
         phone: profile.phone || prev.phone,
       }));
       if ((profile as { companyLogo?: string }).companyLogo) {
-        setCompanyLogoUrl((profile as { companyLogo?: string }).companyLogo);
+        setCompanyLogoUrl((profile as { companyLogo?: string }).companyLogo ?? null);
       }
     }
   }, [profile]);
@@ -1184,8 +1184,7 @@ export default function CompanyOnboarding() {
         return;
       }
       if (config.publishableKey) {
-        const stripe = await loadStripe(config.publishableKey);
-        setStripePromise(stripe);
+        setStripePromise(loadStripe(config.publishableKey));
       }
       const setupRes = await fetch("/api/stripe/create-setup-intent", {
         method: "POST",

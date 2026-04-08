@@ -291,7 +291,7 @@ export default function PostJob() {
   const [showSkillsetDropdown, setShowSkillsetDropdown] = useState(false);
   const [showSelectedSkillsetsOnly, setShowSelectedSkillsetsOnly] = useState(false);
   const [isListening, setIsListening] = useState(false);
-  const recognitionRef = useRef<SpeechRecognition | null>(null);
+  const recognitionRef = useRef<WebSpeechRecognition | null>(null);
 
   // Get company's preferred categories from their profile or job history
   const getCompanyPreferredCategories = (): string[] => {
@@ -831,8 +831,24 @@ export default function PostJob() {
       setOneDayFormStep(d.oneDayFormStep ?? 1);
       setRecurringFormStep(d.recurringFormStep ?? 1);
       setMonthlyFormStep(d.monthlyFormStep ?? 1);
-      setOneDaySchedule(d.oneDaySchedule);
-      setRecurringSchedule(d.recurringSchedule);
+      if (d.oneDaySchedule) {
+        setOneDaySchedule({
+          date: d.oneDaySchedule.date ?? getTomorrowStr(),
+          startTime: d.oneDaySchedule.startTime ?? "09:00",
+          endTime: d.oneDaySchedule.endTime ?? "17:00",
+        });
+      }
+      if (d.recurringSchedule) {
+        const rs = d.recurringSchedule;
+        setRecurringSchedule({
+          days: rs.days ?? [],
+          startDate: rs.startDate ?? getTomorrowStr(),
+          endDate: rs.endDate ?? "",
+          startTime: rs.startTime ?? "09:00",
+          endTime: rs.endTime ?? "17:00",
+          weeks: rs.weeks ?? 1,
+        });
+      }
       if (d.monthlySchedule) {
         const ms = d.monthlySchedule as { startDate: string; endDate?: string; months?: number; days: string[]; startTime: string; endTime: string };
         let endDate = ms.endDate;
@@ -855,6 +871,7 @@ export default function PostJob() {
       setNewLocation({
         ...d.newLocation,
         address2: d.newLocation.address2 || "",
+        selectedPhoneOption: (d.newLocation.selectedPhoneOption || "company") as Location["selectedPhoneOption"],
       });
       setMediaPreviews((prev) => {
         const restored = d.mediaPermanentUrls.map((m) => ({
@@ -970,7 +987,6 @@ export default function PostJob() {
     setJobBudgetDollars(null);
     setAutoFulfillEnabled(false);
     setAutoFulfillMinWorkerStars(1);
-    setSaveAfDefaults(false);
     setOnDemandDate(getTomorrowStr());
     setOnDemandDoneByDate("");
     setOnDemandStartTime("09:00");
@@ -1070,8 +1086,8 @@ export default function PostJob() {
         setOneDaySchedule(prev => ({ ...prev, date: suggestion.startDate! }));
       }
       if (suggestion.shiftType === "recurring") {
-        const startStr = aiScheduleSuggestion.startDate || getTomorrowStr();
-        const weeks = aiScheduleSuggestion.weeks ?? 1;
+        const startStr = suggestion.startDate || getTomorrowStr();
+        const weeks = suggestion.weeks ?? 1;
         const start = new Date(startStr);
         const end = new Date(start);
         end.setDate(end.getDate() + (weeks - 1) * 7);
@@ -3399,7 +3415,7 @@ export default function PostJob() {
                       <p className="text-xs text-muted-foreground mb-3">Messages and calls for this location will go to:</p>
                       <div className="flex items-center gap-4">
                         <Avatar className="h-12 w-12 ring-2 ring-border">
-                          <AvatarImage src={profile?.avatarUrl} alt="" />
+                          <AvatarImage src={profile?.avatarUrl ?? undefined} alt="" />
                           <AvatarFallback className="bg-primary/10 text-primary font-medium">
                             {profile?.firstName?.[0] || profile?.companyName?.[0] || "?"}{profile?.lastName?.[0] || profile?.companyName?.[1] || ""}
                           </AvatarFallback>
@@ -3517,7 +3533,7 @@ export default function PostJob() {
                               <Users className="w-4 h-4 text-muted-foreground" />
                               <div className="flex-1">
                                 <p className="font-medium text-sm">Select from Team</p>
-                                <Select modal={false}
+                                <Select
                                   value={newLocation.representativeTeamMemberId === -1 || newLocation.representativeTeamMemberId === null ? "none" : newLocation.representativeTeamMemberId.toString()}
                                   onValueChange={(v) => {
                                     if (v === "__new__") { setShowAddTeamMemberPopup(true); setNewLocation(prev => ({ ...prev, representativeTeamMemberId: null, contactName: "", contactEmail: "" })); return; }
@@ -3633,7 +3649,7 @@ export default function PostJob() {
                       <p className="text-xs text-muted-foreground mb-3">Messages and calls for this location will go to:</p>
                       <div className="flex items-center gap-4">
                         <Avatar className="h-12 w-12 ring-2 ring-border">
-                          <AvatarImage src={profile?.avatarUrl} alt="" />
+                          <AvatarImage src={profile?.avatarUrl ?? undefined} alt="" />
                           <AvatarFallback className="bg-primary/10 text-primary font-medium">
                             {profile?.firstName?.[0] || profile?.companyName?.[0] || "?"}{profile?.lastName?.[0] || profile?.companyName?.[1] || ""}
                           </AvatarFallback>
@@ -3701,7 +3717,7 @@ export default function PostJob() {
                               <Users className="w-4 h-4 text-muted-foreground" />
                               <div className="flex-1">
                                 <p className="font-medium text-sm">Select from Team</p>
-                                <Select modal={false} value={newLocation.representativeTeamMemberId === -1 || newLocation.representativeTeamMemberId === null ? "none" : newLocation.representativeTeamMemberId.toString()} onValueChange={(v) => {
+                                <Select value={newLocation.representativeTeamMemberId === -1 || newLocation.representativeTeamMemberId === null ? "none" : newLocation.representativeTeamMemberId.toString()} onValueChange={(v) => {
                                   if (v === "__new__") { setShowAddTeamMemberPopup(true); setNewLocation(prev => ({ ...prev, representativeTeamMemberId: null, contactName: "", contactEmail: "" })); return; }
                                   if (v === "none") setNewLocation(prev => ({ ...prev, representativeTeamMemberId: null, contactName: "", contactEmail: "" }));
                                   else { const member = teamMembers.find((m: any) => m.id.toString() === v); setNewLocation(prev => ({ ...prev, representativeTeamMemberId: Number(v), contactName: member ? `${member.firstName} ${member.lastName}`.trim() : "", contactEmail: member?.email || "", contactPhone: member?.phone || prev.contactPhone, selectedPhoneOption: member?.phone ? "team" : prev.selectedPhoneOption })); }

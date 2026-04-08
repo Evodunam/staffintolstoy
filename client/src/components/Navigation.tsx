@@ -495,7 +495,7 @@ export function Navigation({ tabs, sidebarNavItems, onSidebarNavSelect, hidePost
             <div className="flex-shrink-0 border-t border-border bg-muted/30 pb-4">
               <div className="flex items-center gap-3 p-3 rounded-xl bg-background/80 shadow-sm border border-border/50">
                 <Avatar className="h-10 w-10 flex-shrink-0 ring-2 ring-border/50">
-                  <AvatarImage src={profile?.avatarUrl} alt="" />
+                  <AvatarImage src={profile?.avatarUrl ?? undefined} alt="" />
                   <AvatarFallback className="text-sm font-medium bg-primary/10 text-primary">
                     {profile?.companyName?.[0] || profile?.firstName?.[0] || user?.firstName?.[0] || "U"}
                   </AvatarFallback>

@@ -31,7 +31,8 @@ import {
   type WorkerWithAdmin,
   type CompanyWithAdmin,
   type JobWithCompany,
-  type ImportRow
+  type ImportRow,
+  type AdminStripePaymentRow
 } from "@/hooks/use-admin";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -50,7 +51,7 @@ import {
   Users, Building, Briefcase, DollarSign, Activity, Shield, AlertTriangle, 
   Ban, Eye, MoreVertical, Plus, Search, ArrowLeft, Check, X, Clock,
   TrendingUp, TrendingDown, RefreshCw, Phone, Mail, MapPin, Star, Settings,
-  Download, Upload, MessageSquare, UserPlus, RotateCcw, Send, Bell
+  Download, Upload, MessageSquare, UserPlus, RotateCcw, Send, Bell, UserCircle
 } from "lucide-react";
 import { 
   DropdownMenu, 
@@ -96,6 +97,10 @@ export default function AdminDashboard() {
   const [showSettingsDialog, setShowSettingsDialog] = useState(false);
   const [settingsCompany, setSettingsCompany] = useState<CompanyWithAdmin | null>(null);
   const [autoReplenishThreshold, setAutoReplenishThreshold] = useState("");
+  const [chatsSelectedJobId, setChatsSelectedJobId] = useState<number | null>(null);
+  const [activityLogLimit, setActivityLogLimit] = useState(100);
+  const [importEntity, setImportEntity] = useState<"workers" | "companies">("workers");
+  const [importRows, setImportRows] = useState<ImportRow[]>([]);
   
   const { data: workers = [], isLoading: loadingWorkers } = useAdminWorkers();
   const { data: companies = [], isLoading: loadingCompanies } = useAdminCompanies();
@@ -144,7 +149,6 @@ export default function AdminDashboard() {
   const [refundPaymentIntentId, setRefundPaymentIntentId] = useState("");
   const [refundAmountCents, setRefundAmountCents] = useState("");
   const [refundReason, setRefundReason] = useState("");
-  const [chatsSelectedJobId, setChatsSelectedJobId] = useState<number | null>(null);
   const [supportMessageContent, setSupportMessageContent] = useState("");
   const [pushTarget, setPushTarget] = useState<"workers" | "companies" | "all">("all");
   const [pushTitle, setPushTitle] = useState("");
@@ -153,7 +157,6 @@ export default function AdminDashboard() {
   const [resolveStrikeId, setResolveStrikeId] = useState<number | null>(null);
   const [resolveStrikeNotes, setResolveStrikeNotes] = useState("");
   const [showResolveStrikeDialog, setShowResolveStrikeDialog] = useState(false);
-  const [activityLogLimit, setActivityLogLimit] = useState(100);
   const [jobStatusFilter, setJobStatusFilter] = useState<string>("");
   const [strikesActiveOnly, setStrikesActiveOnly] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);

@@ -4,7 +4,7 @@ import { Navigation } from "@/components/Navigation";
 import { useFindWork, useDismissJob } from "@/hooks/use-jobs";
 import { useAuth } from "@/hooks/use-auth";
 import { useProfile } from "@/hooks/use-profiles";
-import { Loader2, Search, MapPin, List, Map as MapIcon, Clock, DollarSign, Building2, X, ChevronRight, AlertCircle, CheckCircle, Users, Send, ChevronLeft, Sparkles, Settings } from "lucide-react";
+import { Loader2, Search, MapPin, List, Map as MapIcon, Clock, DollarSign, Building2, X, ChevronRight, AlertCircle, CheckCircle, Check, Users, Send, ChevronLeft, Sparkles, Settings } from "lucide-react";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Button } from "@/components/ui/button";
@@ -357,6 +357,7 @@ function JobDetailsPanel({ job, onClose, onApply, onDismiss, application }: JobD
 
 export default function FindWorkPage() {
   const { t } = useTranslation("findWork");
+  const { t: tCommon } = useTranslation("common");
   const { user } = useAuth();
   const { data: profile } = useProfile(user?.id);
   const { toast } = useToast();
@@ -542,7 +543,7 @@ export default function FindWorkPage() {
     // Check skill match
     let personSkills: string[] | null | undefined;
     if (workerId === "self") {
-      personSkills = profile?.skillsets as string[] | null | undefined;
+      personSkills = (profile as { skillsets?: string[] | null })?.skillsets;
     } else {
       const member = activeTeamMembers.find(m => m.id === workerId);
       personSkills = member?.skillsets as string[] | null | undefined;
@@ -651,7 +652,10 @@ export default function FindWorkPage() {
           hourlyRate: job.hourlyRate,
           city: job.city || undefined,
           state: job.state || undefined,
-          status: application ? (application.status === "accepted" ? "confirmed" : "pending") : "open",
+          status: (application ? (application.status === "accepted" ? "confirmed" : "pending") : "open") as
+            | "open"
+            | "pending"
+            | "confirmed",
           application: application || null,
           urgencyColor: urgency.color,
           payout: job.hourlyRate ? calculatePayout(job.hourlyRate, job.estimatedHours ?? undefined) : undefined,

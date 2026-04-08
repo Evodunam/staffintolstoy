@@ -131,13 +131,16 @@ export function NotificationPopup({ profileId }: NotificationPopupProps) {
     
     try {
       await updateProfile.mutateAsync({
-        emailNotifications: localSettings.emailNotifications,
-        smsNotifications: localSettings.smsNotifications,
-        pushNotifications: localSettings.pushNotifications,
-        notifyNewJobs: localSettings.emailNewApplications || localSettings.smsNewApplications || localSettings.pushNewApplications,
-        notifyJobUpdates: localSettings.emailTimesheets || localSettings.smsTimesheets || localSettings.pushTimesheets,
-        notifyPayments: localSettings.emailPayments || localSettings.smsPayments || localSettings.pushPayments,
-        notifyMessages: localSettings.emailMessages || localSettings.smsMessages || localSettings.pushMessages,
+        id: profile.id,
+        data: {
+          emailNotifications: localSettings.emailNotifications,
+          smsNotifications: localSettings.smsNotifications,
+          pushNotifications: localSettings.pushNotifications,
+          notifyNewJobs: localSettings.emailNewApplications || localSettings.smsNewApplications || localSettings.pushNewApplications,
+          notifyJobUpdates: localSettings.emailTimesheets || localSettings.smsTimesheets || localSettings.pushTimesheets,
+          notifyPayments: localSettings.emailPayments || localSettings.smsPayments || localSettings.pushPayments,
+          notifyMessages: localSettings.emailMessages || localSettings.smsMessages || localSettings.pushMessages,
+        },
       });
       
       toast({
@@ -755,7 +758,7 @@ export function NotificationPopup({ profileId }: NotificationPopupProps) {
                                   {(() => {
                                     // Make notification body more interactive with clickable elements
                                     const body = notification.body;
-                                    const data = notification.data || {};
+                                    const data = (notification.data || {}) as { jobId?: number };
                                     
                                     // If body contains quoted text (job titles, etc.), make them clickable
                                     const parts: Array<string | JSX.Element> = [];

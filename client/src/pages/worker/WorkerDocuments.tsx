@@ -95,14 +95,16 @@ export default function WorkerDocuments() {
           if (profile) {
             updateProfile({
               id: profile.id,
-              insuranceDocumentUrl: base64Data,
-              insurancePolicyNumber: result.data.policyNumber,
-              insuranceIssuer: result.data.issuer,
-              insuranceStartDate: result.data.startDate ? new Date(result.data.startDate) : null,
-              insuranceEndDate: result.data.endDate ? new Date(result.data.endDate) : null,
-              insuranceCoverageType: result.data.coverageType || null,
-              insuranceCoverageAmount: result.data.coverageAmount || null,
-              insuranceVerified: isInsuranceValid(result.data.startDate, result.data.endDate),
+              data: {
+                insuranceDocumentUrl: base64Data,
+                insurancePolicyNumber: result.data.policyNumber,
+                insuranceIssuer: result.data.issuer,
+                insuranceStartDate: result.data.startDate ? new Date(result.data.startDate) : null,
+                insuranceEndDate: result.data.endDate ? new Date(result.data.endDate) : null,
+                insuranceCoverageType: result.data.coverageType || null,
+                insuranceCoverageAmount: result.data.coverageAmount || null,
+                insuranceVerified: isInsuranceValid(result.data.startDate, result.data.endDate),
+              },
             });
           }
           
@@ -179,8 +181,10 @@ export default function WorkerDocuments() {
         if (profile) {
           updateProfile({
             id: profile.id,
-            w9DocumentUrl: base64Data,
-            w9UploadedAt: new Date(),
+            data: {
+              w9DocumentUrl: base64Data,
+              w9UploadedAt: new Date(),
+            },
           });
         }
         

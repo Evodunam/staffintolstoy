@@ -10,7 +10,7 @@ import { attachProfile, clearProfileSnapshot } from "./auth/middleware";
 import passport from "passport";
 import { db } from "./db";
 import { users } from "@shared/models/auth";
-import { profiles, jobs, type Job, digitalSignatures, deviceTokens, notifications, insertDeviceTokenSchema, applications, timesheets, companyTeamMembers, teamInvites, locationPings, timesheetEvents, companyPaymentMethods, companyTransactions, teams, workerTeamMembers, jobAssignments, jobSchedules, jobMessages, jobMessageEmailLog, chatMessagePendingDigest, chatMessageDigestSent, jobBudgetReviewEmailSent, reviews, skills, referrals, affiliates, insertAffiliateSchema, companyAgreements } from "@shared/schema";
+import { profiles, jobs, type Job, digitalSignatures, deviceTokens, notifications, notificationTypes, insertDeviceTokenSchema, applications, timesheets, companyTeamMembers, teamInvites, locationPings, timesheetEvents, companyPaymentMethods, companyTransactions, teams, workerTeamMembers, jobAssignments, jobSchedules, jobMessages, jobMessageEmailLog, chatMessagePendingDigest, chatMessageDigestSent, jobBudgetReviewEmailSent, reviews, skills, referrals, affiliates, insertAffiliateSchema, companyAgreements } from "@shared/schema";
 import { eq, and, asc, desc, inArray, isNull, isNotNull, or, gte, lte, sql } from "drizzle-orm";
 import { sendEmail, ALL_EMAIL_TYPES, getSampleDataForType } from "./email-service";
 import { setupWebSocket, notifyNewJob, notifyApplicationUpdate, notifyJobUpdate, notifyTimesheetUpdate, broadcastPresenceUpdate, notifyWorkerTeamPresence } from "./websocket";
@@ -35,6 +35,7 @@ import {
   clearPaymentHoldsForCompanyIfSolvent,
 } from "./auto-replenishment-scheduler";
 import { ensureCompanyStripeCustomer } from "./lib/company-stripe";
+import type Stripe from "stripe";
 import { addHours } from "date-fns";
 
 function generateInviteToken(): string {
@@ -258,14 +259,25 @@ function getStartDateRelative(startDate: Date | string | null): string {
   return '';
 }
 
+function notificationPrefsOnly(
+  p: { emailNotifications?: boolean | null; notifyNewJobs?: boolean | null; notifyJobUpdates?: boolean | null } | null | undefined
+): { emailNotifications?: boolean; notifyNewJobs?: boolean; notifyJobUpdates?: boolean } {
+  if (!p) return { emailNotifications: true, notifyNewJobs: true, notifyJobUpdates: true };
+  return {
+    emailNotifications: p.emailNotifications ?? undefined,
+    notifyNewJobs: p.notifyNewJobs ?? undefined,
+    notifyJobUpdates: p.notifyJobUpdates ?? undefined,
+  };
+}
+
 /** Resolve notification recipient for job/location: location rep/teammate or company admin. Returns { email, profile } for checking notification prefs. */
 async function getNotificationRecipientForJob(
   job: { companyLocationId?: number | null; companyId: number },
-  notificationType: 'worker_inquiry' | 'worker_clocked_out'
+  _notificationType: "worker_inquiry" | "worker_clocked_out"
 ): Promise<{ email: string; profile: { emailNotifications?: boolean; notifyNewJobs?: boolean; notifyJobUpdates?: boolean } } | null> {
   const companyProfile = await storage.getProfile(job.companyId);
   if (!companyProfile?.email) return null;
-  const companyFallback = { email: companyProfile.email, profile: companyProfile };
+  const companyFallback = { email: companyProfile.email, profile: notificationPrefsOnly(companyProfile) };
   if (!job.companyLocationId) return companyFallback;
   const location = await storage.getCompanyLocation(job.companyLocationId);
   if (!location) return companyFallback;
@@ -275,14 +287,14 @@ async function getNotificationRecipientForJob(
     const member = await storage.getCompanyTeamMember(loc.representativeTeamMemberId);
     if (member?.email) {
       const memberProfile = await storage.getProfileByUserId(member.userId);
-      return { email: member.email, profile: memberProfile || { emailNotifications: true, notifyNewJobs: true, notifyJobUpdates: true } };
+      return { email: member.email, profile: notificationPrefsOnly(memberProfile) };
     }
   }
   if (loc.assignedTeamMemberIds?.length) {
     const member = await storage.getCompanyTeamMember(loc.assignedTeamMemberIds[0]);
     if (member?.email) {
       const memberProfile = await storage.getProfileByUserId(member.userId);
-      return { email: member.email, profile: memberProfile || { emailNotifications: true, notifyNewJobs: true, notifyJobUpdates: true } };
+      return { email: member.email, profile: notificationPrefsOnly(memberProfile) };
     }
   }
   if (loc.contactEmail) return { email: loc.contactEmail, profile: { emailNotifications: true, notifyNewJobs: true, notifyJobUpdates: true } };
@@ -475,8 +487,8 @@ async function computeTimeAwayFromSite(
   for (let i = 0; i < pings.length - 1; i++) {
     const p0 = pings[i];
     const p1 = pings[i + 1];
-    const t0 = new Date(p0.createdAt).getTime();
-    const t1 = new Date(p1.createdAt).getTime();
+    const t0 = new Date(p0.createdAt as string | Date).getTime();
+    const t1 = new Date(p1.createdAt as string | Date).getTime();
     const intervalMs = t1 - t0;
     const d0 = p0.distanceFromJob != null ? Number(p0.distanceFromJob) : 0;
     const d1 = p1.distanceFromJob != null ? Number(p1.distanceFromJob) : 0;
@@ -886,9 +898,106 @@ export async function registerRoutes(
   registerObjectStorageRoutes(app);
 
   // === Development-only: Account Switcher for Testing ===
-  // Strict: only enable when NODE_ENV is development (never in production)
+  // Nested /api/dev/* blocks below register only when NODE_ENV is exactly `development`.
   const isDevOnly = process.env.NODE_ENV === 'development';
-  
+
+  /**
+   * Dev tooling: fills accepted slots from pending apps + seeded workers.
+   * Registered whenever NODE_ENV !== production so `npm run start:dev` (no cross-env) still works.
+   */
+  app.post("/api/dev/fill-job-worker-slots", async (req, res) => {
+    if (process.env.NODE_ENV === "production") {
+      return res.status(404).json({ message: "Not found" });
+    }
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    const profile = req.profile;
+    if (!profile || profile.role !== "company") {
+      return res.status(403).json({ message: "Only companies can use this" });
+    }
+    const jobId = Number((req.body as { jobId?: unknown })?.jobId);
+    if (!Number.isFinite(jobId)) {
+      return res.status(400).json({ message: "jobId required" });
+    }
+    const job = await storage.getJob(jobId);
+    if (!job || job.companyId !== profile.id) {
+      return res.status(403).json({ message: "Not your job" });
+    }
+    if (!["open", "in_progress"].includes(String(job.status))) {
+      return res.status(400).json({ message: "Job must be open or in progress" });
+    }
+
+    let apps = await storage.getJobApplications(jobId);
+    const acceptedCount = apps.filter((a) => a.status === "accepted").length;
+    const max = job.maxWorkersNeeded ?? 1;
+    let slots = Math.max(0, max - acceptedCount);
+    let hired = 0;
+
+    const pending = apps.filter((a) => a.status === "pending").sort((a, b) => a.id - b.id);
+    for (const app of pending) {
+      if (slots <= 0) break;
+      await storage.updateApplicationStatus(app.id, "accepted");
+      notifyApplicationUpdate(app.workerId, {
+        applicationId: app.id,
+        jobId: job.id,
+        jobTitle: job.title,
+        status: "accepted",
+      });
+      hired++;
+      slots--;
+    }
+
+    if (slots > 0) {
+      apps = await storage.getJobApplications(jobId);
+      const teamRows = await db.select({ ownerId: teams.ownerId }).from(teams);
+      const ownerIds = new Set(
+        teamRows.map((t) => t.ownerId).filter((id): id is number => typeof id === "number")
+      );
+      const workerCandidates = await db
+        .select()
+        .from(profiles)
+        .where(and(eq(profiles.role, "worker"), isNull(profiles.teamId)));
+      const usedWorkerIds = new Set(apps.map((a) => a.workerId));
+      const candidates = workerCandidates.filter((w) => !ownerIds.has(w.id) && !usedWorkerIds.has(w.id));
+      const rate = workerFacingJobHourlyCents(job.hourlyRate);
+
+      for (const worker of candidates) {
+        if (slots <= 0) break;
+        try {
+          const newApp = await storage.createApplication({
+            jobId: job.id,
+            workerId: worker.id,
+            message: "[dev] auto-seeded hire",
+            ...(rate > 0 ? { proposedRate: rate } : {}),
+          });
+          usedWorkerIds.add(worker.id);
+          await storage.updateApplicationStatus(newApp.id, "accepted");
+          notifyApplicationUpdate(worker.id, {
+            applicationId: newApp.id,
+            jobId: job.id,
+            jobTitle: job.title,
+            status: "accepted",
+          });
+          hired++;
+          slots--;
+        } catch (e) {
+          console.warn("[dev fill-job-worker-slots] seed worker failed:", e);
+        }
+      }
+    }
+
+    if (hired > 0) {
+      await afterHireFundingCheck(job.id, job.companyId).catch((err) =>
+        console.error("[dev fill-job-worker-slots] afterHireFundingCheck:", err)
+      );
+    }
+
+    return res.json({
+      hired,
+      remainingSlots: slots,
+      maxWorkersNeeded: max,
+    });
+  });
+
   if (isDevOnly) {
     // Get list of test accounts - return ALL users from database
     app.get("/api/dev/test-accounts", async (req, res) => {
@@ -3449,7 +3558,7 @@ export async function registerRoutes(
               lastName: teamMember.lastName,
               avatarUrl: teamMember.avatarUrl ?? app.worker.avatarUrl,
               phone: teamMember.phone ?? app.worker.phone,
-              hourlyRate: (teamMember.hourlyRate ?? app.worker.hourlyRate) ?? undefined,
+              hourlyRate: (teamMember.hourlyRate ?? app.worker.hourlyRate) ?? null,
               averageRating: app.worker.averageRating,
               completedJobs: app.worker.completedJobs,
               trades: teamMember.skillsets ?? app.worker.trades,
@@ -4149,11 +4258,11 @@ Respond ONLY in this exact JSON format:
         longitude,
         companyId: profile.id,
         timezone,
-        status: saveAsDraft ? "draft" : "open",
       });
-
       if (saveAsDraft) {
-        return res.status(201).json(job);
+        await storage.updateJob(job.id, { status: "draft" });
+        const draftJob = await storage.getJob(job.id);
+        return res.status(201).json(draftJob ?? job);
       }
 
       // Send real-time WebSocket notification to matching workers
@@ -4477,6 +4586,16 @@ Respond ONLY in this exact JSON format:
       if (job.status !== "open") {
         return res.status(400).json({ message: "Can only send alerts for open jobs" });
       }
+
+      const WORKER_ALERT_COOLDOWN_MS = 24 * 60 * 60 * 1000;
+      const lastAlert = job.lastWorkerAlertAt ? new Date(job.lastWorkerAlertAt).getTime() : 0;
+      if (lastAlert && Date.now() - lastAlert < WORKER_ALERT_COOLDOWN_MS) {
+        const nextAvailableAt = new Date(lastAlert + WORKER_ALERT_COOLDOWN_MS);
+        return res.status(429).json({
+          message: "You can send one worker alert per job every 24 hours.",
+          nextAvailableAt: nextAvailableAt.toISOString(),
+        });
+      }
       
       // Get company profile for name
       const companyProfile = await storage.getProfile(job.companyId);
@@ -4650,11 +4769,15 @@ Respond ONLY in this exact JSON format:
 
         console.log(`[Send Alert] Sent ${emailsSent} emails for job ${job.id}`);
       }
+
+      const alertSentAt = new Date();
+      await db.update(jobs).set({ lastWorkerAlertAt: alertSentAt }).where(eq(jobs.id, jobId));
       
       res.json({ 
         success: true, 
         message: "Alert sent to matching workers",
-        emailsSent 
+        emailsSent,
+        lastWorkerAlertAt: alertSentAt.toISOString(),
       });
     } catch (err: any) {
       console.error("Error sending alert:", err);
@@ -6580,8 +6703,8 @@ Respond ONLY in this exact JSON format:
           city: inquiry.city,
           state: inquiry.state,
           zipCode: inquiry.zipCode,
-          latitude: inquiry.latitude,
-          longitude: inquiry.longitude,
+          latitude: inquiry.latitude ?? undefined,
+          longitude: inquiry.longitude ?? undefined,
           requiredSkills: inquiry.requiredSkills,
           hourlyRate: inquiry.hourlyRate,
           trade: (inquiry.requiredSkills && inquiry.requiredSkills.length > 0 ? inquiry.requiredSkills[0] : "General Labor") as any,
@@ -8385,9 +8508,8 @@ Respond ONLY in this exact JSON format:
         const restrict =
           tm.role !== "admin" && Array.isArray(tm.locationIds) && tm.locationIds.length > 0;
         if (restrict) {
-          const allowed = new Set(
-            tm.locationIds.map((id) => Number(id)).filter((n) => Number.isFinite(n))
-          );
+          const locIds = tm.locationIds ?? [];
+          const allowed = new Set(locIds.map((id) => Number(id)).filter((n) => Number.isFinite(n)));
           locations = locations.filter((loc) => allowed.has(loc.id));
         }
       }
@@ -9462,7 +9584,7 @@ Respond ONLY in this exact JSON format:
       await sendPushNotification(workerProfileId, "auto_clock", {
         jobId: timesheet.jobId,
         jobTitle: job?.title || "Job",
-        action: "clock_out",
+        action: "clocked_out",
       });
     } catch (e) {
       console.error("[performServerSideClockOut] Notify error:", e);
@@ -10637,7 +10759,7 @@ Respond ONLY in this exact JSON format:
             const firstUsable = autoApprovalMethods.find((m: any) => {
               const hasStripe = !!(m.stripePaymentMethodId ?? m.stripe_payment_method_id);
               const isMercury = !!((m.mercuryRecipientId ?? m.mercury_recipient_id) || (m.mercuryExternalAccountId ?? m.mercury_external_account_id));
-              return hasStripe && !isMercury && (m.type === "card" || (m.type === "ach" && (m.isVerified ?? m.is_verified)));
+              return hasStripe && !isMercury && (m.type === "card" || (m.type === "ach" && m.isVerified));
             }) ?? autoApprovalMethods[0];
             if (firstUsable) await storage.updateCompanyPaymentMethod(firstUsable.id, { isPrimary: true });
           }
@@ -10879,7 +11001,10 @@ Respond ONLY in this exact JSON format:
               paymentStatus: "failed",
               companyNotes: 'Auto-approved after 48 hours - payment failed, retry required',
             });
-            const failedMethodId = primaryPaymentMethod?.id ?? autoApprovalMethods.find((m: any) => m.isPrimary ?? m.is_primary)?.id ?? autoApprovalMethods[0]?.id;
+            const failedMethodId =
+              (await storage.getPrimaryPaymentMethod(company.id))?.id ??
+              autoApprovalMethods.find((m: any) => m.isPrimary ?? m.is_primary)?.id ??
+              autoApprovalMethods[0]?.id;
             if (failedMethodId) await storage.updateProfile(company.id, { lastFailedPaymentMethodId: failedMethodId });
             failedCount++;
             continue;
@@ -11860,7 +11985,7 @@ Respond ONLY in this exact JSON format:
     
     console.log(`[BulkApproval] Company ${profile.id} approving ${timesheetIds.length} timesheets`);
     
-    const results: { id: number; success: boolean; error?: string; escrowInfo?: any }[] = [];
+    const results: { id: number; success: boolean; error?: string; escrowInfo?: any; skipped?: boolean }[] = [];
     let escrowCount = 0;
     
     for (const id of timesheetIds) {
@@ -12456,8 +12581,6 @@ Respond ONLY in this exact JSON format:
           skillLevel: "elite",
           hourlyRate: HOURLY_RATE_CENTS,
           maxWorkersNeeded: Math.max(1, 1 + teamMembers.length),
-          workersHired: 1,
-          status: "in_progress",
           startDate,
           endDate,
           scheduledTime: "9:00 AM - 5:00 PM",
@@ -12467,14 +12590,14 @@ Respond ONLY in this exact JSON format:
           scheduleDays: ["monday", "tuesday", "wednesday", "thursday", "friday"],
           recurringWeeks: 4,
         });
+        await storage.updateJob(job.id, { status: "in_progress", workersHired: 1 });
         const application = await storage.createApplication({
           jobId: job.id,
           workerId: operator.id,
           teamMemberId: null,
-          status: "accepted",
           proposedRate: HOURLY_RATE_CENTS,
-          respondedAt: new Date(),
         });
+        await storage.updateApplicationStatus(application.id, "accepted");
         const today = new Date();
         today.setHours(0, 0, 0, 0);
         const jobLat = 37.3382;
@@ -12538,7 +12661,13 @@ Respond ONLY in this exact JSON format:
       String(req.query.unreadOnly) === "1" ||
       String(req.query.unreadOnly).toLowerCase() === "true";
     const typeParam = String(req.query.type || "").trim();
-    const typeFilter = typeParam ? typeParam.split(",").map((s: string) => s.trim()).filter(Boolean) : [];
+    const allowedTypes = new Set(notificationTypes);
+    const typeFilter = typeParam
+      ? typeParam
+          .split(",")
+          .map((s: string) => s.trim())
+          .filter((t): t is (typeof notificationTypes)[number] => allowedTypes.has(t as (typeof notificationTypes)[number]))
+      : [];
     const conditions = [eq(notifications.profileId, profileId)];
     if (unreadOnly) conditions.push(eq(notifications.isRead, false));
     if (typeFilter.length > 0) conditions.push(inArray(notifications.type, typeFilter));
@@ -13440,9 +13569,9 @@ Respond ONLY in this exact JSON format:
     let userEmail = (req.user as any)?.claims?.email as string | undefined;
     if (session?.originalUserId) {
       const originalUser = await authStorage.getUser(session.originalUserId);
-      userEmail = originalUser?.email;
+      userEmail = originalUser?.email ?? undefined;
     }
-    userEmail = userEmail?.toLowerCase();
+    userEmail = userEmail ? userEmail.toLowerCase() : undefined;
     if (!userEmail || !ADMIN_EMAILS.includes(userEmail)) {
       return res.status(403).json({ message: "Admin access required" });
     }
@@ -14011,18 +14140,21 @@ Respond ONLY in this exact JSON format:
       const stripe = stripeService.getStripe();
       if (!stripe) return res.status(503).json({ message: "Stripe not configured" });
 
-      const refundOpts: { payment_intent: string; amount?: number; reason?: string } = { payment_intent: paymentIntentId };
-      if (amountCents && amountCents > 0) refundOpts.amount = amountCents;
-      if (reason) refundOpts.reason = reason === "duplicate" ? "duplicate" : reason === "fraudulent" ? "fraudulent" : "requested_by_customer";
+      const refundParams: Stripe.RefundCreateParams = { payment_intent: paymentIntentId };
+      if (amountCents && amountCents > 0) refundParams.amount = amountCents;
+      if (reason) {
+        refundParams.reason =
+          reason === "duplicate" ? "duplicate" : reason === "fraudulent" ? "fraudulent" : "requested_by_customer";
+      }
 
-      const refund = await stripe.refunds.create(refundOpts);
+      const refund = await stripe.refunds.create(refundParams);
 
       await storage.logAdminActivity({
         adminEmail: getAdminEmail(req) || ADMIN_EMAILS[0],
         action: "stripe_refund",
         entityType: "payment",
         entityId: 0,
-        details: { paymentIntentId, refundId: refund.id, amountCents: refundOpts.amount },
+        details: { paymentIntentId, refundId: refund.id, amountCents: refundParams.amount },
       });
 
       res.json({ success: true, refundId: refund.id, status: refund.status });
@@ -14115,7 +14247,7 @@ Respond ONLY in this exact JSON format:
       }
 
       const { sendPushNotification } = await import("./firebase-admin");
-      const data = url ? { url } : {};
+      const data: Record<string, string> = url ? { url: typeof url === "string" ? url : String(url) } : {};
       const result = await sendPushNotification(tokenStrings, title, body, data);
 
       await storage.logAdminActivity({
@@ -14524,9 +14656,11 @@ Respond ONLY in this exact JSON format:
       }
 
       // Sync profile cache: primary payment method id, verified flag, and Stripe verification status (for verify-cents popup)
-      const primary = stripeOnly.find((m: any) => m.isPrimary ?? m.is_primary) ?? stripeOnly.find((m: any) => (m.type === "card" || (m.type === "ach" && (m.isVerified ?? m.is_verified))));
+      const primary =
+        stripeOnly.find((m: any) => m.isPrimary ?? m.is_primary) ??
+        stripeOnly.find((m: any) => m.type === "card" || (m.type === "ach" && m.isVerified));
       const primaryId = primary?.id ?? null;
-      const primaryVerified = primary ? (primary.type === "card" || (primary.type === "ach" && (primary.isVerified ?? primary.is_verified))) : false;
+      const primaryVerified = primary ? primary.type === "card" || (primary.type === "ach" && !!primary.isVerified) : false;
       let primaryVerificationStatus: string | null = null;
       if (primary) {
         if (primary.id === lastFailedId && !clearFailedId) {
@@ -14567,91 +14701,6 @@ Respond ONLY in this exact JSON format:
     return res.status(400).json({
       message: "Company payment methods must be added via Stripe (card or bank). Mercury is used only for worker payouts.",
     });
-
-    const { routingNumber: providedRoutingNumber, accountNumber, accountType, bankName } = req.body;
-
-    if (!providedRoutingNumber || !accountNumber || !accountType) {
-      return res.status(400).json({ message: "Missing required bank account details" });
-    }
-
-    try {
-      const { mercuryService } = await import("./services/mercury");
-      const lastFour = accountNumber.slice(-4);
-      
-      // Mercury automatically handles routing number validation (no workarounds needed)
-      const routingNumber = providedRoutingNumber;
-
-      // Create or get recipient in Mercury
-      let recipientId = profile.mercuryRecipientId;
-      let externalAccountId: string | null = null;
-
-      if (!recipientId) {
-        // Create new recipient for this company
-        const recipient = await mercuryService.createRecipient({
-          name: profile.companyName || `${profile.firstName} ${profile.lastName}`,
-          email: profile.email || "",
-          accountType: accountType.toLowerCase() as "checking" | "savings",
-          routingNumber,
-          accountNumber,
-          note: `Company profile ${profile.id}`,
-        });
-        recipientId = recipient.id;
-        externalAccountId = recipient.id; // Mercury uses recipient ID as account reference
-        
-        // Update profile with recipient ID
-        await storage.updateProfile(profile.id, {
-          mercuryRecipientId: recipientId,
-          mercuryExternalAccountId: externalAccountId,
-          bankAccountLinked: true,
-        });
-      } else {
-        // Create additional recipient for new bank account
-        // (Most companies will have one primary account, but this allows multiple)
-        const recipient = await mercuryService.createRecipient({
-          name: profile.companyName || `${profile.firstName} ${profile.lastName}`,
-          email: profile.email || "",
-          accountType: accountType.toLowerCase() as "checking" | "savings",
-          routingNumber,
-          accountNumber,
-          note: `Additional account for company profile ${profile.id}`,
-        });
-        recipientId = recipient.id;
-        externalAccountId = recipient.id;
-      }
-
-      // Auto-determine primary: only make primary if no existing primary method
-      const existingMethods = await storage.getCompanyPaymentMethods(profile.id);
-      const hasPrimary = existingMethods.some(m => m.isPrimary);
-      const isPrimary = !hasPrimary;
-
-      // Store as payment method
-      const paymentMethod = await storage.createCompanyPaymentMethod({
-        profileId: profile.id,
-        type: "ach",
-        lastFour,
-        bankName: bankName || "Bank Account",
-        mercuryRecipientId: recipientId,
-        mercuryExternalAccountId: externalAccountId,
-        routingNumber,
-        accountNumber: lastFour,
-        isPrimary,
-        isVerified: false, // Will be verified via Mercury Bank
-      });
-
-      // If primary, update profile with Mercury references
-      if (isPrimary) {
-        await storage.updateProfile(profile.id, {
-          mercuryRecipientId: recipientId,
-          mercuryExternalAccountId: externalAccountId,
-          mercuryBankVerified: false,
-        });
-      }
-
-      res.json({ paymentMethod, success: true });
-    } catch (err: any) {
-      console.error("Add payment method error:", err);
-      res.status(500).json({ message: err.message });
-    }
   });
 
   // Set a payment method as primary
@@ -14682,7 +14731,7 @@ Respond ONLY in this exact JSON format:
       // Set this one as primary
       await storage.updateCompanyPaymentMethod(methodId, { isPrimary: true });
 
-      const verified = method.type === "card" || (method.type === "ach" && (method.isVerified ?? method.is_verified));
+      const verified = method.type === "card" || (method.type === "ach" && !!method.isVerified);
       // Update profile with primary counterparty and cached payment method (for popup logic without fetching)
       await storage.updateProfile(profile.id, {
         mercuryRecipientId: method.mercuryRecipientId,
@@ -14860,7 +14909,7 @@ Respond ONLY in this exact JSON format:
         if (remainingMethods.length > 0) {
           const newPrimary = remainingMethods[0];
           await storage.updateCompanyPaymentMethod(newPrimary.id, { isPrimary: true });
-          const verified = newPrimary.type === "card" || (newPrimary.type === "ach" && (newPrimary.isVerified ?? newPrimary.is_verified));
+          const verified = newPrimary.type === "card" || (newPrimary.type === "ach" && !!newPrimary.isVerified);
           await storage.updateProfile(profile.id, {
             mercuryRecipientId: newPrimary.mercuryRecipientId,
             mercuryExternalAccountId: newPrimary.mercuryExternalAccountId,
@@ -15962,105 +16011,6 @@ Respond ONLY in this exact JSON format:
     return res.status(400).json({
       message: "Company payment methods for funding are added via Stripe (card or bank). Mercury-linked accounts are only for workers who need to get paid.",
     });
-
-    const { routingNumber: providedRoutingNumber, accountNumber, accountType, bankName } = req.body;
-    console.log("Link bank request:", { routingNumber: providedRoutingNumber, accountType, bankName, hasAccountNumber: !!accountNumber });
-
-    if (!providedRoutingNumber || !accountNumber || !accountType) {
-      return res.status(400).json({ message: "Missing required bank account details" });
-    }
-
-    // Validate routing number format (9 digits)
-    if (!/^\d{9}$/.test(providedRoutingNumber)) {
-      return res.status(400).json({ message: "Routing number must be exactly 9 digits" });
-    }
-
-    try {
-      const { mercuryService } = await import("./services/mercury");
-      const lastFour = accountNumber.slice(-4);
-      const normalizedAccountType = accountType.toLowerCase() as "checking" | "savings";
-      
-      // In sandbox/development mode, use a valid test routing number that MT accepts for ACH
-      // This ensures ACH debit operations work correctly in sandbox testing
-      const isDev = process.env.NODE_ENV === "development";
-      const routingNumber = isDev ? "021000021" : providedRoutingNumber; // Chase routing number works in MT sandbox
-      
-      if (isDev && providedRoutingNumber !== "021000021") {
-        console.log(`Sandbox mode: Using test routing number 021000021 instead of ${providedRoutingNumber}`);
-      }
-      
-      let counterpartyId = profile.mercuryRecipientId;
-      let externalAccountId = null;
-      
-      if (!counterpartyId) {
-        // Create new recipient for this company
-        console.log("Creating new Mercury recipient for company:", profile.id);
-        const recipient = await mercuryService.createRecipient({
-          name: profile.companyName || `${profile.firstName} ${profile.lastName}`,
-          email: profile.email || "",
-          accountType: normalizedAccountType,
-          routingNumber,
-          accountNumber,
-          note: `Company profile ${profile.id}`,
-        });
-        counterpartyId = recipient.id;
-        externalAccountId = recipient.id; // Mercury uses recipient ID as account reference
-        console.log("Created recipient:", counterpartyId);
-      } else {
-        // Recipient already exists - create additional recipient for new bank account
-        console.log("Creating additional recipient for company:", counterpartyId);
-        const recipient = await mercuryService.createRecipient({
-          name: profile.companyName || `${profile.firstName} ${profile.lastName}`,
-          email: profile.email || "",
-          accountType: normalizedAccountType,
-          routingNumber,
-          accountNumber,
-          note: `Additional account for company profile ${profile.id}`,
-        });
-        counterpartyId = recipient.id;
-        externalAccountId = recipient.id;
-        console.log("Created additional recipient:", counterpartyId);
-      }
-
-      // Update profile with Mercury IDs
-      await storage.updateProfile(profile.id, {
-        mercuryRecipientId: counterpartyId,
-        mercuryExternalAccountId: externalAccountId,
-        bankAccountLinked: true,
-      });
-
-      // Unset any existing primary payment methods
-      const existingMethods = await storage.getCompanyPaymentMethods(profile.id);
-      for (const m of existingMethods) {
-        if (m.isPrimary) {
-          await storage.updateCompanyPaymentMethod(m.id, { isPrimary: false });
-        }
-      }
-      
-      // Create new payment method record as primary
-      await storage.createCompanyPaymentMethod({
-        profileId: profile.id,
-        type: "ach",
-        lastFour,
-        bankName: bankName || "Bank Account",
-        mercuryRecipientId: counterpartyId,
-        mercuryExternalAccountId: externalAccountId,
-        accountNumber: lastFour,
-        isPrimary: true,
-      });
-
-      console.log("Bank account linked successfully for company:", profile.id);
-      res.json({
-        success: true,
-        counterpartyId,
-        externalAccountId,
-        lastFour,
-        message: "Bank account linked for ACH payments",
-      });
-    } catch (err: any) {
-      console.error("Company bank link error:", err.message, err.stack);
-      res.status(500).json({ message: err.message || "Failed to link bank account" });
-    }
   });
 
   // Fund company balance — Stripe only. We do NOT use Mercury for companies; Mercury is for worker payouts only.
@@ -16639,7 +16589,7 @@ Respond ONLY in this exact JSON format:
       if (pmStatus === "verified") {
         const methods = await storage.getCompanyPaymentMethods(profile.id);
         const ourMethod = methods.find((m: any) => (m.stripePaymentMethodId ?? m.stripe_payment_method_id) === stripePaymentMethodId);
-        if (ourMethod && !(ourMethod.isVerified ?? ourMethod.is_verified)) {
+        if (ourMethod && !ourMethod.isVerified) {
           await storage.updateCompanyPaymentMethod(ourMethod.id, { isVerified: true });
         }
         return res.status(200).json({ alreadyVerified: true });
@@ -16661,7 +16611,7 @@ Respond ONLY in this exact JSON format:
         if (hasSucceededIntent) {
           const methods = await storage.getCompanyPaymentMethods(profile.id);
           const ourMethod = methods.find((m: any) => (m.stripePaymentMethodId ?? m.stripe_payment_method_id) === stripePaymentMethodId);
-          if (ourMethod && !(ourMethod.isVerified ?? ourMethod.is_verified)) {
+          if (ourMethod && !ourMethod.isVerified) {
             await storage.updateCompanyPaymentMethod(ourMethod.id, { isVerified: true });
           }
           return res.status(200).json({ alreadyVerified: true });
@@ -17018,11 +16968,12 @@ Respond ONLY in this exact JSON format:
       if (!paymentIntentId || !stripePaymentMethodId) {
         return res.status(400).json({ message: "Payment intent ID and Stripe payment method ID required" });
       }
-    
+
+      let authorizedMethod: { id: number } | undefined;
     try {
       // SECURITY: Verify that the stripePaymentMethodId belongs to this company
       const existingMethods = await storage.getCompanyPaymentMethods(profile.id);
-      const authorizedMethod = existingMethods.find((m: any) =>
+      authorizedMethod = existingMethods.find((m: any) =>
         (m.stripePaymentMethodId ?? m.stripe_payment_method_id) === stripePaymentMethodId
       );
       

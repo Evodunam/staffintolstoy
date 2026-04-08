@@ -79,7 +79,7 @@ export function AccountDocumentsContent({ embedded = false, initialTab }: { embe
   });
 
   // When W-9 tab shows "W-9 on File", trigger server-side release of pending payouts and refresh banner data
-  const w9OnFile = !!(w9Status?.attached || (profile as { w9UploadedAt?: string })?.w9UploadedAt);
+  const w9OnFile = !!(w9Status?.attached || (profile as unknown as { w9UploadedAt?: string })?.w9UploadedAt);
   useEffect(() => {
     if (activeTab !== "w9" || !profile?.id || profile?.role !== "worker" || !w9OnFile) return;
     const run = async () => {
@@ -430,7 +430,7 @@ export function AccountDocumentsContent({ embedded = false, initialTab }: { embe
                     Go to Payout Settings
                   </Button>
                 </div>
-              ) : (w9Status?.attached || (profile as { w9UploadedAt?: string })?.w9UploadedAt) ? (
+              ) : (w9Status?.attached || (profile as unknown as { w9UploadedAt?: string })?.w9UploadedAt) ? (
                 <div className="flex items-center gap-3 p-4 bg-green-50 dark:bg-green-950/20 rounded-lg border border-green-200 dark:border-green-800">
                   <CheckCircle2 className="w-5 h-5 text-green-600" />
                   <div className="flex-1">

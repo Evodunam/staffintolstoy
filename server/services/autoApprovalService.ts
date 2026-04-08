@@ -63,7 +63,7 @@ export async function processAutoApprovals(): Promise<{ processed: number; paid:
           autoApprovedAt: new Date(),
           companyNotes: 'Auto-approved after 48 hours',
           totalPay,
-          adjustedHours: hoursWorked,
+          adjustedHours: String(hoursWorked),
         });
         approvedCount++;
         
