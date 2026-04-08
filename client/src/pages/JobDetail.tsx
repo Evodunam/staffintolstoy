@@ -12,6 +12,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { useState } from "react";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
 import { useTranslation } from "react-i18next";
+import { workerFacingJobHourlyCents } from "@shared/platformPayPolicy";
 
 function formatDateFriendly(dateString: string | Date): string {
   if (!dateString) return "";
@@ -80,6 +81,9 @@ export default function JobDetail() {
     );
   }
 
+  const wfJob = workerFacingJobHourlyCents(job.hourlyRate);
+  const workerDisplayHourly = wfJob > 0 ? wfJob / 100 : job.hourlyRate / 100;
+
   return (
     <div className="min-h-screen bg-background pb-20">
       <Navigation />
@@ -104,7 +108,7 @@ export default function JobDetail() {
               </div>
               
               <div className="text-right">
-                <div className="text-2xl font-bold mb-1">${(job.hourlyRate / 100).toFixed(2)}<span className="text-base font-normal text-muted-foreground">/hr</span></div>
+                <div className="text-2xl font-bold mb-1">${workerDisplayHourly.toFixed(2)}<span className="text-base font-normal text-muted-foreground">/hr</span></div>
                 <div className="text-sm text-muted-foreground">{t("approxHours", { hours: job.estimatedHours })}</div>
               </div>
             </div>

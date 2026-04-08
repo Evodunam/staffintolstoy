@@ -28,6 +28,7 @@ import {
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import { stripPhonesAndEmails } from "@/lib/utils";
 import type { Job, Profile, JobMessage } from "@shared/schema";
+import { workerFacingJobHourlyCents } from "@shared/platformPayPolicy";
 
 interface AcceptedJobPopupProps {
   open: boolean;
@@ -158,7 +159,11 @@ export function AcceptedJobPopup({
     }
   };
 
-  const hourlyRate = job.hourlyRate ? (job.hourlyRate / 100).toFixed(0) : null;
+  const wfAccepted = workerFacingJobHourlyCents(job.hourlyRate);
+  const hourlyRate =
+    job.hourlyRate != null
+      ? ((wfAccepted > 0 ? wfAccepted : job.hourlyRate) / 100).toFixed(0)
+      : null;
 
   const JobDetailsSection = () => (
     <div className="space-y-4">

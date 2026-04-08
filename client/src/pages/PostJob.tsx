@@ -1,6 +1,6 @@
 import { useState, useEffect, useMemo, useRef, useCallback } from "react";
 import { useAuth } from "@/hooks/use-auth";
-import { useProfile, profileMeQueryKey } from "@/hooks/use-profiles";
+import { useProfile } from "@/hooks/use-profiles";
 import { useLocation } from "wouter";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { queryClient, apiRequest } from "@/lib/queryClient";
@@ -17,13 +17,13 @@ import { Navigation } from "@/components/Navigation";
 import { AnimatedNavigationTabs } from "@/components/ui/animated-navigation-tabs";
 import { useToast } from "@/hooks/use-toast";
 import { Badge } from "@/components/ui/badge";
-import { Checkbox } from "@/components/ui/checkbox";
 import confetti from "canvas-confetti";
 import type { CompanyLocation } from "@shared/schema";
 import { 
   Loader2, ArrowRight, ArrowLeft, MapPin, Plus, Minus, Check, 
   AlertCircle, Sparkles, DollarSign, Image as ImageIcon, Video, Trash2,
-  Briefcase, Calendar, X, Mic, Users, User, CreditCard, Building2, Phone, Mail, Send
+  Briefcase, Calendar, X, Mic, Users, User, CreditCard, Building2, Phone, Mail, Send, Star,
+  ShieldCheck,
 } from "lucide-react";
 import { Separator } from "@/components/ui/separator";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
@@ -33,9 +33,14 @@ import { HardHat, Wrench, Hammer, Zap, ChevronDown, ChevronRight } from "lucide-
 import { INDUSTRY_CATEGORIES, getAllRoles, type IndustryRole } from "@shared/industries";
 import {
   computeBillableWorkerHours,
+  hoursBetweenTimes,
   minimumLaborBudgetCentsForWorkerHours,
 } from "@shared/postJobBillableHours";
-import { PLATFORM_MIN_BILLABLE_HOURLY_USD } from "@shared/platformPayPolicy";
+import { PLATFORM_MIN_JOB_BUDGET_HOURLY_USD } from "@shared/platformPayPolicy";
+import {
+  computeAppliedSuggestedBudgetUsd,
+  suggestPlanningHourlyUsd,
+} from "@shared/suggestedBudgetPlanning";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Calendar as DateCalendar } from "@/components/ui/calendar";
 import { GooglePlacesAutocomplete } from "@/components/GooglePlacesAutocomplete";
@@ -51,9 +56,15 @@ import {
   getStoredDraft,
   type PostJobDraft,
 } from "@/hooks/use-post-job-draft";
+import {
+  isSubstantivePostJobFormState,
+  isSubstantiveStoredDraft,
+  isDraftLocationAllowedForVisibleLocations,
+} from "@/lib/post-job-draft";
 
 // Use shared industries for all skill categories
 const allSkillCategories = getAllRoles();
+const ROLE_LABEL_BY_ID = new Map(allSkillCategories.map((r) => [r.id, r.label]));
 
 // Keywords for sophisticated skillset matching from description
 const SKILLSET_KEYWORDS: Record<string, string[]> = {
@@ -100,7 +111,6 @@ const SKILLSET_KEYWORDS: Record<string, string[]> = {
 const TOTAL_STEPS = 4;
 
 type ShiftType = "on-demand" | "one-day" | "recurring" | "monthly";
-type AutoFulfillBudgetWindow = "one_day" | "weekly" | "monthly" | "custom";
 
 const SHIFT_TYPE_INFO: Record<ShiftType, { title: string; description: string; recommended?: boolean }> = {
   "on-demand": {
@@ -125,9 +135,8 @@ const SHIFT_TYPE_INFO: Record<ShiftType, { title: string; description: string; r
 const DAYS_OF_WEEK = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"];
 
 const baseHourlyRate = 25;
-const HOURLY_MARKUP = 13;
-/** Rate used for estimate displays only ($40/hr). Do not show actual $ figure. */
-const ESTIMATE_DISPLAY_RATE = 40;
+/** Suggested total budget when entering step 3: schedule floor + 10% (whole dollars). */
+const POST_JOB_BUDGET_DEFAULT_BUFFER = 1.1;
 
 interface Location {
   id?: number;
@@ -577,26 +586,7 @@ export default function PostJob() {
 
   const [jobBudgetDollars, setJobBudgetDollars] = useState<number | null>(null);
   const [autoFulfillEnabled, setAutoFulfillEnabled] = useState(false);
-  const [autoFulfillLaborBudgetDollars, setAutoFulfillLaborBudgetDollars] = useState<number | null>(null);
-  const [autoFulfillBudgetWindow, setAutoFulfillBudgetWindow] = useState<AutoFulfillBudgetWindow>("one_day");
-  const [autoFulfillCustomStart, setAutoFulfillCustomStart] = useState("");
-  const [autoFulfillCustomEnd, setAutoFulfillCustomEnd] = useState("");
-  const [autoFulfillExpectedHoursOverride, setAutoFulfillExpectedHoursOverride] = useState("");
-  const [autoFulfillMinRating, setAutoFulfillMinRating] = useState("");
-  const [autoFulfillMinReviews, setAutoFulfillMinReviews] = useState(1);
-  const [autoFulfillMaxHourlyDollars, setAutoFulfillMaxHourlyDollars] = useState("");
-  const [autoFulfillMinHourlyDollars, setAutoFulfillMinHourlyDollars] = useState("");
-  const [autoFulfillTermsAck, setAutoFulfillTermsAck] = useState(false);
-  const [saveAfDefaults, setSaveAfDefaults] = useState(false);
-
-  const prevWizardStepRef = useRef(step);
-  useEffect(() => {
-    if (prevWizardStepRef.current === 2 && step === 3) {
-      setJobBudgetDollars((prev) => (prev == null && onDemandBudget != null ? onDemandBudget : prev));
-      setAutoFulfillLaborBudgetDollars((prev) => (prev == null && onDemandBudget != null ? onDemandBudget : prev));
-    }
-    prevWizardStepRef.current = step;
-  }, [step, onDemandBudget]);
+  const [autoFulfillMinWorkerStars, setAutoFulfillMinWorkerStars] = useState(1);
 
   const getTomorrowStr = () => {
     const d = new Date();
@@ -804,17 +794,7 @@ export default function PostJob() {
       newLocation: { ...newLocation, address2: newLocation.address2 || "" },
       jobBudgetDollars,
       autoFulfillEnabled,
-      autoFulfillLaborBudgetDollars,
-      autoFulfillBudgetWindow,
-      autoFulfillCustomStart,
-      autoFulfillCustomEnd,
-      autoFulfillExpectedHoursOverride,
-      autoFulfillMinRating,
-      autoFulfillMinReviews,
-      autoFulfillMaxHourlyDollars,
-      autoFulfillMinHourlyDollars,
-      autoFulfillTermsAck,
-      saveAfDefaults,
+      autoFulfillMinWorkerStars,
       version: 2,
     }),
     [
@@ -824,10 +804,7 @@ export default function PostJob() {
       onDemandDoneByDate, onDemandStartTime, onDemandFormStep, oneDayFormStep, recurringFormStep, monthlyFormStep, oneDaySchedule, recurringSchedule, monthlySchedule,
       showSchedulePopup, datePickerFor, showLocationPopup, editingLocationId, addLocationStep,
       showCustomContactPopup, showAddTeamMemberPopup, newLocation,
-      jobBudgetDollars, autoFulfillEnabled, autoFulfillLaborBudgetDollars, autoFulfillBudgetWindow,
-      autoFulfillCustomStart, autoFulfillCustomEnd, autoFulfillExpectedHoursOverride,
-      autoFulfillMinRating, autoFulfillMinReviews, autoFulfillMaxHourlyDollars, autoFulfillMinHourlyDollars,
-      autoFulfillTermsAck, saveAfDefaults,
+      jobBudgetDollars, autoFulfillEnabled, autoFulfillMinWorkerStars,
     ]
   );
 
@@ -888,19 +865,22 @@ export default function PostJob() {
         }));
         return restored.length > 0 ? restored : prev;
       });
-      setJobBudgetDollars(d.jobBudgetDollars ?? null);
+      setJobBudgetDollars(
+        d.jobBudgetDollars ??
+          (typeof d.autoFulfillLaborBudgetDollars === "number" ? d.autoFulfillLaborBudgetDollars : null) ??
+          null
+      );
       setAutoFulfillEnabled(d.autoFulfillEnabled ?? false);
-      setAutoFulfillLaborBudgetDollars(d.autoFulfillLaborBudgetDollars ?? null);
-      if (d.autoFulfillBudgetWindow) setAutoFulfillBudgetWindow(d.autoFulfillBudgetWindow);
-      setAutoFulfillCustomStart(d.autoFulfillCustomStart ?? "");
-      setAutoFulfillCustomEnd(d.autoFulfillCustomEnd ?? "");
-      setAutoFulfillExpectedHoursOverride(d.autoFulfillExpectedHoursOverride ?? "");
-      setAutoFulfillMinRating(d.autoFulfillMinRating ?? "");
-      setAutoFulfillMinReviews(d.autoFulfillMinReviews ?? 1);
-      setAutoFulfillMaxHourlyDollars(d.autoFulfillMaxHourlyDollars ?? "");
-      setAutoFulfillMinHourlyDollars(d.autoFulfillMinHourlyDollars ?? "");
-      setAutoFulfillTermsAck(d.autoFulfillTermsAck ?? false);
-      setSaveAfDefaults(d.saveAfDefaults ?? false);
+      {
+        let stars = 1;
+        if (typeof d.autoFulfillMinWorkerStars === "number" && d.autoFulfillMinWorkerStars >= 1 && d.autoFulfillMinWorkerStars <= 5) {
+          stars = Math.round(d.autoFulfillMinWorkerStars);
+        } else if (d.autoFulfillMinRating != null && String(d.autoFulfillMinRating).trim() !== "") {
+          const n = parseFloat(String(d.autoFulfillMinRating));
+          if (Number.isFinite(n)) stars = Math.min(5, Math.max(1, Math.round(n)));
+        }
+        setAutoFulfillMinWorkerStars(stars);
+      }
     },
     []
   );
@@ -913,7 +893,63 @@ export default function PostJob() {
     onRestore: onRestoreDraft,
   });
 
-  const hasDraft = !!getStoredDraft(profile?.id);
+  const showResumeDraftBanner = useMemo(() => {
+    if (isNewJob || isDirectRequest || step !== 1) return false;
+    if (!profile || profile.role !== "company") return false;
+    if (locationsLoading) return false;
+    const stored = profile.id != null ? getStoredDraft(profile.id) : null;
+    const substantive =
+      isSubstantivePostJobFormState({
+        step,
+        jobDescription,
+        selectedSkillsets,
+        companyJobTitle,
+        selectedLocationId,
+        mediaCount: mediaPreviews.length,
+        shiftType,
+      }) || isSubstantiveStoredDraft(stored);
+    if (!substantive) return false;
+    const visibleIds = new Set(
+      companyLocations.map((l) => l.id).filter((id): id is number => id != null && Number.isFinite(id))
+    );
+    const locationForAccess = selectedLocationId ?? stored?.selectedLocationId ?? null;
+    if (!isDraftLocationAllowedForVisibleLocations(locationForAccess, visibleIds)) return false;
+    return true;
+  }, [
+    isNewJob,
+    isDirectRequest,
+    step,
+    profile,
+    locationsLoading,
+    companyLocations,
+    jobDescription,
+    selectedSkillsets,
+    companyJobTitle,
+    selectedLocationId,
+    mediaPreviews.length,
+    shiftType,
+  ]);
+
+  const resumeBannerTitleText = useMemo(() => {
+    const t = companyJobTitle.trim() || aiGeneratedTitle?.trim();
+    if (t) return t.length > 48 ? `${t.slice(0, 46)}…` : t;
+    const d = jobDescription.trim();
+    if (d.length > 0) {
+      const one = d.split(/\s+/).slice(0, 8).join(" ");
+      return one.length > 48 ? `${one.slice(0, 46)}…` : one;
+    }
+    return null;
+  }, [companyJobTitle, aiGeneratedTitle, jobDescription]);
+
+  const resumeBannerLocationLabel = useMemo(() => {
+    if (selectedLocationId == null) return null;
+    const loc = companyLocations.find((l) => l.id === selectedLocationId);
+    if (!loc) return `Location #${selectedLocationId}`;
+    const name = (loc.name || "").trim();
+    const cityState = [loc.city, loc.state].filter(Boolean).join(", ");
+    if (name && cityState) return `${name} · ${cityState}`;
+    return name || cityState || `Location #${selectedLocationId}`;
+  }, [selectedLocationId, companyLocations]);
 
   const handleStartNewJob = useCallback(() => {
     clearStoredDraft(profile?.id);
@@ -933,16 +969,7 @@ export default function PostJob() {
     setOnDemandBudget(null);
     setJobBudgetDollars(null);
     setAutoFulfillEnabled(false);
-    setAutoFulfillLaborBudgetDollars(null);
-    setAutoFulfillBudgetWindow("one_day");
-    setAutoFulfillCustomStart("");
-    setAutoFulfillCustomEnd("");
-    setAutoFulfillExpectedHoursOverride("");
-    setAutoFulfillMinRating("");
-    setAutoFulfillMinReviews(1);
-    setAutoFulfillMaxHourlyDollars("");
-    setAutoFulfillMinHourlyDollars("");
-    setAutoFulfillTermsAck(false);
+    setAutoFulfillMinWorkerStars(1);
     setSaveAfDefaults(false);
     setOnDemandDate(getTomorrowStr());
     setOnDemandDoneByDate("");
@@ -1231,17 +1258,6 @@ export default function PostJob() {
     return days * ON_DEMAND_EST_HOURS_PER_DAY * ON_DEMAND_EST_HOURLY * workersNeeded;
   })();
 
-  const calculateEstimatedCost = () => {
-    if (shiftType === "on-demand") return null;
-    return billableScheduleHours * ESTIMATE_DISPLAY_RATE;
-  };
-
-  const effectiveEstimatedHoursForAutoFulfill = useMemo(() => {
-    const o = parseFloat(autoFulfillExpectedHoursOverride);
-    if (Number.isFinite(o) && o > 0) return o;
-    return billableScheduleHours;
-  }, [autoFulfillExpectedHoursOverride, billableScheduleHours]);
-
   const minimumJobBudgetUsd = useMemo(
     () =>
       billableScheduleHours > 0
@@ -1250,65 +1266,142 @@ export default function PostJob() {
     [billableScheduleHours]
   );
 
-  const minimumAfLaborBudgetUsd = useMemo(
+  const planningRateBand = useMemo(
     () =>
-      effectiveEstimatedHoursForAutoFulfill > 0
-        ? minimumLaborBudgetCentsForWorkerHours(effectiveEstimatedHoursForAutoFulfill) / 100
-        : 0,
-    [effectiveEstimatedHoursForAutoFulfill]
+      suggestPlanningHourlyUsd({
+        selectedRoleIds: selectedSkillsets,
+        location: { state: selectedLocation?.state, city: selectedLocation?.city },
+      }),
+    [selectedSkillsets, selectedLocation?.state, selectedLocation?.city]
   );
 
+  const selectedRoleLabels = useMemo(
+    () => selectedSkillsets.map((id) => ROLE_LABEL_BY_ID.get(id) ?? id),
+    [selectedSkillsets]
+  );
+
+  const appliedSuggestedBudgetUsd = useMemo(
+    () =>
+      computeAppliedSuggestedBudgetUsd({
+        planningMidHourlyUsd: planningRateBand.mid,
+        billableWorkerHours: billableScheduleHours,
+        buffer: POST_JOB_BUDGET_DEFAULT_BUFFER,
+        minimumTotalUsd: minimumJobBudgetUsd,
+      }),
+    [planningRateBand.mid, billableScheduleHours, minimumJobBudgetUsd]
+  );
+
+  /** Rich copy for step-3 “Budget vs. your schedule” (workers, calendar pattern, long-run framing). */
+  const scheduleBudgetExplainer = useMemo(() => {
+    if (!shiftType || billableScheduleHours <= 0) return null;
+    const workers = Math.max(1, workersNeeded);
+    let hoursPerShift = 0;
+    if (shiftType === "recurring") {
+      hoursPerShift = hoursBetweenTimes(recurringSchedule.startTime, recurringSchedule.endTime);
+    } else if (shiftType === "monthly") {
+      hoursPerShift = hoursBetweenTimes(monthlySchedule.startTime, monthlySchedule.endTime);
+    } else if (shiftType === "one-day") {
+      hoursPerShift = hoursBetweenTimes(oneDaySchedule.startTime, oneDaySchedule.endTime);
+    } else {
+      hoursPerShift = 8;
+    }
+    if (!Number.isFinite(hoursPerShift) || hoursPerShift <= 0) hoursPerShift = 8;
+    const hRounded = Math.round(hoursPerShift * 10) / 10;
+
+    type Pattern =
+      | { kind: "recurring"; daysPerWeek: number; weeks: number; shiftsPerWorker: number }
+      | { kind: "monthly"; daysPerMonth: number; months: number; shiftsPerWorker: number }
+      | { kind: "one-day" }
+      | { kind: "on-demand"; calendarDays: number }
+      | { kind: "none" };
+
+    let pattern: Pattern = { kind: "none" };
+    if (shiftType === "recurring" && recurringSchedule.days.length > 0 && recurringSchedule.weeks >= 1) {
+      const daysPerWeek = recurringSchedule.days.length;
+      const weeks = recurringSchedule.weeks;
+      pattern = {
+        kind: "recurring",
+        daysPerWeek,
+        weeks,
+        shiftsPerWorker: daysPerWeek * weeks,
+      };
+    } else if (shiftType === "monthly" && monthlySchedule.days.length > 0 && monthlyMonthsCount >= 1) {
+      const daysPerMonth = monthlySchedule.days.length;
+      const months = monthlyMonthsCount;
+      pattern = {
+        kind: "monthly",
+        daysPerMonth,
+        months,
+        shiftsPerWorker: daysPerMonth * months,
+      };
+    } else if (shiftType === "one-day") {
+      pattern = { kind: "one-day" };
+    } else if (shiftType === "on-demand" && onDemandDate && onDemandDoneByDate) {
+      const start = parseLocalDate(onDemandDate);
+      const end = parseLocalDate(onDemandDoneByDate);
+      if (end >= start) {
+        const calendarDays = Math.ceil((end.getTime() - start.getTime()) / 86400000) + 1;
+        pattern = { kind: "on-demand", calendarDays };
+      }
+    }
+
+    let scope: "long" | "mid" | null = null;
+    if (shiftType === "monthly") {
+      if (monthlyMonthsCount >= 4) scope = "long";
+      else if (monthlyMonthsCount >= 2) scope = "mid";
+    } else if (shiftType === "recurring") {
+      if (recurringSchedule.weeks >= 16) scope = "long";
+      else if (recurringSchedule.weeks >= 6) scope = "mid";
+    }
+
+    return { workers, hoursPerShift: hRounded, pattern, scope };
+  }, [
+    shiftType,
+    billableScheduleHours,
+    workersNeeded,
+    recurringSchedule.startTime,
+    recurringSchedule.endTime,
+    recurringSchedule.days.length,
+    recurringSchedule.weeks,
+    monthlySchedule.startTime,
+    monthlySchedule.endTime,
+    monthlySchedule.days.length,
+    monthlyMonthsCount,
+    oneDaySchedule.startTime,
+    oneDaySchedule.endTime,
+    onDemandDate,
+    onDemandDoneByDate,
+  ]);
+
+  useEffect(() => {
+    if (step !== 3 || isDirectRequest) return;
+    setJobBudgetDollars((prev) => {
+      if (prev != null && prev > 0) return prev;
+      if (onDemandBudget != null && onDemandBudget > 0) return onDemandBudget;
+      if (minimumJobBudgetUsd > 0) {
+        return Math.ceil(minimumJobBudgetUsd * POST_JOB_BUDGET_DEFAULT_BUFFER);
+      }
+      return prev;
+    });
+  }, [step, isDirectRequest, onDemandBudget, minimumJobBudgetUsd]);
+
   const validateBudgetStep = (): string | null => {
+    if (!isDirectRequest) {
+      if (jobBudgetDollars == null || jobBudgetDollars <= 0) {
+        return "Enter a total budget (USD).";
+      }
+    }
     if (billableScheduleHours > 0 && jobBudgetDollars != null && jobBudgetDollars > 0) {
       const minCents = minimumLaborBudgetCentsForWorkerHours(billableScheduleHours);
       if (jobBudgetDollars * 100 < minCents - 0.5) {
-        return `Your schedule is about ${Math.round(billableScheduleHours * 10) / 10} total worker-hours. At $${PLATFORM_MIN_BILLABLE_HOURLY_USD}/hr, plan at least $${(minCents / 100).toFixed(2)} for this posting.`;
+        return `Your schedule is about ${Math.round(billableScheduleHours * 10) / 10} total worker-hours. At $${PLATFORM_MIN_JOB_BUDGET_HOURLY_USD}/hr minimum for your budget, plan at least $${(minCents / 100).toFixed(2)} for this posting.`;
       }
     }
-
-    if (!autoFulfillEnabled || isDirectRequest) return null;
-    const labor = autoFulfillLaborBudgetDollars;
-    if (labor == null || labor <= 0) return "Enter a labor budget for the auto-fulfill window.";
-    if (
-      effectiveEstimatedHoursForAutoFulfill > 0 &&
-      minimumLaborBudgetCentsForWorkerHours(effectiveEstimatedHoursForAutoFulfill) > 0
-    ) {
-      const minAfCents = minimumLaborBudgetCentsForWorkerHours(effectiveEstimatedHoursForAutoFulfill);
-      if (labor * 100 < minAfCents - 0.5) {
-        return `Labor budget must be at least $${(minAfCents / 100).toFixed(2)} for ~${Math.round(effectiveEstimatedHoursForAutoFulfill * 10) / 10} worker-hours at $${PLATFORM_MIN_BILLABLE_HOURLY_USD}/hr.`;
+    if (autoFulfillEnabled && !isDirectRequest) {
+      if (billableScheduleHours <= 0 || !Number.isFinite(billableScheduleHours)) {
+        return "Complete your schedule before using auto-fulfill.";
       }
     }
-    if (autoFulfillBudgetWindow === "custom") {
-      if (!autoFulfillCustomStart.trim() || !autoFulfillCustomEnd.trim()) {
-        return "Select start and end dates for your custom budget window.";
-      }
-      if (parseLocalDate(autoFulfillCustomEnd) < parseLocalDate(autoFulfillCustomStart)) {
-        return "Budget window end must be on or after the start date.";
-      }
-    }
-    const maxD = parseFloat(autoFulfillMaxHourlyDollars);
-    const hasMax = Number.isFinite(maxD) && maxD > 0;
-    const effH = effectiveEstimatedHoursForAutoFulfill;
-    if (!hasMax && (!Number.isFinite(effH) || effH <= 0)) {
-      return "Add expected hours or a max hourly rate so we can enforce pay limits.";
-    }
-    const minHr = parseFloat(autoFulfillMinHourlyDollars);
-    if (
-      autoFulfillMinHourlyDollars.trim() !== "" &&
-      Number.isFinite(minHr) &&
-      minHr > 0 &&
-      minHr < PLATFORM_MIN_BILLABLE_HOURLY_USD
-    ) {
-      return `Minimum hourly can't be below $${PLATFORM_MIN_BILLABLE_HOURLY_USD}/hr.`;
-    }
-    if (hasMax && maxD < PLATFORM_MIN_BILLABLE_HOURLY_USD) {
-      return `Max hourly can't be below $${PLATFORM_MIN_BILLABLE_HOURLY_USD}/hr.`;
-    }
-    const minR = parseFloat(autoFulfillMinRating);
-    if (autoFulfillMinRating.trim() !== "" && (!Number.isFinite(minR) || minR < 0 || minR > 5)) {
-      return "Minimum rating must be between 0 and 5.";
-    }
-    if (!autoFulfillTermsAck) return "Confirm the Auto-fulfill terms to continue.";
     return null;
   };
 
@@ -1540,46 +1633,15 @@ export default function PostJob() {
         .map(m => m.permanentUrl);
 
       const budgetDollarsCombined = jobBudgetDollars ?? onDemandBudget;
-      const maxHourlyCents =
-        autoFulfillMaxHourlyDollars.trim() !== "" &&
-        Number.isFinite(parseFloat(autoFulfillMaxHourlyDollars)) &&
-        parseFloat(autoFulfillMaxHourlyDollars) > 0
-          ? Math.round(parseFloat(autoFulfillMaxHourlyDollars) * 100)
-          : undefined;
-      const minHourlyCents =
-        autoFulfillMinHourlyDollars.trim() !== "" &&
-        Number.isFinite(parseFloat(autoFulfillMinHourlyDollars)) &&
-        parseFloat(autoFulfillMinHourlyDollars) > 0
-          ? Math.round(parseFloat(autoFulfillMinHourlyDollars) * 100)
-          : undefined;
-      const expHoursOverride = parseFloat(autoFulfillExpectedHoursOverride);
-      const autoFulfillExpectedHoursStr =
-        Number.isFinite(expHoursOverride) && expHoursOverride > 0
-          ? String(expHoursOverride)
-          : undefined;
-      const minRatingVal = parseFloat(autoFulfillMinRating);
-      const autoFulfillMinWorkerRating =
-        autoFulfillMinRating.trim() !== "" && Number.isFinite(minRatingVal) ? minRatingVal : undefined;
 
       const autoFulfillPayload =
         !isDirectRequest && autoFulfillEnabled
           ? {
               autoFulfillEnabled: true,
-              autoFulfillBudgetCents: Math.round((autoFulfillLaborBudgetDollars ?? 0) * 100),
-              autoFulfillBudgetWindow: autoFulfillBudgetWindow,
-              autoFulfillWindowStart:
-                autoFulfillBudgetWindow === "custom" && autoFulfillCustomStart.trim()
-                  ? parseLocalDate(autoFulfillCustomStart.trim()).toISOString()
-                  : undefined,
-              autoFulfillWindowEnd:
-                autoFulfillBudgetWindow === "custom" && autoFulfillCustomEnd.trim()
-                  ? parseLocalDate(autoFulfillCustomEnd.trim()).toISOString()
-                  : undefined,
-              autoFulfillExpectedHours: autoFulfillExpectedHoursStr,
-              autoFulfillMinWorkerRating,
-              autoFulfillMinWorkerReviews: autoFulfillMinReviews,
-              autoFulfillMaxHourlyCents: maxHourlyCents,
-              autoFulfillMinHourlyCents: minHourlyCents,
+              autoFulfillBudgetCents: Math.round((jobBudgetDollars ?? 0) * 100),
+              autoFulfillBudgetWindow: "one_day" as const,
+              autoFulfillMinWorkerRating: autoFulfillMinWorkerStars,
+              autoFulfillMinWorkerReviews: 0,
               autoFulfillPolicy: "first_match" as const,
             }
           : { autoFulfillEnabled: false };
@@ -1682,8 +1744,7 @@ export default function PostJob() {
         // Regular job posting (or save as draft)
         const payload = {
           ...(saveAsDraft ? { ...jobData, status: "draft" as const } : jobData),
-          autoFulfillTermsAcknowledged:
-            !isDirectRequest && autoFulfillEnabled && autoFulfillTermsAck,
+          autoFulfillTermsAcknowledged: !isDirectRequest && autoFulfillEnabled,
         };
         const response = await apiRequest("POST", "/api/jobs", payload);
         const createdJob = await response.json();
@@ -1696,23 +1757,6 @@ export default function PostJob() {
           toast({ title: t("draftSaved", "Draft saved"), description: t("draftSavedDesc", "Publish from Your Jobs when you're ready.") });
           setTimeout(() => setLocation("/company-dashboard?tab=jobs"), 1500);
         } else {
-          if (saveAfDefaults && autoFulfillEnabled && !isDirectRequest) {
-            try {
-              await apiRequest("PUT", "/api/company/auto-fulfill-defaults", {
-                defaults: {
-                  autoFulfillBudgetWindow,
-                  autoFulfillMinRating,
-                  autoFulfillMinReviews,
-                  autoFulfillMaxHourlyDollars,
-                  autoFulfillMinHourlyDollars,
-                  autoFulfillExpectedHoursOverride,
-                },
-              });
-              queryClient.invalidateQueries({ queryKey: profileMeQueryKey(user?.id) });
-            } catch {
-              /* non-fatal */
-            }
-          }
           confetti({ particleCount: 100, spread: 70, origin: { y: 0.6 } });
           toast({ title: t("jobPostedSuccessfully"), description: t("workersWillBeNotified") });
           setTimeout(() => setLocation("/company-dashboard?tab=team"), 2000);
@@ -1745,7 +1789,6 @@ export default function PostJob() {
   }
 
   const hasCompleteLocation = companyLocations.length > 0;
-  const estimatedCost = calculateEstimatedCost();
   const scheduleIsValid = isScheduleValid();
 
   const stepTitles: Record<number, string> = {
@@ -1753,13 +1796,6 @@ export default function PostJob() {
     2: "Schedule & workers",
     3: "Budget & auto-fulfill",
     4: "Review & confirm",
-  };
-
-  const afWindowLabels: Record<AutoFulfillBudgetWindow, string> = {
-    one_day: "One day",
-    weekly: "Weekly",
-    monthly: "Monthly",
-    custom: "Custom range",
   };
 
   return (
@@ -1826,6 +1862,24 @@ export default function PostJob() {
       )}
 
       <div className="flex-1 min-h-0 overflow-y-auto">
+        {step === 3 && (
+          <div
+            className="w-full border-b border-border bg-muted/30 px-4 py-3 sm:px-6 sm:py-3.5"
+            role="note"
+            aria-label="How verified on-site hours work"
+          >
+            <p className="text-sm font-medium text-foreground flex items-center gap-2">
+              <ShieldCheck className="w-4 h-4 shrink-0 text-green-600 dark:text-green-500" aria-hidden />
+              Verified on-site hours only
+            </p>
+            <p className="mt-1.5 text-sm text-muted-foreground leading-relaxed sm:text-xs">
+              What you budget here covers workers who are actually on the job and <strong>clock in</strong> through our
+              time tracking. Hours are tied to real shifts; our <strong>time-and-location services</strong> help prevent
+              time fraud — <strong>nobody is paid for hours they didn&apos;t work.</strong> Your spend stays aligned with
+              verified on-site labor.
+            </p>
+          </div>
+        )}
         <div className="max-w-2xl mx-auto px-4 py-8 pb-24 md:pb-8">
           {/* Direct Request Banner */}
           {isDirectRequest && directRequestWorkerName && (
@@ -1852,17 +1906,49 @@ export default function PostJob() {
             </div>
           )}
 
-          {hasDraft && (
-            <p className="text-sm text-muted-foreground mb-4 text-center">
-              Continuing where you left off.{" "}
-              <button
-                type="button"
-                onClick={handleStartNewJob}
-                className="text-primary hover:underline font-medium"
-              >
-                Start new job
-              </button>
-            </p>
+          {showResumeDraftBanner && (
+            <div className="mb-4 rounded-xl border border-border bg-muted/35 px-4 py-3 space-y-3">
+              <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+                <p className="text-sm font-medium text-foreground text-center sm:text-left">
+                  Continue where you left off
+                </p>
+                <button
+                  type="button"
+                  onClick={handleStartNewJob}
+                  className="text-sm text-primary hover:underline font-medium text-center sm:text-right shrink-0"
+                >
+                  Start new job
+                </button>
+              </div>
+              <div className="flex flex-wrap justify-center sm:justify-start gap-2">
+                <Badge variant="secondary" className="rounded-full font-normal">
+                  Step {step} of {TOTAL_STEPS}
+                </Badge>
+                {resumeBannerTitleText && (
+                  <Badge variant="outline" className="rounded-full font-normal max-w-full truncate">
+                    {resumeBannerTitleText}
+                  </Badge>
+                )}
+                {resumeBannerLocationLabel && (
+                  <Badge variant="outline" className="rounded-full font-normal gap-1 pl-2 pr-2.5 max-w-full">
+                    <MapPin className="h-3 w-3 shrink-0 opacity-70" aria-hidden />
+                    <span className="truncate">{resumeBannerLocationLabel}</span>
+                  </Badge>
+                )}
+                {shiftType && SHIFT_TYPE_INFO[shiftType] && (
+                  <Badge variant="outline" className="rounded-full font-normal">
+                    <Calendar className="h-3 w-3 mr-1 inline opacity-70" aria-hidden />
+                    {SHIFT_TYPE_INFO[shiftType].title}
+                  </Badge>
+                )}
+                {selectedSkillsets.length > 0 && (
+                  <Badge variant="outline" className="rounded-full font-normal max-w-[200px] truncate">
+                    {selectedSkillsets.slice(0, 2).join(", ")}
+                    {selectedSkillsets.length > 2 ? ` +${selectedSkillsets.length - 2}` : ""}
+                  </Badge>
+                )}
+              </div>
+            </div>
           )}
           {step === 1 && (
             <Card>
@@ -2576,280 +2662,277 @@ export default function PostJob() {
                 Budget &amp; hiring
               </CardTitle>
             </CardHeader>
-            <CardContent className="space-y-6">
-              {billableScheduleHours > 0 && (
-                <div className="rounded-lg border border-border bg-muted/30 p-4 space-y-2 text-sm">
-                  <p className="font-medium flex items-center gap-2">
-                    <Calendar className="w-4 h-4 shrink-0 text-muted-foreground" />
-                    Budget vs. your schedule
-                  </p>
-                  <p className="text-muted-foreground leading-relaxed">
-                    From the times you chose, we estimate about{" "}
-                    <strong>
-                      {billableScheduleHours.toLocaleString(undefined, { maximumFractionDigits: 1 })} total worker-hours
-                    </strong>{" "}
-                    (shift length × days in scope × workers). At{" "}
-                    <strong>${PLATFORM_MIN_BILLABLE_HOURLY_USD}/hr</strong> minimum, that implies roughly{" "}
-                    <strong>${minimumJobBudgetUsd.toFixed(2)}</strong> in labor before fees — budgets below that
-                    can&apos;t be posted.
-                  </p>
-                  {shiftType === "on-demand" && (
-                    <p className="text-xs text-muted-foreground">
-                      On-demand uses each calendar day from start through &ldquo;done by&rdquo; × 8 hours × workers. Tighten
-                      the date range in the schedule step if you need a smaller footprint.
+            <CardContent className="p-4 sm:p-6 pt-4 sm:pt-[21px] pb-4 sm:pb-[21px]">
+              <div className="rounded-xl border border-border p-4 space-y-5">
+                {billableScheduleHours > 0 && (
+                  <div className="space-y-2 text-sm">
+                    <p className="font-medium flex items-center gap-2">
+                      <Calendar className="w-4 h-4 shrink-0 text-muted-foreground" />
+                      Budget vs. your schedule
                     </p>
-                  )}
-                </div>
-              )}
-
-              <div className="space-y-2">
-                <Label htmlFor="job-budget-usd">Total job budget (optional)</Label>
-                <p className="text-xs text-muted-foreground">
-                  If you enter an amount, it must cover your scheduled worker-hours at ${PLATFORM_MIN_BILLABLE_HOURLY_USD}/hr
-                  minimum{minimumJobBudgetUsd > 0 ? ` (~$${minimumJobBudgetUsd.toFixed(0)}+)` : ""}.
-                </p>
-                <div className="relative">
-                  <span className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground text-sm">$</span>
-                  <Input
-                    id="job-budget-usd"
-                    type="number"
-                    min={0}
-                    step={1}
-                    placeholder={minimumJobBudgetUsd > 0 ? `e.g. ${Math.ceil(minimumJobBudgetUsd)}+` : "e.g. 1200"}
-                    className="pl-7"
-                    value={jobBudgetDollars ?? ""}
-                    onChange={(e) => {
-                      const v = e.target.value;
-                      if (v === "") setJobBudgetDollars(null);
-                      else {
-                        const n = Number(v);
-                        setJobBudgetDollars(Number.isFinite(n) ? Math.max(0, n) : null);
-                      }
-                    }}
-                    data-testid="input-job-budget"
-                  />
-                </div>
-              </div>
-
-              {!isDirectRequest && (
-                <div className="rounded-xl border border-border p-4 space-y-4">
-                  <div className="flex items-start justify-between gap-3">
-                    <div className="space-y-1 min-w-0">
-                      <div className="flex items-center gap-2">
-                        <Sparkles className="w-4 h-4 text-primary shrink-0" />
-                        <span className="font-medium">Auto-fulfill</span>
-                      </div>
-                      <p className="text-sm text-muted-foreground">
-                        Automatically accept the first qualified applicant who fits your rules (rate, rating, reviews). You agree to platform payment terms when this is on.
+                    <div
+                      className={cn(
+                        "text-muted-foreground leading-relaxed space-y-2",
+                        "[&_strong]:rounded-sm [&_strong]:bg-yellow-200/90 [&_strong]:px-0.5 [&_strong]:font-semibold [&_strong]:text-foreground [&_strong]:box-decoration-clone dark:[&_strong]:bg-yellow-500/35 dark:[&_strong]:text-foreground"
+                      )}
+                    >
+                      {scheduleBudgetExplainer && scheduleBudgetExplainer.workers > 1 && (
+                        <p>
+                          You&apos;re staffing{" "}
+                          <strong>
+                            {scheduleBudgetExplainer.workers} people on each shift
+                          </strong>{" "}
+                          (every scheduled day). We multiply shift length × days in your calendar ×{" "}
+                          <strong>{scheduleBudgetExplainer.workers}</strong> to reach total worker-hours.
+                        </p>
+                      )}
+                      {scheduleBudgetExplainer?.pattern.kind === "recurring" && (
+                        <p>
+                          Weekly calendar:{" "}
+                          <strong>{scheduleBudgetExplainer.pattern.daysPerWeek}</strong> working day
+                          {scheduleBudgetExplainer.pattern.daysPerWeek === 1 ? "" : "s"} per week ×{" "}
+                          <strong>{scheduleBudgetExplainer.pattern.weeks}</strong> week
+                          {scheduleBudgetExplainer.pattern.weeks === 1 ? "" : "s"} (~
+                          <strong>{scheduleBudgetExplainer.pattern.shiftsPerWorker}</strong> shift
+                          {scheduleBudgetExplainer.pattern.shiftsPerWorker === 1 ? "" : "s"} per worker in that window),
+                          about <strong>{scheduleBudgetExplainer.hoursPerShift}</strong> hours per shift.
+                        </p>
+                      )}
+                      {scheduleBudgetExplainer?.pattern.kind === "monthly" && (
+                        <p>
+                          Monthly calendar:{" "}
+                          <strong>{scheduleBudgetExplainer.pattern.daysPerMonth}</strong> working day
+                          {scheduleBudgetExplainer.pattern.daysPerMonth === 1 ? "" : "s"} per month across{" "}
+                          <strong>{scheduleBudgetExplainer.pattern.months}</strong> month
+                          {scheduleBudgetExplainer.pattern.months === 1 ? "" : "s"} (~
+                          <strong>{scheduleBudgetExplainer.pattern.shiftsPerWorker}</strong> shift
+                          {scheduleBudgetExplainer.pattern.shiftsPerWorker === 1 ? "" : "s"} per worker in scope), about{" "}
+                          <strong>{scheduleBudgetExplainer.hoursPerShift}</strong> hours per shift.
+                        </p>
+                      )}
+                      {scheduleBudgetExplainer?.pattern.kind === "one-day" && (
+                        <p>
+                          Single scheduled day: about <strong>{scheduleBudgetExplainer.hoursPerShift}</strong> hour
+                          {scheduleBudgetExplainer.hoursPerShift === 1 ? "" : "s"} per worker.
+                        </p>
+                      )}
+                      {scheduleBudgetExplainer?.pattern.kind === "on-demand" && (
+                        <p>
+                          On-demand window: <strong>{scheduleBudgetExplainer.pattern.calendarDays}</strong> calendar day
+                          {scheduleBudgetExplainer.pattern.calendarDays === 1 ? "" : "s"} (start through &ldquo;done
+                          by&rdquo;), estimated <strong>8</strong> hours/day ×{" "}
+                          <strong>{scheduleBudgetExplainer.workers}</strong> worker
+                          {scheduleBudgetExplainer.workers === 1 ? "" : "s"}.
+                        </p>
+                      )}
+                      {scheduleBudgetExplainer?.pattern.kind === "none" && (
+                        <p>
+                          Totals follow shift length × scheduled days in scope × workers from the prior step.
+                        </p>
+                      )}
+                      {scheduleBudgetExplainer?.scope === "long" && scheduleBudgetExplainer.pattern.kind === "monthly" && (
+                        <p>
+                          Over <strong>several months</strong> of fixed days, labor stacks up — the minimum below is for
+                          the <strong>full period</strong> you set in the calendar, not a single week.
+                        </p>
+                      )}
+                      {scheduleBudgetExplainer?.scope === "mid" && scheduleBudgetExplainer.pattern.kind === "monthly" && (
+                        <p>
+                          Multi-month schedules add more hours than a short posting; the minimum tracks the whole stretch
+                          you selected.
+                        </p>
+                      )}
+                      {scheduleBudgetExplainer?.scope === "long" && scheduleBudgetExplainer.pattern.kind === "recurring" && (
+                        <p>
+                          Many weeks of recurring shifts mean a large total commitment — the floor matches{" "}
+                          <strong>the entire weekly pattern</strong> you chose (weeks × days per week × shift length ×
+                          workers).
+                        </p>
+                      )}
+                      {scheduleBudgetExplainer?.scope === "mid" && scheduleBudgetExplainer.pattern.kind === "recurring" && (
+                        <p>
+                          Longer weekly runs accumulate hours quickly; the minimum is sized for the full week count in
+                          your schedule, not just the first week.
+                        </p>
+                      )}
+                      <p>
+                        In total, about{" "}
+                        <strong>
+                          {billableScheduleHours.toLocaleString(undefined, { maximumFractionDigits: 1 })} worker-hours
+                        </strong>
+                        . At <strong>${PLATFORM_MIN_JOB_BUDGET_HOURLY_USD}/hr</strong> minimum for budgeting, that means
+                        at least <strong>${minimumJobBudgetUsd.toFixed(2)}</strong> in labor for this posting — budgets
+                        below that can&apos;t be posted.
                       </p>
                     </div>
-                    <Switch
-                      checked={autoFulfillEnabled}
-                      onCheckedChange={(v) => {
-                        setAutoFulfillEnabled(v);
-                        if (v) {
-                          if (shiftType === "recurring") setAutoFulfillBudgetWindow("weekly");
-                          else if (shiftType === "monthly") setAutoFulfillBudgetWindow("monthly");
-                          else setAutoFulfillBudgetWindow("one_day");
-                        } else {
-                          setAutoFulfillTermsAck(false);
-                          setSaveAfDefaults(false);
+                    {shiftType === "on-demand" &&
+                      scheduleBudgetExplainer?.pattern.kind !== "on-demand" && (
+                        <p className="text-xs text-muted-foreground">
+                          Add start and &ldquo;done by&rdquo; dates to see the day count here. On-demand uses each calendar
+                          day in that span × 8 hours × workers.
+                        </p>
+                      )}
+                  </div>
+                )}
+
+                <div className="space-y-2">
+                  <Label htmlFor="total-job-budget-usd">
+                    Total budget (USD){!isDirectRequest ? "" : " (optional)"}
+                  </Label>
+                  <p className="text-xs text-muted-foreground">
+                    {isDirectRequest
+                      ? "If you enter an amount, it must cover your scheduled worker-hours at the minimum rate used for budgets."
+                      : `Must cover your scheduled worker-hours at $${PLATFORM_MIN_JOB_BUDGET_HOURLY_USD}/hr minimum for budgeting`}
+                    {minimumJobBudgetUsd > 0 ? ` (~$${minimumJobBudgetUsd.toFixed(0)}+)` : ""}
+                    {!isDirectRequest &&
+                      ". This amount is also used for auto-fulfill when enabled."}
+                  </p>
+                  <div className="relative max-w-md">
+                    <span className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground text-sm">$</span>
+                    <Input
+                      id="total-job-budget-usd"
+                      type="number"
+                      min={0}
+                      step={1}
+                      placeholder={minimumJobBudgetUsd > 0 ? `e.g. ${Math.ceil(minimumJobBudgetUsd)}+` : "e.g. 1200"}
+                      className="pl-7"
+                      value={jobBudgetDollars ?? ""}
+                      onChange={(e) => {
+                        const v = e.target.value;
+                        if (v === "") setJobBudgetDollars(null);
+                        else {
+                          const n = Number(v);
+                          setJobBudgetDollars(Number.isFinite(n) ? Math.max(0, n) : null);
                         }
                       }}
-                      data-testid="switch-auto-fulfill"
+                      data-testid="input-job-budget"
                     />
                   </div>
+                </div>
 
-                  {autoFulfillEnabled && (
-                    <div className="space-y-4 pt-2 border-t border-border">
-                      <div className="space-y-2">
-                        <Label>Labor budget for this window (USD)</Label>
-                        <p className="text-xs text-muted-foreground">
-                          Maximum labor spend we use to evaluate hourly limits for auto-accepted workers.
-                          {minimumAfLaborBudgetUsd > 0 && (
-                            <>
-                              {" "}
-                              Minimum for your hours: <strong>${minimumAfLaborBudgetUsd.toFixed(2)}</strong>.
-                            </>
-                          )}
-                        </p>
-                        <div className="relative max-w-xs">
-                          <span className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground text-sm">$</span>
-                          <Input
-                            type="number"
-                            min={0}
-                            step={1}
-                            className="pl-7"
-                            placeholder={
-                              minimumAfLaborBudgetUsd > 0
-                                ? `Min ${Math.ceil(minimumAfLaborBudgetUsd)}+`
-                                : "Required"
-                            }
-                            value={autoFulfillLaborBudgetDollars ?? ""}
-                            onChange={(e) => {
-                              const v = e.target.value;
-                              if (v === "") setAutoFulfillLaborBudgetDollars(null);
-                              else {
-                                const n = Number(v);
-                                setAutoFulfillLaborBudgetDollars(Number.isFinite(n) ? Math.max(0, n) : null);
-                              }
-                            }}
-                            data-testid="input-auto-fulfill-labor-budget"
-                          />
-                        </div>
-                      </div>
-
-                      <div className="space-y-2">
-                        <Label>Budget window</Label>
-                        <Select
-                          value={autoFulfillBudgetWindow}
-                          onValueChange={(v) => setAutoFulfillBudgetWindow(v as AutoFulfillBudgetWindow)}
-                        >
-                          <SelectTrigger data-testid="select-af-window">
-                            <SelectValue />
-                          </SelectTrigger>
-                          <SelectContent>
-                            {(Object.keys(afWindowLabels) as AutoFulfillBudgetWindow[]).map((k) => (
-                              <SelectItem key={k} value={k}>
-                                {afWindowLabels[k]}
-                              </SelectItem>
-                            ))}
-                          </SelectContent>
-                        </Select>
-                      </div>
-
-                      {autoFulfillBudgetWindow === "custom" && (
-                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                          <div className="space-y-1">
-                            <Label htmlFor="af-win-start">Window start</Label>
-                            <Input
-                              id="af-win-start"
-                              type="date"
-                              value={autoFulfillCustomStart}
-                              onChange={(e) => setAutoFulfillCustomStart(e.target.value)}
-                              min={todayStr}
-                            />
-                          </div>
-                          <div className="space-y-1">
-                            <Label htmlFor="af-win-end">Window end</Label>
-                            <Input
-                              id="af-win-end"
-                              type="date"
-                              value={autoFulfillCustomEnd}
-                              onChange={(e) => setAutoFulfillCustomEnd(e.target.value)}
-                              min={autoFulfillCustomStart || todayStr}
-                            />
-                          </div>
-                        </div>
-                      )}
-
-                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                        <div className="space-y-1">
-                          <Label htmlFor="af-exp-hrs">Expected hours (optional)</Label>
-                          <Input
-                            id="af-exp-hrs"
-                            type="number"
-                            min={0}
-                            step={0.5}
-                            placeholder={
-                              effectiveEstimatedHoursForAutoFulfill > 0
-                                ? `From schedule: ~${effectiveEstimatedHoursForAutoFulfill}`
-                                : "Override schedule"
-                            }
-                            value={autoFulfillExpectedHoursOverride}
-                            onChange={(e) => setAutoFulfillExpectedHoursOverride(e.target.value)}
-                          />
-                        </div>
-                        <div className="space-y-1">
-                          <Label htmlFor="af-max-hr">Max hourly pay ($)</Label>
-                          <Input
-                            id="af-max-hr"
-                            type="number"
-                            min={PLATFORM_MIN_BILLABLE_HOURLY_USD}
-                            step={1}
-                            placeholder={`${PLATFORM_MIN_BILLABLE_HOURLY_USD}+ or leave blank`}
-                            value={autoFulfillMaxHourlyDollars}
-                            onChange={(e) => setAutoFulfillMaxHourlyDollars(e.target.value)}
-                          />
-                        </div>
-                      </div>
-
-                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                        <div className="space-y-1">
-                          <Label htmlFor="af-min-rating">Min worker rating (0–5)</Label>
-                          <Input
-                            id="af-min-rating"
-                            type="number"
-                            min={0}
-                            max={5}
-                            step={0.1}
-                            placeholder="No minimum"
-                            value={autoFulfillMinRating}
-                            onChange={(e) => setAutoFulfillMinRating(e.target.value)}
-                          />
-                        </div>
-                        <div className="space-y-1">
-                          <Label htmlFor="af-min-reviews">Min reviews</Label>
-                          <Input
-                            id="af-min-reviews"
-                            type="number"
-                            min={0}
-                            step={1}
-                            value={autoFulfillMinReviews}
-                            onChange={(e) => setAutoFulfillMinReviews(Math.max(0, parseInt(e.target.value, 10) || 0))}
-                          />
-                        </div>
-                      </div>
-
-                      <div className="space-y-1">
-                        <Label htmlFor="af-min-hr">Min hourly pay ($, optional)</Label>
-                        <Input
-                          id="af-min-hr"
-                          type="number"
-                          min={PLATFORM_MIN_BILLABLE_HOURLY_USD}
-                          step={1}
-                          placeholder={`Default floor $${PLATFORM_MIN_BILLABLE_HOURLY_USD}+`}
-                          value={autoFulfillMinHourlyDollars}
-                          onChange={(e) => setAutoFulfillMinHourlyDollars(e.target.value)}
-                        />
-                      </div>
-
-                      <div className="flex items-start gap-2 rounded-lg border border-border bg-muted/20 p-3">
-                        <Checkbox
-                          id="af-terms"
-                          checked={autoFulfillTermsAck}
-                          onCheckedChange={(c) => setAutoFulfillTermsAck(c === true)}
-                          data-testid="checkbox-af-terms"
-                        />
-                        <label htmlFor="af-terms" className="text-sm leading-snug cursor-pointer">
-                          I agree to the Auto-fulfill and auto-pay terms described in the{" "}
-                          <a href="/terms" className="text-primary underline underline-offset-2" target="_blank" rel="noreferrer">
-                            Terms of Service
-                          </a>
-                          .
-                        </label>
-                      </div>
-
-                      <div className="flex items-center gap-2">
-                        <Checkbox
-                          id="af-save-defaults"
-                          checked={saveAfDefaults}
-                          onCheckedChange={(c) => setSaveAfDefaults(c === true)}
-                        />
-                        <label htmlFor="af-save-defaults" className="text-sm cursor-pointer">
-                          Save these auto-fulfill settings as defaults for future jobs
-                        </label>
-                      </div>
+                {!isDirectRequest &&
+                  billableScheduleHours > 0 &&
+                  selectedSkillsets.length > 0 && (
+                    <div className="flex flex-nowrap items-center gap-2 w-full max-w-md pt-1 min-h-[1.75rem]">
+                      <p
+                        className="min-w-0 flex-1 truncate text-xs text-muted-foreground leading-tight"
+                        title={`Illustrative ~$${planningRateBand.low}–$${planningRateBand.high}/hr for ${selectedRoleLabels.join(", ")}${selectedLocation?.city || selectedLocation?.state ? ` in ${[selectedLocation.city, selectedLocation.state].filter(Boolean).join(", ")}` : ""}. $${PLATFORM_MIN_JOB_BUDGET_HOURLY_USD}/hr posting minimum; ~$${minimumJobBudgetUsd.toFixed(0)}+ for this schedule. Not a wage quote or legal advice.`}
+                      >
+                        {`~$${planningRateBand.low}–${planningRateBand.high}/hr · ${selectedRoleLabels.join(", ")}${
+                          selectedLocation?.city || selectedLocation?.state
+                            ? `, ${[selectedLocation.city, selectedLocation.state].filter(Boolean).join(", ")}`
+                            : ""
+                        } · min ~$${minimumJobBudgetUsd.toFixed(0)}+`}
+                      </p>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        className="h-7 shrink-0 px-2 text-xs whitespace-nowrap"
+                        data-testid="button-use-suggested-budget"
+                        disabled={
+                          appliedSuggestedBudgetUsd <= 0 ||
+                          (jobBudgetDollars != null && jobBudgetDollars === appliedSuggestedBudgetUsd)
+                        }
+                        onClick={() => {
+                          setJobBudgetDollars(appliedSuggestedBudgetUsd);
+                          toast({
+                            title: "Budget updated",
+                            description: `Set to $${appliedSuggestedBudgetUsd.toLocaleString()} (planning mid-rate × your hours, plus 10% buffer).`,
+                          });
+                        }}
+                      >
+                        Use ${appliedSuggestedBudgetUsd.toLocaleString()}
+                      </Button>
                     </div>
                   )}
-                </div>
-              )}
 
-              {isDirectRequest && (
-                <p className="text-sm text-muted-foreground">
-                  Auto-fulfill applies to public job posts. This direct request uses your budget only.
-                </p>
-              )}
+                {!isDirectRequest && (
+                  <>
+                    <div className="flex items-start justify-between gap-3 pt-1">
+                      <div className="space-y-1 min-w-0">
+                        <div className="flex items-center gap-2">
+                          <Sparkles className="w-4 h-4 text-primary shrink-0" />
+                          <span className="font-medium">Auto-fulfill</span>
+                        </div>
+                        <p className="text-sm text-muted-foreground">
+                          Automatically accept the first applicant who meets your budget and minimum star rating. Turning this on is covered by our{" "}
+                          <a href="/terms" className="text-primary underline underline-offset-2" target="_blank" rel="noreferrer">
+                            Terms
+                          </a>{" "}
+                          and{" "}
+                          <a href="/privacy" className="text-primary underline underline-offset-2" target="_blank" rel="noreferrer">
+                            Privacy Policy
+                          </a>
+                          .
+                        </p>
+                      </div>
+                      <Switch
+                        variant="status"
+                        checked={autoFulfillEnabled}
+                        onCheckedChange={setAutoFulfillEnabled}
+                        data-testid="switch-auto-fulfill"
+                      />
+                    </div>
+
+                    {autoFulfillEnabled && (
+                      <div className="space-y-4 pt-2 border-t border-border">
+                        <div className="space-y-2">
+                          <Label>Minimum worker rating (out of 5)</Label>
+                          <p className="text-xs text-muted-foreground">
+                            Nothing is highlighted by default — that still allows new workers with no reviews. Tap stars to
+                            require a higher average once someone has reviews.
+                          </p>
+                          <div
+                            className="flex items-center gap-1"
+                            role="group"
+                            aria-label="Minimum worker stars"
+                            aria-valuemin={1}
+                            aria-valuemax={5}
+                            aria-valuenow={autoFulfillMinWorkerStars > 1 ? autoFulfillMinWorkerStars : undefined}
+                            aria-valuetext={
+                              autoFulfillMinWorkerStars <= 1
+                                ? "Default minimum (no stars shown); workers with no reviews allowed"
+                                : `Minimum ${autoFulfillMinWorkerStars} of 5 stars`
+                            }
+                          >
+                            {[1, 2, 3, 4, 5].map((s) => {
+                              const filled = autoFulfillMinWorkerStars > 1 && s <= autoFulfillMinWorkerStars;
+                              return (
+                              <button
+                                key={s}
+                                type="button"
+                                className={cn(
+                                  "rounded-md p-1 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                                  filled ? "text-amber-500" : "text-muted-foreground/40 hover:text-muted-foreground"
+                                )}
+                                aria-label={`Set minimum to ${s} of 5 stars`}
+                                onClick={() => setAutoFulfillMinWorkerStars(s)}
+                              >
+                                <Star
+                                  className={cn(
+                                    "h-8 w-8 shrink-0",
+                                    filled
+                                      ? "fill-amber-400 text-amber-500"
+                                      : "fill-transparent text-muted-foreground/35"
+                                  )}
+                                />
+                              </button>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                  </>
+                )}
+
+                {isDirectRequest && (
+                  <p className="text-sm text-muted-foreground pt-1">
+                    Auto-fulfill applies to public job posts. This direct request uses your budget only.
+                  </p>
+                )}
+              </div>
             </CardContent>
           </Card>
         )}
@@ -2981,35 +3064,34 @@ export default function PostJob() {
                         <span className="font-medium">Auto-fulfill: On</span>
                         <div className="text-muted-foreground text-xs space-y-0.5">
                           <div>
-                            Labor budget:{" "}
+                            Total budget:{" "}
                             <strong>
-                              {autoFulfillLaborBudgetDollars != null
-                                ? `$${autoFulfillLaborBudgetDollars.toLocaleString()}`
+                              {jobBudgetDollars != null
+                                ? `$${jobBudgetDollars.toLocaleString()}`
                                 : "—"}
-                            </strong>{" "}
-                            · Window: <strong>{afWindowLabels[autoFulfillBudgetWindow]}</strong>
+                            </strong>
                           </div>
-                          {autoFulfillBudgetWindow === "custom" && (autoFulfillCustomStart || autoFulfillCustomEnd) && (
-                            <div>
-                              {autoFulfillCustomStart} → {autoFulfillCustomEnd}
-                            </div>
-                          )}
-                          {autoFulfillMinRating.trim() !== "" && (
-                            <div>
-                              Min rating <strong>{autoFulfillMinRating}</strong>, min reviews{" "}
-                              <strong>{autoFulfillMinReviews}</strong>
-                            </div>
-                          )}
-                          {(autoFulfillMaxHourlyDollars.trim() !== "" || autoFulfillMinHourlyDollars.trim() !== "") && (
-                            <div>
-                              {autoFulfillMaxHourlyDollars.trim() !== "" && (
-                                <>Max <strong>${autoFulfillMaxHourlyDollars}</strong>/hr </>
-                              )}
-                              {autoFulfillMinHourlyDollars.trim() !== "" && (
-                                <>· Min <strong>${autoFulfillMinHourlyDollars}</strong>/hr</>
-                              )}
-                            </div>
-                          )}
+                          <div className="flex flex-wrap items-center gap-x-1 gap-y-0.5">
+                            <span>Minimum rating:</span>
+                            {autoFulfillMinWorkerStars <= 1 ? (
+                              <span className="text-foreground/90">Any (includes workers with no reviews)</span>
+                            ) : (
+                              <>
+                                <span className="inline-flex items-center gap-0.5 text-amber-500" aria-hidden>
+                                  {[1, 2, 3, 4, 5].map((s) => (
+                                    <Star
+                                      key={s}
+                                      className={cn(
+                                        "h-3.5 w-3.5",
+                                        s <= autoFulfillMinWorkerStars ? "fill-current" : "fill-transparent opacity-35"
+                                      )}
+                                    />
+                                  ))}
+                                </span>
+                                <span className="tabular-nums text-muted-foreground">({autoFulfillMinWorkerStars}/5)</span>
+                              </>
+                            )}
+                          </div>
                         </div>
                       </div>
                     </li>

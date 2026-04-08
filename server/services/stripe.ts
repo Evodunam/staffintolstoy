@@ -232,6 +232,8 @@ export async function chargeAchOffSession(params: {
   }
 }
 
+// Stripe Identity: government ID + selfie (and flow-configured checks). It does not return
+// criminal history or credit data; those require a separate consumer-reporting / screening integration.
 // Stripe Identity verification flow IDs (https://docs.stripe.com/identity/verification-flows)
 // Sandbox (test mode): onboarding = worker onboarding, settings = Account & Documents
 // Live: onboarding = worker onboarding, settings = worker settings menu

@@ -9,6 +9,7 @@ import {
   Circle,
 } from "@react-google-maps/api";
 import type { Job } from "@shared/schema";
+import { workerFacingJobHourlyCents } from "@shared/platformPayPolicy";
 import { Button } from "@/components/ui/button";
 import { GOOGLE_MAPS_LOADER_ID, GOOGLE_MAPS_LIBRARIES } from "@/lib/google-maps";
 import { MapPin, Clock, DollarSign, Home, Users, Activity } from "lucide-react";
@@ -74,7 +75,11 @@ const mapStyles = [
 ];
 
 function getJobPriceDisplay(job: JobPin): string {
-  return job.payout || (job.hourlyRate != null ? `$${(job.hourlyRate / 100).toFixed(0)}` : "$--");
+  if (job.payout) return job.payout;
+  if (job.hourlyRate == null) return "$--";
+  const wf = workerFacingJobHourlyCents(job.hourlyRate);
+  const cents = wf > 0 ? wf : job.hourlyRate;
+  return `$${(cents / 100).toFixed(0)}`;
 }
 
 function getPricePillColors(job: JobPin, isSelected: boolean, isHovered: boolean) {

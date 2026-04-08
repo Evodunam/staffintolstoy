@@ -591,27 +591,30 @@ export function AccountDocumentsContent({ embedded = false, initialTab }: { embe
             <CardHeader>
               <CardTitle className="flex items-center gap-2">
                 <IdCard className="w-5 h-5" />
-                Identity Verification
+                {t("identityVerificationTitle")}
               </CardTitle>
-              <CardDescription>Verify your identity with Stripe</CardDescription>
+              <CardDescription>{t("identityVerificationCardDescription")}</CardDescription>
+              <p className="text-xs text-muted-foreground mt-2 leading-relaxed">
+                {t("identityVerificationScopeNote")}
+              </p>
             </CardHeader>
             <CardContent>
               {profile?.identityVerified ? (
                 <div className="flex items-center gap-3 p-4 bg-green-50 dark:bg-green-950/20 rounded-lg border border-green-200 dark:border-green-800">
                   <CheckCircle2 className="w-5 h-5 text-green-600" />
                   <div className="flex-1">
-                    <p className="font-medium text-green-900 dark:text-green-100">Identity Verified</p>
-                    <p className="text-sm text-green-700 dark:text-green-300">Your identity has been confirmed</p>
+                    <p className="font-medium text-green-900 dark:text-green-100">{t("identityVerifiedTitle")}</p>
+                    <p className="text-sm text-green-700 dark:text-green-300">{t("identityVerifiedBody")}</p>
                   </div>
                 </div>
               ) : (
                 <div className="text-center py-8">
                   <IdCard className="w-12 h-12 mx-auto text-muted-foreground mb-4" />
-                  <h3 className="font-semibold mb-2">Verify Your Identity</h3>
-                  <p className="text-sm text-muted-foreground mb-4">Complete identity verification to unlock all features</p>
+                  <h3 className="font-semibold mb-2">{t("identityVerifyPromptTitle")}</h3>
+                  <p className="text-sm text-muted-foreground mb-4">{t("identityVerifyPromptBody")}</p>
                   <Button onClick={handleIdVerification}>
                     <ExternalLink className="w-4 h-4 mr-2" />
-                    Start Identity Verification
+                    {t("startIdentityVerification")}
                   </Button>
                 </div>
               )}

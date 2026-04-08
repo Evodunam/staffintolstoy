@@ -3,6 +3,7 @@ import { format } from "date-fns";
 import { MapPin, Clock, DollarSign, Calendar } from "lucide-react";
 import { Link } from "wouter";
 import { getDisplayJobTitle } from "@/lib/job-display";
+import { workerFacingJobHourlyCents } from "@shared/platformPayPolicy";
 
 interface JobCardProps {
   job: Job & { companyName?: string | null; company?: Profile };
@@ -10,6 +11,8 @@ interface JobCardProps {
 
 export function JobCard({ job }: JobCardProps) {
   const companyName = job.companyName || job.company?.companyName || "Anonymous Company";
+  const wf = workerFacingJobHourlyCents(job.hourlyRate);
+  const displayHr = wf > 0 ? wf / 100 : job.hourlyRate / 100;
 
   return (
     <Link href={`/jobs/${job.id}`}>
@@ -27,7 +30,7 @@ export function JobCard({ job }: JobCardProps) {
             </div>
             <div className="flex flex-col items-end">
               <span className="text-lg font-bold">
-                ${(job.hourlyRate / 100).toFixed(2)}/hr
+                ${displayHr.toFixed(2)}/hr
               </span>
               <span className="text-xs text-muted-foreground">Fixed Rate</span>
             </div>

@@ -69,7 +69,8 @@
     "auto": "Auto",
     "optional": "Opcional",
     "address": "Dirección",
-    "saving": "Guardando..."
+    "saving": "Guardando...",
+    "idVerifiedBadgeTooltip": "Identidad gubernamental verificada con Stripe. No es un informe de antecedentes penales ni de crédito."
   },
   "dashboard": {
     "overview": "Resumen",
@@ -1430,7 +1431,15 @@
     "insurance": "Insurance",
     "insuranceDescription": "Verified insurance shows companies you're protected against job site liability. Workers with verified insurance get more job opportunities.",
     "w9": "W-9",
-    "w9Description": "Required for tax purposes when you earn over $600. This form is included with your job applications."
+    "w9Description": "Required for tax purposes when you earn over $600. This form is included with your job applications.",
+    "identityVerificationTitle": "Verificación de identidad",
+    "identityVerificationCardDescription": "Confirma tu identificación oficial y selfie con Stripe.",
+    "identityVerificationScopeNote": "Esto comprueba que tu identificación es auténtica y coincide con tu foto. No es una verificación de antecedentes penales, de crédito ni un informe de selección de personal.",
+    "identityVerifiedTitle": "Identidad verificada",
+    "identityVerifiedBody": "Tu identidad ha sido confirmada.",
+    "identityVerifyPromptTitle": "Verifica tu identidad",
+    "identityVerifyPromptBody": "Completa la verificación de identidad para desbloquear todas las funciones.",
+    "startIdentityVerification": "Iniciar verificación de identidad"
   },
   "businessOperator": {
     "wizardSteps": {

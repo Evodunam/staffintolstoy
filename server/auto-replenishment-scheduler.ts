@@ -8,6 +8,10 @@ import { profiles, jobs, applications, companyTransactions, timesheets, companyP
 import { eq, and, inArray, desc, isNotNull } from "drizzle-orm";
 import { chargeCardOffSession, chargeAchOffSession, calculateCardFee } from "./services/stripe";
 import { ensureCompanyStripeCustomer } from "./lib/company-stripe";
+import {
+  notifyCompanyPaymentFundingIssue,
+  syncPaymentFailureReminderState,
+} from "./payment-failure-reminder-scheduler";
 
 const REPLENISHMENT_CHECK_INTERVAL_MS = 5 * 60 * 1000; // Check every 5 minutes
 const REPLENISHMENT_BUFFER_PERCENT = 30; // Add 30% to charge amount to maintain balance
@@ -176,6 +180,23 @@ async function calculatePendingPayments(companyId: number): Promise<number> {
     const rate = ts.hourlyRate || 2500;
     return sum + Math.round(hours * rate * 1.52);
   }, 0);
+}
+
+/** Clear payment holds on jobs when balance covers pending timesheets + accepted-hire commitments. */
+export async function clearPaymentHoldsForCompanyIfSolvent(companyId: number): Promise<void> {
+  const [profile] = await db.select().from(profiles).where(eq(profiles.id, companyId)).limit(1);
+  if (!profile) return;
+  const balance = profile.depositAmount || 0;
+  const pending = await calculatePendingPayments(companyId);
+  const commitments = await calculateJobCommitments(companyId);
+  const required = pending + commitments;
+  if (balance >= required) {
+    await db
+      .update(jobs)
+      .set({ paymentHoldAt: null })
+      .where(and(eq(jobs.companyId, companyId), isNotNull(jobs.paymentHoldAt)));
+  }
+  await syncPaymentFailureReminderState(companyId);
 }
 
 /** Pending amount (cents) by job location; null = jobs with no companyLocationId. Includes pending + disputed. */
@@ -587,6 +608,7 @@ async function processAutoReplenishment(company: CompanyCommitments): Promise<bo
       } catch (mercuryErr: any) {
         console.warn("[AutoReplenish] Mercury service not available for AR invoice:", mercuryErr?.message);
       }
+      await clearPaymentHoldsForCompanyIfSolvent(company.companyId);
       return true;
     }
     if (lastFailedMethodId != null) {
@@ -595,6 +617,9 @@ async function processAutoReplenishment(company: CompanyCommitments): Promise<bo
         .where(eq(profiles.id, profile.id));
     }
     console.error(`[AutoReplenish] All payment methods failed for company ${company.companyId}`);
+    notifyCompanyPaymentFundingIssue(company.companyId).catch((e) =>
+      console.warn("[AutoReplenish] notifyCompanyPaymentFundingIssue:", e)
+    );
     return false;
   } catch (error: any) {
     console.error(`[AutoReplenish] Error processing company ${company.companyId}:`, error.message);
@@ -792,5 +817,23 @@ export async function triggerAutoReplenishmentForCompany(
   } catch (error: any) {
     console.error(`[AutoReplenish] Error checking company ${companyId}:`, error.message);
     return { success: false, noChargeNeeded: false };
+  }
+}
+
+/**
+ * Run after a worker is hired (application → accepted): attempt Stripe replenishment for balance shortfall.
+ * On success or if no charge is needed, clear any payment holds when solvent.
+ * On failure, set jobs.payment_hold_at so new applies and clock-in are blocked until funding succeeds.
+ */
+export async function afterHireFundingCheck(jobId: number, companyId: number): Promise<void> {
+  const r = await triggerAutoReplenishmentForCompany(companyId);
+  if (r.success || r.noChargeNeeded) {
+    await clearPaymentHoldsForCompanyIfSolvent(companyId);
+  } else {
+    await db.update(jobs).set({ paymentHoldAt: new Date() }).where(eq(jobs.id, jobId));
+    console.warn(`[PaymentHold] Job ${jobId}: payment_hold_at set after failed funding (company ${companyId})`);
+    notifyCompanyPaymentFundingIssue(companyId).catch((e) =>
+      console.warn("[PaymentHold] notifyCompanyPaymentFundingIssue:", e)
+    );
   }
 }

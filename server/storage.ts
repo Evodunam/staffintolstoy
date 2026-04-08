@@ -112,6 +112,8 @@ export interface IStorage {
   // Company Team Members
   getCompanyTeamMember(id: number): Promise<CompanyTeamMember | undefined>;
   getCompanyTeamMemberByUserId(companyProfileId: number, userId: string): Promise<CompanyTeamMember | undefined>;
+  /** Active company team membership for this auth user (any company), if any. */
+  getActiveCompanyTeamMembershipForUser(userId: string): Promise<CompanyTeamMember | undefined>;
   getCompanyTeamMembers(companyProfileId: number): Promise<CompanyTeamMember[]>;
   createCompanyTeamMember(member: InsertCompanyTeamMember): Promise<CompanyTeamMember>;
   updateCompanyTeamMember(id: number, updates: Partial<InsertCompanyTeamMember>): Promise<CompanyTeamMember>;
@@ -393,7 +395,7 @@ export class DatabaseStorage implements IStorage {
       })
       .from(jobs)
       .leftJoin(profiles, eq(jobs.companyId, profiles.id))
-      .where(eq(jobs.status, 'open'))
+      .where(and(eq(jobs.status, "open"), isNull(jobs.paymentHoldAt)))
       .orderBy(desc(jobs.createdAt));
     
     // Apply filters at database level for better performance
@@ -649,6 +651,15 @@ export class DatabaseStorage implements IStorage {
     const [member] = await db.select().from(companyTeamMembers).where(
       and(eq(companyTeamMembers.companyProfileId, companyProfileId), eq(companyTeamMembers.userId, userId))
     );
+    return member;
+  }
+
+  async getActiveCompanyTeamMembershipForUser(userId: string): Promise<CompanyTeamMember | undefined> {
+    const [member] = await db
+      .select()
+      .from(companyTeamMembers)
+      .where(and(eq(companyTeamMembers.userId, userId), eq(companyTeamMembers.isActive, true)))
+      .limit(1);
     return member;
   }
   

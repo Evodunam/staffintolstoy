@@ -1,7 +1,8 @@
 "use client";
 
 import { useState } from "react";
-import { format } from "date-fns";
+import { differenceInCalendarDays, format, isAfter } from "date-fns";
+import type { DateRange } from "react-day-picker";
 import { Button } from "@/components/ui/button";
 import { Calendar } from "@/components/ui/calendar";
 import {
@@ -12,6 +13,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { Separator } from "@/components/ui/separator";
 import { AlertCircle, CalendarDays, ChevronDown, ChevronRight } from "lucide-react";
 import { cn, getTimeSlots, getEndTimeSlotCandidates, getValidEndTimeSlots, getEarliestEndTime, formatTime12h } from "@/lib/utils";
 
@@ -83,6 +85,8 @@ export function RecurringScheduleMultiStep({
   // Only one of Start time / End time accordion open at a time
   const [startTimeOpen, setStartTimeOpen] = useState(!startTime);
   const [endTimeOpen, setEndTimeOpen] = useState(!!startTime && !endTime);
+  /** Partial range while user is picking the end date (controlled calendar needs explicit `to: undefined`). */
+  const [rangeDraft, setRangeDraft] = useState<DateRange | undefined>(undefined);
 
   const startStr = startDate || todayStr;
   /** End date = start + (weeks * 7 - 1) days so N weeks gives exactly N*7 days inclusive */
@@ -96,7 +100,21 @@ export function RecurringScheduleMultiStep({
     return computeEndFromWeeks(start, weeks);
   })();
 
+  /** While picking the second date, don’t treat the schedule as spanning the full week-based end. */
+  const effectiveEndStr =
+    rangeDraft?.from && !rangeDraft.to ? format(rangeDraft.from, "yyyy-MM-dd") : endStr;
+
+  const resetScheduleToDefault = () => {
+    setRangeDraft(undefined);
+    const start = new Date(minDate.getFullYear(), minDate.getMonth(), minDate.getDate());
+    const startFmt = format(start, "yyyy-MM-dd");
+    onStartDateChange(startFmt);
+    onWeeksChange(1);
+    onEndDateChange(computeEndFromWeeks(start, 1));
+  };
+
   const handleWeeksChange = (w: number) => {
+    setRangeDraft(undefined);
     onWeeksChange(w);
     if (startStr && w > 0) {
       const start = parseLocalDate(startStr);
@@ -104,15 +122,36 @@ export function RecurringScheduleMultiStep({
     }
   };
 
-  const handleStartDateSelect = (newDate: Date | undefined) => {
-    if (!newDate) return;
-    const str = format(newDate, "yyyy-MM-dd");
-    onStartDateChange(str);
-    const newStart = parseLocalDate(str);
-    const currentEnd = endDate ? parseLocalDate(endDate) : null;
-    if (!currentEnd || currentEnd < newStart) {
-      onEndDateChange(computeEndFromWeeks(newStart, weeks));
+  const handleRangeSelect = (
+    range: DateRange | undefined,
+    _selectedDay: Date,
+    _activeModifiers: unknown,
+    e: React.MouseEvent
+  ) => {
+    if (e.detail === 2) {
+      resetScheduleToDefault();
+      return;
     }
+    if (!range) {
+      resetScheduleToDefault();
+      return;
+    }
+    const { from, to } = range;
+    if (!from) return;
+    if (!to) {
+      setRangeDraft({ from, to: undefined });
+      onStartDateChange(format(from, "yyyy-MM-dd"));
+      onEndDateChange("");
+      return;
+    }
+    setRangeDraft(undefined);
+    const start = isAfter(from, to) ? to : from;
+    const end = isAfter(from, to) ? from : to;
+    const inclusive = differenceInCalendarDays(end, start) + 1;
+    const w = Math.min(52, Math.max(1, Math.ceil(inclusive / 7)));
+    onStartDateChange(format(start, "yyyy-MM-dd"));
+    onEndDateChange(format(end, "yyyy-MM-dd"));
+    onWeeksChange(w);
   };
 
   const toggleDay = (day: string) => {
@@ -123,9 +162,9 @@ export function RecurringScheduleMultiStep({
 
   // Working days: dates between start and end that fall on selected weekdays only
   const workingDates = (() => {
-    if (!startStr || !endStr || days.length === 0) return [];
+    if (!startStr || !effectiveEndStr || days.length === 0) return [];
     const start = parseLocalDate(startStr);
-    const end = parseLocalDate(endStr);
+    const end = parseLocalDate(effectiveEndStr);
     if (end < start) return [];
     const result: Date[] = [];
     const dayNums = days.map((d) => DAY_TO_NUM[d] ?? -1).filter((n) => n >= 0);
@@ -150,12 +189,18 @@ export function RecurringScheduleMultiStep({
 
   const startDateObj = startStr ? parseLocalDate(startStr) : undefined;
 
+  const calendarSelected: DateRange | undefined =
+    rangeDraft ??
+    (startDateObj
+      ? { from: startDateObj, to: parseLocalDate(endStr) }
+      : undefined);
+
   const hoursPerDay =
     startTime && endTime
       ? parseInt(endTime.split(":")[0]) - parseInt(startTime.split(":")[0])
       : 0;
   const estimatedHours =
-    days.length > 0 && startStr && endStr && workingDates.length > 0
+    days.length > 0 && startStr && effectiveEndStr && workingDates.length > 0
       ? hoursPerDay * workingDates.length * workersNeeded
       : hoursPerDay * days.length * weeks * workersNeeded;
 
@@ -165,99 +210,74 @@ export function RecurringScheduleMultiStep({
     !!startStr &&
     !!startTime &&
     !!endTime &&
-    hoursPerDay > 0;
+    hoursPerDay > 0 &&
+    !(rangeDraft?.from && !rangeDraft.to);
 
   const handleDone = () => {
     if (canProceed && onComplete) onComplete();
   };
 
-  /* Single card: left = calendar + weeks, right = days + start/end time */
+  /* Single card: left = calendar, right = days + times + weeks */
   return (
     <div className="space-y-4 py-2">
       <div className="rounded-none border border-border overflow-hidden">
         <div className="flex flex-row overflow-x-auto">
-          {/* Left column: calendar + number of weeks */}
+          {/* Left column: start week calendar */}
           <div className="flex-[5] min-w-0 shrink-0 border-r border-border flex flex-col items-center px-[5px] py-4 bg-muted/20 gap-4 min-w-[200px]">
             <div className="w-full max-w-[260px]">
-              <Label className="text-sm font-semibold">Start week</Label>
-              <p className="text-xs text-muted-foreground mb-2">Pick the start date</p>
-              <Calendar
-                mode="single"
-                selected={startDateObj}
-                onSelect={handleStartDateSelect}
-                className="p-2 sm:p-3 bg-background w-full max-w-full rounded-md border border-border"
-                disabled={{ before: minDate }}
-                classNames={{
-                  day_selected:
-                    "bg-gray-200 text-gray-900 hover:bg-gray-300 focus:bg-gray-200 dark:bg-gray-600 dark:text-gray-100 dark:hover:bg-gray-500 dark:focus:bg-gray-600",
+              <Label className="text-sm font-semibold">Schedule range</Label>
+              <p className="text-xs text-muted-foreground mb-2">
+                Click start date, then end date — “How many weeks?” follows the span. Right-click or
+                double-click a day to reset; with both picked, click the start date again to clear.
+              </p>
+              <div
+                className="rounded-md border border-border"
+                onContextMenu={(ev) => {
+                  ev.preventDefault();
+                  resetScheduleToDefault();
                 }}
-                modifiers={
-                  workingDates.length > 0
-                    ? { working: (date: Date) => isWorkingDate(date) }
-                    : undefined
-                }
-                modifiersClassNames={
-                  workingDates.length > 0
-                    ? { working: "bg-green-600 text-white ring-1 ring-green-600/50 dark:bg-green-600 dark:text-white dark:ring-green-500/50" }
-                    : undefined
-                }
-              />
+              >
+                <Calendar
+                  mode="range"
+                  selected={calendarSelected}
+                  onSelect={handleRangeSelect}
+                  className="p-2 sm:p-3 bg-background w-full max-w-full rounded-md border-0"
+                  disabled={{ before: minDate }}
+                  classNames={{
+                    day_selected:
+                      "bg-gray-200 text-gray-900 hover:bg-gray-300 focus:bg-gray-200 dark:bg-gray-600 dark:text-gray-100 dark:hover:bg-gray-500 dark:focus:bg-gray-600",
+                    day_range_start:
+                      "bg-gray-200 text-gray-900 hover:bg-gray-300 focus:bg-gray-200 rounded-l-md dark:bg-gray-600 dark:text-gray-100 dark:hover:bg-gray-500",
+                    day_range_end:
+                      "bg-gray-200 text-gray-900 hover:bg-gray-300 focus:bg-gray-200 rounded-r-md dark:bg-gray-600 dark:text-gray-100 dark:hover:bg-gray-500",
+                    day_range_middle:
+                      "bg-gray-100 text-gray-900 dark:bg-gray-700 dark:text-gray-100",
+                  }}
+                  modifiers={
+                    workingDates.length > 0
+                      ? { working: (date: Date) => isWorkingDate(date) }
+                      : undefined
+                  }
+                  modifiersClassNames={
+                    workingDates.length > 0
+                      ? {
+                          working:
+                            "!bg-green-600 !text-white shadow-[inset_0_0_0_1px_rgb(22_163_74)] hover:!bg-green-700 hover:!text-white focus-visible:!bg-green-600 focus-visible:!text-white dark:!bg-green-600 dark:!text-white dark:shadow-[inset_0_0_0_1px_rgb(22_101_52)] dark:hover:!bg-green-700 dark:focus-visible:!bg-green-600",
+                        }
+                      : undefined
+                  }
+                />
+              </div>
               {startStr && (
                 <p className="text-xs text-muted-foreground mt-2">
-                  Starts {format(parseLocalDate(startStr), "EEE, MMM d")}
+                  {rangeDraft?.from && !rangeDraft.to
+                    ? `Starts ${format(rangeDraft.from, "EEE, MMM d")} — choose end date`
+                    : `${format(parseLocalDate(startStr), "EEE, MMM d")} – ${format(parseLocalDate(endStr), "EEE, MMM d")} · ${weeks} week${weeks === 1 ? "" : "s"}`}
                 </p>
               )}
             </div>
-            <div className="w-full max-w-[260px]">
-              <Label className="text-xs font-medium text-muted-foreground">
-                How many weeks?
-              </Label>
-              <div className="mt-1 flex w-full items-center gap-0 rounded-lg border border-border bg-background overflow-hidden">
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="icon"
-                  className="h-9 w-9 shrink-0 rounded-none border-0 border-r border-border"
-                  onClick={(e) => {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    handleWeeksChange(Math.max(1, weeks - 1));
-                  }}
-                  disabled={weeks <= 1}
-                  aria-label="Decrease weeks"
-                >
-                  −
-                </Button>
-                <Input
-                  type="number"
-                  min={1}
-                  max={52}
-                  value={weeks}
-                  onChange={(e) => {
-                    const v = parseInt(e.target.value, 10);
-                    if (!Number.isNaN(v)) handleWeeksChange(Math.max(1, Math.min(52, v)));
-                  }}
-                  className="h-9 flex-1 min-w-0 rounded-none border-0 text-center px-1 [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
-                />
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="icon"
-                  className="h-9 w-9 shrink-0 rounded-none border-0 border-l border-border"
-                  onClick={(e) => {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    handleWeeksChange(Math.min(52, weeks + 1));
-                  }}
-                  disabled={weeks >= 52}
-                  aria-label="Increase weeks"
-                >
-                  +
-                </Button>
-              </div>
-            </div>
           </div>
-          {/* Right column: which days + start time + end time */}
+          {/* Right column: which days + start/end time + weeks */}
           <div className="flex-[4] min-w-0 px-[6px] py-4 min-h-[280px] min-w-[180px]">
             <ScrollArea className="h-full">
               <div className="space-y-4 pr-2">
@@ -366,6 +386,55 @@ export function RecurringScheduleMultiStep({
                       </div>
                     </CollapsibleContent>
                   </Collapsible>
+                </div>
+                <Separator className="my-4" />
+                <div className="w-full max-w-[260px]">
+                  <Label className="text-xs font-medium text-muted-foreground">
+                    How many weeks?
+                  </Label>
+                  <div className="mt-1 flex w-full items-center gap-0 rounded-lg border border-border bg-background overflow-hidden">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="icon"
+                      className="h-9 w-9 shrink-0 rounded-none border-0 border-r border-border"
+                      onClick={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        handleWeeksChange(Math.max(1, weeks - 1));
+                      }}
+                      disabled={weeks <= 1}
+                      aria-label="Decrease weeks"
+                    >
+                      −
+                    </Button>
+                    <Input
+                      type="number"
+                      min={1}
+                      max={52}
+                      value={weeks}
+                      onChange={(e) => {
+                        const v = parseInt(e.target.value, 10);
+                        if (!Number.isNaN(v)) handleWeeksChange(Math.max(1, Math.min(52, v)));
+                      }}
+                      className="h-9 flex-1 min-w-0 rounded-none border-0 text-center px-1 [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
+                    />
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="icon"
+                      className="h-9 w-9 shrink-0 rounded-none border-0 border-l border-border"
+                      onClick={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        handleWeeksChange(Math.min(52, weeks + 1));
+                      }}
+                      disabled={weeks >= 52}
+                      aria-label="Increase weeks"
+                    >
+                      +
+                    </Button>
+                  </div>
                 </div>
               </div>
             </ScrollArea>

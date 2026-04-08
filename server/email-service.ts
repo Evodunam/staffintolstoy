@@ -15,6 +15,7 @@ const COMPANY_EMAIL_TYPES = new Set<string>([
   'new_job_posted_admin', 'worker_inquiry', 'worker_accepted_job', 'balance_low', 'balance_recharged',
   'job_posted', 'job_filled', 'welcome_company', 'team_member_joined', 'team_invite_sent', 'company_onboarding_reminder',
   'close_project_review', 'worker_request_start_job_now', 'job_abandoned_company',
+  'company_payment_action_required',
 ]);
 
 const BRAND_COLORS = {
@@ -228,7 +229,8 @@ export type EmailType =
   | 'job_abandoned_worker'
   | 'geolocation_clock_in_reminder'
   | 'geolocation_clock_out_reminder'
-  | 'geolocation_auto_clocked_out';
+  | 'geolocation_auto_clocked_out'
+  | 'company_payment_action_required';
 
 interface EmailData {
   to: string;
@@ -1805,6 +1807,54 @@ ${showAiDispatchPrompt ? `<p style="margin:0 0 10px;font-size:11px;color:${BRAND
       </div>
     `
   }),
+
+  company_payment_action_required: (data) => {
+    const n = Number(data.reminderNumber) || 1;
+    const jobs: Array<{ id: number; title: string }> = Array.isArray(data.jobsOnHold) ? data.jobsOnHold : [];
+    const jobsRows =
+      jobs.length === 0
+        ? `<p style="margin: 0; color: ${BRAND_COLORS.textMuted}; font-size: 14px;">No individual jobs are on payment hold right now; your account still needs a successful payment or balance top-up.</p>`
+        : `<ul style="margin: 0; padding-left: 20px; color: ${BRAND_COLORS.text}; font-size: 14px; line-height: 1.7;">
+            ${jobs
+              .slice(0, 20)
+              .map(
+                (j) =>
+                  `<li style="margin: 6px 0;"><a href="${data.jobUrlPrefix || `${BASE_URL}/company-dashboard`}?job=${encodeURIComponent(String(j.id))}" style="color: ${BRAND_COLORS.buttonGreen}; font-weight: 600;">${(j.title || `Job #${j.id}`).replace(/</g, "")}</a></li>`
+              )
+              .join("")}
+          </ul>${jobs.length > 20 ? `<p style="margin: 8px 0 0; font-size: 12px; color: ${BRAND_COLORS.textMuted};">And more in your dashboard.</p>` : ""}`;
+    return {
+      subject:
+        n <= 1
+          ? "Action required: complete payment to keep your jobs active"
+          : `Reminder ${n}: Payment still needed — verify funding and payment methods`,
+      content: `
+      <h2 style="margin: 0 0 16px; font-size: 20px; color: ${BRAND_COLORS.danger};">Payment needed on your account</h2>
+      <p style="margin: 0 0 16px; color: ${BRAND_COLORS.textMuted}; line-height: 1.6;">
+        Hi ${data.firstName || "there"}, we could not fund your company balance as required. Until this is resolved, affected jobs may be paused (workers cannot apply or clock in for those jobs).
+      </p>
+      ${getCard(`
+        <p style="margin: 0 0 12px; font-size: 13px; font-weight: 600; color: ${BRAND_COLORS.text}; text-transform: uppercase; letter-spacing: 0.04em;">What to do</p>
+        <ul style="margin: 0; padding-left: 18px; color: ${BRAND_COLORS.textMuted}; font-size: 14px; line-height: 1.65;">
+          <li style="margin: 6px 0;">Open your company dashboard and <strong>add or fix a payment method</strong> (card or verified bank).</li>
+          <li style="margin: 6px 0;"><strong>Top up your balance</strong> if needed so posted work is covered.</li>
+          ${data.hasFailedPaymentMethod ? `<li style="margin: 6px 0;">Your last automatic charge <strong>did not go through</strong> — update the card or bank on file, then retry.</li>` : ""}
+        </ul>
+      `)}
+      <p style="margin: 20px 0 8px; font-size: 13px; font-weight: 600; color: ${BRAND_COLORS.text};">Jobs on payment hold</p>
+      ${jobsRows}
+      <p style="margin: 20px 0 0; font-size: 12px; color: ${BRAND_COLORS.textMuted}; line-height: 1.5;">
+        This is reminder #${n}. We will keep emailing on this schedule until your funding issue is resolved. You can manage notification frequency in your dashboard settings.
+      </p>
+      <div style="text-align: center; margin-top: 24px;">
+        ${getButton('Fix payment & billing', data.fixPaymentUrl || `${BASE_URL}/company-dashboard?section=billing`, 'warning')}
+      </div>
+      <div style="text-align: center; margin-top: 12px;">
+        ${getButtonLight('Open jobs', data.jobsDashboardUrl || `${BASE_URL}/company-dashboard/jobs`)}
+      </div>
+    `,
+    };
+  },
 };
 
 /** All Resend email types (for sample/test sending). */
@@ -1981,6 +2031,20 @@ export function getSampleDataForType(type: EmailType): Record<string, any> {
       return { ...common, workerName: 'Sample Worker' };
     case 'geolocation_auto_clocked_out':
       return { ...common, workerName: 'Sample Worker', clockOutTime: '5:00 PM', reason: 'We stopped receiving your location.' };
+    case 'company_payment_action_required':
+      return {
+        firstName: 'Sam',
+        companyName: 'Sample Company LLC',
+        reminderNumber: 2,
+        hasFailedPaymentMethod: true,
+        jobsOnHold: [
+          { id: 101, title: 'Warehouse unload – overnight' },
+          { id: 102, title: 'Electrical rough-in' },
+        ],
+        fixPaymentUrl: `${BASE_URL_SAMPLE}/company-dashboard?section=billing`,
+        jobsDashboardUrl: `${BASE_URL_SAMPLE}/company-dashboard/jobs`,
+        jobUrlPrefix: `${BASE_URL_SAMPLE}/company-dashboard`,
+      };
     case 'chat_unread_digest':
       return { items: [{ jobTitle: common.jobTitle, jobId: 1, unreadCount: 3, lastPreview: 'Can you start earlier?' }] };
     case 'payment_reminder':

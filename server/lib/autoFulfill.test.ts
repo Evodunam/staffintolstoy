@@ -73,6 +73,30 @@ describe("autoFulfill", () => {
     expect(r.accept).toBe(true);
   });
 
+  it("evaluate rejects when job has payment hold", () => {
+    const job = applyAutoFulfillLegalAck(
+      {
+        autoFulfillEnabled: true,
+        autoFulfillBudgetCents: 50000,
+        autoFulfillBudgetWindow: "weekly",
+        estimatedHours: 10,
+        hourlyRate: 4000,
+        maxWorkersNeeded: 1,
+        status: "open",
+        paymentHoldAt: new Date(),
+      } as any,
+      true
+    );
+    const r = evaluateAutoFulfillAccept({
+      job: job as any,
+      worker: { averageRating: "5", totalReviews: 10 } as any,
+      proposedRateCents: 4000,
+      acceptedApplicationCount: 0,
+    });
+    expect(r.accept).toBe(false);
+    expect(r.reason).toBe("payment_hold");
+  });
+
   it("evaluate rejects rate above derived max", () => {
     const job = applyAutoFulfillLegalAck(
       {
@@ -121,5 +145,30 @@ describe("autoFulfill", () => {
     });
     expect(r.accept).toBe(false);
     expect(r.reason).toBe("below_min_rating");
+  });
+
+  it("evaluate skips average rating check when worker has no reviews yet", () => {
+    const job = applyAutoFulfillLegalAck(
+      {
+        autoFulfillEnabled: true,
+        autoFulfillBudgetCents: 50000,
+        autoFulfillBudgetWindow: "weekly",
+        estimatedHours: 10,
+        hourlyRate: 4000,
+        autoFulfillMinWorkerRating: "5",
+        autoFulfillMinWorkerReviews: 0,
+        maxWorkersNeeded: 1,
+        status: "open",
+      } as any,
+      true
+    );
+    const worker = { averageRating: null, totalReviews: 0 } as any;
+    const r = evaluateAutoFulfillAccept({
+      job: job as any,
+      worker,
+      proposedRateCents: 4000,
+      acceptedApplicationCount: 0,
+    });
+    expect(r.accept).toBe(true);
   });
 });

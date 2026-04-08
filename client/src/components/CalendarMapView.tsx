@@ -16,6 +16,7 @@ import { Separator } from "@/components/ui/separator";
 import { Table as TableComponent, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { GOOGLE_MAPS_LOADER_ID, GOOGLE_MAPS_LIBRARIES } from "@/lib/google-maps";
 import { REPLAY_QUERY_KEYS, parseReplayUrlState, writeReplayUrlState } from "@/lib/replay-url";
+import { workerFacingJobHourlyCents } from "@shared/platformPayPolicy";
 
 const MILES_TO_METERS = 1609.344;
 
@@ -3302,7 +3303,13 @@ export function CalendarMapView({
                         </div>
                         {availableJob.hourlyRate && (
                           <p className="text-xs text-muted-foreground mb-3 flex items-center gap-1">
-                            <DollarSign className="w-3 h-3" />${(availableJob.hourlyRate / 100).toFixed(2)}/hr
+                            <DollarSign className="w-3 h-3" />$
+                            {(
+                              (workerFacingJobHourlyCents(availableJob.hourlyRate) > 0
+                                ? workerFacingJobHourlyCents(availableJob.hourlyRate)
+                                : availableJob.hourlyRate) / 100
+                            ).toFixed(2)}
+                            /hr
                           </p>
                         )}
                         {onJobAction && (

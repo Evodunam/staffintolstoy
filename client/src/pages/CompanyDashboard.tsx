@@ -5845,6 +5845,14 @@ export default function CompanyDashboard() {
                             <div className="flex items-start justify-between gap-2">
                               <h3 className="font-medium text-foreground truncate">{job.title}</h3>
                               <div className="flex items-center gap-1.5 flex-shrink-0">
+                                {((job as any).paymentHoldAt ?? (job as any).payment_hold_at) && (
+                                  <span
+                                    className="rounded-md bg-destructive/15 text-destructive px-1.5 py-0.5 text-xs font-medium"
+                                    title="Funding failed after hire — fix payment in the payment dialog until balance covers this job."
+                                  >
+                                    Payment hold
+                                  </span>
+                                )}
                                 {jobHasActiveCallSet.has(job.id) && (
                                   <span className="flex items-center gap-1 rounded-md bg-green-500/15 text-green-700 dark:text-green-400 px-1.5 py-0.5 text-xs font-medium" title="Call in progress">
                                     <Phone className="w-3.5 h-3.5" />
@@ -7474,7 +7482,11 @@ export default function CompanyDashboard() {
                       <Star className="w-4 h-4 fill-yellow-500 text-yellow-500" />
                       <span>{selectedApplication.worker.rating}</span>
                       {selectedApplication.worker.identityVerified && (
-                        <Badge variant="outline" className="bg-green-50 text-green-700 border-green-200 dark:bg-green-950/50 dark:text-green-300 dark:border-green-800">
+                        <Badge
+                          variant="outline"
+                          className="bg-green-50 text-green-700 border-green-200 dark:bg-green-950/50 dark:text-green-300 dark:border-green-800"
+                          title={tCommon("idVerifiedBadgeTooltip")}
+                        >
                           <CheckCircle className="w-3 h-3 mr-1" />
                           ID Verified
                         </Badge>
@@ -9305,7 +9317,11 @@ export default function CompanyDashboard() {
                                 </div>
                                 <div className="flex flex-wrap gap-1 justify-end flex-shrink-0">
                                   {app.worker.identityVerified && (
-                                    <Badge variant="outline" className="text-[9px] px-1 py-0 h-4 bg-green-50 text-green-700 border-green-200 dark:bg-green-950/50 dark:text-green-300 dark:border-green-800">
+                                    <Badge
+                                      variant="outline"
+                                      className="text-[9px] px-1 py-0 h-4 bg-green-50 text-green-700 border-green-200 dark:bg-green-950/50 dark:text-green-300 dark:border-green-800"
+                                      title={tCommon("idVerifiedBadgeTooltip")}
+                                    >
                                       <CheckCircle className="w-2.5 h-2.5 mr-0.5" /> ID
                                     </Badge>
                                   )}
@@ -9831,7 +9847,11 @@ export default function CompanyDashboard() {
                                     </div>
                                     <div className="flex flex-wrap gap-1 mt-1">
                                       {app.worker.identityVerified && (
-                                        <Badge variant="outline" className="text-[9px] px-1 py-0 bg-green-50 text-green-700 border-green-200">
+                                        <Badge
+                                          variant="outline"
+                                          className="text-[9px] px-1 py-0 bg-green-50 text-green-700 border-green-200"
+                                          title={tCommon("idVerifiedBadgeTooltip")}
+                                        >
                                           <CheckCircle className="w-2 h-2 mr-0.5" /> ID
                                         </Badge>
                                       )}
@@ -9963,7 +9983,11 @@ export default function CompanyDashboard() {
                                   </div>
                                   <div className="flex flex-wrap gap-1 justify-end flex-shrink-0">
                                     {app.worker.identityVerified && (
-                                      <Badge variant="outline" className="text-[9px] px-1 py-0 h-4 bg-green-50 text-green-700 border-green-200 dark:bg-green-950/50 dark:text-green-300 dark:border-green-800">
+                                      <Badge
+                                        variant="outline"
+                                        className="text-[9px] px-1 py-0 h-4 bg-green-50 text-green-700 border-green-200 dark:bg-green-950/50 dark:text-green-300 dark:border-green-800"
+                                        title={tCommon("idVerifiedBadgeTooltip")}
+                                      >
                                         <CheckCircle className="w-2.5 h-2.5 mr-0.5" /> ID
                                       </Badge>
                                     )}

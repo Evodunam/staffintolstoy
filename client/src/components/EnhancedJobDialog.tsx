@@ -44,6 +44,7 @@ import { ResponsiveDialog } from "@/components/ui/responsive-dialog";
 import { MaterialInvoiceDialog } from "@/components/MaterialInvoiceDialog";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { usePersistentFilter } from "@/hooks/use-persistent-filter";
+import { workerFacingJobHourlyCents } from "@shared/platformPayPolicy";
 
 /** Converts stored rate (cents or dollars) to dollars. Values > 100 are treated as cents. Matches WorkerDashboard so map pill and panel show same payout. */
 function rateToDollars(v: number | null | undefined): number {
@@ -51,10 +52,16 @@ function rateToDollars(v: number | null | undefined): number {
   return v > 100 ? v / 100 : v;
 }
 
+/** Job list hourly is billable cents; workers see wage portion only. */
+function jobHourlyCentsForWorkerUI(jobBillableCents: number | null | undefined): number {
+  const wf = workerFacingJobHourlyCents(jobBillableCents);
+  return wf > 0 ? wf : (jobBillableCents ?? 0);
+}
+
 /** Worker hourly rate in dollars; profile/job may be in cents. Matches WorkerDashboard getWorkerHourlyRate. */
-function getWorkerHourlyRate(profileRate: number | null | undefined, jobRate: number): number {
+function getWorkerHourlyRate(profileRate: number | null | undefined, jobBillableCents: number): number {
   if (profileRate != null && profileRate > 0) return rateToDollars(profileRate);
-  return rateToDollars(jobRate);
+  return rateToDollars(jobHourlyCentsForWorkerUI(jobBillableCents));
 }
 
 /** Compute effective total hours + day span for payout math and breakdown copy. */
@@ -1136,7 +1143,8 @@ function ApplySheet({
       return Math.round(Math.max(18, Math.min(28, minDollars - 1)) * 100) / 100;
     }
     const userRate = profile?.hourlyRate || 30;
-    const jobRate = job.hourlyRate ? job.hourlyRate / 100 : null;
+    const wfSheet = workerFacingJobHourlyCents(job.hourlyRate);
+    const jobRate = wfSheet > 0 ? wfSheet / 100 : null;
     const tradePremiums: Record<string, number> = {
       Electrical: 1.15, Plumbing: 1.12, HVAC: 1.10, Carpentry: 1.08, Concrete: 1.05,
       Drywall: 1.03, Painting: 1.02, "General Labor": 1.0, Demolition: 1.0, Cleaning: 0.95,
@@ -2192,7 +2200,7 @@ export function JobContent({
     const hours = payoutBreakdown.totalHours;
     return allApps.reduce((total, app) => {
       // Use only submitted proposedRate so swapping teammates never changes displayed payout
-      const rateDollars = rateToDollars(app.proposedRate ?? profile?.hourlyRate ?? (job.hourlyRate ? job.hourlyRate / 100 : 0));
+      const rateDollars = rateToDollars(app.proposedRate ?? profile?.hourlyRate ?? jobHourlyCentsForWorkerUI(job.hourlyRate));
       return total + (rateDollars * hours);
     }, 0);
   }, [application, allApps, job.hourlyRate, profile?.hourlyRate, payoutBreakdown.totalHours]);
@@ -2286,7 +2294,8 @@ export function JobContent({
     }
 
     const userRate = profile?.hourlyRate || 30;
-    const jobRate = job.hourlyRate ? job.hourlyRate / 100 : null;
+    const wfCentsInline = workerFacingJobHourlyCents(job.hourlyRate);
+    const jobRate = wfCentsInline > 0 ? wfCentsInline / 100 : null;
     const tradePremiums: Record<string, number> = {
       Electrical: 1.15, Plumbing: 1.12, HVAC: 1.10, Carpentry: 1.08, Concrete: 1.05,
       Drywall: 1.03, Painting: 1.02, "General Labor": 1.0, Demolition: 1.0, Cleaning: 0.95,
@@ -2719,12 +2728,18 @@ export function JobContent({
       const member = acceptedTeamMembers.find(m => m.id === id);
       return { id, name: member ? `${member.firstName} ${member.lastName}` : "Team Member" };
     });
-    applyMutation.mutate({ 
-      jobId: job.id, 
-      message: applyMessage, 
+    const submitRateDollars =
+      customInlineRate != null && customInlineRate > 0
+        ? customInlineRate
+        : getSelectedRateInline;
+    applyMutation.mutate({
+      jobId: job.id,
+      message: applyMessage,
       selectedApplicants: applicants,
       useSmartRate: customInlineRate == null && useSmartRateInline,
-      ...(customInlineRate != null ? { proposedRate: Math.round(customInlineRate * 100) } : {}),
+      ...(submitRateDollars != null && submitRateDollars > 0
+        ? { proposedRate: Math.round(submitRateDollars * 100) }
+        : {}),
     });
   };
 
@@ -4846,7 +4861,7 @@ export function JobContent({
                             payoutBreakdown.totalHours,
                             payoutBreakdown.hoursPerDay,
                             payoutBreakdown.days,
-                            rateToDollars(application.proposedRate ?? profile?.hourlyRate ?? (job.hourlyRate ? job.hourlyRate / 100 : 0)),
+                            rateToDollars(application.proposedRate ?? profile?.hourlyRate ?? jobHourlyCentsForWorkerUI(job.hourlyRate)),
                             displayPayout
                           )}</>
                         )}
@@ -4867,7 +4882,7 @@ export function JobContent({
                         const renderAppPill = (app: typeof allApps[0]) => {
                           const member = app.teamMember;
                           const displayName = member ? `${member.firstName ?? ""} ${member.lastName ?? ""}`.trim() : (t("myself") || "Myself");
-                          const appliedRate = rateToDollars(app.proposedRate ?? profile?.hourlyRate ?? (job.hourlyRate ? job.hourlyRate / 100 : 0));
+                          const appliedRate = rateToDollars(app.proposedRate ?? profile?.hourlyRate ?? jobHourlyCentsForWorkerUI(job.hourlyRate));
                           const canReassign = (application.status === "pending" || application.status === "accepted") && onAssignTeamMember && (activeTeamMembers.length > 0 || allApps.length > 1);
                           const pillContent = (
                             <>
@@ -5842,7 +5857,7 @@ function ApplicationViewDialog({
   
   // Pending/accepted application: payout and rate must never change when swapping teammates — use only submitted proposedRate
   const combinedPayout = allApps.reduce((total, app) => {
-    const rateDollars = rateToDollars(app.proposedRate ?? profile?.hourlyRate ?? (job.hourlyRate ? job.hourlyRate / 100 : 0));
+    const rateDollars = rateToDollars(app.proposedRate ?? profile?.hourlyRate ?? jobHourlyCentsForWorkerUI(job.hourlyRate));
     return total + (rateDollars * estimatedHours);
   }, 0);
   
@@ -5955,14 +5970,14 @@ function ApplicationViewDialog({
           </p>
           <p className="text-sm text-muted-foreground mt-1">
             {hasMultipleWorkers ? (() => {
-              const rates = allApps.map(app => rateToDollars(app.proposedRate ?? profile?.hourlyRate ?? (job.hourlyRate ? job.hourlyRate / 100 : 0)));
+              const rates = allApps.map(app => rateToDollars(app.proposedRate ?? profile?.hourlyRate ?? jobHourlyCentsForWorkerUI(job.hourlyRate)));
               const uniqueRates = Array.from(new Set(rates.map(r => Math.round(r))));
               if (uniqueRates.length === 1) {
                 return t("workersHoursRate", { workers: allApps.length, hours: estimatedHours, rate: uniqueRates[0] });
               } else {
                 return t("workersHoursRatesVary", { workers: allApps.length, hours: estimatedHours });
               }
-            })() : t("hoursAtRate", { hours: estimatedHours, rate: Math.round(rateToDollars(application.proposedRate ?? profile?.hourlyRate ?? (job.hourlyRate ? job.hourlyRate / 100 : 0))) })}
+            })() : t("hoursAtRate", { hours: estimatedHours, rate: Math.round(rateToDollars(application.proposedRate ?? profile?.hourlyRate ?? jobHourlyCentsForWorkerUI(job.hourlyRate))) })}
           </p>
         </div>
         
@@ -6209,7 +6224,7 @@ function ApplicationViewDialog({
                 const renderAppRow = (app: typeof allApps[0]) => {
                   const member = app.teamMember;
                   const displayName = member ? `${member.firstName} ${member.lastName}` : `${profile?.firstName} ${profile?.lastName} (${t("myself")})`;
-                  const appliedRateDollars = rateToDollars(app.proposedRate ?? profile?.hourlyRate ?? (job.hourlyRate ? job.hourlyRate / 100 : 0));
+                  const appliedRateDollars = rateToDollars(app.proposedRate ?? profile?.hourlyRate ?? jobHourlyCentsForWorkerUI(job.hourlyRate));
                   return (
                     <button
                       key={app.id}
@@ -7055,10 +7070,10 @@ function TeammateSettingsPopup({
             <TabsContent value="rate" className="space-y-4 mt-0">
               <div className="bg-muted/30 rounded-lg p-3 border border-border/50">
                 <p className="text-xs text-muted-foreground">
-                  Job rate: <strong>${(job.hourlyRate / 100).toFixed(2)}/hr</strong>
+                  Job rate: <strong>${(jobHourlyCentsForWorkerUI(job.hourlyRate) / 100).toFixed(2)}/hr</strong>
                   {job.estimatedHours && (
                     <span className="ml-2">
-                      × {job.estimatedHours} hrs = ${((job.hourlyRate / 100) * job.estimatedHours).toFixed(2)}
+                      × {job.estimatedHours} hrs = ${((jobHourlyCentsForWorkerUI(job.hourlyRate) / 100) * job.estimatedHours).toFixed(2)}
                     </span>
                   )}
                 </p>

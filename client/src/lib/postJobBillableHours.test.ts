@@ -4,7 +4,7 @@ import {
   hoursBetweenTimes,
   minimumLaborBudgetCentsForWorkerHours,
 } from "@shared/postJobBillableHours";
-import { PLATFORM_MIN_BILLABLE_HOURLY_CENTS } from "@shared/platformPayPolicy";
+import { PLATFORM_MIN_JOB_BUDGET_HOURLY_CENTS } from "@shared/platformPayPolicy";
 
 describe("@shared/postJobBillableHours", () => {
   it("hoursBetweenTimes handles minutes", () => {
@@ -27,7 +27,7 @@ describe("@shared/postJobBillableHours", () => {
   });
 
   it("minimumLaborBudgetCentsForWorkerHours rounds up cents", () => {
-    expect(minimumLaborBudgetCentsForWorkerHours(10)).toBe(10 * PLATFORM_MIN_BILLABLE_HOURLY_CENTS);
-    expect(minimumLaborBudgetCentsForWorkerHours(10.1)).toBe(Math.ceil(10.1 * PLATFORM_MIN_BILLABLE_HOURLY_CENTS));
+    expect(minimumLaborBudgetCentsForWorkerHours(10)).toBe(10 * PLATFORM_MIN_JOB_BUDGET_HOURLY_CENTS);
+    expect(minimumLaborBudgetCentsForWorkerHours(10.1)).toBe(Math.ceil(10.1 * PLATFORM_MIN_JOB_BUDGET_HOURLY_CENTS));
   });
 });

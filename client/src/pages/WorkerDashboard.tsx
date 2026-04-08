@@ -91,6 +91,11 @@ import { jobRequiresLiteOrElite as jobRequiresLiteOrEliteLib, checkSkillMatch as
 import { parseJobLatLng, isPlausibleLatLng } from "@/lib/geo";
 import { buildJobGeocodeQuery, stripLeadingStreetNumber } from "@shared/jobGeocode";
 import { getDisplayJobTitle } from "@/lib/job-display";
+import {
+  workerFacingJobHourlyCents,
+  PLATFORM_JOB_BUDGET_PER_WORKER_HOUR_USD,
+  PLATFORM_MIN_BILLABLE_HOURLY_USD,
+} from "@shared/platformPayPolicy";
 
 type DashboardTab = "find" | "jobs" | "calendar" | "menu" | "today" | "chats";
 
@@ -154,12 +159,14 @@ function rateToDollars(v: number | null | undefined): number {
   return v > 100 ? v / 100 : v;
 }
 
-/** Returns worker hourly rate in dollars. Profile/job may be in cents (>100) or dollars. */
-function getWorkerHourlyRate(profileRate: number | null | undefined, jobRate: number): number {
+/** Returns worker hourly rate in dollars. Profile/job may be in cents (>100) or dollars. Job list rate is billable cents → wage only. */
+function getWorkerHourlyRate(profileRate: number | null | undefined, jobBillableCents: number): number {
   if (profileRate != null && profileRate > 0) {
     return profileRate > 100 ? profileRate / 100 : profileRate;
   }
-  return jobRate > 100 ? jobRate / 100 : jobRate;
+  const wf = workerFacingJobHourlyCents(jobBillableCents);
+  const cents = wf > 0 ? wf : jobBillableCents;
+  return cents > 100 ? cents / 100 : cents;
 }
 
 /** Total est. payout for all slots — same formula as mobile find list + map $ pills. */
@@ -2881,7 +2888,8 @@ export default function WorkerDashboard() {
     const selectedWorkerCount = selectedApplicants.size || 1;
     
     // Base rate factors
-    const jobRate = applyJob.hourlyRate ? applyJob.hourlyRate / 100 : null;
+    const wfDash = workerFacingJobHourlyCents(applyJob.hourlyRate);
+    const jobRate = wfDash > 0 ? wfDash / 100 : null;
     
     // Trade premium multipliers (higher-paying trades)
     const tradePremiums: Record<string, number> = {
@@ -2911,9 +2919,12 @@ export default function WorkerDashboard() {
     if (applyJob.budgetCents) {
       const totalBudget = applyJob.budgetCents / 100;
       const hoursPerWorker = applyJob.estimatedHours || 8;
-      const budgetRate = totalBudget / (hoursPerWorker * selectedWorkerCount);
-      // Budget rate minus small buffer for competitiveness
-      baseRate = budgetRate * 0.92;
+      const billablePerWorkerHour = totalBudget / (hoursPerWorker * selectedWorkerCount);
+      const workerFacingPerHour = Math.max(
+        PLATFORM_MIN_BILLABLE_HOURLY_USD,
+        billablePerWorkerHour - PLATFORM_JOB_BUDGET_PER_WORKER_HOUR_USD
+      );
+      baseRate = workerFacingPerHour * 0.92;
     } else if (jobRate) {
       // Use job rate with competitive discount
       baseRate = jobRate * 0.88;
@@ -3303,13 +3314,14 @@ export default function WorkerDashboard() {
               
               let proposedRate: number | undefined = undefined;
               if (aiDispatchRateAdjustments && job.hourlyRate) {
-                const jobRate = job.hourlyRate;
-                const workerRate = workerId === "self"
-                  ? (profile?.hourlyRate || 30)
-                  : (member?.hourlyRate ?? 30);
-                
-                // Use competitive rate: job rate if it's higher, otherwise worker rate with small discount
-                proposedRate = Math.max(workerRate * 0.95, Math.min(jobRate, workerRate));
+                const wf = workerFacingJobHourlyCents(job.hourlyRate);
+                const jobRateDollars = wf > 0 ? wf / 100 : job.hourlyRate / 100;
+                const workerRateDollars = workerId === "self"
+                  ? rateToDollars(profile?.hourlyRate)
+                  : rateToDollars(member?.hourlyRate);
+                proposedRate = Math.round(
+                  100 * Math.max(workerRateDollars * 0.95, Math.min(jobRateDollars, workerRateDollars))
+                );
               }
               
               // Sanitize message
@@ -3550,7 +3562,9 @@ export default function WorkerDashboard() {
   // Calculate estimated payout based on worker/team member rate and hours
   const getEstimatedPayout = (job: Job, application?: ApplicationWithDetails): string => {
     const hours = job.estimatedHours || 8;
-    let rate = job.hourlyRate > 100 ? job.hourlyRate / 100 : job.hourlyRate;
+    const wf = workerFacingJobHourlyCents(job.hourlyRate);
+    const jobCents = wf > 0 ? wf : job.hourlyRate;
+    let rate = jobCents > 100 ? jobCents / 100 : jobCents;
     if (application?.teamMember?.hourlyRate != null) {
       rate = rateToDollars(application.teamMember.hourlyRate);
     } else if (application?.proposedRate != null) {
@@ -7699,12 +7713,21 @@ export default function WorkerDashboard() {
 
             <div>
               <h3 className="font-semibold mb-2">Pay</h3>
-              <p className="text-2xl font-bold">${selectedCalendarJob.hourlyRate / 100}/hr</p>
-              {selectedCalendarJob.estimatedHours && (
-                <p className="text-sm text-muted-foreground">
-                  Est. {selectedCalendarJob.estimatedHours} hours = ${(selectedCalendarJob.hourlyRate / 100) * selectedCalendarJob.estimatedHours}
-                </p>
-              )}
+              {(() => {
+                const wfCal = workerFacingJobHourlyCents(selectedCalendarJob.hourlyRate);
+                const hr = wfCal > 0 ? wfCal / 100 : selectedCalendarJob.hourlyRate / 100;
+                return (
+                  <>
+                    <p className="text-2xl font-bold">${hr.toFixed(0)}/hr</p>
+                    {selectedCalendarJob.estimatedHours ? (
+                      <p className="text-sm text-muted-foreground">
+                        Est. {selectedCalendarJob.estimatedHours} hours = $
+                        {(hr * selectedCalendarJob.estimatedHours).toFixed(0)}
+                      </p>
+                    ) : null}
+                  </>
+                );
+              })()}
             </div>
 
             <div>

@@ -70,7 +70,8 @@
     "email": "Email",
     "auto": "Auto",
     "optional": "Optional",
-    "address": "Address"
+    "address": "Address",
+    "idVerifiedBadgeTooltip": "Government ID verified with Stripe. This is not a criminal background check or credit report."
   },
   "dashboard": {
     "overview": "Overview",
@@ -1673,7 +1674,15 @@
     "insurance": "Insurance",
     "insuranceDescription": "Verified insurance shows companies you're protected against job site liability. Workers with verified insurance get more job opportunities.",
     "w9": "W-9",
-    "w9Description": "Required for tax purposes when you earn over $600. This form is included with your job applications."
+    "w9Description": "Required for tax purposes when you earn over $600. This form is included with your job applications.",
+    "identityVerificationTitle": "Identity verification",
+    "identityVerificationCardDescription": "Confirm your government ID and selfie with Stripe.",
+    "identityVerificationScopeNote": "This checks that your ID is authentic and matches your photo. It is not a criminal background check, credit check, or employment screening report.",
+    "identityVerifiedTitle": "Identity verified",
+    "identityVerifiedBody": "Your identity has been confirmed.",
+    "identityVerifyPromptTitle": "Verify your identity",
+    "identityVerifyPromptBody": "Complete identity verification to unlock all features.",
+    "startIdentityVerification": "Start identity verification"
   },
   "businessOperator": {
     "wizardSteps": {

@@ -1,6 +1,10 @@
 import type { Job, Profile } from "@shared/schema";
 import { AUTO_FULFILL_LEGAL_VERSION } from "@shared/autoFulfillLegal";
-import { PLATFORM_MIN_BILLABLE_HOURLY_CENTS } from "@shared/platformPayPolicy";
+import {
+  PLATFORM_MIN_BILLABLE_HOURLY_CENTS,
+  PLATFORM_MIN_JOB_BUDGET_HOURLY_CENTS,
+  workerFacingJobHourlyCents,
+} from "@shared/platformPayPolicy";
 
 function effectiveAutoFulfillWorkerHours(j: Partial<JobAuto>): number {
   const expH = j.autoFulfillExpectedHours != null ? Number(j.autoFulfillExpectedHours) : NaN;
@@ -61,9 +65,9 @@ export function validateAutoFulfillJobPayload(j: Partial<JobAuto>): string | nul
   }
   const hoursEff = effectiveAutoFulfillWorkerHours(j);
   if (hoursEff > 0 && Number.isFinite(budget) && budget > 0) {
-    const minBudgetCents = Math.ceil(hoursEff * PLATFORM_MIN_BILLABLE_HOURLY_CENTS);
+    const minBudgetCents = Math.ceil(hoursEff * PLATFORM_MIN_JOB_BUDGET_HOURLY_CENTS);
     if (budget < minBudgetCents) {
-      return `Auto-fulfill labor budget must cover at least ${hoursEff} worker-hours at the platform minimum rate (minimum $${(minBudgetCents / 100).toFixed(2)}).`;
+      return `Auto-fulfill labor budget must cover at least ${hoursEff} worker-hours at the minimum billable rate for budgets (minimum $${(minBudgetCents / 100).toFixed(2)}).`;
     }
   }
   if (j.autoFulfillMinWorkerRating != null) {
@@ -99,6 +103,10 @@ export function evaluateAutoFulfillAccept(args: {
   const st = String(j.status ?? "");
   if (st !== "open" && st !== "in_progress") return { accept: false, reason: "job_not_bookable" };
 
+  if ((j as { paymentHoldAt?: Date | null }).paymentHoldAt) {
+    return { accept: false, reason: "payment_hold" };
+  }
+
   const maxSlots = j.maxWorkersNeeded ?? 1;
   if (args.acceptedApplicationCount >= maxSlots) return { accept: false, reason: "job_full" };
 
@@ -111,20 +119,23 @@ export function evaluateAutoFulfillAccept(args: {
 
   const minRating =
     j.autoFulfillMinWorkerRating != null ? parseFloat(String(j.autoFulfillMinWorkerRating)) : null;
-  const minReviews = j.autoFulfillMinWorkerReviews ?? 1;
+  const minReviewsRaw =
+    j.autoFulfillMinWorkerReviews != null ? Number(j.autoFulfillMinWorkerReviews) : 0;
+  const minReviews = Number.isFinite(minReviewsRaw) ? Math.max(0, Math.floor(minReviewsRaw)) : 0;
   const workerRating =
     args.worker.averageRating != null ? parseFloat(String(args.worker.averageRating)) : 0;
   const workerReviews = args.worker.totalReviews ?? 0;
 
   if (minRating != null && Number.isFinite(minRating)) {
     if (workerReviews < minReviews) return { accept: false, reason: "insufficient_reviews" };
-    if (workerRating < minRating) return { accept: false, reason: "below_min_rating" };
+    // No public reviews yet — don't block on average (often 0/null); company min still applies once they have reviews.
+    if (workerReviews > 0 && workerRating < minRating) return { accept: false, reason: "below_min_rating" };
   }
 
   const effectiveRate =
     args.proposedRateCents != null && args.proposedRateCents > 0
       ? args.proposedRateCents
-      : j.hourlyRate ?? 0;
+      : workerFacingJobHourlyCents(j.hourlyRate);
 
   let maxHourly = j.autoFulfillMaxHourlyCents != null ? Number(j.autoFulfillMaxHourlyCents) : null;
   if (maxHourly == null || !Number.isFinite(maxHourly) || maxHourly <= 0) {

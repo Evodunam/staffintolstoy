@@ -53,10 +53,14 @@ export interface PostJobDraft {
     selectedPhoneOption: string;
     paymentMethodId?: number | null;
   };
-  /** Step 3 — optional overall job budget (USD), separate from on-demand flow budget */
+  /** Step 3 — total job budget (USD); also used for auto-fulfill when enabled */
   jobBudgetDollars?: number | null;
   autoFulfillEnabled?: boolean;
+  /** @deprecated merged into jobBudgetDollars; read on restore only */
   autoFulfillLaborBudgetDollars?: number | null;
+  /** 1–5, minimum worker star rating for auto-accept */
+  autoFulfillMinWorkerStars?: number;
+  /** @deprecated restored for older drafts only */
   autoFulfillBudgetWindow?: "one_day" | "weekly" | "monthly" | "custom";
   autoFulfillCustomStart?: string;
   autoFulfillCustomEnd?: string;
@@ -66,7 +70,6 @@ export interface PostJobDraft {
   autoFulfillMaxHourlyDollars?: string;
   autoFulfillMinHourlyDollars?: string;
   autoFulfillTermsAck?: boolean;
-  saveAfDefaults?: boolean;
   version: number;
 }
 

@@ -155,6 +155,7 @@ import { startInvoiceReminderScheduler } from "./invoice-reminder-scheduler";
 import { startAffiliateEmailScheduler } from "./services/affiliate-email-scheduler";
 import { startAutoApprovalScheduler } from "./auto-approval-scheduler";
 import { startChatDigestScheduler } from "./chat-digest-scheduler";
+import { startPaymentFailureReminderScheduler } from "./payment-failure-reminder-scheduler";
 
 const app = express();
 const httpServer = createServer(app);
@@ -312,6 +313,7 @@ app.use((req, res, next) => {
         startAffiliateEmailScheduler();
         startAutoApprovalScheduler();
         startChatDigestScheduler();
+        startPaymentFailureReminderScheduler();
       }, 1500);
     },
   ).on('error', (err: NodeJS.ErrnoException) => {

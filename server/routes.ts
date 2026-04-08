@@ -26,9 +26,14 @@ import {
 } from "./lib/autoFulfill";
 import { isLocalDevHostFromRequest } from "./lib/isLocalDevRequest";
 import { minimumLaborBudgetCentsForWorkerHours } from "@shared/postJobBillableHours";
+import { workerFacingJobHourlyCents } from "@shared/platformPayPolicy";
 import * as calendarIntegration from "./services/calendarIntegration";
 import { Client as GoogleMapsClient } from "@googlemaps/google-maps-services-js";
-import { triggerAutoReplenishmentForCompany } from "./auto-replenishment-scheduler";
+import {
+  triggerAutoReplenishmentForCompany,
+  afterHireFundingCheck,
+  clearPaymentHoldsForCompanyIfSolvent,
+} from "./auto-replenishment-scheduler";
 import { ensureCompanyStripeCustomer } from "./lib/company-stripe";
 import { addHours } from "date-fns";
 
@@ -584,9 +589,7 @@ export async function registerRoutes(
         },
       }).catch((err) => console.error("Failed to send application accepted email:", err));
     }
-    triggerAutoReplenishmentForCompany(companyIdForReplenishment).catch((err) =>
-      console.error("Failed to trigger auto-replenishment:", err)
-    );
+    await afterHireFundingCheck(job.id, companyIdForReplenishment);
   }
   
   // WebSocket setup for real-time notifications
@@ -4115,7 +4118,7 @@ Respond ONLY in this exact JSON format:
           const minB = minimumLaborBudgetCentsForWorkerHours(eh);
           if (minB > 0 && bc < minB) {
             return res.status(400).json({
-              message: `Job budget is too low for this schedule: at least $${(minB / 100).toFixed(2)} required for ${eh} worker-hours at the platform minimum rate.`,
+              message: `Job budget is too low for this schedule: at least $${(minB / 100).toFixed(2)} required for ${eh} worker-hours at the minimum billable rate used for budgets.`,
               code: "JOB_BUDGET_BELOW_FLOOR",
             });
           }
@@ -5834,9 +5837,10 @@ Respond ONLY in this exact JSON format:
         }).catch(err => console.error('Failed to send worker accepted job email:', err));
       }
       
-      // Trigger auto-replenishment check when worker accepts and commitments increase
-      triggerAutoReplenishmentForCompany(job.companyId)
-        .catch(err => console.error('Failed to trigger auto-replenishment:', err));
+      // Balance shortfall → Stripe replenishment; on failure job gets payment_hold_at + profile lastFailed PM for global modal
+      await afterHireFundingCheck(job.id, job.companyId).catch((err) =>
+        console.error("afterHireFundingCheck (worker accept):", err)
+      );
     }
     
     res.json(updated);
@@ -5853,12 +5857,36 @@ Respond ONLY in this exact JSON format:
       }
 
       const input = api.applications.create.input.parse(req.body);
+      const job = await storage.getJob(input.jobId);
+      if (!job) {
+        return res.status(404).json({ message: "Job not found" });
+      }
+      if (job.status !== "open") {
+        return res.status(400).json({ message: "This job is not accepting applications." });
+      }
+      if (job.paymentHoldAt) {
+        return res.status(400).json({
+          message: "This job is on hold until the company resolves payment.",
+          code: "JOB_PAYMENT_HOLD",
+        });
+      }
+
+      const defaultWorkerRateCents = workerFacingJobHourlyCents(job.hourlyRate);
+      const resolvedProposedRate =
+        input.proposedRate != null && input.proposedRate > 0
+          ? input.proposedRate
+          : defaultWorkerRateCents > 0
+            ? defaultWorkerRateCents
+            : undefined;
+
       let application;
       try {
         application = await storage.createApplication({
-          ...input,
+          jobId: input.jobId,
           message: sanitizeMessage(input.message),
           workerId: profile.id,
+          teamMemberId: input.teamMemberId ?? null,
+          proposedRate: resolvedProposedRate ?? null,
         });
       } catch (createErr: any) {
         if (createErr?.code === "23505") {
@@ -5867,14 +5895,13 @@ Respond ONLY in this exact JSON format:
         throw createErr;
       }
 
-      const job = await storage.getJob(input.jobId);
       if (job) {
         const appsForCount = await storage.getJobApplications(job.id);
         const acceptedCount = appsForCount.filter((a: any) => a.status === "accepted").length;
         const decision = evaluateAutoFulfillAccept({
           job: job as any,
           worker: profile,
-          proposedRateCents: input.proposedRate,
+          proposedRateCents: application.proposedRate,
           acceptedApplicationCount: acceptedCount,
         });
         if (decision.accept) {
@@ -6605,9 +6632,9 @@ Respond ONLY in this exact JSON format:
           console.error("Failed to create notification:", e);
         }
         
-        // Trigger auto-replenishment check when direct inquiry creates committed job
-        triggerAutoReplenishmentForCompany(inquiry.companyId)
-          .catch(err => console.error('Failed to trigger auto-replenishment:', err));
+        await afterHireFundingCheck(job.id, inquiry.companyId).catch((err) =>
+          console.error("afterHireFundingCheck (direct inquiry):", err)
+        );
         
         res.json({ ...updatedInquiry, convertedJobId: job.id });
       } else {
@@ -8346,8 +8373,26 @@ Respond ONLY in this exact JSON format:
     const user = req.user as any;
     const profile = req.profile;
     if (!profile) return res.status(404).json({ message: "Profile not found" });
-    
-    const locations = await storage.getCompanyLocations(profile.id);
+
+    let companyProfileId = profile.id;
+    let locations = await storage.getCompanyLocations(companyProfileId);
+
+    if (profile.role === "company" && profile.userId) {
+      const tm = await storage.getActiveCompanyTeamMembershipForUser(String(profile.userId));
+      if (tm) {
+        companyProfileId = tm.companyProfileId;
+        locations = await storage.getCompanyLocations(companyProfileId);
+        const restrict =
+          tm.role !== "admin" && Array.isArray(tm.locationIds) && tm.locationIds.length > 0;
+        if (restrict) {
+          const allowed = new Set(
+            tm.locationIds.map((id) => Number(id)).filter((n) => Number.isFinite(n))
+          );
+          locations = locations.filter((loc) => allowed.has(loc.id));
+        }
+      }
+    }
+
     res.json(locations);
   });
 
@@ -8505,7 +8550,7 @@ Respond ONLY in this exact JSON format:
       const assignments = await db.select().from(jobAssignments).where(and(eq(jobAssignments.workerId, workerId), eq(jobAssignments.status, "assigned")));
       for (const a of assignments) {
         const job = await storage.getJob(a.jobId);
-        if (!job || !["open", "in_progress"].includes(job.status)) continue;
+        if (!job || !["open", "in_progress"].includes(job.status) || job.paymentHoldAt) continue;
         const win = await getPingWindowForJob(job);
         if (!win || now < win.windowStart || now > win.windowEnd) continue;
         const todayTs = await db.select().from(timesheets).where(and(eq(timesheets.jobId, job.id), eq(timesheets.workerId, workerId), gte(timesheets.clockInTime, startOfDay), lte(timesheets.clockInTime, endOfDay))).limit(1);
@@ -8516,7 +8561,7 @@ Respond ONLY in this exact JSON format:
       for (const app of apps) {
         if (assignments.some((a) => a.jobId === app.jobId)) continue;
         const job = await storage.getJob(app.jobId);
-        if (!job || !["open", "in_progress"].includes(job.status)) continue;
+        if (!job || !["open", "in_progress"].includes(job.status) || job.paymentHoldAt) continue;
         const win = await getPingWindowForJob(job);
         if (!win || now < win.windowStart || now > win.windowEnd) continue;
         const todayTs = await db.select().from(timesheets).where(and(eq(timesheets.jobId, job.id), eq(timesheets.workerId, workerId), gte(timesheets.clockInTime, startOfDay), lte(timesheets.clockInTime, endOfDay))).limit(1);
@@ -9012,6 +9057,13 @@ Respond ONLY in this exact JSON format:
         return res.status(404).json({ message: "Job not found" });
       }
 
+      if (job.paymentHoldAt) {
+        return res.status(403).json({
+          message: "This job is on hold until the company resolves payment. You cannot clock in yet.",
+          code: "JOB_PAYMENT_HOLD",
+        });
+      }
+
       // Require accepted application or job assignment for this job (prevent clock-in to arbitrary jobs)
       const [hasAssignment] = await db.select().from(jobAssignments).where(and(
         eq(jobAssignments.jobId, jobId),
@@ -9245,6 +9297,7 @@ Respond ONLY in this exact JSON format:
   ): Promise<void> {
     const job = await storage.getJob(jobId);
     if (!job?.latitude || !job?.longitude) return;
+    if (job.paymentHoldAt) return;
     const profile = await storage.getProfile(workerProfileId);
     if (!profile) return;
     const existingActive = await storage.getActiveTimesheet(workerProfileId);
@@ -9715,7 +9768,7 @@ Respond ONLY in this exact JSON format:
       }).returning();
 
       // Server-side auto clock-in when ping is within auto geofence and worker is assigned but not yet clocked in
-      if (jobId && job && withinGeofence && isWithinGeofence(distanceFromJob ?? Infinity, true)) {
+      if (jobId && job && !job.paymentHoldAt && withinGeofence && isWithinGeofence(distanceFromJob ?? Infinity, true)) {
         const performClockIn = (globalThis as any).__performServerSideClockIn;
         if (typeof performClockIn === "function") {
           performClockIn(profile.id, jobId, latitude, longitude, distanceFromJob ?? 0).catch((e: unknown) =>
@@ -9765,7 +9818,7 @@ Respond ONLY in this exact JSON format:
         distanceFromJob: Math.round(distanceFromJob),
         withinGeofence,
       }).returning();
-      if (withinGeofence && isWithinGeofence(distanceFromJob, true)) {
+      if (!job.paymentHoldAt && withinGeofence && isWithinGeofence(distanceFromJob, true)) {
         const fn = (globalThis as any).__performServerSideClockIn;
         if (typeof fn === "function") {
           fn(profile.id, Number(jobId), lat, lng, distanceFromJob).catch((e: unknown) => console.error("[LocationPings/from-push] Auto clock-in failed:", e));
@@ -14323,7 +14376,17 @@ Respond ONLY in this exact JSON format:
         clientShortfallCents: clientShortfallCents && clientShortfallCents > 0 ? clientShortfallCents : undefined,
       });
       if (result.success) {
+        await clearPaymentHoldsForCompanyIfSolvent(profile.id);
         return res.json({ success: true, message: "Balance replenished successfully." });
+      }
+      if (result.noChargeNeeded) {
+        await clearPaymentHoldsForCompanyIfSolvent(profile.id);
+      }
+      if (!result.success && !result.noChargeNeeded) {
+        const { notifyCompanyPaymentFundingIssue } = await import("./payment-failure-reminder-scheduler");
+        notifyCompanyPaymentFundingIssue(profile.id).catch((e) =>
+          console.warn("[trigger-auto-charge] notifyCompanyPaymentFundingIssue:", e)
+        );
       }
       return res.json({
         success: false,
@@ -16096,6 +16159,8 @@ Respond ONLY in this exact JSON format:
         : "Balance top-up via ACH (Stripe)";
       const { mercuryService } = await import("./services/mercury");
       await mercuryService.recordCompanyPaymentAsMercuryInvoice(profile, amountCents, depositDescription, chargeResult.paymentIntentId);
+
+      await clearPaymentHoldsForCompanyIfSolvent(profile.id);
 
       res.json({
         success: true,

@@ -4,7 +4,7 @@ import { Navigation } from "@/components/Navigation";
 import { useFindWork, useDismissJob } from "@/hooks/use-jobs";
 import { useAuth } from "@/hooks/use-auth";
 import { useProfile } from "@/hooks/use-profiles";
-import { Loader2, Search, MapPin, List, Map, Clock, DollarSign, Building2, X, ChevronRight, AlertCircle, CheckCircle, Users, Send, ChevronLeft, Sparkles, Settings } from "lucide-react";
+import { Loader2, Search, MapPin, List, Map as MapIcon, Clock, DollarSign, Building2, X, ChevronRight, AlertCircle, CheckCircle, Users, Send, ChevronLeft, Sparkles, Settings } from "lucide-react";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Button } from "@/components/ui/button";
@@ -29,6 +29,12 @@ import { useTranslation } from "react-i18next";
 import { LayeredAvatars } from "@/components/LayeredAvatars";
 import { apiRequest } from "@/lib/queryClient";
 import { parseJobLatLng } from "@/lib/geo";
+import { workerFacingJobHourlyCents } from "@shared/platformPayPolicy";
+
+function workerDisplayHourlyCents(billableCents: number): number {
+  const wf = workerFacingJobHourlyCents(billableCents);
+  return wf > 0 ? wf : billableCents;
+}
 
 function formatUrgency(startDate: Date, t: (key: string, options?: any) => string): { label: string; color: string } {
   const now = new Date();
@@ -50,12 +56,13 @@ function formatUrgency(startDate: Date, t: (key: string, options?: any) => strin
 }
 
 function formatRate(cents: number): string {
-  return `$${(cents / 100).toFixed(0)}`;
+  return `$${(workerDisplayHourlyCents(cents) / 100).toFixed(0)}`;
 }
 
-function calculatePayout(hourlyRateCents: number, estimatedHours?: number): string {
+function calculatePayout(billableHourlyCents: number, estimatedHours?: number): string {
   const hours = estimatedHours || 8;
-  const payout = (hourlyRateCents / 100) * hours;
+  const c = workerDisplayHourlyCents(billableHourlyCents);
+  const payout = (c / 100) * hours;
   return `$${payout.toFixed(0)}`;
 }
 
@@ -683,8 +690,9 @@ export default function FindWorkPage() {
   // Calculate smart rate suggestion
   const smartRateSuggestion = useMemo(() => {
     if (!applyJob?.hourlyRate) return 20;
-    const jobRate = applyJob.hourlyRate;
-    const suggested = Math.min(jobRate * 0.95, 24.99);
+    const wf = workerFacingJobHourlyCents(applyJob.hourlyRate);
+    const jobRateDollars = wf > 0 ? wf / 100 : applyJob.hourlyRate / 100;
+    const suggested = Math.min(jobRateDollars * 0.95, 24.99);
     return Math.max(suggested, 15);
   }, [applyJob?.hourlyRate]);
   
@@ -776,6 +784,7 @@ export default function FindWorkPage() {
         return { id, name: member ? `${member.firstName} ${member.lastName}` : "Team Member" };
       });
       
+      const submitRate = getSelectedRate;
       const res = await fetch("/api/applications", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -784,6 +793,7 @@ export default function FindWorkPage() {
           message: applicationMessage || null,
           selectedApplicants: applicants,
           useSmartRate: useSmartRate,
+          ...(submitRate != null && submitRate > 0 ? { proposedRate: Math.round(submitRate * 100) } : {}),
         }),
         credentials: "include",
       });
@@ -913,7 +923,7 @@ export default function FindWorkPage() {
                 onClick={() => setViewMode("map")}
                 data-testid="view-map-button"
               >
-                <Map className="w-4 h-4 mr-1" />
+                <MapIcon className="w-4 h-4 mr-1" />
                 {t("map")}
               </Button>
             </div>
