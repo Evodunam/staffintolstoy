@@ -27,6 +27,15 @@ jobs:
       - name: Typecheck
         run: npm run check
 
+      - name: SEO smoke test
+        run: npm run seo:smoke:ci
+
+      - name: SEO mode smoke (shuffled + sequential)
+        run: npm run seo:smoke:all-modes
+
+      - name: SEO phased rollout smoke
+        run: npm run seo:smoke:all-phases
+
       - name: Unit tests (client)
         run: npm test
 

@@ -1,0 +1,218 @@
+{
+  "serviceBuyerCompatibility": {
+    "General Labor": [
+      "construction companies",
+      "facility operators",
+      "property management teams",
+      "hospitality operators",
+      "retail groups",
+      "warehouse operators",
+      "event teams",
+      "franchise owners",
+      "municipal teams",
+      "manufacturing teams"
+    ],
+    "Carpentry": [
+      "construction companies",
+      "property management teams",
+      "franchise owners",
+      "facility operators",
+      "hospitality operators"
+    ],
+    "Electrical Staffing": [
+      "construction companies",
+      "facility operators",
+      "property management teams",
+      "hospitality operators",
+      "franchise owners"
+    ],
+    "Plumbing Staffing": [
+      "construction companies",
+      "facility operators",
+      "property management teams",
+      "hospitality operators",
+      "franchise owners"
+    ],
+    "HVAC Staffing": [
+      "construction companies",
+      "facility operators",
+      "property management teams",
+      "hospitality operators",
+      "manufacturing teams"
+    ],
+    "Painting Staffing": [
+      "construction companies",
+      "property management teams",
+      "hospitality operators",
+      "retail groups",
+      "franchise owners"
+    ],
+    "Warehouse Staffing": [
+      "warehouse operators",
+      "retail groups",
+      "manufacturing teams",
+      "franchise owners"
+    ],
+    "Landscaping Staffing": [
+      "property management teams",
+      "municipal teams",
+      "hospitality operators",
+      "franchise owners"
+    ],
+    "Drywall Staffing": [
+      "construction companies",
+      "property management teams",
+      "hospitality operators"
+    ],
+    "Demolition Crews": [
+      "construction companies",
+      "property management teams",
+      "municipal teams"
+    ],
+    "Event Setup Crews": [
+      "event teams",
+      "hospitality operators",
+      "retail groups",
+      "franchise owners"
+    ],
+    "Forklift Operators": [
+      "warehouse operators",
+      "manufacturing teams",
+      "retail groups"
+    ],
+    "Retail Merchandising": [
+      "retail groups",
+      "franchise owners",
+      "warehouse operators"
+    ],
+    "Janitorial Staffing": [
+      "facility operators",
+      "property management teams",
+      "hospitality operators",
+      "retail groups",
+      "municipal teams"
+    ],
+    "Moving Labor": [
+      "property management teams",
+      "facility operators",
+      "retail groups",
+      "franchise owners"
+    ],
+    "Concrete Crews": [
+      "construction companies",
+      "municipal teams",
+      "property management teams"
+    ],
+    "Roofing Labor": [
+      "construction companies",
+      "property management teams",
+      "facility operators"
+    ],
+    "Maintenance Technicians": [
+      "facility operators",
+      "property management teams",
+      "hospitality operators",
+      "manufacturing teams",
+      "retail groups"
+    ],
+    "Solar Installers": [
+      "construction companies",
+      "municipal teams",
+      "facility operators"
+    ],
+    "Production Line Staffing": [
+      "manufacturing teams",
+      "warehouse operators",
+      "retail groups"
+    ]
+  },
+  "intentBuyerCompatibility": {
+    "same day": [
+      "construction companies",
+      "facility operators",
+      "property management teams",
+      "hospitality operators",
+      "retail groups",
+      "warehouse operators",
+      "event teams",
+      "franchise owners",
+      "municipal teams",
+      "manufacturing teams"
+    ],
+    "next day": [
+      "construction companies",
+      "facility operators",
+      "property management teams",
+      "hospitality operators",
+      "retail groups",
+      "warehouse operators",
+      "event teams",
+      "franchise owners",
+      "municipal teams",
+      "manufacturing teams"
+    ],
+    "weekend": [
+      "hospitality operators",
+      "retail groups",
+      "event teams",
+      "property management teams",
+      "franchise owners",
+      "facility operators"
+    ],
+    "night shift": [
+      "warehouse operators",
+      "manufacturing teams",
+      "facility operators",
+      "retail groups",
+      "construction companies"
+    ],
+    "seasonal": [
+      "retail groups",
+      "hospitality operators",
+      "warehouse operators",
+      "event teams",
+      "franchise owners"
+    ],
+    "project based": [
+      "construction companies",
+      "facility operators",
+      "property management teams",
+      "hospitality operators",
+      "retail groups",
+      "warehouse operators",
+      "event teams",
+      "franchise owners",
+      "municipal teams",
+      "manufacturing teams"
+    ],
+    "emergency": [
+      "facility operators",
+      "property management teams",
+      "construction companies",
+      "hospitality operators",
+      "municipal teams"
+    ],
+    "recurring": [
+      "facility operators",
+      "property management teams",
+      "warehouse operators",
+      "manufacturing teams",
+      "retail groups",
+      "franchise owners"
+    ],
+    "temp to hire": [
+      "warehouse operators",
+      "manufacturing teams",
+      "retail groups",
+      "facility operators",
+      "construction companies"
+    ],
+    "peak demand": [
+      "retail groups",
+      "warehouse operators",
+      "manufacturing teams",
+      "event teams",
+      "hospitality operators"
+    ]
+  }
+}

@@ -146,6 +146,7 @@ import express, { type Request, Response, NextFunction } from "express";
 import compression from "compression";
 import rateLimit from "express-rate-limit";
 import { registerRoutes } from "./routes";
+import { registerSeoRoutes } from "./seo";
 import { serveStatic } from "./static";
 import { createServer } from "http";
 import { startJobReminderScheduler } from "./job-reminder-scheduler";
@@ -257,6 +258,8 @@ app.use((req, res, next) => {
 
   next();
 });
+
+registerSeoRoutes(app);
 
 (async () => {
   // Load secrets from GCP in production before starting the server
