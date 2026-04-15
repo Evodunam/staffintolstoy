@@ -3,6 +3,10 @@
   "version": "1.0.0",
   "type": "module",
   "license": "MIT",
+  "engines": {
+    "node": "22.x",
+    "npm": "11.x"
+  },
   "scripts": {
     "predev": "node -e \"require('fs').mkdirSync('.cache/temp', {recursive: true})\"",
     "dev": "cross-env NODE_ENV=development TMP=.cache/temp TEMP=.cache/temp dotenv -e .env.development -- tsx server/index.ts",

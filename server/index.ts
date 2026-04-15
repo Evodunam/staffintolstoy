@@ -145,19 +145,7 @@ if (verboseEnv) {
 import express, { type Request, Response, NextFunction } from "express";
 import compression from "compression";
 import rateLimit from "express-rate-limit";
-import { registerRoutes } from "./routes";
-import { registerSeoRoutes } from "./seo";
-import { serveStatic } from "./static";
 import { createServer } from "http";
-import { startJobReminderScheduler } from "./job-reminder-scheduler";
-import { startAutoReplenishmentScheduler } from "./auto-replenishment-scheduler";
-import { startGeolocationWakeupScheduler } from "./schedulers/geolocationWakeup";
-import { startAutoClockOutFromPingsScheduler } from "./schedulers/autoClockOutFromPings";
-import { startInvoiceReminderScheduler } from "./invoice-reminder-scheduler";
-import { startAffiliateEmailScheduler } from "./services/affiliate-email-scheduler";
-import { startAutoApprovalScheduler } from "./auto-approval-scheduler";
-import { startChatDigestScheduler } from "./chat-digest-scheduler";
-import { startPaymentFailureReminderScheduler } from "./payment-failure-reminder-scheduler";
 
 const app = express();
 const httpServer = createServer(app);
@@ -259,12 +247,41 @@ app.use((req, res, next) => {
   next();
 });
 
-registerSeoRoutes(app);
-
 (async () => {
   // Load secrets from GCP in production before starting the server
   await loadSecretsFromGCP();
-  
+
+  // Import DB-dependent modules after secrets are loaded.
+  // This prevents startup crashes when DATABASE_URL only exists in GSM.
+  const [
+    { registerRoutes },
+    { registerSeoRoutes },
+    { serveStatic },
+    { startJobReminderScheduler },
+    { startAutoReplenishmentScheduler },
+    { startGeolocationWakeupScheduler },
+    { startAutoClockOutFromPingsScheduler },
+    { startInvoiceReminderScheduler },
+    { startAffiliateEmailScheduler },
+    { startAutoApprovalScheduler },
+    { startChatDigestScheduler },
+    { startPaymentFailureReminderScheduler },
+  ] = await Promise.all([
+    import("./routes"),
+    import("./seo"),
+    import("./static"),
+    import("./job-reminder-scheduler"),
+    import("./auto-replenishment-scheduler"),
+    import("./schedulers/geolocationWakeup"),
+    import("./schedulers/autoClockOutFromPings"),
+    import("./invoice-reminder-scheduler"),
+    import("./services/affiliate-email-scheduler"),
+    import("./auto-approval-scheduler"),
+    import("./chat-digest-scheduler"),
+    import("./payment-failure-reminder-scheduler"),
+  ]);
+
+  registerSeoRoutes(app);
   await registerRoutes(httpServer, app);
 
   app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
