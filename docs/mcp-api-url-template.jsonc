@@ -1,0 +1,23 @@
+{
+  // Cursor MCP config template
+  // Copy into .cursor/mcp.json (or merge with your existing file).
+  "mcpServers": {
+    // Option A: remote MCP server reachable over HTTP
+    "my-remote-mcp": {
+      "url": "https://api.example.com/mcp",
+      "headers": {
+        "Authorization": "Bearer ${MCP_API_KEY}"
+      }
+    },
+
+    // Option B: local/stdin-stdout MCP process with API URL passed in env
+    "my-local-mcp": {
+      "command": "node",
+      "args": ["./path/to/mcp-server.js"],
+      "env": {
+        "API_URL": "https://api.example.com",
+        "API_KEY": "${MCP_API_KEY}"
+      }
+    }
+  }
+}
