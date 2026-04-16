@@ -20,7 +20,21 @@ class SecretsManagerService {
     // Only initialize client in production
     if (process.env.NODE_ENV === "production") {
       try {
-        this.client = new SecretManagerServiceClient();
+        const inlineServiceAccount = process.env.GCP_SERVICE_ACCOUNT_JSON?.trim();
+        if (inlineServiceAccount) {
+          const credentials = JSON.parse(inlineServiceAccount);
+          this.client = new SecretManagerServiceClient({ credentials });
+          console.log("[Secrets Manager] Using inline GCP service account credentials (GCP_SERVICE_ACCOUNT_JSON)");
+        } else if (process.env.GOOGLE_APPLICATION_CREDENTIALS?.trim()) {
+          // Explicit ADC path provided by environment.
+          this.client = new SecretManagerServiceClient();
+          console.log("[Secrets Manager] Using GOOGLE_APPLICATION_CREDENTIALS for auth");
+        } else {
+          // Do not initialize an ADC-based client implicitly on platforms without ADC.
+          // We will use environment variables as the source of truth in this mode.
+          this.client = null;
+          console.warn("[Secrets Manager] No explicit GCP credentials provided; using environment variable fallback");
+        }
         console.log(`[Secrets Manager] Initialized for project: ${this.projectId}`);
       } catch (error) {
         console.error("[Secrets Manager] Failed to initialize client:", error);
@@ -34,9 +48,18 @@ class SecretsManagerService {
    * Falls back to environment variable if not in production or if GCP fails
    */
   async getSecret(secretName: string, envVarName?: string): Promise<string | undefined> {
+    const fallbackKey = envVarName || secretName;
+
     // In development, always use environment variables
     if (process.env.NODE_ENV !== "production") {
-      return process.env[envVarName || secretName];
+      return process.env[fallbackKey];
+    }
+
+    // In production, prefer explicit environment variables first.
+    // This avoids unnecessary Secret Manager calls when values are already present.
+    const envValue = process.env[fallbackKey];
+    if (envValue && envValue.length > 0) {
+      return envValue;
     }
 
     // Check cache first
@@ -67,6 +90,12 @@ class SecretsManagerService {
         // If secret doesn't exist in GCP, fall back to env var
         if (error.code === 5 || error.code === 'NOT_FOUND') {
           console.warn(`[Secrets Manager] ⚠️  Secret "${secretName}" not found in GCP, using environment variable`);
+        } else if (
+          String(error?.message || "").includes("Could not load the default credentials") ||
+          String(error?.message || "").includes("NO_ADC_FOUND")
+        ) {
+          console.warn("[Secrets Manager] ADC not available; disabling GCP client and using environment variables");
+          this.client = null;
         } else {
           console.error(`[Secrets Manager] ❌ Error fetching secret "${secretName}":`, error.message);
         }
@@ -74,7 +103,7 @@ class SecretsManagerService {
     }
 
     // Fallback to environment variable
-    return process.env[envVarName || secretName];
+    return process.env[fallbackKey];
   }
 
   /**
