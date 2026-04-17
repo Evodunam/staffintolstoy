@@ -245,6 +245,45 @@ const PUBLIC_PATHS = [
   "/for-service-professionals",
   "/for-affiliates",
   "/how-time-keeping-works",
+  "/worker-onboarding",
+  "/company-onboarding",
+  "/find-work",
+  "/jobs",
+];
+
+/**
+ * Tuned sitemap entries for the core site.
+ * Priority + changefreq matter to crawlers; tune per page importance.
+ */
+const CORE_SITEMAP_URLS: Array<{ path: string; priority: string; changefreq: string }> = [
+  // Top-level + revenue critical
+  { path: "/", priority: "1.0", changefreq: "daily" },
+  { path: "/find-work", priority: "0.95", changefreq: "daily" },
+  { path: "/jobs", priority: "0.9", changefreq: "daily" },
+  { path: "/for-service-professionals", priority: "0.9", changefreq: "weekly" },
+  { path: "/for-affiliates", priority: "0.9", changefreq: "weekly" },
+  { path: "/worker-onboarding", priority: "0.9", changefreq: "weekly" },
+  { path: "/company-onboarding", priority: "0.9", changefreq: "weekly" },
+
+  // Programmatic SEO hubs (chunked sitemaps cover individual leaves)
+  { path: "/services", priority: "0.85", changefreq: "weekly" },
+  { path: "/company-onboarding/cities", priority: "0.85", changefreq: "weekly" },
+  { path: "/worker-onboarding/cities", priority: "0.85", changefreq: "weekly" },
+
+  // Trust + product info
+  { path: "/how-time-keeping-works", priority: "0.8", changefreq: "monthly" },
+
+  // Brand + corporate
+  { path: "/about", priority: "0.6", changefreq: "monthly" },
+  { path: "/careers", priority: "0.6", changefreq: "weekly" },
+  { path: "/press", priority: "0.5", changefreq: "monthly" },
+  { path: "/contact", priority: "0.5", changefreq: "monthly" },
+  { path: "/support", priority: "0.5", changefreq: "monthly" },
+
+  // Legal / compliance
+  { path: "/terms", priority: "0.4", changefreq: "monthly" },
+  { path: "/privacy", priority: "0.4", changefreq: "monthly" },
+  { path: "/legal", priority: "0.4", changefreq: "monthly" },
 ];
 
 const ROBOTS_DISALLOW_PATHS = [
@@ -1215,27 +1254,21 @@ function renderWorkerCityTradePageHtml(
 }
 
 function renderCoreSitemapXml(baseUrl: string): string {
-  const urls = [
-    ...PUBLIC_PATHS.map((path) => ({ path, priority: "0.8" })),
-    { path: "/services", priority: "0.8" },
-    { path: "/company-onboarding/cities", priority: "0.8" },
-    { path: "/worker-onboarding/cities", priority: "0.8" },
-  ];
-
-  const urlNodes = urls
-    .map(
-      ({ path, priority }) => `<url>
+  const seen = new Set<string>();
+  const urlNodes: string[] = [];
+  for (const { path, priority, changefreq } of CORE_SITEMAP_URLS) {
+    if (seen.has(path)) continue;
+    seen.add(path);
+    urlNodes.push(`<url>
   <loc>${escapeHtml(`${baseUrl}${path}`)}</loc>
   <lastmod>${LASTMOD_ISO}</lastmod>
-  <changefreq>weekly</changefreq>
+  <changefreq>${changefreq}</changefreq>
   <priority>${priority}</priority>
-</url>`,
-    )
-    .join("\n");
-
+</url>`);
+  }
   return `<?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
-${urlNodes}
+${urlNodes.join("\n")}
 </urlset>`;
 }
 
@@ -1373,44 +1406,165 @@ function renderLlmsTxt(baseUrl: string): string {
     sampleWorkerTradeUrls.push(`${baseUrl}${page.path}`);
   }
 
-  return `# ${SITE_NAME} llms.txt
+  return `# ${SITE_NAME}
+
+> ${SITE_NAME} is a B2B on-demand contract labor marketplace. Companies post hourly jobs and shifts. Independent service workers (and worker-led teams) get matched, scheduled, and dispatched, with location-verified clock-in/out, automated timesheets, and ACH or card billing. Pay flows directly to workers via verified bank payouts.
 
 Site: ${baseUrl}
-Description: B2B on-demand staffing platform connecting businesses and service professionals.
-Programmatic SEO pages generated: ${PAGE_COUNT.toLocaleString()}
-Programmatic SEO pages indexable: ${EFFECTIVE_INDEXABLE_PAGE_COUNT.toLocaleString()}
-Programmatic SEO pages hub-linked: ${EFFECTIVE_HUB_LINK_COUNT.toLocaleString()}
-City hiring pages generated: ${ALL_HIRE_CITY_PAGES.length.toLocaleString()}
-City hiring pages indexable: ${INDEXABLE_HIRE_CITY_PAGES.length.toLocaleString()}
-City hiring pages hub-linked: ${HIRE_CITY_HUB_PAGES.length.toLocaleString()}
-Worker city pages generated: ${ALL_WORKER_CITY_PAGES.length.toLocaleString()}
-Worker city pages indexable: ${INDEXABLE_WORKER_CITY_PAGES.length.toLocaleString()}
-Worker city pages hub-linked: ${WORKER_CITY_HUB_PAGES.length.toLocaleString()}
-Worker city trade pages generated: ${WORKER_CITY_TRADE_PAGE_COUNT.toLocaleString()}
-Worker city trade pages indexable: ${WORKER_CITY_TRADE_INDEXABLE_LIMIT.toLocaleString()}
-Programmatic relevance filter enforced: ${ENFORCE_RELEVANCE_FILTER ? "yes" : "no"}
-Programmatic service/buyer override source: ${ENV_SERVICE_BUYER_COMPATIBILITY_JSON ? "env" : "default"}
-Programmatic intent/buyer override source: ${ENV_INTENT_BUYER_COMPATIBILITY_JSON ? "env" : "default"}
-Programmatic index order mode: ${INDEX_ORDER_MODE}
-Programmatic index order stride: ${INDEX_ORDER_STRIDE}
 
-Primary pages:
-${PUBLIC_PATHS.map((path) => `${baseUrl}${path}`).join("\n")}
+## What it is
 
-SEO service area pages:
+- B2B staffing platform for hourly, location-based work.
+- Three-sided marketplace:
+  1. Companies (hire workers per shift)
+  2. Service workers (individuals, optionally with worker teams)
+  3. Affiliates (drive company sign-ups)
+- Workers are independent contractors, not W-2 employees of ${SITE_NAME} or the hiring company.
+
+## What companies use it for
+
+- Post a job once and have qualified workers matched by skill, location, schedule, and rating.
+- Schedule shifts, including auto-fulfillment when allowed (system pairs qualified workers automatically).
+- Manage multiple business locations and assign payment methods per location.
+- Verify shifts via worker location and timestamps at clock-in / clock-out.
+- Auto-approve timesheets when workers complete shifts inside a verified geofence and within scheduled time, otherwise route timesheets for review.
+- Get billed only for actual verified worked hours.
+- Fund jobs via:
+  - Stripe card (3.5% convenience fee)
+  - ACH bank transfer (no convenience fee, recommended)
+- Optionally invite teammates with role-based access (admin / manager / viewer).
+
+## What service workers use it for
+
+- Find local hourly jobs that match their skills, service radius, and availability.
+- Apply directly or get auto-matched.
+- Clock in/out from the mobile app with location verification.
+- Get paid by ACH for hours worked, processed after timesheet approval.
+- Build a verified profile: skills, prior work, certifications, optional ID verification, reviews.
+- Optionally form or join worker teams; a team lead can dispatch jobs to teammates.
+
+## What affiliates use it for
+
+- Refer companies to the platform.
+- Track redemptions, leads, conversions, and earnings inside an affiliate dashboard.
+
+## Industries supported
+
+- Construction
+  - Laborer, Landscaping, Painting, Drywall, Concrete
+  - Carpentry (Lite + Elite)
+  - Electrical (Lite + Elite)
+  - Plumbing (Lite + Elite)
+  - HVAC (Lite + Elite)
+- Manufacturing & Logistics
+  - Assembly Line Worker, Forklift Operator, Warehouse Associate, Supply Chain Coordinator
+- Retail
+  - Sales Associate, Inventory Specialist, Store Supervisor
+- Housekeeping
+  - Housekeeper, Laundry Staff, Janitorial Staff
+- Event Planning & Management
+  - Event Coordinator, Banquet Server, Setup / Teardown Crew, AV Technician
+- Management & Administration
+  - Hotel/Site Manager, Supervisor, Office Admin, HR Coordinator
+
+Lite vs Elite:
+- Lite roles cover repairs, replacements, and smaller-scope work.
+- Elite roles cover full installs, complex builds, and larger-scope work.
+- Workers can hold either Lite or Elite for a given trade, not both.
+
+## Pay & billing
+
+${SITE_NAME} is hourly and per-shift, not per-application or per-lead.
+
+- Worker pay
+  - Workers set their own hourly rate when applying or being matched.
+  - Workers are paid by ACH to a verified bank account after timesheet approval.
+  - Optional Instant Payout available for a small fee per payout.
+  - Minimum worker-side billable rate is $15/hr USD platform-wide.
+- Company billing
+  - Companies are charged per worker-hour worked, not flat fees per job post.
+  - Each job has an hourly billable rate that includes:
+    1. Worker wage
+    2. Per-worker-hour platform/payroll allocation (currently $13/hr USD)
+  - Companies see a single billable-per-hour number when posting; workers see only the wage portion.
+  - Card payments add a 3.5% convenience fee. ACH is free.
+  - No deposit at onboarding; payment method is saved securely (Stripe) and charged after timesheet approval.
+- Timesheet integrity
+  - Clock-in/out is location-verified.
+  - Inside auto-fulfill geofence (~0.25 mi from job site): can auto-approve.
+  - Inside manual geofence (~5 mi): manual approval flow.
+  - Beyond ~50 mi validation radius: rejected and may trigger a worker strike.
+
+## Trust, safety, and verification
+
+- Required worker face photo to prevent profile spoofing.
+- Optional government ID verification.
+- W-9 collection for U.S. workers (required before certain payouts can release).
+- Reviews and ratings on both sides of the marketplace.
+- Strike system for repeated location/timesheet violations.
+
+## Platform behavior at a glance
+
+- All work is hourly and shift-based (not project-based fixed bids).
+- All work is location-anchored (job site address with lat/lng).
+- All payments flow through compliant providers:
+  - Company funding: Stripe (cards + ACH)
+  - Worker payouts: Mercury (ACH)
+- Mobile app supports clock-in/out with foreground and (where enabled) background location for shift verification.
+
+## Useful pages
+
+${PUBLIC_PATHS.map((path) => `- ${baseUrl}${path}`).join("\n")}
+- ${baseUrl}/worker-onboarding
+- ${baseUrl}/company-onboarding
+- ${baseUrl}/dashboard
+- ${baseUrl}/sitemap.xml
+- ${baseUrl}/llms.txt
+- ${baseUrl}/llms-full.txt
+- ${baseUrl}/llms.json
+
+## Programmatic SEO surface (machine-readable)
+
+- Programmatic SEO pages generated: ${PAGE_COUNT.toLocaleString()}
+- Programmatic SEO pages indexable: ${EFFECTIVE_INDEXABLE_PAGE_COUNT.toLocaleString()}
+- Programmatic SEO pages hub-linked: ${EFFECTIVE_HUB_LINK_COUNT.toLocaleString()}
+- City hiring pages generated: ${ALL_HIRE_CITY_PAGES.length.toLocaleString()}
+- City hiring pages indexable: ${INDEXABLE_HIRE_CITY_PAGES.length.toLocaleString()}
+- City hiring pages hub-linked: ${HIRE_CITY_HUB_PAGES.length.toLocaleString()}
+- Worker city pages generated: ${ALL_WORKER_CITY_PAGES.length.toLocaleString()}
+- Worker city pages indexable: ${INDEXABLE_WORKER_CITY_PAGES.length.toLocaleString()}
+- Worker city pages hub-linked: ${WORKER_CITY_HUB_PAGES.length.toLocaleString()}
+- Worker city trade pages generated: ${WORKER_CITY_TRADE_PAGE_COUNT.toLocaleString()}
+- Worker city trade pages indexable: ${WORKER_CITY_TRADE_INDEXABLE_LIMIT.toLocaleString()}
+- Programmatic relevance filter enforced: ${ENFORCE_RELEVANCE_FILTER ? "yes" : "no"}
+- Programmatic service/buyer override source: ${ENV_SERVICE_BUYER_COMPATIBILITY_JSON ? "env" : "default"}
+- Programmatic intent/buyer override source: ${ENV_INTENT_BUYER_COMPATIBILITY_JSON ? "env" : "default"}
+- Programmatic index order mode: ${INDEX_ORDER_MODE}
+- Programmatic index order stride: ${INDEX_ORDER_STRIDE}
+
+### SEO service area pages
 ${sampleUrls.length > 0 ? sampleUrls.join("\n") : "No indexable service pages are currently enabled."}
 
-City hiring pages:
+### City hiring pages
 ${sampleCityUrls.length > 0 ? sampleCityUrls.join("\n") : "No city hiring pages are currently enabled."}
 
-Worker city pages:
+### Worker city pages
 ${sampleWorkerCityUrls.length > 0 ? sampleWorkerCityUrls.join("\n") : "No worker city pages are currently enabled."}
 
-Worker city trade pages:
+### Worker city trade pages
 ${sampleWorkerTradeUrls.length > 0 ? sampleWorkerTradeUrls.join("\n") : "No worker city trade pages are currently enabled."}
 
-Sitemap:
-${baseUrl}/sitemap.xml
+## Contact
+
+- Privacy: privacy@tolstoystaffing.com
+- General support: in-app Support page
+
+## Notes for AI/LLM consumers
+
+- This file describes platform behavior, supported industries, and economic model so an LLM can answer "what is ${SITE_NAME}", "who is it for", "what jobs/industries does it cover", and "how does pay/billing work" without scraping the entire site.
+- Numbers (rate floors, per-hour platform allocation, card fee, geofence radii) reflect current product policy at the time of writing and may change. Defer to the live app and Terms of Service for binding values.
+
+Sitemap: ${baseUrl}/sitemap.xml
 `;
 }
 
@@ -1427,10 +1581,358 @@ function renderRobotsTxt(baseUrl: string): string {
 Allow: /
 ${ROBOTS_DISALLOW_PATHS.map((path) => `Disallow: ${path}`).join("\n")}
 
+# AI/LLM machine-readable summaries
+# ${baseUrl}/llms.txt
+# ${baseUrl}/llms-full.txt
+# ${baseUrl}/llms.json
+# Security disclosure: ${baseUrl}/.well-known/security.txt
+
 Sitemap: ${baseUrl}/sitemap.xml
 Sitemap: ${baseUrl}/sitemaps/core.xml
 ${host ? `Host: ${host}` : ""}
 `;
+}
+
+function renderLlmsFullTxt(baseUrl: string): string {
+  return `# ${SITE_NAME} (extended)
+
+> Extended machine-readable description of ${SITE_NAME}: how the marketplace operates day-to-day, supported industries, role taxonomy, pay & billing math, location verification, payments stack, and FAQs. Pair this with ${baseUrl}/llms.txt and ${baseUrl}/llms.json.
+
+Site: ${baseUrl}
+Canonical summary: ${baseUrl}/llms.txt
+Structured data: ${baseUrl}/llms.json
+Sitemap index: ${baseUrl}/sitemap.xml
+
+## Operating model
+
+- Marketplace type: B2B on-demand contract labor.
+- Core unit of work: an hourly shift at a specific company location.
+- Worker employment status: independent contractor (1099-style in U.S.).
+- Liability model: companies retain operational control of the worksite; ${SITE_NAME} provides the marketplace, scheduling, verification, billing, and payouts.
+
+## Industry & role taxonomy
+
+### Construction
+- Laborer — Furniture assembly, demolition, moving, general labor
+- Landscaping — Lawn care, gardening, outdoor work
+- Painting — Interior and exterior painting
+- Drywall — Hanging, mudding, taping
+- Concrete — Pouring, finishing, repairs
+- Carpentry Lite — Trim, tools, framing walls, small stairs
+- Carpentry Elite — Full structures, homes, complex builds
+- Electrical Lite — Outlets, ceiling fans, replacing fixtures
+- Electrical Elite — Full home wiring, new installations
+- Plumbing Lite — Faucets, toilets, repairs
+- Plumbing Elite — Full installs from scratch
+- HVAC Lite — Repairs, existing systems
+- HVAC Elite — Full installs, ducting, minisplits, AC units
+
+### Manufacturing & Logistics
+- Assembly Line Worker
+- Forklift Operator
+- Warehouse Associate
+- Supply Chain Coordinator
+
+### Retail
+- Sales Associate
+- Inventory Specialist
+- Store Supervisor
+
+### Housekeeping
+- Housekeeper
+- Laundry Staff
+- Janitorial Staff
+
+### Event Planning & Management
+- Event Coordinator
+- Banquet Server
+- Setup / Teardown Crew
+- AV Technician
+
+### Management & Administration
+- Hotel / Site Manager
+- Supervisor
+- Office Admin
+- HR Coordinator
+
+### Lite vs Elite
+- Lite is repair/replacement scope.
+- Elite is full installs and complex builds.
+- A worker holds either Lite or Elite for a given trade, never both at once.
+
+## Pay model (math)
+
+- Worker minimum billable rate: $15/hr USD.
+- Per-worker-hour platform/payroll allocation included in company billing: $13/hr USD.
+- Job hourly billable rate (company-side) = worker wage + $13/hr platform allocation.
+- Worker-facing display rate = company billable hourly − $13/hr platform allocation.
+- Card payments add a 3.5% convenience fee on top of charges.
+- ACH bank transfer charges have no convenience fee.
+- No deposit at onboarding. Companies are charged when workers complete shifts and timesheets are approved.
+
+### Worked example
+- Worker rate: $25/hr.
+- Company billable rate: $25 + $13 = $38/hr.
+- 4-hour shift, 1 worker:
+  - Worker payout (gross before any optional Instant Payout fee): 4 × $25 = $100
+  - Company labor charge: 4 × $38 = $152
+  - If paid by card: 4 × $38 × 1.035 = $157.32
+  - If paid by ACH: $152
+
+## Payments stack
+
+- Company funding: Stripe (cards + US bank ACH via Stripe Financial Connections / micro-deposits).
+- Worker payouts: Mercury (ACH credit to worker bank).
+- W-9 collection required for U.S. workers before some payouts can be released.
+- Instant Payout option for workers (faster ACH availability for a small fee per payout).
+
+## Location verification & timesheets
+
+- Workers clock in/out from the mobile app.
+- Mobile location is captured at clock-in and at clock-out, and (where enabled) periodically during the shift.
+- Geofence radii (current product policy):
+  - Auto-approve geofence: ~0.25 mi (~402 m) from job site.
+  - Manual approval geofence: ~5 mi (~8,047 m).
+  - Validation cutoff: ~50 mi. Beyond this, timesheets are rejected and may incur a worker strike.
+- Auto-approval requires:
+  - Clock-in and clock-out inside auto geofence.
+  - Times within scheduled window.
+  - No outstanding integrity flags on the worker or job.
+
+## Trust & safety
+
+- Required worker face photo to prevent profile spoofing.
+- Optional government ID verification for higher trust signaling.
+- Worker reviews and ratings; companies receive ratings as well.
+- Strike system for repeat geofence/timesheet violations and other policy issues.
+
+## Companies: typical lifecycle
+
+1. Sign up via Google or email + password.
+2. Add at least one business location (Google-verified address with lat/lng).
+3. Add a payment method (ACH preferred; card with 3.5% fee).
+4. Sign service agreement.
+5. Post a job: title, location, schedule, required skills, # workers, hourly billable rate.
+6. Workers apply or are auto-matched.
+7. Workers clock in/out at the site; timesheets auto-approve when in geofence and on schedule.
+8. Company is charged per verified worker-hour. Worker is paid via ACH after approval.
+
+## Workers: typical lifecycle
+
+1. Sign up via Google or email + password.
+2. Upload face photo (required).
+3. Add address, service categories, hourly rate.
+4. Optionally upload portfolio, certifications, ID for verification.
+5. Connect a U.S. bank account for ACH payouts; submit W-9 if required.
+6. Apply to or accept matched jobs.
+7. Clock in/out from mobile app at the worksite.
+8. Receive ACH payout after timesheet approval.
+
+## Affiliates: typical lifecycle
+
+1. Sign up to the affiliate program.
+2. Get a referral link.
+3. Refer companies; redemptions, leads, and conversions are tracked.
+4. Earnings appear in the affiliate dashboard.
+
+## Mobile permissions disclosure (Google Play / iOS)
+
+- Foreground location: required for clock-in/out and active shift verification.
+- Background location: requested only where needed to support reliable shift verification (e.g. periodic checks during long active shifts).
+- Disabling location may prevent a worker from clocking in, completing certain shift tasks, or having timesheets approved.
+- Location data is used only for operational integrity (attendance, billing accuracy, dispute handling, fraud/abuse prevention). It is not used for third-party advertising and is not sold.
+
+## Data & privacy summary
+
+- Account/identity data, job/staffing data, shift-linked location/timestamp data, billing/payout metadata, communications, and support records are collected.
+- Data is shared between counterparties only to operate the marketplace (companies ↔ workers, with affiliates for attribution, and with payments/auth/hosting providers).
+- Data retention reflects operational, contractual, and legal requirements. See ${baseUrl}/privacy for the full Privacy Policy.
+
+## FAQ
+
+- Q: Is this a job board?
+  - A: No. ${SITE_NAME} is an end-to-end staffing marketplace: matching, scheduling, location-verified clock-in/out, automated timesheets, billing to companies, and ACH payouts to workers.
+- Q: Does the company hire workers as employees?
+  - A: No. Workers are independent contractors. Companies pay for verified worked hours; ${SITE_NAME} handles billing and payouts.
+- Q: What does the company pay?
+  - A: Worker wage plus a per-worker-hour platform allocation ($13/hr USD). Card payments add a 3.5% convenience fee; ACH is free.
+- Q: When is the company charged?
+  - A: After workers complete shifts and timesheets are approved. There is no deposit at onboarding.
+- Q: How do workers get paid?
+  - A: ACH transfer to a verified U.S. bank after timesheet approval. Optional Instant Payout for a small fee per payout.
+- Q: What stops fake clock-ins?
+  - A: Location-verified clock-in/out with geofencing, timestamping, and a strike system for repeat violations.
+- Q: What if a worker is far from the site?
+  - A: Inside ~5 mi → manual approval flow. Beyond ~50 mi → rejected and may trigger a strike.
+- Q: What industries are covered?
+  - A: Construction, Manufacturing & Logistics, Retail, Housekeeping, Event Planning & Management, Management & Administration. Each has multiple roles; some construction trades have Lite vs Elite scopes.
+- Q: Can a worker manage a team?
+  - A: Yes. Workers can run a team and dispatch jobs to teammates.
+- Q: Where is ${SITE_NAME} available?
+  - A: U.S.-focused. See city pages and worker city pages under the SEO surface for active markets.
+
+## Related machine-readable resources
+
+- ${baseUrl}/llms.txt — concise summary
+- ${baseUrl}/llms.json — structured JSON
+- ${baseUrl}/sitemap.xml — sitemap index
+- ${baseUrl}/robots.txt — crawler directives
+`;
+}
+
+function renderLlmsJson(baseUrl: string): unknown {
+  return {
+    name: SITE_NAME,
+    site: baseUrl,
+    type: "B2B on-demand contract labor marketplace",
+    summary:
+      "Companies post hourly jobs and shifts; independent service workers (and worker teams) get matched, scheduled, and dispatched with location-verified clock-in/out, automated timesheets, and ACH or card billing.",
+    sides: ["companies", "service_workers", "worker_teams", "affiliates"],
+    employment_model: {
+      worker_status: "independent_contractor",
+      company_status: "buyer_of_services",
+      platform_role: "marketplace_billing_payouts_verification",
+    },
+    pay_model: {
+      currency: "USD",
+      worker_min_billable_hourly: 15,
+      platform_per_worker_hour_allocation: 13,
+      company_billable_hourly_formula: "worker_wage + platform_per_worker_hour_allocation",
+      worker_facing_hourly_formula: "company_billable_hourly - platform_per_worker_hour_allocation",
+      payment_methods: {
+        card: { fee_percent: 3.5, fee_basis: "transaction_amount" },
+        ach: { fee_percent: 0 },
+      },
+      deposit_required_at_onboarding: false,
+      charge_trigger: "after_timesheet_approval",
+      worker_payout_method: "ACH",
+      instant_payout_available: true,
+    },
+    timesheet_verification: {
+      mobile_clock_in_out: true,
+      location_required: true,
+      geofence_radius_miles: {
+        auto_approve: 0.25,
+        manual_approval: 5,
+        rejection_cutoff: 50,
+      },
+      auto_approval_conditions: [
+        "clock_in_and_out_inside_auto_geofence",
+        "times_within_scheduled_window",
+        "no_open_integrity_flags",
+      ],
+    },
+    payments_stack: {
+      company_funding: "Stripe",
+      worker_payouts: "Mercury",
+      tax_forms: ["W-9 (US workers)"],
+    },
+    industries: [
+      {
+        id: "construction",
+        label: "Construction",
+        roles: [
+          { id: "Laborer", scope: null },
+          { id: "Landscaping", scope: null },
+          { id: "Painting", scope: null },
+          { id: "Drywall", scope: null },
+          { id: "Concrete", scope: null },
+          { id: "Carpentry Lite", scope: "lite" },
+          { id: "Carpentry Elite", scope: "elite" },
+          { id: "Electrical Lite", scope: "lite" },
+          { id: "Electrical Elite", scope: "elite" },
+          { id: "Plumbing Lite", scope: "lite" },
+          { id: "Plumbing Elite", scope: "elite" },
+          { id: "HVAC Lite", scope: "lite" },
+          { id: "HVAC Elite", scope: "elite" },
+        ],
+      },
+      {
+        id: "manufacturing_logistics",
+        label: "Manufacturing & Logistics",
+        roles: [
+          { id: "Assembly Line Worker" },
+          { id: "Forklift Operator" },
+          { id: "Warehouse Associate" },
+          { id: "Supply Chain Coordinator" },
+        ],
+      },
+      {
+        id: "retail",
+        label: "Retail",
+        roles: [
+          { id: "Sales Associate" },
+          { id: "Inventory Specialist" },
+          { id: "Store Supervisor" },
+        ],
+      },
+      {
+        id: "housekeeping",
+        label: "Housekeeping",
+        roles: [
+          { id: "Housekeeper" },
+          { id: "Laundry Staff" },
+          { id: "Janitorial Staff" },
+        ],
+      },
+      {
+        id: "event_planning",
+        label: "Event Planning & Management",
+        roles: [
+          { id: "Event Coordinator" },
+          { id: "Banquet Server" },
+          { id: "Setup Crew" },
+          { id: "AV Technician" },
+        ],
+      },
+      {
+        id: "management_admin",
+        label: "Management & Administration",
+        roles: [
+          { id: "Site Manager" },
+          { id: "Supervisor" },
+          { id: "Office Admin" },
+          { id: "HR Coordinator" },
+        ],
+      },
+    ],
+    primary_pages: PUBLIC_PATHS.map((path) => `${baseUrl}${path}`).concat([
+      `${baseUrl}/worker-onboarding`,
+      `${baseUrl}/company-onboarding`,
+      `${baseUrl}/dashboard`,
+      `${baseUrl}/sitemap.xml`,
+      `${baseUrl}/llms.txt`,
+      `${baseUrl}/llms-full.txt`,
+      `${baseUrl}/llms.json`,
+    ]),
+    seo_surface: {
+      programmatic_pages_generated: PAGE_COUNT,
+      programmatic_pages_indexable: EFFECTIVE_INDEXABLE_PAGE_COUNT,
+      programmatic_pages_hub_linked: EFFECTIVE_HUB_LINK_COUNT,
+      city_hire_pages_generated: ALL_HIRE_CITY_PAGES.length,
+      city_hire_pages_indexable: INDEXABLE_HIRE_CITY_PAGES.length,
+      worker_city_pages_generated: ALL_WORKER_CITY_PAGES.length,
+      worker_city_pages_indexable: INDEXABLE_WORKER_CITY_PAGES.length,
+      worker_city_trade_pages_generated: WORKER_CITY_TRADE_PAGE_COUNT,
+      worker_city_trade_pages_indexable: WORKER_CITY_TRADE_INDEXABLE_LIMIT,
+    },
+    contact: {
+      privacy_email: "privacy@tolstoystaffing.com",
+      support_path: `${baseUrl}/support`,
+    },
+    canonical_resources: {
+      llms_txt: `${baseUrl}/llms.txt`,
+      llms_full_txt: `${baseUrl}/llms-full.txt`,
+      llms_json: `${baseUrl}/llms.json`,
+      sitemap_xml: `${baseUrl}/sitemap.xml`,
+      robots_txt: `${baseUrl}/robots.txt`,
+    },
+    notes: [
+      "Numbers reflect current product policy and may change.",
+      "Defer to live app and Terms of Service for binding values.",
+    ],
+    last_modified: LASTMOD_ISO,
+  };
 }
 
 export function registerSeoRoutes(app: Express): void {
@@ -1730,4 +2232,44 @@ export function registerSeoRoutes(app: Express): void {
     const body = getCachedOrCompute(`llms:${baseUrl}`, () => renderLlmsTxt(baseUrl));
     res.send(body);
   });
+
+  app.get("/llms-full.txt", (req: Request, res: Response) => {
+    const baseUrl = getBaseUrl(req);
+    res.setHeader("Content-Type", "text/plain; charset=utf-8");
+    res.setHeader("Cache-Control", "public, max-age=3600, stale-while-revalidate=86400");
+    res.setHeader("Last-Modified", LASTMOD_UTC);
+    if (respondNotModifiedIfFresh(req, res)) return;
+    const body = getCachedOrCompute(`llms-full:${baseUrl}`, () => renderLlmsFullTxt(baseUrl));
+    res.send(body);
+  });
+
+  app.get("/llms.json", (req: Request, res: Response) => {
+    const baseUrl = getBaseUrl(req);
+    res.setHeader("Content-Type", "application/json; charset=utf-8");
+    res.setHeader("Cache-Control", "public, max-age=3600, stale-while-revalidate=86400");
+    res.setHeader("Last-Modified", LASTMOD_UTC);
+    if (respondNotModifiedIfFresh(req, res)) return;
+    const body = renderLlmsJson(baseUrl);
+    res.json(body);
+  });
+
+  // RFC 9116 security.txt — published at /.well-known/security.txt and root for legacy.
+  const securityTxtHandler = (req: Request, res: Response) => {
+    const baseUrl = getBaseUrl(req);
+    const expires = new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toISOString();
+    res.setHeader("Content-Type", "text/plain; charset=utf-8");
+    res.setHeader("Cache-Control", "public, max-age=86400, stale-while-revalidate=604800");
+    if (respondNotModifiedIfFresh(req, res)) return;
+    res.send(
+      `Contact: mailto:security@tolstoystaffing.com
+Contact: mailto:privacy@tolstoystaffing.com
+Expires: ${expires}
+Preferred-Languages: en
+Canonical: ${baseUrl}/.well-known/security.txt
+Policy: ${baseUrl}/legal
+`,
+    );
+  };
+  app.get("/.well-known/security.txt", securityTxtHandler);
+  app.get("/security.txt", securityTxtHandler);
 }

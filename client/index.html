@@ -3,15 +3,112 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, minimum-scale=1, maximum-scale=1" />
-    <meta name="description" content="Tolstoy Staffing - Connect skilled workers with businesses" />
-    <meta name="theme-color" content="#000000" />
-    
+    <title>Tolstoy Staffing - On-Demand Hourly Workers for Businesses</title>
+    <meta
+      name="description"
+      content="Tolstoy Staffing is a B2B on-demand contract labor marketplace. Post hourly jobs, get matched with verified service workers, and get billed only for location-verified worked hours."
+    />
+    <meta name="theme-color" content="#00A86B" />
+
+    <!-- Canonical -->
+    <link rel="canonical" href="https://tolstoystaffing.com/" />
+
+    <!-- AI/LLM crawler directives -->
+    <meta name="robots" content="index,follow,max-snippet:-1,max-image-preview:large,max-video-preview:-1" />
+    <meta name="googlebot" content="index,follow" />
+    <meta name="GPTBot" content="index,follow" />
+    <meta name="Claude-Web" content="index,follow" />
+    <meta name="ClaudeBot" content="index,follow" />
+    <meta name="anthropic-ai" content="index,follow" />
+    <meta name="PerplexityBot" content="index,follow" />
+    <meta name="ai-content-declaration" content="primary-source: tolstoystaffing.com; canonical-summary: /llms.txt" />
+
+    <!-- Open Graph / Twitter -->
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="Tolstoy Staffing" />
+    <meta property="og:title" content="Tolstoy Staffing - On-Demand Hourly Workers for Businesses" />
+    <meta
+      property="og:description"
+      content="B2B staffing marketplace: post hourly jobs, location-verified clock-in/out, automated timesheets, ACH or card billing. Workers paid by ACH after timesheets approve."
+    />
+    <meta property="og:url" content="https://tolstoystaffing.com/" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Tolstoy Staffing" />
+    <meta
+      name="twitter:description"
+      content="On-demand hourly contract labor marketplace for businesses and skilled service workers."
+    />
+
     <!-- Favicons -->
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <link rel="icon" type="image/png" sizes="32x32" href="/favicon.png" />
     <link rel="icon" type="image/png" sizes="16x16" href="/favicon.png" />
     <link rel="apple-touch-icon" sizes="180x180" href="/favicon.png" />
     <link rel="manifest" href="/site.webmanifest" />
+
+    <!-- Machine-readable summaries for LLMs/AI crawlers -->
+    <link rel="alternate" type="text/plain" title="LLM-friendly summary" href="/llms.txt" />
+    <link rel="alternate" type="text/plain" title="LLM-friendly extended summary" href="/llms-full.txt" />
+    <link rel="alternate" type="application/json" title="LLM-friendly structured data" href="/llms.json" />
+    <link rel="sitemap" type="application/xml" title="Sitemap" href="/sitemap.xml" />
+
+    <!-- JSON-LD: Organization + Service -->
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@graph": [
+          {
+            "@type": "Organization",
+            "@id": "https://tolstoystaffing.com/#org",
+            "name": "Tolstoy Staffing",
+            "url": "https://tolstoystaffing.com/",
+            "logo": "https://tolstoystaffing.com/favicon.svg",
+            "description": "B2B on-demand contract labor marketplace connecting businesses with verified service professionals.",
+            "areaServed": "US",
+            "sameAs": []
+          },
+          {
+            "@type": "WebSite",
+            "@id": "https://tolstoystaffing.com/#website",
+            "url": "https://tolstoystaffing.com/",
+            "name": "Tolstoy Staffing",
+            "publisher": { "@id": "https://tolstoystaffing.com/#org" },
+            "inLanguage": "en-US"
+          },
+          {
+            "@type": "Service",
+            "@id": "https://tolstoystaffing.com/#service",
+            "name": "On-Demand Contract Labor Staffing",
+            "serviceType": "B2B staffing marketplace",
+            "provider": { "@id": "https://tolstoystaffing.com/#org" },
+            "areaServed": "US",
+            "audience": [
+              { "@type": "BusinessAudience", "name": "Companies hiring hourly workers" },
+              { "@type": "Audience", "name": "Independent service workers" },
+              { "@type": "Audience", "name": "Affiliates" }
+            ],
+            "offers": {
+              "@type": "Offer",
+              "priceCurrency": "USD",
+              "priceSpecification": {
+                "@type": "UnitPriceSpecification",
+                "priceCurrency": "USD",
+                "unitText": "HOUR",
+                "description": "Companies are billed per worker-hour worked. Per-worker-hour platform allocation of $13/hr is included in the company billable rate. Card payments add a 3.5% convenience fee. ACH is free. No deposit at onboarding."
+              }
+            },
+            "category": [
+              "Construction",
+              "Manufacturing & Logistics",
+              "Retail",
+              "Housekeeping",
+              "Event Planning & Management",
+              "Management & Administration"
+            ]
+          }
+        ]
+      }
+    </script>
     <script>
       // Suppress console warnings and errors for known issues
       if (typeof window !== 'undefined' && typeof console !== 'undefined') {

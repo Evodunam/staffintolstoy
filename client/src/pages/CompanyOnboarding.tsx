@@ -559,6 +559,17 @@ export default function CompanyOnboarding() {
     saveCompanyOnboardingProgress({ step: stepId, step2SubStep: stepId === 2 ? (step2Sub ?? 0) : undefined, step3SubStep: stepId === 3 ? (step3Sub ?? 0) : undefined });
   };
 
+  // Form data
+  const [businessInfo, setBusinessInfo] = useState({
+    firstName: user?.firstName || "",
+    lastName: user?.lastName || "",
+    companyEmail: user?.email || "",
+    altEmail: "",
+    companyName: "",
+    phone: "",
+    altPhone: "",
+  });
+
   const continueWithGoogle = useCallback((stepAtAuth: number) => {
     const onboardingData = JSON.stringify({ ...businessInfo, authProvider: "google", stepAtAuth });
     const returnTo = stepAtAuth === 0 ? "/company-onboarding" : `/company-onboarding?step=${stepAtAuth}`;
@@ -620,17 +631,6 @@ export default function CompanyOnboarding() {
     window.history.replaceState(null, "", path);
     setLocation(path);
   }, [step, isAuthenticated, isAuthLoading, setLocation]);
-
-  // Form data
-  const [businessInfo, setBusinessInfo] = useState({
-    firstName: user?.firstName || "",
-    lastName: user?.lastName || "",
-    companyEmail: user?.email || "",
-    altEmail: "",
-    companyName: "",
-    phone: "",
-    altPhone: "",
-  });
 
   const [locations, setLocations] = useState<LocationData[]>([{
     name: "Main Office",

@@ -1,7 +1,7 @@
 {
   "name": "Tolstoy Staffing",
   "short_name": "Tolstoy",
-  "description": "Connect skilled workers with businesses",
+  "description": "B2B on-demand contract labor marketplace. Hire verified hourly workers; workers find local shifts with location-verified clock-in/out and ACH payouts.",
   "icons": [
     {
       "src": "/favicon.svg",
@@ -20,8 +20,35 @@
       "type": "image/png"
     }
   ],
-  "theme_color": "#000000",
+  "theme_color": "#00A86B",
   "background_color": "#ffffff",
   "display": "standalone",
-  "start_url": "/"
+  "orientation": "portrait",
+  "start_url": "/",
+  "scope": "/",
+  "lang": "en-US",
+  "categories": ["business", "productivity", "lifestyle"],
+  "shortcuts": [
+    {
+      "name": "Find Work",
+      "short_name": "Find Work",
+      "description": "Browse available hourly shifts and apply to jobs",
+      "url": "/find-work",
+      "icons": [{ "src": "/favicon.png", "sizes": "192x192" }]
+    },
+    {
+      "name": "Hire Workers",
+      "short_name": "Hire",
+      "description": "Post a job and get matched with verified hourly workers",
+      "url": "/company-onboarding",
+      "icons": [{ "src": "/favicon.png", "sizes": "192x192" }]
+    },
+    {
+      "name": "Worker Sign Up",
+      "short_name": "Sign Up",
+      "description": "Become a service worker on Tolstoy Staffing",
+      "url": "/worker-onboarding",
+      "icons": [{ "src": "/favicon.png", "sizes": "192x192" }]
+    }
+  ]
 }
