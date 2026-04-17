@@ -7,6 +7,7 @@ import { useIsMobile, useIsDesktop, useIsSmallMobile } from "@/hooks/use-mobile"
 import { useScrollHeader } from "@/hooks/use-scroll-header";
 import { useApproveTimesheet, useRejectTimesheet } from "@/hooks/use-timesheets";
 import { apiRequest } from "@/lib/queryClient";
+import { getCurrentLanguage } from "@/lib/i18n";
 import { cn, normalizeAvatarUrl, stripPhonesAndEmails } from "@/lib/utils";
 import { getDisplayJobTitle } from "@/lib/job-display";
 import { format, formatDistanceToNow, isSameDay } from "date-fns";
@@ -20,9 +21,13 @@ import { useToast } from "@/hooks/use-toast";
 
 async function postMessage(
   url: string,
-  payload: { content: string; attachmentUrls?: string[]; mentionedProfileIds?: number[]; metadata?: Record<string, unknown> }
+  payload: { content: string; attachmentUrls?: string[]; mentionedProfileIds?: number[]; metadata?: Record<string, unknown>; senderLanguageCode?: string }
 ) {
-  const res = await apiRequest('POST', url, payload);
+  const withLanguage = {
+    ...payload,
+    senderLanguageCode: payload.senderLanguageCode || getCurrentLanguage(),
+  };
+  const res = await apiRequest('POST', url, withLanguage);
   return res.json();
 }
 
@@ -76,6 +81,7 @@ interface ChatJob {
 
 interface MessageWithSender extends JobMessage {
   sender?: Profile;
+  displayContent?: string;
 }
 
 function getJobLocationSummary(job: Job): { primary: string; secondary: string | null } {
@@ -414,6 +420,7 @@ export default function ChatsPage({ embedInDashboard }: ChatsPageProps = {}) {
   const { t: tEmpty } = useTranslation("empty");
   const { toast } = useToast();
   const { openTimesheetApprovalInvoice } = useTimesheetApprovalInvoice();
+  const viewerLanguage = getCurrentLanguage();
   
   // Get display avatar - use impersonated team member's avatar when impersonating
   const displayAvatarUrl = useMemo(() => {
@@ -593,8 +600,12 @@ export default function ChatsPage({ embedInDashboard }: ChatsPageProps = {}) {
   });
 
   const { data: messages, isLoading: messagesLoading, refetch: refetchMessages } = useQuery<MessageWithSender[]>({
-    queryKey: ['/api/jobs', selectedJobId, 'messages'],
+    queryKey: ['/api/jobs', selectedJobId, 'messages', viewerLanguage],
     enabled: !!selectedJobId,
+    queryFn: async () => {
+      const res = await apiRequest("GET", `/api/jobs/${selectedJobId}/messages?viewerLanguage=${encodeURIComponent(viewerLanguage)}`);
+      return res.json();
+    },
     refetchInterval: (query) => {
       const msgs = query.state.data;
       if (!msgs?.length) return false;
@@ -640,6 +651,7 @@ export default function ChatsPage({ embedInDashboard }: ChatsPageProps = {}) {
         jobId: selectedJobId,
         senderId: profile.id,
         content: payload.content,
+        senderLanguageCode: viewerLanguage,
         messageType: 'text',
         timesheetId: null,
         metadata: Object.keys(meta).length > 0 ? meta : null,
@@ -749,6 +761,19 @@ export default function ChatsPage({ embedInDashboard }: ChatsPageProps = {}) {
     return "";
   })();
 
+  const openCallRoom = useCallback((roomUrl: string) => {
+    const trimmed = roomUrl?.trim();
+    if (!trimmed) return;
+    if (!/^https?:\/\//i.test(trimmed)) {
+      toast({ title: "Invalid call URL", description: "Call room URL must start with http:// or https://", variant: "destructive" });
+      return;
+    }
+    const win = window.open(trimmed, "_blank", "noopener,noreferrer");
+    if (!win) {
+      window.location.href = trimmed;
+    }
+  }, [toast]);
+
   const callInviteMutation = useMutation({
     mutationFn: async ({ jobId, roomUrl, targetProfileIds }: { jobId: number; roomUrl: string; targetProfileIds?: number[] }) => {
       const payload = targetProfileIds?.length ? { roomUrl, targetProfileIds } : { roomUrl };
@@ -770,10 +795,7 @@ export default function ChatsPage({ embedInDashboard }: ChatsPageProps = {}) {
     onSuccess: (data, { roomUrl }) => {
       setCallInviteOpen(false);
       setCallInviteRoomUrl(null);
-      setCallingRoomUrl(roomUrl);
-      setCallStarterProfileId(profile?.id ?? null);
-      if (selectedJobId) activeCallContextRef.current = { jobId: selectedJobId, roomUrl };
-      setCallingDialogOpen(true);
+      openCallRoom(roomUrl);
       if ((data as { alreadyInProgress?: boolean })?.alreadyInProgress) {
         toast({ title: "Call in progress", description: "Joining the existing call." });
         return;
@@ -1416,7 +1438,7 @@ export default function ChatsPage({ embedInDashboard }: ChatsPageProps = {}) {
                           ? "bg-primary text-primary-foreground rounded-br-sm"
                           : "bg-secondary rounded-bl-sm"
                     )}>
-                      <p className="text-sm">{msg.content}</p>
+                      <p className="text-sm">{msg.displayContent ?? msg.content}</p>
                       {showWorkerPending && (
                         <p className="text-xs font-medium mt-1 flex items-center gap-1.5 opacity-90">
                           <span className="inline-block w-1.5 h-1.5 rounded-full bg-amber-700 dark:bg-amber-900 animate-pulse" aria-hidden />
@@ -1555,11 +1577,8 @@ export default function ChatsPage({ embedInDashboard }: ChatsPageProps = {}) {
                           <button
                             type="button"
                             onClick={() => {
-                              if (videoCallRoomUrl && selectedJobId) {
-                                setCallingRoomUrl(videoCallRoomUrl);
-                                setCallStarterProfileId(msg.sender?.id ?? null);
-                                activeCallContextRef.current = { jobId: selectedJobId, roomUrl: videoCallRoomUrl };
-                                setCallingDialogOpen(true);
+                              if (videoCallRoomUrl) {
+                                openCallRoom(videoCallRoomUrl);
                               }
                             }}
                             className={cn(
@@ -1647,7 +1666,7 @@ export default function ChatsPage({ embedInDashboard }: ChatsPageProps = {}) {
                         })}
                       </div>
                     )}
-                    <p className="text-sm whitespace-pre-wrap break-words">{msg.content?.trim() || null}</p>
+                    <p className="text-sm whitespace-pre-wrap break-words">{msg.displayContent?.trim() || msg.content?.trim() || null}</p>
                     <p className={`text-[10px] mt-1 ${isMe ? "text-primary-foreground/70" : "text-muted-foreground"}`}>
                       {format(new Date(msg.createdAt!), "h:mm a")}
                     </p>

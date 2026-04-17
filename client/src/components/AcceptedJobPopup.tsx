@@ -75,6 +75,7 @@ export function AcceptedJobPopup({
         jobId: job.id,
         senderId: currentUser.id,
         content,
+        senderLanguageCode: null,
         messageType: "text",
         timesheetId: null,
         metadata: null,

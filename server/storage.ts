@@ -3,7 +3,7 @@ import {
   profiles, jobs, applications, jobAssignments, reviews, users, companyLocations, teamInvites, timesheets, companyTeamMembers,
   adminStrikes, jobSuspensions, billingActions, adminActivityLog, workerStatuses, companyStatuses,
   companyPaymentMethods, companyTransactions, workerPayouts, payoutAccounts, invoices, invoiceItems, workerDismissedJobs,
-  teams, workerTeamMembers, savedTeamMembers, timesheetReports, directJobInquiries, jobMessages,
+  teams, workerTeamMembers, savedTeamMembers, timesheetReports, directJobInquiries, jobMessages, messageTranslations,
   type Profile, type InsertProfile,
   type Job, type InsertJob,
   type Application, type InsertApplication,
@@ -30,7 +30,7 @@ import {
   type SavedTeamMember, type InsertSavedTeamMember,
   type TimesheetReport, type InsertTimesheetReport,
   type DirectJobInquiry, type InsertDirectJobInquiry,
-  type JobMessage, type InsertJobMessage,
+  type JobMessage, type InsertJobMessage, type MessageTranslation,
   affiliates,
   type Affiliate, type InsertAffiliate,
   affiliateLeads,
@@ -241,6 +241,8 @@ export interface IStorage {
   // Job Messages (Chat)
   getJobMessages(jobId: number): Promise<(JobMessage & { sender: Profile })[]>;
   createJobMessage(message: InsertJobMessage): Promise<JobMessage>;
+  getMessageTranslation(messageId: number, languageCode: string): Promise<MessageTranslation | undefined>;
+  upsertMessageTranslation(messageId: number, languageCode: string, content: string): Promise<MessageTranslation>;
   updateJobMessageMetadata(jobId: number, messageId: number, metadataPatch: Record<string, unknown>): Promise<JobMessage | undefined>;
   markMessagesAsRead(jobId: number, readerId: number): Promise<void>;
   getUnreadMessageCount(jobId: number, userId: number): Promise<number>;
@@ -1514,6 +1516,26 @@ export class DatabaseStorage implements IStorage {
   async createJobMessage(message: InsertJobMessage): Promise<JobMessage> {
     const [created] = await db.insert(jobMessages).values(message).returning();
     return created;
+  }
+
+  async getMessageTranslation(messageId: number, languageCode: string): Promise<MessageTranslation | undefined> {
+    const [translated] = await db
+      .select()
+      .from(messageTranslations)
+      .where(and(eq(messageTranslations.messageId, messageId), eq(messageTranslations.languageCode, languageCode)));
+    return translated;
+  }
+
+  async upsertMessageTranslation(messageId: number, languageCode: string, content: string): Promise<MessageTranslation> {
+    const [saved] = await db
+      .insert(messageTranslations)
+      .values({ messageId, languageCode, content })
+      .onConflictDoUpdate({
+        target: [messageTranslations.messageId, messageTranslations.languageCode],
+        set: { content },
+      })
+      .returning();
+    return saved;
   }
 
   async updateJobMessageMetadata(jobId: number, messageId: number, metadataPatch: Record<string, unknown>): Promise<JobMessage | undefined> {

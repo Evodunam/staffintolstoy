@@ -1516,6 +1516,7 @@ export const jobMessages = pgTable("job_messages", {
   jobId: integer("job_id").notNull().references(() => jobs.id, { onDelete: "cascade" }),
   senderId: integer("sender_id").notNull().references(() => profiles.id, { onDelete: "cascade" }),
   content: text("content").notNull(),
+  senderLanguageCode: text("sender_language_code"),
   messageType: text("message_type", { enum: ["text", "clock_in", "clock_out", "timesheet_summary"] }).default("text"),
   timesheetId: integer("timesheet_id").references(() => timesheets.id, { onDelete: "set null" }),
   metadata: jsonb("metadata"),
@@ -1546,6 +1547,28 @@ export const jobMessagesRelations = relations(jobMessages, ({ one }) => ({
 
 export type JobMessage = typeof jobMessages.$inferSelect;
 export type InsertJobMessage = typeof jobMessages.$inferInsert;
+
+// Cached translation for one message in one target language
+export const messageTranslations = pgTable("message_translations", {
+  id: serial("id").primaryKey(),
+  messageId: integer("message_id").notNull().references(() => jobMessages.id, { onDelete: "cascade" }),
+  languageCode: text("language_code").notNull(),
+  content: text("content").notNull(),
+  createdAt: timestamp("created_at").defaultNow(),
+}, (table) => [
+  uniqueIndex("idx_message_translations_message_lang").on(table.messageId, table.languageCode),
+  index("idx_message_translations_message").on(table.messageId),
+]);
+
+export const messageTranslationsRelations = relations(messageTranslations, ({ one }) => ({
+  message: one(jobMessages, {
+    fields: [messageTranslations.messageId],
+    references: [jobMessages.id],
+  }),
+}));
+
+export type MessageTranslation = typeof messageTranslations.$inferSelect;
+export type InsertMessageTranslation = typeof messageTranslations.$inferInsert;
 
 // Log of when we sent "new_job_message" email to a recipient (at most 1 per day per recipient, any job)
 export const jobMessageEmailLog = pgTable("job_message_email_log", {

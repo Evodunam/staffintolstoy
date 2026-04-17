@@ -36,6 +36,7 @@ import {
   clearPaymentHoldsForCompanyIfSolvent,
 } from "./auto-replenishment-scheduler";
 import { ensureCompanyStripeCustomer } from "./lib/company-stripe";
+import { normalizeLanguageCode as normalizeChatLanguageCode, translateChatText } from "./services/chatTranslation";
 import type Stripe from "stripe";
 import { addHours } from "date-fns";
 
@@ -64,6 +65,18 @@ function isPlausibleLatLng(lat: number, lng: number): boolean {
   if (lat < -90 || lat > 90 || lng < -180 || lng > 180) return false;
   if (Math.abs(lat) < 1e-5 && Math.abs(lng) < 1e-5) return false;
   return true;
+}
+
+function getProfileLanguageCode(profile: { language?: string | null } | null | undefined): string | undefined {
+  return normalizeChatLanguageCode(profile?.language);
+}
+
+function getViewerLanguageCode(req: any, profile: { language?: string | null } | null | undefined): string | undefined {
+  const explicit = normalizeChatLanguageCode(
+    typeof req.query?.viewerLanguage === "string" ? req.query.viewerLanguage : undefined,
+  );
+  if (explicit) return explicit;
+  return getProfileLanguageCode(profile);
 }
 
 async function ensureJobGeofenceCoords(job: Job): Promise<{ lat: number; lng: number } | null> {
@@ -5097,6 +5110,24 @@ Respond ONLY in this exact JSON format:
     if (!worker || worker.role !== "worker") {
       return res.status(404).json({ message: "Worker not found" });
     }
+
+    // Avoid duplicate pending direct requests for the same worker + job.
+    const existingInquiries = await storage.getDirectJobInquiriesForCompany(profile.id);
+    const now = Date.now();
+    const existingPendingInquiry = existingInquiries.find((inq: any) => {
+      if (inq.workerId !== Number(workerId)) return false;
+      if (inq.convertedJobId !== job.id) return false;
+      if (inq.status !== "pending") return false;
+      if (!inq.expiresAt) return true;
+      return new Date(inq.expiresAt).getTime() > now;
+    });
+    if (existingPendingInquiry) {
+      return res.status(409).json({
+        message: "A pending direct request already exists for this worker on this job.",
+        inquiryId: existingPendingInquiry.id,
+        expiresAt: existingPendingInquiry.expiresAt,
+      });
+    }
     
     // Create a direct inquiry linked to the existing job with a 24h response window.
     // This unifies expiry + fallback behavior with the direct-inquiries flow.
@@ -5216,6 +5247,7 @@ Respond ONLY in this exact JSON format:
       return res.status(403).json({ message: "Not authorized to view messages for this job" });
     }
     
+    const viewerLanguageCode = getViewerLanguageCode(req, profile);
     const allMessages = await storage.getJobMessages(jobId);
     
     // Filter out company-only messages for workers
@@ -5223,10 +5255,28 @@ Respond ONLY in this exact JSON format:
       ? allMessages 
       : allMessages.filter(msg => !msg.visibleToCompanyOnly);
     
+    const messagesWithDisplay = await Promise.all(messages.map(async (message) => {
+      if (message.messageType !== "text") return message;
+      const messageMeta = (message.metadata as { type?: string } | null | undefined) || undefined;
+      if (messageMeta?.type) return message;
+      const senderLanguageCode = normalizeChatLanguageCode(message.senderLanguageCode);
+      if (!viewerLanguageCode || !senderLanguageCode || viewerLanguageCode === senderLanguageCode) {
+        return message;
+      }
+      const cached = await storage.getMessageTranslation(message.id, viewerLanguageCode);
+      if (cached?.content) {
+        return { ...message, displayContent: cached.content };
+      }
+      const translated = await translateChatText(message.content, senderLanguageCode, viewerLanguageCode);
+      if (!translated || translated === message.content) return message;
+      await storage.upsertMessageTranslation(message.id, viewerLanguageCode, translated);
+      return { ...message, displayContent: translated };
+    }));
+
     // Mark messages as read for this user
     await storage.markMessagesAsRead(jobId, profile.id);
     
-    res.json(messages);
+    res.json(messagesWithDisplay);
   });
   
   // Send a message for a job
@@ -5234,7 +5284,7 @@ Respond ONLY in this exact JSON format:
     if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
     
     const jobId = Number(req.params.id);
-    const { content, attachmentUrls, mentionedProfileIds, metadata: bodyMetadata } = req.body;
+    const { content, attachmentUrls, mentionedProfileIds, metadata: bodyMetadata, senderLanguageCode } = req.body;
     
     const trimmedContent = typeof content === 'string' ? content.trim() : '';
     if (!trimmedContent && (!attachmentUrls || !Array.isArray(attachmentUrls) || attachmentUrls.length === 0)) {
@@ -5321,12 +5371,28 @@ Respond ONLY in this exact JSON format:
       Object.assign(metadata, bodyMetadata);
     }
     
+    const normalizedSenderLanguage = normalizeChatLanguageCode(senderLanguageCode) || getProfileLanguageCode(profile);
     const message = await storage.createJobMessage({
       jobId,
       senderId: profile.id,
       content: trimmedContent || " ",
+      senderLanguageCode: normalizedSenderLanguage,
       metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
     });
+
+    if (trimmedContent && message.messageType === "text" && normalizedSenderLanguage) {
+      const messageMeta = (message.metadata as { type?: string } | null | undefined) || undefined;
+      if (!messageMeta?.type) {
+        const targetLanguages = [...new Set(recipientProfiles
+          .map((recipient) => getProfileLanguageCode(recipient))
+          .filter((lang): lang is string => Boolean(lang) && lang !== normalizedSenderLanguage))];
+        for (const targetLanguage of targetLanguages) {
+          const translated = await translateChatText(trimmedContent, normalizedSenderLanguage, targetLanguage);
+          if (!translated || translated === trimmedContent) continue;
+          await storage.upsertMessageTranslation(message.id, targetLanguage, translated);
+        }
+      }
+    }
     
     // Schedule 1hr digest: if recipients don't read within 1hr, they get an email
     await db.insert(chatMessagePendingDigest).values({
@@ -5515,13 +5581,13 @@ Respond ONLY in this exact JSON format:
     }
 
     const existingMessages = await storage.getJobMessages(jobId);
-    const hasActiveCall = existingMessages.some((m: any) => {
-      const meta = m.metadata as { type?: string; callStatus?: string } | undefined;
-      return meta?.type === "video_call" && meta?.callStatus !== "ended";
-    });
-    if (hasActiveCall) {
-      return res.status(409).json({ message: "A call is already in progress for this job. Only one call can occur at a time." });
-    }
+    const latestActiveCallMessage = [...existingMessages]
+      .sort((a: any, b: any) => new Date(b.createdAt!).getTime() - new Date(a.createdAt!).getTime())
+      .find((m: any) => {
+        const meta = m.metadata as { type?: string; callStatus?: string } | undefined;
+        return meta?.type === "video_call" && meta?.callStatus !== "ended";
+      });
+    const hasActiveCall = !!latestActiveCallMessage;
 
     // Ensure the call URL is absolute so email and push action buttons open the exact call
     const trimmed = roomUrl.trim();
@@ -5581,7 +5647,13 @@ Respond ONLY in this exact JSON format:
         console.error("Failed to create call invite notification for", recipient.id, err);
       }
     }
-    res.json({ success: true, totalRecipients: recipientProfiles.length });
+    res.json({
+      success: true,
+      totalRecipients: recipientProfiles.length,
+      alreadyInProgress: hasActiveCall,
+      activeCallMessageId: latestActiveCallMessage?.id ?? null,
+      roomUrl: callUrl,
+    });
   });
 
   // Update video call message metadata (call status, participants) – e.g. when call ends or presence changes
