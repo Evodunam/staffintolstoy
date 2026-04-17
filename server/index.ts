@@ -247,6 +247,15 @@ app.use((req, res, next) => {
   next();
 });
 
+// Keep process alive on background-job promise failures; log and continue serving requests.
+process.on("unhandledRejection", (reason) => {
+  console.error("[Process] Unhandled promise rejection:", reason);
+});
+
+process.on("uncaughtException", (error) => {
+  console.error("[Process] Uncaught exception:", error);
+});
+
 (async () => {
   // Load secrets from GCP in production before starting the server
   await loadSecretsFromGCP();
@@ -326,15 +335,30 @@ app.use((req, res, next) => {
       log(`serving on port ${port}`);
       // Defer scheduler startup so "serving" appears first; reduces boot noise and perceived delay
       setTimeout(() => {
-        startJobReminderScheduler();
-        startAutoReplenishmentScheduler();
-        startGeolocationWakeupScheduler();
-        startAutoClockOutFromPingsScheduler();
-        startInvoiceReminderScheduler();
-        startAffiliateEmailScheduler();
-        startAutoApprovalScheduler();
-        startChatDigestScheduler();
-        startPaymentFailureReminderScheduler();
+        const schedulerStarts: Array<{ name: string; start: () => unknown }> = [
+          { name: "JobReminder", start: startJobReminderScheduler },
+          { name: "AutoReplenish", start: startAutoReplenishmentScheduler },
+          { name: "GeolocationWakeup", start: startGeolocationWakeupScheduler },
+          { name: "AutoClockOutFromPings", start: startAutoClockOutFromPingsScheduler },
+          { name: "InvoiceReminder", start: startInvoiceReminderScheduler },
+          { name: "AffiliateEmail", start: startAffiliateEmailScheduler },
+          { name: "AutoApproval", start: startAutoApprovalScheduler },
+          { name: "ChatDigest", start: startChatDigestScheduler },
+          { name: "PaymentFailureEmail", start: startPaymentFailureReminderScheduler },
+        ];
+
+        for (const scheduler of schedulerStarts) {
+          try {
+            const maybePromise = scheduler.start();
+            if (maybePromise && typeof (maybePromise as Promise<unknown>).catch === "function") {
+              (maybePromise as Promise<unknown>).catch((err) => {
+                console.error(`[${scheduler.name}] Failed to start:`, err);
+              });
+            }
+          } catch (err) {
+            console.error(`[${scheduler.name}] Failed to start:`, err);
+          }
+        }
       }, 1500);
     },
   ).on('error', (err: NodeJS.ErrnoException) => {
