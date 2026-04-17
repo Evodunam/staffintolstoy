@@ -55,6 +55,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:server": "vitest run --config vitest.server.config.ts",
+    "test:server:runtime": "vitest run --config vitest.server.config.ts server/lib/runtimeRouteGuards.test.ts server/routes.runtime-endpoints.test.ts",
+    "test:ci:runtime-guards": "npm run check && npm run test:server:runtime",
     "test:e2e": "playwright test",
     "full-flow": "dotenv -e .env.development -- tsx script/full-flow-test.ts",
     "seo:smoke": "tsx script/seo-smoke-test.ts",
