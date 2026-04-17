@@ -59,6 +59,7 @@ import { cn } from "@/lib/utils";
 import type { PayoutAccount } from "@shared/schema";
 
 const TOTAL_STEPS = 7; // Step 1: Account, Step 2: Location, Step 3: Skills & Services, Step 4: Business Operator & Teammates (skippable), Step 5: Payout, Step 6: Documents, Step 7: Contract
+const PENDING_W9_STORAGE_KEY = "workerOnboardingPendingW9Document";
 
 // Bio validation - prevent email, phone numbers, and URLs
 function validateBio(bio: string): { isValid: boolean; error?: string } {
@@ -655,10 +656,10 @@ export default function WorkerOnboarding() {
     
     if (!user || !existingProfile) {
       safeToast({
-        title: "Please complete previous steps first",
-        description: "You need to create your profile before connecting a bank account.",
-        variant: "destructive"
+        title: "Bank details saved",
+        description: "We'll connect your bank account automatically after your profile is created.",
       });
+      nextStep();
       return;
     }
     
@@ -1011,6 +1012,32 @@ export default function WorkerOnboarding() {
       loadOnboardingProgress();
     }
   }, [user, isAuthenticated]);
+
+  // If W-9 was uploaded before account/profile existed, attach it once profile is available.
+  useEffect(() => {
+    if (!user?.id || !existingProfile?.id) return;
+    const pendingW9 = localStorage.getItem(PENDING_W9_STORAGE_KEY);
+    if (!pendingW9) return;
+
+    (async () => {
+      try {
+        await updateProfile({
+          id: existingProfile.id,
+          data: { w9DocumentUrl: pendingW9, w9UploadedAt: new Date() },
+          skipToast: true,
+        });
+        localStorage.removeItem(PENDING_W9_STORAGE_KEY);
+        invalidateSessionProfileQueries(queryClient);
+        await queryClient.invalidateQueries({ queryKey: ["/api/worker/w9-status"] });
+        safeToast({
+          title: "W-9 attached",
+          description: "Your previously uploaded W-9 has been attached to your profile.",
+        });
+      } catch (error) {
+        console.error("Deferred W-9 attach failed:", error);
+      }
+    })();
+  }, [user?.id, existingProfile?.id]);
 
   // Prepopulate from affiliate lead when URL has ref and lead (redeem link from Sales kanban)
   useEffect(() => {
@@ -4957,11 +4984,22 @@ export default function WorkerOnboarding() {
                       className="hidden"
                       onChange={async (e) => {
                         const file = e.target.files?.[0];
-                        if (!file || !user || !existingProfile) return;
+                        if (!file) return;
 
                         const reader = new FileReader();
                         reader.onload = async (ev) => {
                           const base64Data = ev.target?.result as string;
+                          if (!base64Data) return;
+
+                          if (!user || !existingProfile) {
+                            localStorage.setItem(PENDING_W9_STORAGE_KEY, base64Data);
+                            safeToast({
+                              title: "W-9 saved",
+                              description: "We'll attach it automatically once your profile is created.",
+                            });
+                            nextStep();
+                            return;
+                          }
                           
                           try {
                             await updateProfile({

@@ -1336,12 +1336,10 @@ export default function CompanyOnboarding() {
       return;
     }
     if (step === 2) {
+      // Allow onboarding progression before account creation.
+      // We defer server-side profile persistence until auth/profile exists.
       if (!user?.id) {
-        toast({
-          title: "Sign in required",
-          description: "Please create/sign in to your account before saving onboarding details.",
-          variant: "destructive",
-        });
+        setStepAndUrl(step + 1);
         return;
       }
       try {
