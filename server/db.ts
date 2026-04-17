@@ -1,6 +1,7 @@
 import { drizzle } from "drizzle-orm/node-postgres";
 import pg from "pg";
 import * as schema from "@shared/schema";
+import { getDbRequestClient } from "./db-request-context";
 
 const { Pool } = pg;
 
@@ -11,4 +12,14 @@ if (!process.env.DATABASE_URL) {
 }
 
 export const pool = new Pool({ connectionString: process.env.DATABASE_URL });
-export const db = drizzle(pool, { schema });
+const queryRouter = {
+  query: (...args: Parameters<typeof pool.query>) => {
+    const requestClient = getDbRequestClient();
+    if (requestClient) {
+      return requestClient.query(...args);
+    }
+    return pool.query(...args);
+  },
+};
+
+export const db = drizzle(queryRouter as any, { schema });

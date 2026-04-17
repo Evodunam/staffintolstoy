@@ -537,10 +537,10 @@ export default function Login() {
         description={t("chooseHowToUse")}
         contentClassName="sm:max-w-lg"
       >
-        <div className="grid gap-6 py-6 px-2">
+        <div className="grid gap-6 py-6 px-2 min-w-0">
             <Button
               variant="outline"
-              className="w-full h-auto p-6 sm:p-8 flex flex-col sm:flex-row items-start gap-4 sm:gap-5 hover:bg-blue-50 hover:border-blue-500 transition-all duration-200 hover:shadow-lg group"
+              className="w-full min-w-0 h-auto p-6 sm:p-8 flex flex-col sm:flex-row items-start justify-start gap-4 sm:gap-5 whitespace-normal hover:bg-blue-50 hover:border-blue-500 transition-all duration-200 hover:shadow-lg group"
               onClick={() => {
                 setShowSignupDialog(false);
                 // Pass email as query param if available
@@ -566,7 +566,7 @@ export default function Login() {
             
             <Button
               variant="outline"
-              className="w-full h-auto p-6 sm:p-8 flex flex-col sm:flex-row items-start gap-4 sm:gap-5 hover:bg-green-50 hover:border-green-500 transition-all duration-200 hover:shadow-lg group"
+              className="w-full min-w-0 h-auto p-6 sm:p-8 flex flex-col sm:flex-row items-start justify-start gap-4 sm:gap-5 whitespace-normal hover:bg-green-50 hover:border-green-500 transition-all duration-200 hover:shadow-lg group"
               onClick={() => {
                 setShowSignupDialog(false);
                 // Pass email as query param if available

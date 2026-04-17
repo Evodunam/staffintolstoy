@@ -892,6 +892,14 @@ export default function CompanyOnboarding() {
   // Handle logo upload (presigned URL flow - works without profile)
   const handleLogoUpload = async (file: File) => {
     if (!file) return;
+    if (!user?.id) {
+      toast({
+        title: "Please sign in first",
+        description: "Create/sign in to your account before uploading a company logo.",
+        variant: "destructive",
+      });
+      return;
+    }
     if (!file.type.startsWith("image/")) {
       toast({ title: "Invalid file", description: "Please upload an image (PNG, JPG)", variant: "destructive" });
       return;
@@ -1312,6 +1320,14 @@ export default function CompanyOnboarding() {
           
           // Refresh authentication state
           await queryClient.invalidateQueries({ queryKey: ["/api/auth/user"] });
+          const hydratedUser = await queryClient.fetchQuery({
+            queryKey: ["/api/auth/user"],
+          });
+          if (!hydratedUser) {
+            setRegistrationError("Account was created, but your session is not active yet. Please click Continue again.");
+            setIsRegistering(false);
+            return;
+          }
           
           toast({ title: "Account created!", description: "Welcome to Tolstoy Staffing" });
         } catch (error: any) {
@@ -1326,6 +1342,14 @@ export default function CompanyOnboarding() {
       return;
     }
     if (step === 2) {
+      if (!user?.id) {
+        toast({
+          title: "Sign in required",
+          description: "Please create/sign in to your account before saving onboarding details.",
+          variant: "destructive",
+        });
+        return;
+      }
       try {
         await profileMutation.mutateAsync({
           firstName: businessInfo.firstName,

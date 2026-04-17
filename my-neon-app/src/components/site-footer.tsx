@@ -15,6 +15,8 @@ export default function SiteFooter() {
     >
       <Link to="/terms">Terms of Service</Link>
       <Link to="/privacy">Privacy Policy</Link>
+      <a href="/llms.txt">LLMs</a>
+      <a href="/sitemap.xml">Sitemap</a>
     </footer>
   )
 }

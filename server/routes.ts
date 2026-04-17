@@ -7,6 +7,7 @@ import { getSession, SESSION_TTL_SECONDS } from "./auth/session";
 import { registerAuthRoutes } from "./auth/routes";
 import { authStorage } from "./auth/storage";
 import { attachProfile, clearProfileSnapshot } from "./auth/middleware";
+import { attachRlsDbContext } from "./auth/rls-context";
 import passport from "passport";
 import { db } from "./db";
 import { users } from "@shared/models/auth";
@@ -273,7 +274,7 @@ function notificationPrefsOnly(
 /** Resolve notification recipient for job/location: location rep/teammate or company admin. Returns { email, profile } for checking notification prefs. */
 async function getNotificationRecipientForJob(
   job: { companyLocationId?: number | null; companyId: number },
-  _notificationType: "worker_inquiry" | "worker_clocked_out"
+  _notificationType: "worker_inquiry" | "worker_clocked_in" | "worker_clocked_out"
 ): Promise<{ email: string; profile: { emailNotifications?: boolean; notifyNewJobs?: boolean; notifyJobUpdates?: boolean } } | null> {
   const companyProfile = await storage.getProfile(job.companyId);
   if (!companyProfile?.email) return null;
@@ -574,6 +575,88 @@ export async function registerRoutes(
   app: Express
 ): Promise<Server> {
   const BASE_URL = process.env.BASE_URL || process.env.APP_URL || "http://localhost:5000";
+  const jobFilledEmailSentForJobIds = new Set<number>();
+
+  async function sendJobFilledIfNeeded(job: Job, companyProfile: typeof profiles.$inferSelect | null | undefined): Promise<void> {
+    if (!companyProfile?.email) return;
+    const acceptedApps = await storage.getApplicationsByJob(job.id);
+    const acceptedCount = acceptedApps.filter((a) => a.status === "accepted").length;
+    const totalPositions = job.maxWorkersNeeded || 1;
+    if (acceptedCount !== totalPositions) return;
+    if (jobFilledEmailSentForJobIds.has(job.id)) return;
+    jobFilledEmailSentForJobIds.add(job.id);
+    sendEmail({
+      to: companyProfile.email,
+      type: "job_filled",
+      data: {
+        jobTitle: job.title,
+        jobId: job.id,
+        workersNeeded: totalPositions,
+        startDate: job.startDate ? new Date(job.startDate).toLocaleDateString() : "TBD",
+      },
+    }).catch((err) => console.error("Failed to send job filled email:", err));
+  }
+
+  async function convertInquiryToPublicJob(inquiry: any): Promise<{ jobId: number | null; postedPublicly: boolean }> {
+    if (!inquiry?.fallbackToPublic) return { jobId: inquiry?.convertedJobId ?? null, postedPublicly: false };
+    if (inquiry.convertedJobId) return { jobId: inquiry.convertedJobId, postedPublicly: true };
+    const job = await storage.createJob({
+      companyId: inquiry.companyId,
+      title: inquiry.title,
+      description: inquiry.description,
+      location: inquiry.location,
+      locationName: inquiry.locationName,
+      address: inquiry.address,
+      city: inquiry.city,
+      state: inquiry.state,
+      zipCode: inquiry.zipCode,
+      latitude: inquiry.latitude ?? undefined,
+      longitude: inquiry.longitude ?? undefined,
+      requiredSkills: inquiry.requiredSkills,
+      hourlyRate: inquiry.hourlyRate,
+      trade: (inquiry.requiredSkills && inquiry.requiredSkills.length > 0 ? inquiry.requiredSkills[0] : "General Labor") as any,
+      startDate: inquiry.startDate,
+      endDate: inquiry.endDate || undefined,
+      scheduledTime: inquiry.scheduledTime,
+      estimatedHours: inquiry.estimatedHours,
+      jobType: inquiry.jobType as any,
+      images: inquiry.images,
+      videos: inquiry.videos,
+      budgetCents: inquiry.budgetCents,
+      maxWorkersNeeded: inquiry.maxWorkersNeeded,
+      isOnDemand: inquiry.jobType === "on_demand",
+      timezone: getTimezoneForState(inquiry.state),
+    });
+    await storage.updateDirectJobInquiry(inquiry.id, { status: "converted" as any, convertedJobId: job.id });
+    return { jobId: job.id, postedPublicly: true };
+  }
+
+  async function expireDirectInquiryAndNotify(
+    inquiry: any,
+    companyProfile: typeof profiles.$inferSelect | null | undefined,
+    workerName: string
+  ): Promise<{ status: "expired" | "converted"; jobId: number; postedPublicly: boolean }> {
+    const publicResult = await convertInquiryToPublicJob(inquiry);
+    const postedPublicly = publicResult.postedPublicly;
+    const jobId = publicResult.jobId ?? inquiry.convertedJobId ?? inquiry.id;
+    const nextStatus: "expired" | "converted" = postedPublicly ? "converted" : "expired";
+    if (!postedPublicly) {
+      await storage.updateDirectJobInquiry(inquiry.id, { status: "expired" as any });
+    }
+    if (companyProfile?.email && companyProfile.emailNotifications) {
+      sendEmail({
+        to: companyProfile.email,
+        type: "direct_request_expired",
+        data: {
+          jobTitle: inquiry.title,
+          jobId,
+          workerName: workerName || "The worker",
+          postedPublicly,
+        },
+      }).catch((err) => console.error("Failed to send direct request expired email:", err));
+    }
+    return { status: nextStatus, jobId, postedPublicly };
+  }
 
   /** Email + replenishment only (caller sends WebSocket via notifyApplicationUpdate). */
   async function sendApplicationAcceptedEmailAndReplenish(params: {
@@ -601,6 +684,9 @@ export async function registerRoutes(
         },
       }).catch((err) => console.error("Failed to send application accepted email:", err));
     }
+
+    await sendJobFilledIfNeeded(job, companyProfile);
+
     await afterHireFundingCheck(job.id, companyIdForReplenishment);
   }
   
@@ -613,6 +699,7 @@ export async function registerRoutes(
   app.use(passport.initialize());
   app.use(passport.session());
   app.use(attachProfile);
+  app.use(attachRlsDbContext);
 
   passport.serializeUser((user: Express.User, cb) => cb(null, user));
   passport.deserializeUser((user: Express.User, cb) => cb(null, user));
@@ -1631,15 +1718,28 @@ export async function registerRoutes(
           console.error("Login error after registration:", err);
           return res.status(500).json({ message: "Registration succeeded but login failed" });
         }
-        clearProfileSnapshot(req);
-        res.json({ 
-          success: true, 
-          user: {
-            id: newUser.id,
-            email: newUser.email,
-            firstName: newUser.firstName,
-            lastName: newUser.lastName,
+        const session = req.session as any;
+        const finalize = () => {
+          clearProfileSnapshot(req);
+          res.json({
+            success: true,
+            user: {
+              id: newUser.id,
+              email: newUser.email,
+              firstName: newUser.firstName,
+              lastName: newUser.lastName,
+            },
+          });
+        };
+        if (!session || typeof session.save !== "function") {
+          return finalize();
+        }
+        session.save((saveErr: unknown) => {
+          if (saveErr) {
+            console.error("Session save error after registration:", saveErr);
+            return res.status(500).json({ message: "Registration succeeded but session persistence failed" });
           }
+          return finalize();
         });
       });
     } catch (error: any) {
@@ -1698,15 +1798,28 @@ export async function registerRoutes(
           console.error("Login error:", err);
           return res.status(500).json({ message: "Login failed" });
         }
-        clearProfileSnapshot(req);
-        res.json({ 
-          success: true, 
-          user: {
-            id: user.id,
-            email: user.email,
-            firstName: user.firstName,
-            lastName: user.lastName,
+        const session = req.session as any;
+        const finalize = () => {
+          clearProfileSnapshot(req);
+          res.json({
+            success: true,
+            user: {
+              id: user.id,
+              email: user.email,
+              firstName: user.firstName,
+              lastName: user.lastName,
+            },
+          });
+        };
+        if (!session || typeof session.save !== "function") {
+          return finalize();
+        }
+        session.save((saveErr: unknown) => {
+          if (saveErr) {
+            console.error("Session save error after login:", saveErr);
+            return res.status(500).json({ message: "Login succeeded but session persistence failed" });
           }
+          return finalize();
         });
       });
     } catch (error: any) {
@@ -1838,22 +1951,54 @@ export async function registerRoutes(
       await authStorage.setMagicLinkToken(email, magicToken, magicExpiresAt);
       const magicLink = `${BASE_URL}/api/auth/login/magic-link?token=${magicToken}`;
 
-      // Single email with login code and sign-in button (no separate "sign in" email)
-      await sendEmail({
-        to: email,
-        type: "otp_and_magic_link_login",
-        data: {
-          otpCode,
-          magicLink,
-          firstName: user.firstName || "User",
-        },
-      });
+      const selectedMethod = method === "magic_link" || method === "otp" ? method : null;
+      const shouldSendBoth = sendBoth === true || (!selectedMethod && sendBoth !== false);
+      const loginEmailType = shouldSendBoth
+        ? "otp_and_magic_link_login"
+        : selectedMethod === "magic_link"
+        ? "magic_link_login"
+        : "otp_login";
+
+      if (loginEmailType === "magic_link_login") {
+        await sendEmail({
+          to: email,
+          type: "magic_link_login",
+          data: {
+            magicLink,
+            firstName: user.firstName || "User",
+          },
+        });
+      } else if (loginEmailType === "otp_login") {
+        await sendEmail({
+          to: email,
+          type: "otp_login",
+          data: {
+            otpCode,
+            firstName: user.firstName || "User",
+          },
+        });
+      } else {
+        await sendEmail({
+          to: email,
+          type: "otp_and_magic_link_login",
+          data: {
+            otpCode,
+            magicLink,
+            firstName: user.firstName || "User",
+          },
+        });
+      }
 
       res.json({
         success: true,
         userExists: true,
-        message: "Login code sent to your email",
-        showOtpInput: true,
+        message:
+          loginEmailType === "magic_link_login"
+            ? "Magic sign-in link sent to your email"
+            : loginEmailType === "otp_login"
+            ? "Login code sent to your email"
+            : "Login code and sign-in link sent to your email",
+        showOtpInput: loginEmailType !== "magic_link_login",
       });
     } catch (error: any) {
       console.error("OTP/Magic link request error:", error);
@@ -2110,6 +2255,37 @@ export async function registerRoutes(
       }
 
       const profile = await storage.createProfile(input);
+      if (profile.referredByAffiliateId) {
+        const affiliate = await storage.getAffiliate(profile.referredByAffiliateId);
+        if (affiliate) {
+          const affiliateUser = await authStorage.getUser(affiliate.userId);
+          const affiliateEmail = (affiliate.email || affiliateUser?.email || "").trim();
+          if (affiliateEmail) {
+            const baseUrl = (
+              process.env.BASE_URL ||
+              process.env.APP_URL ||
+              `${req.protocol || "https"}://${req.get("host") || ""}`
+            ).replace(/\/$/, "");
+            const referredName =
+              (profile.companyName || "").trim() ||
+              [profile.firstName, profile.lastName].filter(Boolean).join(" ").trim() ||
+              "New signup";
+            sendEmail({
+              to: affiliateEmail,
+              type: "affiliate_referred_lead_signed_up",
+              data: {
+                firstName: affiliate.firstName || "there",
+                referredName,
+                referredRole: profile.role,
+                signedUpAt: new Date().toLocaleDateString("en-US"),
+                dashboardUrl: `${baseUrl}/affiliate-dashboard`,
+              },
+            }).catch((emailErr) => {
+              console.error("[ProfileCreate] Failed affiliate referred signup email:", emailErr);
+            });
+          }
+        }
+      }
       res.status(201).json(profile);
     } catch (err) {
       if (err instanceof z.ZodError) {
@@ -2331,6 +2507,31 @@ export async function registerRoutes(
       if (Object.prototype.hasOwnProperty.call(raw, "sales_tracker_enabled")) updates.salesTrackerEnabled = Boolean(raw.sales_tracker_enabled);
       updates.updatedAt = new Date();
       const updated = await storage.updateAffiliate(affiliate.id, updates as Parameters<typeof storage.updateAffiliate>[1]);
+      const affiliateJustCompletedOnboarding =
+        affiliate.onboardingComplete !== true && updated.onboardingComplete === true;
+      if (affiliateJustCompletedOnboarding) {
+        const userAccount = await authStorage.getUser(userId);
+        const recipientEmail = (updated.email || userAccount?.email || "").trim();
+        if (recipientEmail) {
+          const baseUrl = (
+            process.env.BASE_URL ||
+            process.env.APP_URL ||
+            `${req.protocol || "https"}://${req.get("host") || ""}`
+          ).replace(/\/$/, "");
+          const referralLink = `${baseUrl}/company-onboarding?ref=${encodeURIComponent(updated.code)}`;
+          sendEmail({
+            to: recipientEmail,
+            type: "affiliate_welcome",
+            data: {
+              firstName: updated.firstName || "there",
+              referralLink,
+              dashboardUrl: `${baseUrl}/affiliate-dashboard`,
+            },
+          }).catch((err) => {
+            console.error("[AffiliateOnboarding] Failed to send welcome email:", err);
+          });
+        }
+      }
       res.json(updated);
     } catch (err) {
       if (process.env.NODE_ENV !== "production") console.error("[PATCH /api/affiliates/me]", err);
@@ -2842,6 +3043,62 @@ export async function registerRoutes(
         } catch (mercuryErr: any) {
           console.error(`[ProfileUpdate] Failed to create Mercury AR customer for company ${profile.id}:`, mercuryErr?.message ?? mercuryErr);
           // Don't fail the profile update
+        }
+      }
+
+      const workerJustCompletedOnboarding =
+        currentProfile?.role === "worker" &&
+        currentProfile.onboardingStatus !== "complete" &&
+        profile.role === "worker" &&
+        profile.onboardingStatus === "complete";
+      const companyJustCompletedOnboarding =
+        currentProfile?.role === "company" &&
+        currentProfile.onboardingStatus !== "complete" &&
+        profile.role === "company" &&
+        profile.onboardingStatus === "complete";
+      const completionEmail = (profile.email || "").trim();
+      if (completionEmail && (workerJustCompletedOnboarding || companyJustCompletedOnboarding)) {
+        const baseUrl = (
+          process.env.BASE_URL ||
+          process.env.APP_URL ||
+          `${req.protocol || "https"}://${req.get("host") || ""}`
+        ).replace(/\/$/, "");
+        try {
+          if (workerJustCompletedOnboarding) {
+            const rawHourlyRate = Number(profile.hourlyRate || 0);
+            const normalizedHourlyRate =
+              rawHourlyRate > 1000 ? Math.round(rawHourlyRate / 100) : Math.round(rawHourlyRate);
+            const skills = Array.isArray(profile.serviceCategories) && profile.serviceCategories.length > 0
+              ? profile.serviceCategories.join(", ")
+              : "Your selected services";
+            const location = [profile.city, profile.state].filter(Boolean).join(", ") || "Your service area";
+            await sendEmail({
+              to: completionEmail,
+              type: "welcome_worker",
+              data: {
+                firstName: (profile.firstName || "there").trim() || "there",
+                hourlyRate: normalizedHourlyRate > 0 ? normalizedHourlyRate : 0,
+                skills,
+                location,
+                dashboardUrl: `${baseUrl}/dashboard`,
+              },
+            });
+          } else if (companyJustCompletedOnboarding) {
+            const companyName =
+              (profile.companyName || "").trim() ||
+              [profile.firstName, profile.lastName].filter(Boolean).join(" ") ||
+              "your company";
+            await sendEmail({
+              to: completionEmail,
+              type: "welcome_company",
+              data: {
+                companyName,
+                dashboardUrl: `${baseUrl}/company-dashboard`,
+              },
+            });
+          }
+        } catch (welcomeErr) {
+          console.error("[ProfileUpdate] Failed onboarding completion welcome email:", welcomeErr);
         }
       }
 
@@ -4264,6 +4521,20 @@ Respond ONLY in this exact JSON format:
         const draftJob = await storage.getJob(job.id);
         return res.status(201).json(draftJob ?? job);
       }
+      if (profile.email && profile.emailNotifications) {
+        sendEmail({
+          to: profile.email,
+          type: "job_posted",
+          data: {
+            jobTitle: job.title,
+            jobId: job.id,
+            trade: job.trade || job.serviceCategory || "General",
+            hourlyRate: job.hourlyRate ? (job.hourlyRate / 100).toFixed(0) : "0",
+            workersNeeded: job.maxWorkersNeeded || 1,
+            location: job.location || [job.city, job.state].filter(Boolean).join(", ") || "See details",
+          },
+        }).catch((err) => console.error("Failed to send job posted email:", err));
+      }
 
       // Send real-time WebSocket notification to matching workers
       notifyNewJob({
@@ -4772,6 +5043,24 @@ Respond ONLY in this exact JSON format:
 
       const alertSentAt = new Date();
       await db.update(jobs).set({ lastWorkerAlertAt: alertSentAt }).where(eq(jobs.id, jobId));
+      if (profile.email && profile.emailNotifications) {
+        const apps = await storage.getJobApplications(job.id);
+        const filledPositions = apps.filter((a) => a.status === "accepted").length;
+        const totalPositions = job.maxWorkersNeeded || 1;
+        const openPositions = Math.max(0, totalPositions - filledPositions);
+        sendEmail({
+          to: profile.email,
+          type: "job_reminder",
+          data: {
+            jobTitle: job.title,
+            jobId: job.id,
+            openPositions,
+            filledPositions,
+            totalPositions,
+            applicationCount: apps.length,
+          },
+        }).catch((err) => console.error("Failed to send job reminder email:", err));
+      }
       
       res.json({ 
         success: true, 
@@ -4809,13 +5098,37 @@ Respond ONLY in this exact JSON format:
       return res.status(404).json({ message: "Worker not found" });
     }
     
-    // Create application for this worker with a response deadline
+    // Create a direct inquiry linked to the existing job with a 24h response window.
+    // This unifies expiry + fallback behavior with the direct-inquiries flow.
     const responseDeadline = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24 hours
-    const application = await storage.createApplication({
-      jobId,
-      workerId,
-      message: `Direct request from ${profile.companyName || profile.firstName}`,
+    const inquiry = await storage.createDirectJobInquiry({
+      companyId: profile.id,
+      workerId: Number(workerId),
+      title: job.title,
+      description: job.description,
+      location: job.location,
+      locationName: job.locationName,
+      address: job.address,
+      city: job.city,
+      state: job.state,
+      zipCode: job.zipCode,
+      latitude: job.latitude ?? undefined,
+      longitude: job.longitude ?? undefined,
+      requiredSkills: job.requiredSkills,
+      hourlyRate: job.hourlyRate,
+      startDate: job.startDate,
+      endDate: job.endDate || undefined,
+      scheduledTime: job.scheduledTime,
+      estimatedHours: job.estimatedHours,
+      jobType: job.jobType as any,
+      images: job.images,
+      videos: job.videos,
+      budgetCents: job.budgetCents,
+      maxWorkersNeeded: job.maxWorkersNeeded,
+      fallbackToPublic: fallbackToPublic === true,
+      expiresAt: responseDeadline,
     });
+    await storage.updateDirectJobInquiry(inquiry.id, { convertedJobId: job.id });
     
     // Send email to worker about job offer
     if (worker.email && worker.emailNotifications) {
@@ -4828,7 +5141,7 @@ Respond ONLY in this exact JSON format:
           hourlyRate: job.hourlyRate ? (job.hourlyRate / 100).toFixed(0) : '0',
           startDate: job.startDate ? new Date(job.startDate).toLocaleDateString() : 'TBD',
           location: job.location || `${job.city}, ${job.state}`,
-          offerId: application.id,
+          offerId: inquiry.id,
         }
       }).catch(err => console.error('Failed to send job offer email:', err));
     }
@@ -4847,7 +5160,17 @@ Respond ONLY in this exact JSON format:
       }).catch(err => console.error('Failed to send direct request confirmation email:', err));
     }
     
-    res.status(201).json({ success: true, application });
+    res.status(201).json({
+      success: true,
+      inquiry,
+      // Legacy compatibility for callers expecting `application`.
+      application: {
+        id: inquiry.id,
+        jobId: job.id,
+        workerId: Number(workerId),
+        status: "pending",
+      },
+    });
   });
 
   // === JOB CHAT MESSAGES ===
@@ -5059,6 +5382,10 @@ Respond ONLY in this exact JSON format:
     
     // Send push notification and email to all recipients
     for (const recipientProfile of recipientProfiles) {
+      const chatUrl = recipientProfile.role === 'company'
+        ? `/company-dashboard/chats/${jobId}`
+        : `/dashboard/chats/${jobId}`;
+
       try {
         const { sendPushNotification } = await import('./firebase-admin');
         // Get FCM tokens for the recipient
@@ -5066,14 +5393,18 @@ Respond ONLY in this exact JSON format:
           .where(eq(deviceTokens.profileId, recipientProfile.id));
         const tokenStrings = tokens.map(t => t.token).filter(Boolean) as string[];
         if (tokenStrings.length > 0) {
-          const chatUrl = recipientProfile.role === 'company'
-            ? `/company-dashboard/chats/${jobId}`
-            : `/dashboard/chats/${jobId}`;
           await sendPushNotification(
             tokenStrings,
             `New message from ${profile.firstName || profile.companyName || 'User'}`,
             (trimmedContent || '').substring(0, 100) || '[Attachment]',
-            { jobId: String(jobId), url: chatUrl, path: chatUrl }
+            {
+              type: 'chat_message',
+              jobId: String(jobId),
+              messageId: String(message.id),
+              senderProfileId: String(profile.id),
+              url: chatUrl,
+              path: chatUrl,
+            }
           );
         }
       } catch (err) {
@@ -5964,6 +6295,7 @@ Respond ONLY in this exact JSON format:
       await afterHireFundingCheck(job.id, job.companyId).catch((err) =>
         console.error("afterHireFundingCheck (worker accept):", err)
       );
+      await sendJobFilledIfNeeded(job, company);
     }
     
     res.json(updated);
@@ -6618,6 +6950,20 @@ Respond ONLY in this exact JSON format:
           console.error("Failed to create notification:", e);
         }
       }
+      if (worker?.email && worker.emailNotifications) {
+        sendEmail({
+          to: worker.email,
+          type: "job_offer_received",
+          data: {
+            jobTitle: inquiry.title,
+            companyName: profile.companyName || `${profile.firstName} ${profile.lastName}`,
+            location: inquiry.location || [inquiry.city, inquiry.state].filter(Boolean).join(", ") || "See details",
+            startDate: inquiry.startDate ? new Date(inquiry.startDate).toLocaleDateString() : "TBD",
+            hourlyRate: inquiry.hourlyRate ? (inquiry.hourlyRate / 100).toFixed(0) : "0",
+            offerId: inquiry.id,
+          },
+        }).catch((err) => console.error("Failed to send direct inquiry offer email:", err));
+      }
       
       res.status(201).json(inquiry);
     } catch (err) {
@@ -6653,6 +6999,19 @@ Respond ONLY in this exact JSON format:
       }
       
       const inquiries = await storage.getDirectJobInquiriesForCompany(profile.id);
+      const now = new Date();
+      for (const inquiry of inquiries) {
+        if (inquiry.status !== "pending" || !inquiry.expiresAt) continue;
+        if (new Date(inquiry.expiresAt).getTime() >= now.getTime()) continue;
+        const workerName = (inquiry.worker as any)?.firstName
+          ? `${(inquiry.worker as any).firstName} ${(inquiry.worker as any).lastName || ""}`.trim()
+          : "The worker";
+        const result = await expireDirectInquiryAndNotify(inquiry, profile, workerName);
+        (inquiry as any).status = result.status;
+        if (result.status === "converted") {
+          (inquiry as any).convertedJobId = result.jobId;
+        }
+      }
       res.json(inquiries);
     } catch (err) {
       console.error("Error fetching company inquiries:", err);
@@ -6683,6 +7042,15 @@ Respond ONLY in this exact JSON format:
       if (inquiry.workerId !== profile.id) {
         return res.status(403).json({ message: "Not authorized to respond to this inquiry" });
       }
+      if (inquiry.expiresAt && new Date(inquiry.expiresAt).getTime() < Date.now()) {
+        const company = await storage.getProfile(inquiry.companyId);
+        await expireDirectInquiryAndNotify(
+          inquiry,
+          company,
+          `${profile.firstName || ""} ${profile.lastName || ""}`.trim() || "The worker"
+        );
+        return res.status(400).json({ message: "Inquiry has expired" });
+      }
       if (inquiry.status !== "pending") {
         return res.status(400).json({ message: "Inquiry has already been responded to" });
       }
@@ -6692,8 +7060,8 @@ Respond ONLY in this exact JSON format:
       
       // If accepted, create the job and auto-accept the worker
       if (status === "accepted") {
-        // Create the job from the inquiry data
-        const job = await storage.createJob({
+        const existingJob = inquiry.convertedJobId ? await storage.getJob(inquiry.convertedJobId) : null;
+        const job = existingJob ?? await storage.createJob({
           companyId: inquiry.companyId,
           title: inquiry.title,
           description: inquiry.description,
@@ -6720,20 +7088,42 @@ Respond ONLY in this exact JSON format:
           isOnDemand: inquiry.jobType === "on_demand",
           timezone: getTimezoneForState(inquiry.state),
         });
+        const companyForPostedEmail = await storage.getProfile(inquiry.companyId);
+        if (!existingJob && companyForPostedEmail?.email && companyForPostedEmail.emailNotifications) {
+          sendEmail({
+            to: companyForPostedEmail.email,
+            type: "job_posted",
+            data: {
+              jobTitle: job.title,
+              jobId: job.id,
+              trade: job.trade || job.serviceCategory || "General",
+              hourlyRate: job.hourlyRate ? (job.hourlyRate / 100).toFixed(0) : "0",
+              workersNeeded: job.maxWorkersNeeded || 1,
+              location: job.location || [job.city, job.state].filter(Boolean).join(", ") || "See details",
+            },
+          }).catch((err) => console.error("Failed to send job posted email (inquiry convert):", err));
+        }
         
-        // Auto-create application as accepted
-        await storage.createApplication({
-          jobId: job.id,
-          workerId: profile.id,
-          message: message || "Accepted direct job request",
-        });
-        
-        // Update the application status to accepted
-        const applications = await storage.getApplicationsByJob(job.id);
-        const workerApp = applications.find(a => a.workerId === profile.id);
-        if (workerApp) {
+        // Ensure worker has an accepted application for this job.
+        let applications = await storage.getApplicationsByJob(job.id);
+        let workerApp = applications.find(a => a.workerId === profile.id);
+        if (!workerApp) {
+          try {
+            await storage.createApplication({
+              jobId: job.id,
+              workerId: profile.id,
+              message: message || "Accepted direct job request",
+            });
+          } catch (createErr: any) {
+            if (createErr?.code !== "23505") throw createErr;
+          }
+          applications = await storage.getApplicationsByJob(job.id);
+          workerApp = applications.find(a => a.workerId === profile.id);
+        }
+        if (workerApp && workerApp.status !== "accepted") {
           await storage.updateApplicationStatus(workerApp.id, "accepted");
         }
+        await sendJobFilledIfNeeded(job, companyForPostedEmail);
         
         // Link the job to the inquiry
         await storage.updateDirectJobInquiry(inquiryId, { 
@@ -9303,6 +9693,20 @@ Respond ONLY in this exact JSON format:
             url: `/company-dashboard?tab=timesheets&timesheetId=${timesheet.id}`,
             data: { jobId, timesheetId: timesheet.id, workerName, isAutomatic: isAutomatic || false },
           });
+          const jobForRouting = { companyLocationId: job.companyLocationId, companyId: job.companyId };
+          const recipient = await getNotificationRecipientForJob(jobForRouting, "worker_clocked_in");
+          if (recipient?.email && (recipient.profile.emailNotifications ?? true) && (recipient.profile.notifyJobUpdates ?? true)) {
+            sendEmail({
+              to: recipient.email,
+              type: "worker_clocked_in",
+              data: {
+                workerName,
+                jobTitle: job.title,
+                location: job.location || [job.city, job.state].filter(Boolean).join(", ") || "Job site",
+                clockInTime: clockInTimeFormatted,
+              },
+            }).catch((err) => console.error("Failed to send worker clocked in email:", err));
+          }
         }
       } catch (notifyErr) {
         console.error("Failed to send clock-in notification:", notifyErr);
@@ -9469,6 +9873,20 @@ Respond ONLY in this exact JSON format:
           url: `/company-dashboard?tab=timesheets&timesheetId=${timesheet.id}`,
           data: { jobId, timesheetId: timesheet.id, workerName, isAutomatic: true },
         });
+        const jobForRouting = { companyLocationId: job.companyLocationId, companyId: job.companyId };
+        const recipient = await getNotificationRecipientForJob(jobForRouting, "worker_clocked_in");
+        if (recipient?.email && (recipient.profile.emailNotifications ?? true) && (recipient.profile.notifyJobUpdates ?? true)) {
+          sendEmail({
+            to: recipient.email,
+            type: "worker_clocked_in",
+            data: {
+              workerName,
+              jobTitle: job.title,
+              location: job.location || [job.city, job.state].filter(Boolean).join(", ") || "Job site",
+              clockInTime: clockInTimeFormatted,
+            },
+          }).catch((err) => console.error("Failed to send auto worker clocked in email:", err));
+        }
       }
     } catch {
       // ignore
@@ -11681,6 +12099,31 @@ Respond ONLY in this exact JSON format:
             amountCents: commissionCents,
             status: "pending",
           });
+          const affiliate = await storage.getAffiliate(referredByAffiliateId);
+          if (affiliate) {
+            const affiliateUser = await authStorage.getUser(affiliate.userId);
+            const affiliateEmail = (affiliate.email || affiliateUser?.email || "").trim();
+            if (affiliateEmail) {
+              const baseUrl = (
+                process.env.BASE_URL ||
+                process.env.APP_URL ||
+                `${req.protocol || "https"}://${req.get("host") || ""}`
+              ).replace(/\/$/, "");
+              sendEmail({
+                to: affiliateEmail,
+                type: "affiliate_commission_available",
+                data: {
+                  firstName: affiliate.firstName || "there",
+                  amountCents: commissionCents,
+                  description: `Commission from approved timesheet #${id}`,
+                  hasPayoutSetup: Boolean(affiliate.mercuryRecipientId && affiliate.w9UploadedAt),
+                  dashboardUrl: `${baseUrl}/affiliate-dashboard`,
+                },
+              }).catch((emailErr) => {
+                console.error("[TimesheetApproval] Failed affiliate commission email:", emailErr);
+              });
+            }
+          }
           console.log(`[TimesheetApproval] Affiliate commission: $${(commissionCents/100).toFixed(2)} (${affiliateCommissionPercent}% of platform fee) for affiliate ${referredByAffiliateId}`);
         }
       }
@@ -11717,6 +12160,18 @@ Respond ONLY in this exact JSON format:
       const balanceBefore = Number(balanceBeforeRow?.depositAmount ?? profile.depositAmount ?? 0);
       const newBalance = Math.max(0, balanceBefore - totalPay);
       await storage.updateProfile(profile.id, { depositAmount: newBalance });
+      const lowBalanceThreshold = Number(profile.autoReplenishThreshold ?? 200000);
+      if ((balanceBefore >= lowBalanceThreshold) && (newBalance < lowBalanceThreshold) && profile.email) {
+        sendEmail({
+          to: profile.email,
+          type: "balance_low",
+          data: {
+            balance: (newBalance / 100).toFixed(2),
+          },
+        }).catch((emailErr) => {
+          console.error("[TimesheetApproval] Failed low balance email:", emailErr);
+        });
+      }
       const workerNameForTx = worker ? `${worker.firstName || ''} ${worker.lastName || ''}`.trim() || 'Worker' : 'Worker';
       await storage.createCompanyTransaction({
         profileId: profile.id,
@@ -11855,6 +12310,14 @@ Respond ONLY in this exact JSON format:
                 isInstantPayout: !!isInstantPayout,
               }
             }).catch(err => console.error('Failed to send payout sent email:', err));
+            sendEmail({
+              to: workerForPayout.email,
+              type: 'payment_received',
+              data: {
+                amount: (payoutAmount / 100).toFixed(2),
+                jobTitle: job?.title || 'Job',
+              }
+            }).catch(err => console.error('Failed to send payment received email:', err));
           }
           if (payoutSuccess) {
             console.log(`[TimesheetApproval] Worker payout initiated: $${(totalPay / 100).toFixed(2)} to worker ${workerForPayout.id} (Payment Order: ${payoutOrderId}). Balance was already deducted on approve.`);
@@ -12057,6 +12520,31 @@ Respond ONLY in this exact JSON format:
           const commissionCents = Math.round(platformFee * affiliateCommissionPercentBulk / 100);
           if (commissionCents > 0) {
             await storage.createAffiliateCommission({ affiliateId: workerForPayout.referredByAffiliateId, timesheetId: id, amountCents: commissionCents, status: "pending" });
+            const affiliate = await storage.getAffiliate(workerForPayout.referredByAffiliateId);
+            if (affiliate) {
+              const affiliateUser = await authStorage.getUser(affiliate.userId);
+              const affiliateEmail = (affiliate.email || affiliateUser?.email || "").trim();
+              if (affiliateEmail) {
+                const baseUrl = (
+                  process.env.BASE_URL ||
+                  process.env.APP_URL ||
+                  `${req.protocol || "https"}://${req.get("host") || ""}`
+                ).replace(/\/$/, "");
+                sendEmail({
+                  to: affiliateEmail,
+                  type: "affiliate_commission_available",
+                  data: {
+                    firstName: affiliate.firstName || "there",
+                    amountCents: commissionCents,
+                    description: `Commission from approved timesheet #${id}`,
+                    hasPayoutSetup: Boolean(affiliate.mercuryRecipientId && affiliate.w9UploadedAt),
+                    dashboardUrl: `${baseUrl}/affiliate-dashboard`,
+                  },
+                }).catch((emailErr) => {
+                  console.error("[BulkApproval] Failed affiliate commission email:", emailErr);
+                });
+              }
+            }
           }
         }
 
@@ -12065,6 +12553,18 @@ Respond ONLY in this exact JSON format:
         const bulkBalanceBefore = Number(bulkBalanceRow?.depositAmount ?? profile.depositAmount ?? 0);
         const bulkNewBalance = Math.max(0, bulkBalanceBefore - totalPay);
         await storage.updateProfile(profile.id, { depositAmount: bulkNewBalance });
+        const bulkLowBalanceThreshold = Number(profile.autoReplenishThreshold ?? 200000);
+        if ((bulkBalanceBefore >= bulkLowBalanceThreshold) && (bulkNewBalance < bulkLowBalanceThreshold) && profile.email) {
+          sendEmail({
+            to: profile.email,
+            type: "balance_low",
+            data: {
+              balance: (bulkNewBalance / 100).toFixed(2),
+            },
+          }).catch((emailErr) => {
+            console.error("[BulkApproval] Failed low balance email:", emailErr);
+          });
+        }
         const bulkWorkerName = workerForPayout ? `${workerForPayout.firstName || ''} ${workerForPayout.lastName || ''}`.trim() || 'Worker' : 'Worker';
         await storage.createCompanyTransaction({
           profileId: profile.id,
@@ -13618,6 +14118,67 @@ Respond ONLY in this exact JSON format:
     } catch (err: any) {
       console.error("Admin update platform-config error:", err);
       res.status(500).json({ message: err.message });
+    }
+  });
+
+  // Admin utility: mark pending affiliate commissions as paid and notify affiliate.
+  app.post("/api/admin/affiliates/:affiliateId/mark-commissions-paid", requireAdmin, async (req, res) => {
+    try {
+      const affiliateId = Number(req.params.affiliateId);
+      if (!Number.isFinite(affiliateId)) {
+        return res.status(400).json({ message: "Invalid affiliate id" });
+      }
+
+      const affiliate = await storage.getAffiliate(affiliateId);
+      if (!affiliate) {
+        return res.status(404).json({ message: "Affiliate not found" });
+      }
+
+      const commissions = await storage.getAffiliateCommissionsByAffiliateId(affiliateId);
+      const pending = commissions.filter((c) => c.status === "pending");
+      if (pending.length === 0) {
+        return res.json({ success: true, updated: 0, amountCents: 0 });
+      }
+
+      const paidAt = new Date();
+      for (const commission of pending) {
+        await storage.updateAffiliateCommission(commission.id, {
+          status: "paid",
+          paidAt,
+        });
+      }
+
+      const amountCents = pending.reduce((sum, commission) => sum + (commission.amountCents || 0), 0);
+      const affiliateUser = await authStorage.getUser(affiliate.userId);
+      const affiliateEmail = (affiliate.email || affiliateUser?.email || "").trim();
+      if (affiliateEmail && amountCents > 0) {
+        const baseUrl = (
+          process.env.BASE_URL ||
+          process.env.APP_URL ||
+          `${req.protocol || "https"}://${req.get("host") || ""}`
+        ).replace(/\/$/, "");
+        sendEmail({
+          to: affiliateEmail,
+          type: "affiliate_payment_sent",
+          data: {
+            firstName: affiliate.firstName || "there",
+            amountCents,
+            description: `${pending.length} commission${pending.length === 1 ? "" : "s"} paid`,
+            dashboardUrl: `${baseUrl}/affiliate-dashboard`,
+          },
+        }).catch((emailErr) => {
+          console.error("[AdminAffiliatePayout] Failed affiliate payment email:", emailErr);
+        });
+      }
+
+      res.json({
+        success: true,
+        updated: pending.length,
+        amountCents,
+      });
+    } catch (err: any) {
+      console.error("Admin affiliate payout mark-paid error:", err);
+      res.status(500).json({ message: err.message || "Failed to mark commissions as paid" });
     }
   });
 
@@ -16080,6 +16641,20 @@ Respond ONLY in this exact JSON format:
         depositAmount: newDepositAmount,
         lastFailedPaymentMethodId: null,
       });
+      const companyEmail = (profile.email || "").trim();
+      if (companyEmail) {
+        sendEmail({
+          to: companyEmail,
+          type: "balance_recharged",
+          data: {
+            amount: (amountCents / 100).toFixed(2),
+            newBalance: (newDepositAmount / 100).toFixed(2),
+            cardLast4: isCard ? (paymentMethod.lastFour || "****") : "bank",
+          },
+        }).catch((emailErr) => {
+          console.error("[CompanyFund] Failed balance recharge email:", emailErr);
+        });
+      }
 
       await storage.createCompanyTransaction({
         profileId: profile.id,

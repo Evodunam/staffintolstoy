@@ -84,6 +84,7 @@ export async function sendPushNotification(
     return { successCount: 0, failureCount: 0, failedTokens: [] };
   }
   
+  const targetPath = data?.url || data?.path || "/";
   const message: admin.messaging.MulticastMessage = {
     tokens,
     notification: {
@@ -91,9 +92,19 @@ export async function sendPushNotification(
       body,
     },
     data: data || {},
+    android: {
+      priority: "high",
+    },
+    apns: {
+      payload: {
+        aps: {
+          sound: "default",
+        },
+      },
+    },
     webpush: {
       fcmOptions: {
-        link: data?.url || data?.path || "/",
+        link: targetPath,
       },
       notification: {
         icon: "/favicon.ico",

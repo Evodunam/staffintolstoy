@@ -61,13 +61,16 @@ async function processChatDigests(): Promise<void> {
 
           const result = await sendEmail({
             to: recipientProfile.email,
-            type: "new_job_message",
+            type: "chat_unread_digest",
             data: {
-              senderName,
-              senderAvatarUrl: senderProfile?.avatarUrl || undefined,
-              jobTitle: job.title,
-              messagePreview: messagePreview || "[Attachment]",
-              jobId: row.jobId,
+              items: [
+                {
+                  jobTitle: job.title,
+                  jobId: row.jobId,
+                  unreadCount,
+                  lastPreview: messagePreview || "[Attachment]",
+                },
+              ],
             },
           });
 
