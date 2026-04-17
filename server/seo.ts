@@ -1,5 +1,7 @@
 import type { Express, Request, Response } from "express";
 import allTheCities from "all-the-cities";
+import { storage } from "./storage";
+import { workerFacingJobHourlyCents } from "@shared/platformPayPolicy";
 
 type LandingPage = {
   id: number;
@@ -1295,6 +1297,10 @@ function renderSitemapIndexXml(baseUrl: string): string {
       `<sitemap><loc>${escapeHtml(`${baseUrl}/sitemaps/worker-city-trades-${chunk}.xml`)}</loc><lastmod>${LASTMOD_ISO}</lastmod></sitemap>`,
     );
   }
+  // Live open jobs (rendered separately with JobPosting schema for Google for Jobs).
+  chunkNodes.push(
+    `<sitemap><loc>${escapeHtml(`${baseUrl}/sitemaps/jobs.xml`)}</loc><lastmod>${LASTMOD_ISO}</lastmod></sitemap>`,
+  );
 
   return `<?xml version="1.0" encoding="UTF-8"?>
 <sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
@@ -1522,6 +1528,8 @@ ${PUBLIC_PATHS.map((path) => `- ${baseUrl}${path}`).join("\n")}
 - ${baseUrl}/llms.txt
 - ${baseUrl}/llms-full.txt
 - ${baseUrl}/llms.json
+- ${baseUrl}/jobs.rss
+- ${baseUrl}/jobs.json
 
 ## Programmatic SEO surface (machine-readable)
 
@@ -1577,18 +1585,33 @@ function renderRobotsTxt(baseUrl: string): string {
     }
   })();
 
+  const disallow = ROBOTS_DISALLOW_PATHS.map((path) => `Disallow: ${path}`).join("\n");
+  const aiBots = ["GPTBot", "ClaudeBot", "Claude-Web", "anthropic-ai", "PerplexityBot", "Google-Extended", "Applebot-Extended", "CCBot", "cohere-ai", "Bytespider"];
+  const aiBotBlocks = aiBots
+    .map(
+      (ua) => `User-agent: ${ua}
+Allow: /
+${disallow}
+`,
+    )
+    .join("\n");
+
   return `User-agent: *
 Allow: /
-${ROBOTS_DISALLOW_PATHS.map((path) => `Disallow: ${path}`).join("\n")}
+${disallow}
 
+${aiBotBlocks}
 # AI/LLM machine-readable summaries
 # ${baseUrl}/llms.txt
 # ${baseUrl}/llms-full.txt
 # ${baseUrl}/llms.json
+# Job feeds: ${baseUrl}/jobs.rss  ${baseUrl}/jobs.json
+# Plugin manifest: ${baseUrl}/.well-known/ai-plugin.json
 # Security disclosure: ${baseUrl}/.well-known/security.txt
 
 Sitemap: ${baseUrl}/sitemap.xml
 Sitemap: ${baseUrl}/sitemaps/core.xml
+Sitemap: ${baseUrl}/sitemaps/jobs.xml
 ${host ? `Host: ${host}` : ""}
 `;
 }
@@ -1926,6 +1949,11 @@ function renderLlmsJson(baseUrl: string): unknown {
       llms_json: `${baseUrl}/llms.json`,
       sitemap_xml: `${baseUrl}/sitemap.xml`,
       robots_txt: `${baseUrl}/robots.txt`,
+      jobs_rss: `${baseUrl}/jobs.rss`,
+      jobs_json_feed: `${baseUrl}/jobs.json`,
+      opensearch: `${baseUrl}/opensearch.xml`,
+      humans_txt: `${baseUrl}/humans.txt`,
+      security_txt: `${baseUrl}/.well-known/security.txt`,
     },
     notes: [
       "Numbers reflect current product policy and may change.",
@@ -2272,4 +2300,251 @@ Policy: ${baseUrl}/legal
   };
   app.get("/.well-known/security.txt", securityTxtHandler);
   app.get("/security.txt", securityTxtHandler);
+
+  // Public job feeds for crawlers + integrations (open jobs only).
+  // Caps + caching keep this cheap; mirrors what /jobs already shows publicly.
+  const PUBLIC_JOB_FEED_LIMIT = 200;
+
+  const fetchPublicJobs = async () => {
+    try {
+      const jobs = await storage.getJobs();
+      return jobs.slice(0, PUBLIC_JOB_FEED_LIMIT);
+    } catch (err) {
+      console.error("[SEO] fetchPublicJobs error:", (err as Error)?.message);
+      return [];
+    }
+  };
+
+  app.get("/jobs.json", async (req: Request, res: Response) => {
+    const baseUrl = getBaseUrl(req);
+    const jobs = await fetchPublicJobs();
+    const items = jobs.map((j: any) => {
+      const wage = workerFacingJobHourlyCents(Number(j.hourlyRate ?? 0));
+      const url = `${baseUrl}/jobs/${j.id}`;
+      const summary = String(j.description ?? "").slice(0, 280);
+      return {
+        id: String(j.id),
+        url,
+        title: String(j.title ?? "Hourly job"),
+        content_text: summary,
+        date_published: j.createdAt ? new Date(j.createdAt).toISOString() : undefined,
+        tags: [j.trade, j.companyName].filter(Boolean),
+        _tolstoy: {
+          worker_hourly_usd: wage > 0 ? wage / 100 : null,
+          location: j.location ?? null,
+          city: j.city ?? null,
+          state: j.state ?? null,
+          trade: j.trade ?? null,
+          company_name: j.companyName ?? null,
+        },
+      };
+    });
+    res.setHeader("Content-Type", "application/feed+json; charset=utf-8");
+    res.setHeader("Cache-Control", "public, max-age=300, stale-while-revalidate=3600");
+    res.json({
+      version: "https://jsonfeed.org/version/1.1",
+      title: `${SITE_NAME} - Open Jobs`,
+      home_page_url: `${baseUrl}/jobs`,
+      feed_url: `${baseUrl}/jobs.json`,
+      description: "Currently open hourly jobs on Tolstoy Staffing.",
+      language: "en-US",
+      items,
+    });
+  });
+
+  app.get("/jobs.rss", async (req: Request, res: Response) => {
+    const baseUrl = getBaseUrl(req);
+    const jobs = await fetchPublicJobs();
+    const items = jobs
+      .map((j: any) => {
+        const wage = workerFacingJobHourlyCents(Number(j.hourlyRate ?? 0));
+        const url = `${baseUrl}/jobs/${j.id}`;
+        const summary = String(j.description ?? "").slice(0, 500);
+        const wageLine = wage > 0 ? ` ($${(wage / 100).toFixed(2)}/hr)` : "";
+        const where = [j.city, j.state].filter(Boolean).join(", ") || j.location || "";
+        const title = `${j.title ?? "Hourly job"}${where ? ` - ${where}` : ""}${wageLine}`;
+        const pubDate = j.createdAt ? new Date(j.createdAt).toUTCString() : new Date().toUTCString();
+        return `    <item>
+      <title>${escapeHtml(title)}</title>
+      <link>${escapeHtml(url)}</link>
+      <guid isPermaLink="true">${escapeHtml(url)}</guid>
+      <pubDate>${pubDate}</pubDate>
+      <description>${escapeHtml(summary)}</description>
+    </item>`;
+      })
+      .join("\n");
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>${escapeHtml(`${SITE_NAME} - Open Jobs`)}</title>
+    <link>${escapeHtml(`${baseUrl}/jobs`)}</link>
+    <description>Currently open hourly jobs on Tolstoy Staffing.</description>
+    <language>en-US</language>
+${items}
+  </channel>
+</rss>`;
+    res.setHeader("Content-Type", "application/rss+xml; charset=utf-8");
+    res.setHeader("Cache-Control", "public, max-age=300, stale-while-revalidate=3600");
+    res.send(xml);
+  });
+
+  // Jobs sitemap chunk — open jobs only, capped, used by sitemap index above.
+  app.get("/sitemaps/jobs.xml", async (req: Request, res: Response) => {
+    const baseUrl = getBaseUrl(req);
+    const jobs = await fetchPublicJobs();
+    const urls = jobs
+      .map((j: any) => {
+        const updated = j.updatedAt ?? j.createdAt;
+        const lastmod = updated ? new Date(updated).toISOString() : LASTMOD_ISO;
+        return `<url>
+  <loc>${escapeHtml(`${baseUrl}/jobs/${j.id}`)}</loc>
+  <lastmod>${lastmod}</lastmod>
+  <changefreq>daily</changefreq>
+  <priority>0.9</priority>
+</url>`;
+      })
+      .join("\n");
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+${urls}
+</urlset>`;
+    res.setHeader("Content-Type", "application/xml; charset=utf-8");
+    res.setHeader("Cache-Control", "public, max-age=300, stale-while-revalidate=3600");
+    res.send(xml);
+  });
+
+  // OpenAI/MCP-style plugin manifest. Some agentic tools still discover via this.
+  app.get("/.well-known/ai-plugin.json", (req: Request, res: Response) => {
+    const baseUrl = getBaseUrl(req);
+    res.setHeader("Content-Type", "application/json; charset=utf-8");
+    res.setHeader("Cache-Control", "public, max-age=3600, stale-while-revalidate=86400");
+    res.json({
+      schema_version: "v1",
+      name_for_human: SITE_NAME,
+      name_for_model: "tolstoy_staffing",
+      description_for_human:
+        "B2B on-demand contract labor marketplace. Companies post hourly jobs; verified service workers fill shifts.",
+      description_for_model:
+        "Tolstoy Staffing is a B2B on-demand staffing marketplace. Use this site for: hourly job postings (open jobs only) at /jobs/{id}, machine-readable job feeds at /jobs.json (JSON Feed) and /jobs.rss (RSS), structured marketplace summary at /llms.json, plain-text summaries at /llms.txt and /llms-full.txt. Workers are independent contractors paid by ACH after location-verified shifts.",
+      logo_url: `${baseUrl}/favicon.svg`,
+      contact_email: "support@tolstoystaffing.com",
+      legal_info_url: `${baseUrl}/legal`,
+      auth: { type: "none" },
+      api: {
+        type: "json_feed",
+        url: `${baseUrl}/jobs.json`,
+        is_user_authenticated: false,
+      },
+      additional_resources: {
+        llms_txt: `${baseUrl}/llms.txt`,
+        llms_full_txt: `${baseUrl}/llms-full.txt`,
+        llms_json: `${baseUrl}/llms.json`,
+        sitemap_xml: `${baseUrl}/sitemap.xml`,
+        jobs_rss: `${baseUrl}/jobs.rss`,
+        jobs_json_feed: `${baseUrl}/jobs.json`,
+      },
+    });
+  });
+
+  // Server-rendered SEO shell for individual jobs so crawlers/LLMs see JobPosting
+  // schema + canonical metadata without executing the SPA. Browsers continue to
+  // load the React app; bots get the structured data immediately.
+  app.get("/jobs/:id", async (req: Request, res: Response, next) => {
+    const ua = String(req.headers["user-agent"] ?? "").toLowerCase();
+    const wantsHtml = (req.headers.accept ?? "").includes("text/html");
+    const isBot =
+      /bot|crawler|spider|crawling|gpt|claude|perplexity|facebookexternalhit|slurp|applebot|bingpreview|adsbot|lighthouse|chrome-lighthouse|google-inspectiontool|duckduckbot|yandex|baiduspider|sogou|cohere|bytespider|cccbot|amazonbot|petalbot|seznambot|whatsapp|telegrambot|linkedinbot|discordbot|skypeuripreview|embedly|nuzzel|outbrain|quora link preview/.test(
+        ua,
+      );
+    if (!wantsHtml || !isBot) return next();
+
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) return next();
+
+    try {
+      const job = (await storage.getJob(id)) as any;
+      if (!job || job.status !== "open") return next();
+      const baseUrl = getBaseUrl(req);
+      const wage = workerFacingJobHourlyCents(Number(job.hourlyRate ?? 0));
+      const where = [job.city, job.state].filter(Boolean).join(", ") || job.location || "";
+      const title = `${job.title ?? "Hourly Job"}${where ? ` in ${where}` : ""} | ${SITE_NAME}`;
+      const description = String(job.description ?? "").slice(0, 280) || `Hourly ${job.trade ?? "service"} job on Tolstoy Staffing.`;
+      const canonical = `${baseUrl}/jobs/${id}`;
+
+      const jsonLd = {
+        "@context": "https://schema.org",
+        "@type": "JobPosting",
+        title: job.title ?? "Hourly Job",
+        description,
+        identifier: { "@type": "PropertyValue", name: "Tolstoy Staffing", value: String(id) },
+        datePosted: job.createdAt ? new Date(job.createdAt).toISOString() : undefined,
+        employmentType: "CONTRACTOR",
+        hiringOrganization: {
+          "@type": "Organization",
+          name: job.companyName ?? "Confidential employer",
+          sameAs: baseUrl,
+        },
+        jobLocation: where
+          ? {
+              "@type": "Place",
+              address: {
+                "@type": "PostalAddress",
+                addressLocality: job.city ?? undefined,
+                addressRegion: job.state ?? undefined,
+                postalCode: job.zipCode ?? undefined,
+                addressCountry: "US",
+                streetAddress: job.address ?? undefined,
+              },
+            }
+          : undefined,
+        baseSalary: wage > 0 ? {
+          "@type": "MonetaryAmount",
+          currency: "USD",
+          value: { "@type": "QuantitativeValue", value: wage / 100, unitText: "HOUR" },
+        } : undefined,
+        directApply: false,
+        url: canonical,
+      };
+
+      res.setHeader("Content-Type", "text/html; charset=utf-8");
+      res.setHeader("Cache-Control", "public, max-age=300, stale-while-revalidate=3600");
+      const breadcrumbs = {
+        "@context": "https://schema.org",
+        "@type": "BreadcrumbList",
+        itemListElement: [
+          { "@type": "ListItem", position: 1, name: SITE_NAME, item: baseUrl },
+          { "@type": "ListItem", position: 2, name: "Jobs", item: `${baseUrl}/jobs` },
+          { "@type": "ListItem", position: 3, name: job.title ?? `Job ${id}`, item: canonical },
+        ],
+      };
+
+      res.send(`<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>${escapeHtml(title)}</title>
+    <meta name="description" content="${escapeHtml(description)}" />
+    <link rel="canonical" href="${escapeHtml(canonical)}" />
+    <link rel="alternate" hreflang="en" href="${escapeHtml(canonical)}" />
+    <link rel="alternate" hreflang="x-default" href="${escapeHtml(canonical)}" />
+    <meta name="robots" content="index,follow,max-snippet:-1,max-image-preview:large" />
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="${escapeHtml(title)}" />
+    <meta property="og:description" content="${escapeHtml(description)}" />
+    <meta property="og:url" content="${escapeHtml(canonical)}" />
+    <meta property="og:site_name" content="${escapeHtml(SITE_NAME)}" />
+    <script type="application/ld+json">${JSON.stringify(jsonLd)}</script>
+    <script type="application/ld+json">${JSON.stringify(breadcrumbs)}</script>
+  </head>
+  <body>
+    <h1>${escapeHtml(job.title ?? "Hourly Job")}</h1>
+    <p>${escapeHtml(description)}</p>
+    <p><a href="${escapeHtml(canonical)}">View this job on ${escapeHtml(SITE_NAME)}</a></p>
+  </body>
+</html>`);
+    } catch (err) {
+      console.error("[SEO] /jobs/:id render error:", (err as Error)?.message);
+      return next();
+    }
+  });
 }

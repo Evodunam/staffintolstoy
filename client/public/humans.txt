@@ -1,0 +1,25 @@
+/* TEAM */
+Site: Tolstoy Staffing
+URL: https://tolstoystaffing.com
+Type: B2B on-demand contract labor marketplace
+Audience: Companies hiring hourly workers, independent service workers, affiliates
+
+/* CONTACT */
+Privacy: privacy@tolstoystaffing.com
+Security: security@tolstoystaffing.com
+Support: https://tolstoystaffing.com/support
+Contact: https://tolstoystaffing.com/contact
+
+/* SITE */
+Last update: 2026
+Standards: HTML5, CSS3, ES2022, Schema.org JSON-LD, RFC 9116 security.txt, llms.txt
+Components: React, TypeScript, Vite, Express, Drizzle ORM
+Payments: Stripe (cards + ACH funding), Mercury (worker payouts)
+Integrations: Google Places (address), Capacitor (mobile)
+
+/* MACHINE-READABLE */
+LLM summary: https://tolstoystaffing.com/llms.txt
+LLM extended: https://tolstoystaffing.com/llms-full.txt
+LLM JSON: https://tolstoystaffing.com/llms.json
+Sitemap: https://tolstoystaffing.com/sitemap.xml
+Security: https://tolstoystaffing.com/.well-known/security.txt

@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<OpenSearchDescription xmlns="http://a9.com/-/spec/opensearch/1.1/">
+  <ShortName>Tolstoy Staffing</ShortName>
+  <Description>Search Tolstoy Staffing for hourly jobs and verified service workers.</Description>
+  <InputEncoding>UTF-8</InputEncoding>
+  <Image width="32" height="32" type="image/png">https://tolstoystaffing.com/favicon.png</Image>
+  <Image width="16" height="16" type="image/x-icon">https://tolstoystaffing.com/favicon.svg</Image>
+  <Url type="text/html" method="get" template="https://tolstoystaffing.com/find-work?q={searchTerms}" />
+  <Url type="application/opensearchdescription+xml" rel="self" template="https://tolstoystaffing.com/opensearch.xml" />
+  <moz:SearchForm xmlns:moz="http://www.mozilla.org/2006/browser/search/">https://tolstoystaffing.com/find-work</moz:SearchForm>
+</OpenSearchDescription>
