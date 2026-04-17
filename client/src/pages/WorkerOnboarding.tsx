@@ -317,6 +317,7 @@ BY SIGNING BELOW, THE CONTRACTOR ACKNOWLEDGES THAT THEY HAVE READ THIS AGREEMENT
 export default function WorkerOnboarding() {
   const [currentStep, setCurrentStep] = useState(0);
   const [isGoogleAuth, setIsGoogleAuth] = useState(false);
+  const unauthStepRedirectedRef = useRef(false);
   const [formData, setFormData] = useState<any>({
     businessName: "",
     serviceCategories: [],
@@ -1013,6 +1014,26 @@ export default function WorkerOnboarding() {
     }
   }, [user, isAuthenticated]);
 
+  // Account must exist before progressing beyond Step 1.
+  useEffect(() => {
+    if (authLoading) return;
+    if (isAuthenticated) {
+      unauthStepRedirectedRef.current = false;
+      return;
+    }
+    if (currentStep <= 1) return;
+    setCurrentStep(1);
+    setLocation("/worker-onboarding?step=1");
+    if (!unauthStepRedirectedRef.current) {
+      unauthStepRedirectedRef.current = true;
+      safeToast({
+        title: "Complete account setup first",
+        description: "Create your account on Step 1 before continuing onboarding.",
+        variant: "destructive",
+      });
+    }
+  }, [authLoading, isAuthenticated, currentStep, setLocation, safeToast]);
+
   // If W-9 was uploaded before account/profile existed, attach it once profile is available.
   useEffect(() => {
     if (!user?.id || !existingProfile?.id) return;
@@ -1448,6 +1469,16 @@ export default function WorkerOnboarding() {
   };
 
   const nextStep = () => {
+    if (currentStep > 1 && !isAuthenticated) {
+      setCurrentStep(1);
+      setLocation("/worker-onboarding?step=1");
+      safeToast({
+        title: "Complete account setup first",
+        description: "Create your account on Step 1 before continuing onboarding.",
+        variant: "destructive",
+      });
+      return;
+    }
     if (currentStep > 0 && !validateStep(currentStep)) {
       return;
     }

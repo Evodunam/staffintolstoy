@@ -495,7 +495,7 @@ const COMPANY_STEPS = [
 export default function CompanyOnboarding() {
   const [location, setLocation] = useLocation();
   const isMobile = useIsMobile();
-  const { user, isAuthenticated } = useAuth();
+  const { user, isAuthenticated, isLoading: isAuthLoading } = useAuth();
   const { toast } = useToast();
   const [step, setStep] = useState(0);
 
@@ -575,6 +575,19 @@ export default function CompanyOnboarding() {
       }
     }
   }, [isAuthenticated, user, step, isGoogleAuth]);
+
+  // Account must exist before payment/agreement steps.
+  useEffect(() => {
+    if (isAuthLoading) return;
+    if (step < 3 || isAuthenticated) return;
+    setIsEmailSignupMode(true);
+    setRegistrationError("Create your account first to continue onboarding.");
+    setStep(2);
+    setStep2SubStep(0);
+    const path = "/company-onboarding?step=2";
+    window.history.replaceState(null, "", path);
+    setLocation(path);
+  }, [step, isAuthenticated, isAuthLoading, setLocation]);
 
   // Form data
   const [businessInfo, setBusinessInfo] = useState({
@@ -1153,7 +1166,19 @@ export default function CompanyOnboarding() {
     setPaymentSetupError(null);
     setSetupClientSecret(null);
     try {
+      if (isAuthLoading) {
+        setPaymentSetupError("Checking your session. Please try again in a moment.");
+        return;
+      }
+      if (!isAuthenticated) {
+        setPaymentSetupError("Please sign in to continue payment setup.");
+        return;
+      }
       const configRes = await fetch("/api/stripe/config", { credentials: "include" });
+      if (configRes.status === 401) {
+        setPaymentSetupError("Your session expired. Please sign in again to continue payment setup.");
+        return;
+      }
       if (!configRes.ok) {
         setPaymentSetupError("Could not load Stripe configuration.");
         return;
@@ -1178,6 +1203,10 @@ export default function CompanyOnboarding() {
         credentials: "include",
         body: JSON.stringify({}),
       });
+      if (setupRes.status === 401) {
+        setPaymentSetupError("Your session expired. Please sign in again to continue payment setup.");
+        return;
+      }
       let setupData: { clientSecret?: string; message?: string } = {};
       try {
         setupData = await setupRes.json();
@@ -1193,7 +1222,27 @@ export default function CompanyOnboarding() {
     } catch (e: any) {
       setPaymentSetupError(e?.message || "Could not load payment form.");
     }
-  }, []);
+  }, [isAuthLoading, isAuthenticated]);
+
+  const refreshSessionAndRetryPayment = useCallback(async () => {
+    setPaymentSetupError(null);
+    try {
+      await queryClient.invalidateQueries({ queryKey: ["/api/auth/user"] });
+      const authRes = await fetch("/api/auth/user", { credentials: "include" });
+      if (authRes.status === 401) {
+        setPaymentSetupError("You are signed out. Please sign in again to continue payment setup.");
+        return;
+      }
+      await initPaymentForm();
+    } catch (e: any) {
+      setPaymentSetupError(e?.message || "Could not refresh your session. Please try again.");
+    }
+  }, [initPaymentForm]);
+
+  const signInForPaymentSetup = useCallback(() => {
+    const returnTo = `${window.location.pathname}${window.location.search}`;
+    setLocation(`/login?returnTo=${encodeURIComponent(returnTo)}`);
+  }, [setLocation]);
 
   // Handle return from Stripe redirect (e.g. bank auth): process success in current session without requiring step3SubStep
   useEffect(() => {
@@ -1259,6 +1308,11 @@ export default function CompanyOnboarding() {
   // Save and continue
   const handleNext = async () => {
     if (step === 2 && !step2OnLastSubStep) {
+      if (step2SubStep === 0 && !isAuthenticated && !isGoogleAuth && !isEmailSignupMode) {
+        setIsEmailSignupMode(true);
+        setRegistrationError("Create a password to finish account setup before continuing.");
+        return;
+      }
       if (isEmailSignupMode && step2SubStep === 0) {
         // Validate password
         const pwdValidation = validatePassword(password);
@@ -1320,10 +1374,15 @@ export default function CompanyOnboarding() {
       return;
     }
     if (step === 2) {
-      // Allow onboarding progression before account creation.
-      // We defer server-side profile persistence until auth/profile exists.
       if (!user?.id) {
-        setStepAndUrl(step + 1);
+        setIsEmailSignupMode(true);
+        setStep2SubStep(0);
+        setRegistrationError("Create your account first to continue onboarding.");
+        toast({
+          title: "Complete account setup",
+          description: "Set your password (or sign in with Google) before continuing.",
+          variant: "destructive",
+        });
         return;
       }
       try {
@@ -2620,10 +2679,18 @@ export default function CompanyOnboarding() {
                     <div className="p-4 border border-destructive/30 bg-destructive/10 rounded-lg">
                       <p className="text-sm text-destructive">{paymentSetupError}</p>
                     </div>
-                    <Button variant="outline" onClick={initPaymentForm}>
-                      <RefreshCw className="w-4 h-4 mr-2" />
-                      Retry
-                    </Button>
+                    <div className="flex flex-wrap gap-2">
+                      <Button variant="outline" onClick={refreshSessionAndRetryPayment}>
+                        <RefreshCw className="w-4 h-4 mr-2" />
+                        Refresh session
+                      </Button>
+                      <Button variant="outline" onClick={initPaymentForm}>
+                        Retry payment setup
+                      </Button>
+                      <Button variant="secondary" onClick={signInForPaymentSetup}>
+                        Sign in again
+                      </Button>
+                    </div>
                   </div>
                 ) : (
                   <div className="flex items-center gap-2 text-muted-foreground">
