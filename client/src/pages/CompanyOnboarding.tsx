@@ -11,7 +11,7 @@ import { useToast } from "@/hooks/use-toast";
 import { useAuth } from "@/hooks/use-auth";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { apiRequest, queryClient } from "@/lib/queryClient";
-import { compressImageIfNeeded, assertMaxUploadSize } from "@/lib/image-compression";
+import { useUpload } from "@/hooks/use-upload";
 import { COMPANY_AGREEMENT_TEXT } from "@/lib/company-agreement-text";
 import { 
   ArrowRight, 
@@ -676,7 +676,7 @@ export default function CompanyOnboarding() {
 
   // Business logo (step 2 substep 0)
   const [companyLogoUrl, setCompanyLogoUrl] = useState<string | null>(null);
-  const [isUploadingLogo, setIsUploadingLogo] = useState(false);
+  const { uploadFile: uploadOnboardingLogo, isUploading: isUploadingLogo } = useUpload({ onboardingUpload: true });
 
   // Email registration state
   const [password, setPassword] = useState("");
@@ -896,54 +896,14 @@ export default function CompanyOnboarding() {
       toast({ title: "Invalid file", description: "Please upload an image (PNG, JPG)", variant: "destructive" });
       return;
     }
-    setIsUploadingLogo(true);
     try {
-      assertMaxUploadSize(file);
-      const fileToUpload = await compressImageIfNeeded(file);
-      const urlResponse = await apiRequest("POST", "/api/uploads/request-url", {
-        name: fileToUpload.name,
-        size: fileToUpload.size,
-        contentType: fileToUpload.type,
-        bucket: "avatar",
-        onboardingUpload: true,
-      });
-      const { uploadURL, objectPath } = await urlResponse.json();
-      try {
-        const uploadResponse = await fetch(uploadURL, {
-          method: "PUT",
-          body: fileToUpload,
-          headers: { "Content-Type": fileToUpload.type },
-        });
-        if (!uploadResponse.ok) throw new Error(`Upload failed (${uploadResponse.status})`);
-        setCompanyLogoUrl(objectPath);
-      } catch (directUploadError) {
-        // Browser/network policies can block cross-origin presigned PUT; fallback to server-side upload proxy.
-        const fallbackRes = await fetch(
-          `/api/uploads/upload-direct?bucket=avatar&onboardingUpload=true&name=${encodeURIComponent(fileToUpload.name)}`,
-          {
-            method: "POST",
-            credentials: "include",
-            headers: { "Content-Type": fileToUpload.type || "application/octet-stream" },
-            body: fileToUpload,
-          }
-        );
-        if (!fallbackRes.ok) {
-          const fallbackText = await fallbackRes.text().catch(() => "");
-          throw new Error(fallbackText || `Fallback upload failed (${fallbackRes.status})`);
-        }
-        const fallbackJson = await fallbackRes.json();
-        const fallbackPath = String(fallbackJson?.objectPath || "").trim();
-        if (!fallbackPath) {
-          throw new Error("Fallback upload completed but object path was missing");
-        }
-        setCompanyLogoUrl(fallbackPath);
-        console.warn("Presigned upload failed; used direct upload fallback", directUploadError);
-      }
+      const uploadResult = await uploadOnboardingLogo(file, "avatar");
+      const objectPath = String(uploadResult?.objectPath || "").trim();
+      if (!objectPath) throw new Error("Upload succeeded but object path was missing");
+      setCompanyLogoUrl(objectPath);
     } catch (error) {
       console.error("Logo upload error:", error);
       toast({ title: "Upload failed", description: "Could not upload logo. Please try again.", variant: "destructive" });
-    } finally {
-      setIsUploadingLogo(false);
     }
   };
 
