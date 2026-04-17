@@ -755,6 +755,8 @@ export default function Home() {
                 <li><a href="/terms" className="hover:taskrabbit-green transition-colors">Terms of Service</a></li>
                 <li><a href="/privacy" className="hover:taskrabbit-green transition-colors">Privacy Policy</a></li>
                 <li><a href="/legal" className="hover:taskrabbit-green transition-colors">Legal</a></li>
+                <li><a href="/llms.txt" className="hover:taskrabbit-green transition-colors">llms.txt</a></li>
+                <li><a href="/sitemap.xml" className="hover:taskrabbit-green transition-colors">Sitemap</a></li>
               </ul>
             </div>
             <div>

@@ -91,8 +91,7 @@ export function GooglePlacesAutocomplete({
 
   // Fetch autocomplete predictions using Places API (New) REST API
   const fetchPredictions = useCallback(async (input: string) => {
-    const apiKey = import.meta.env.VITE_GOOGLE_API_KEY;
-    if (!apiKey || !input.trim() || input.length < 2) {
+    if (!input.trim() || input.length < 2) {
       setPredictions([]);
       setShowDropdown(false);
       return;
@@ -101,52 +100,30 @@ export function GooglePlacesAutocomplete({
     setIsLoading(true);
     try {
       const trimmedInput = input.trim();
-      // Build request body according to Places API (New) specification
-      const requestBody: Record<string, unknown> = {
-        input: trimmedInput,
-      };
-      if (global) {
-        // Global: no region or type restriction so suggestions work worldwide
-      } else {
-        requestBody.includedRegionCodes = ["us", "ca"];
-        requestBody.includedPrimaryTypes = ["street_address", "premise", "subpremise"];
-      }
-
-      const response = await fetch(
-        `https://places.googleapis.com/v1/places:autocomplete`,
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "X-Goog-Api-Key": apiKey,
-            "X-Goog-FieldMask": "suggestions.placePrediction.placeId,suggestions.placePrediction.text,suggestions.placePrediction.structuredFormat",
-          },
-          body: JSON.stringify(requestBody),
-        }
-      );
+      const response = await fetch("/api/google/places/autocomplete", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        credentials: "include",
+        body: JSON.stringify({
+          input: trimmedInput,
+          global,
+        }),
+      });
 
       if (!response.ok) {
         const errorText = await response.text();
-        let errorMessage = `Places API (New) error: ${response.status}`;
+        let errorMessage = `Places autocomplete error: ${response.status}`;
         
         try {
           const errorJson = JSON.parse(errorText);
-          errorMessage += ` - ${errorJson.error?.message || errorText}`;
-          
-          // Provide helpful guidance for common errors
-          if (response.status === 400) {
-            console.error("⚠️ Places API (New) 400 Error - Common causes:");
-            console.error("1. Places API (New) not enabled in Google Cloud Console");
-            console.error("2. API key doesn't have Places API (New) permission");
-            console.error("3. Check: APIs & Services → Library → Search 'Places API (New)' → Enable");
-            console.error("4. Check: APIs & Services → Credentials → Edit API key → Add 'Places API (New)' to restrictions");
-          }
+          errorMessage += ` - ${errorJson.message || errorJson.details || errorText}`;
         } catch {
           errorMessage += ` - ${errorText}`;
         }
         
-        console.error("Places API (New) error response:", errorText);
-        console.error("Request body sent:", JSON.stringify(requestBody, null, 2));
+        console.error("Places autocomplete error response:", errorText);
         throw new Error(errorMessage);
       }
 
@@ -179,20 +156,13 @@ export function GooglePlacesAutocomplete({
 
   // Fetch place details using Places API (New)
   const fetchPlaceDetails = useCallback(async (placeId: string) => {
-    const apiKey = import.meta.env.VITE_GOOGLE_API_KEY;
-    if (!apiKey) return;
+    if (!placeId) return;
 
     try {
-      const response = await fetch(
-        `https://places.googleapis.com/v1/places/${placeId}`,
-        {
-          method: "GET",
-          headers: {
-            "X-Goog-Api-Key": apiKey,
-            "X-Goog-FieldMask": "id,displayName,formattedAddress,addressComponents.longText,addressComponents.shortText,addressComponents.types,location.latitude,location.longitude",
-          },
-        }
-      );
+      const response = await fetch(`/api/google/places/${encodeURIComponent(placeId)}`, {
+        method: "GET",
+        credentials: "include",
+      });
 
       if (!response.ok) {
         throw new Error(`Places API error: ${response.status}`);

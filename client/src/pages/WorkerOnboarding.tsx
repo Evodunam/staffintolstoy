@@ -419,6 +419,15 @@ export default function WorkerOnboarding() {
   const { mutate: updateProfile, isPending: isUpdating } = useUpdateProfile();
   const { data: existingProfile, isLoading: profileLoading } = useProfile(user?.id);
   const [location, setLocation] = useLocation();
+  const continueWithGoogle = useCallback((stepAtAuth: number) => {
+    const onboardingData = JSON.stringify({
+      ...formData,
+      authProvider: "google",
+      stepAtAuth,
+    });
+    const returnTo = stepAtAuth === 0 ? "/worker-onboarding" : `/worker-onboarding?step=${stepAtAuth}`;
+    window.location.href = `/api/auth/google?returnTo=${encodeURIComponent(returnTo)}&onboardingData=${encodeURIComponent(onboardingData)}`;
+  }, [formData]);
   const { toast } = useToast();
   const isMobile = useIsMobile();
   // No toasts on mobile for worker onboarding (avoids overlay clutter). useCallback keeps ref stable so effects depending on safeToast don't re-run every render (avoids "Maximum update depth exceeded" with Radix Toast).
@@ -2413,15 +2422,7 @@ export default function WorkerOnboarding() {
                 {isMobile ? (
                   <>
                     <Button
-                      onClick={() => {
-                        const onboardingData = JSON.stringify({
-                          ...formData,
-                          authProvider: "google",
-                          stepAtAuth: 0,
-                        });
-                        const returnTo = "/worker-onboarding";
-                        window.location.href = `/api/auth/google?returnTo=${encodeURIComponent(returnTo)}&onboardingData=${encodeURIComponent(onboardingData)}`;
-                      }}
+                      onClick={() => continueWithGoogle(0)}
                       variant="outline"
                       className="w-full h-12 rounded-xl border-gray-300 text-gray-700 hover:bg-gray-50 text-base font-medium"
                       data-testid="button-google-signup"
@@ -2461,15 +2462,7 @@ export default function WorkerOnboarding() {
                     </Button>
                     <div className="flex gap-3 flex-1 justify-end">
                       <Button
-                        onClick={() => {
-                          const onboardingData = JSON.stringify({
-                            ...formData,
-                            authProvider: "google",
-                            stepAtAuth: 0,
-                          });
-                          const returnTo = "/worker-onboarding";
-                          window.location.href = `/api/auth/google?returnTo=${encodeURIComponent(returnTo)}&onboardingData=${encodeURIComponent(onboardingData)}`;
-                        }}
+                        onClick={() => continueWithGoogle(0)}
                         variant="outline"
                         className="h-10 border-gray-300 text-gray-700 hover:bg-gray-50"
                         data-testid="button-google-signup"
@@ -3536,6 +3529,24 @@ export default function WorkerOnboarding() {
                 </div>
               </div>
             </div>
+
+            {!isAuthenticated && !isGoogleAuth && (
+              <div className="space-y-3 border-t pt-6">
+                <p className="text-sm text-muted-foreground">
+                  Continue with Google to auto-fill this step, or create a password below.
+                </p>
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="w-full sm:w-auto"
+                  onClick={() => continueWithGoogle(1)}
+                  data-testid="button-google-signup-step1"
+                >
+                  <SiGoogle className="w-4 h-4 mr-2" />
+                  Continue with Google
+                </Button>
+              </div>
+            )}
 
             {/* Password Fields - Only shown for email registration (not Google) */}
             {!isAuthenticated && !isGoogleAuth && (

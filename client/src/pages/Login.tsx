@@ -12,7 +12,7 @@ import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } f
 import { ResponsiveDialog } from "@/components/ui/responsive-dialog";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useToast } from "@/hooks/use-toast";
-import { Loader2, Mail, Lock, ArrowRight, Building2, HardHat, KeyRound, Link as LinkIcon, RefreshCw } from "lucide-react";
+import { Loader2, Mail, Lock, ArrowLeft, ArrowRight, Building2, HardHat, KeyRound, Link as LinkIcon, RefreshCw } from "lucide-react";
 import { queryClient } from "@/lib/queryClient";
 import { getUrlForPath } from "@/lib/subdomain-utils";
 import { useTranslation } from "react-i18next";
@@ -40,6 +40,14 @@ export default function Login() {
   const { toast } = useToast();
   const { t } = useTranslation("auth");
   const { t: tCommon } = useTranslation("common");
+
+  const handleBack = () => {
+    if (window.history.length > 1) {
+      window.history.back();
+      return;
+    }
+    setLocation("/");
+  };
 
   // Get return URL from query params
   const searchParams = new URLSearchParams(window.location.search);
@@ -270,6 +278,16 @@ export default function Login() {
 
   return (
     <div className="min-h-screen flex items-center justify-center bg-background p-4">
+      <div className="w-full max-w-md">
+        <Button
+          type="button"
+          variant="ghost"
+          onClick={handleBack}
+          className="hidden sm:inline-flex mb-3 px-0 text-muted-foreground hover:text-foreground"
+        >
+          <ArrowLeft className="mr-2 h-4 w-4" />
+          {tCommon("back")}
+        </Button>
       <Card className="w-full max-w-md hover-shadow-lift">
         <CardHeader className="space-y-1">
           <div className="flex items-center justify-center mb-4">
@@ -528,6 +546,7 @@ export default function Login() {
           </div>
         </CardContent>
       </Card>
+      </div>
 
       {/* Signup Dialog */}
       <ResponsiveDialog

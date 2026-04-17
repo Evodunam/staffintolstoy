@@ -740,6 +740,96 @@ export async function registerRoutes(
     res.json({ status: "ok", timestamp: new Date().toISOString() });
   });
 
+  // Google Places proxy endpoints (server-side key) for reliable prod autocomplete/details.
+  // This avoids client-side key/env drift and browser referrer restriction issues.
+  app.post("/api/google/places/autocomplete", async (req, res) => {
+    try {
+      const bodySchema = z.object({
+        input: z.string().trim().min(2).max(300),
+        global: z.boolean().optional().default(false),
+      });
+      const parsed = bodySchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({ message: "Invalid request body" });
+      }
+
+      const apiKey = process.env.GOOGLE_API_KEY || process.env.VITE_GOOGLE_API_KEY;
+      if (!apiKey) {
+        return res.status(503).json({ message: "Google Places is not configured" });
+      }
+
+      const requestBody: Record<string, unknown> = {
+        input: parsed.data.input,
+      };
+      if (!parsed.data.global) {
+        requestBody.includedRegionCodes = ["us", "ca"];
+        requestBody.includedPrimaryTypes = ["street_address", "premise", "subpremise"];
+      }
+
+      const response = await fetch("https://places.googleapis.com/v1/places:autocomplete", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Goog-Api-Key": apiKey,
+          "X-Goog-FieldMask":
+            "suggestions.placePrediction.placeId,suggestions.placePrediction.text,suggestions.placePrediction.structuredFormat",
+        },
+        body: JSON.stringify(requestBody),
+      });
+
+      const responseText = await response.text();
+      if (!response.ok) {
+        return res.status(response.status).json({
+          message: "Places autocomplete failed",
+          details: responseText.slice(0, 1000),
+        });
+      }
+
+      const data = responseText ? JSON.parse(responseText) : {};
+      return res.json(data);
+    } catch (error: any) {
+      console.error("[places:autocomplete] error:", error?.message || error);
+      return res.status(500).json({ message: "Failed to fetch place predictions" });
+    }
+  });
+
+  app.get("/api/google/places/:placeId", async (req, res) => {
+    try {
+      const placeId = String(req.params.placeId || "").trim();
+      if (!placeId) {
+        return res.status(400).json({ message: "Missing placeId" });
+      }
+
+      const apiKey = process.env.GOOGLE_API_KEY || process.env.VITE_GOOGLE_API_KEY;
+      if (!apiKey) {
+        return res.status(503).json({ message: "Google Places is not configured" });
+      }
+
+      const response = await fetch(`https://places.googleapis.com/v1/places/${encodeURIComponent(placeId)}`, {
+        method: "GET",
+        headers: {
+          "X-Goog-Api-Key": apiKey,
+          "X-Goog-FieldMask":
+            "id,displayName,formattedAddress,addressComponents.longText,addressComponents.shortText,addressComponents.types,location.latitude,location.longitude",
+        },
+      });
+
+      const responseText = await response.text();
+      if (!response.ok) {
+        return res.status(response.status).json({
+          message: "Place details failed",
+          details: responseText.slice(0, 1000),
+        });
+      }
+
+      const data = responseText ? JSON.parse(responseText) : {};
+      return res.json(data);
+    } catch (error: any) {
+      console.error("[places:details] error:", error?.message || error);
+      return res.status(500).json({ message: "Failed to fetch place details" });
+    }
+  });
+
   // Worker payouts – register first so no other route shadows it (fixes 404 when client fetches recipient payments)
   app.get("/api/worker/payouts", async (req, res) => {
     if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });

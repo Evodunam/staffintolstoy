@@ -211,6 +211,19 @@ function StripePaymentSetupForm({
   const stripe = useStripe();
   const elements = useElements();
   const [isProcessing, setIsProcessing] = useState(false);
+  const hasServerSavedPaymentMethod = useCallback(async (): Promise<boolean> => {
+    try {
+      const res = await fetch("/api/company/payment-methods", {
+        credentials: "include",
+        cache: "no-store",
+      });
+      if (!res.ok) return false;
+      const methods = await res.json();
+      return Array.isArray(methods) && methods.length > 0;
+    } catch {
+      return false;
+    }
+  }, []);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -260,6 +273,11 @@ function StripePaymentSetupForm({
             onSuccess(); // auto-advance to next step
             return;
           }
+          // Reconcile with server in case Stripe save succeeded but confirm endpoint response failed.
+          if (await hasServerSavedPaymentMethod()) {
+            onSuccess();
+            return;
+          }
           onError(msg);
           setIsProcessing(false);
           onRetryNeeded?.();
@@ -268,6 +286,11 @@ function StripePaymentSetupForm({
         onSuccess(); // saved: auto-advance to next step
       }
     } catch (err: any) {
+      // Last-resort reconciliation so we don't block users when persistence succeeded but the request errored.
+      if (await hasServerSavedPaymentMethod()) {
+        onSuccess();
+        return;
+      }
       onError(err?.message || "Something went wrong");
       onRetryNeeded?.();
     } finally {
@@ -535,6 +558,12 @@ export default function CompanyOnboarding() {
     setLocation(path);
     saveCompanyOnboardingProgress({ step: stepId, step2SubStep: stepId === 2 ? (step2Sub ?? 0) : undefined, step3SubStep: stepId === 3 ? (step3Sub ?? 0) : undefined });
   };
+
+  const continueWithGoogle = useCallback((stepAtAuth: number) => {
+    const onboardingData = JSON.stringify({ ...businessInfo, authProvider: "google", stepAtAuth });
+    const returnTo = stepAtAuth === 0 ? "/company-onboarding" : `/company-onboarding?step=${stepAtAuth}`;
+    window.location.href = `/api/auth/google?returnTo=${encodeURIComponent(returnTo)}&onboardingData=${encodeURIComponent(onboardingData)}`;
+  }, [businessInfo]);
   const [hasScrolledContract, setHasScrolledContract] = useState(false);
   
   // Check if user came from Google OAuth
@@ -555,7 +584,10 @@ export default function CompanyOnboarding() {
           if (data.lastName) setBusinessInfo(prev => ({ ...prev, lastName: data.lastName || prev.lastName }));
           if (data.companyEmail) setBusinessInfo(prev => ({ ...prev, companyEmail: data.companyEmail || prev.companyEmail }));
           if (data.stepAtAuth !== undefined) {
-            setStepAndUrl(data.stepAtAuth + 1);
+            const targetStep = Number(data.stepAtAuth) === 0 ? 1 : Number(data.stepAtAuth);
+            if (!Number.isNaN(targetStep) && targetStep >= 0 && targetStep <= TOTAL_STEPS) {
+              setStepAndUrl(targetStep);
+            }
           }
         } catch (e) {
           console.error("Error parsing onboarding data:", e);
@@ -699,8 +731,19 @@ export default function CompanyOnboarding() {
   const [registrationError, setRegistrationError] = useState<string | null>(null);
   const [isRegistering, setIsRegistering] = useState(false);
   const [isEmailSignupMode, setIsEmailSignupMode] = useState(false);
-  // Show password fields if: user clicked email signup AND they haven't registered yet (no user) AND not Google auth
-  const isEmailSignup = isEmailSignupMode && !user && !isGoogleAuth;
+  const needsPasswordSetup = !isAuthenticated && !isGoogleAuth;
+
+  // Always show password section on account substep when user still needs an account.
+  useEffect(() => {
+    if (isAuthLoading) return;
+    if (step === 2 && step2SubStep === 0 && needsPasswordSetup) {
+      setIsEmailSignupMode(true);
+      return;
+    }
+    if (!needsPasswordSetup && isEmailSignupMode) {
+      setIsEmailSignupMode(false);
+    }
+  }, [isAuthLoading, step, step2SubStep, needsPasswordSetup, isEmailSignupMode]);
   const [newLocation, setNewLocation] = useState<LocationData>({
     name: "",
     address: "",
@@ -1308,12 +1351,12 @@ export default function CompanyOnboarding() {
   // Save and continue
   const handleNext = async () => {
     if (step === 2 && !step2OnLastSubStep) {
-      if (step2SubStep === 0 && !isAuthenticated && !isGoogleAuth && !isEmailSignupMode) {
+      if (step2SubStep === 0 && needsPasswordSetup && !isEmailSignupMode) {
         setIsEmailSignupMode(true);
         setRegistrationError("Create a password to finish account setup before continuing.");
         return;
       }
-      if (isEmailSignupMode && step2SubStep === 0) {
+      if (step2SubStep === 0 && needsPasswordSetup) {
         // Validate password
         const pwdValidation = validatePassword(password);
         if (!pwdValidation.valid) {
@@ -2038,7 +2081,25 @@ export default function CompanyOnboarding() {
                 </div>
               </div>
 
-              {isEmailSignupMode && (
+              {step2SubStep === 0 && needsPasswordSetup && (
+                <div className="border-t pt-6 space-y-3">
+                  <p className="text-sm text-muted-foreground">
+                    Continue with Google to auto-fill your account details, or create a password below.
+                  </p>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    className="w-full sm:w-auto"
+                    onClick={() => continueWithGoogle(2)}
+                    data-testid="button-google-signup-step2"
+                  >
+                    <SiGoogle className="w-4 h-4 mr-2" />
+                    Continue with Google
+                  </Button>
+                </div>
+              )}
+
+              {step2SubStep === 0 && needsPasswordSetup && (
                 <div className="border-t pt-6">
                   <h3 className="font-semibold mb-4">Create Your Password</h3>
                   <div className="space-y-4">
@@ -2657,7 +2718,23 @@ export default function CompanyOnboarding() {
                   <Elements stripe={stripePromise} options={{ clientSecret: setupClientSecret, appearance: { theme: "stripe" } }}>
                     <StripePaymentSetupForm
                       clientSecret={setupClientSecret}
-                      onSuccess={() => {
+                      onSuccess={async () => {
+                        // Source of truth is server-side persistence, not local state.
+                        await queryClient.invalidateQueries({ queryKey: ["/api/company/payment-methods"] });
+                        let methods: unknown[] = [];
+                        try {
+                          methods = (await queryClient.fetchQuery({
+                            queryKey: ["/api/company/payment-methods"],
+                          })) as unknown[];
+                        } catch {
+                          methods = [];
+                        }
+                        if (!Array.isArray(methods) || methods.length === 0) {
+                          const msg = "Stripe setup completed, but we could not verify a saved payment method yet. Please retry once.";
+                          setPaymentSetupError(msg);
+                          toast({ title: "Payment verification pending", description: msg, variant: "destructive" });
+                          return;
+                        }
                         setPaymentMethodAdded(true);
                         toast({ title: "Payment method added", description: "Your card or bank account has been saved." });
                         // Defer step/URL update so it isn't overwritten by URL-sync effect; ensures we land on step 4
@@ -3401,11 +3478,7 @@ export default function CompanyOnboarding() {
               {isMobile ? (
                 <>
                   <Button
-                    onClick={() => {
-                      const onboardingData = JSON.stringify({ ...businessInfo, authProvider: "google", stepAtAuth: 0 });
-                      const returnTo = "/company-onboarding";
-                      window.location.href = `/api/auth/google?returnTo=${encodeURIComponent(returnTo)}&onboardingData=${encodeURIComponent(onboardingData)}`;
-                    }}
+                    onClick={() => continueWithGoogle(0)}
                     variant="outline"
                     className="w-full h-12 rounded-xl border-gray-300 text-gray-700 hover:bg-gray-50 text-base font-medium"
                     data-testid="button-google-signup"
@@ -3443,11 +3516,7 @@ export default function CompanyOnboarding() {
                   </Button>
                   <div className="flex gap-3 flex-1 justify-end">
                     <Button
-                      onClick={() => {
-                        const onboardingData = JSON.stringify({ ...businessInfo, authProvider: "google", stepAtAuth: 0 });
-                        const returnTo = "/company-onboarding";
-                        window.location.href = `/api/auth/google?returnTo=${encodeURIComponent(returnTo)}&onboardingData=${encodeURIComponent(onboardingData)}`;
-                      }}
+                      onClick={() => continueWithGoogle(0)}
                       variant="outline"
                       className="h-10 border-gray-300 text-gray-700 hover:bg-gray-50"
                       data-testid="button-google-signup"
@@ -3498,7 +3567,7 @@ export default function CompanyOnboarding() {
                     !businessInfo.companyName?.trim() ||
                     !businessInfo.companyEmail?.trim() ||
                     !businessInfo.phone?.trim() ||
-                    (isEmailSignupMode && (!password || !confirmPassword))
+                    (needsPasswordSetup && (!password || !confirmPassword))
                   )) ||
                   (step2SubStep === 1 && !locations.some(loc => loc.address.trim()))
                 }
