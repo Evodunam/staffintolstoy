@@ -35,6 +35,12 @@ import {
   afterHireFundingCheck,
   clearPaymentHoldsForCompanyIfSolvent,
 } from "./auto-replenishment-scheduler";
+import {
+  findExistingPendingInquiryForWorkerJob,
+  getLatestActiveVideoCallMessage,
+  parseWorkerId,
+  resolveCallInviteUrl,
+} from "./lib/runtimeRouteGuards";
 import { ensureCompanyStripeCustomer } from "./lib/company-stripe";
 import { normalizeLanguageCode as normalizeChatLanguageCode, translateChatText } from "./services/chatTranslation";
 import type Stripe from "stripe";
@@ -5093,6 +5099,10 @@ Respond ONLY in this exact JSON format:
     
     const jobId = Number(req.params.id);
     const { workerId, fallbackToPublic } = req.body;
+    const workerIdNum = parseWorkerId(workerId);
+    if (workerIdNum == null) {
+      return res.status(400).json({ message: "workerId must be a valid integer" });
+    }
     
     const user = req.user as any;
     const profile = req.profile;
@@ -5106,7 +5116,7 @@ Respond ONLY in this exact JSON format:
       return res.status(404).json({ message: "Job not found" });
     }
     
-    const worker = await storage.getProfile(workerId);
+    const worker = await storage.getProfile(workerIdNum);
     if (!worker || worker.role !== "worker") {
       return res.status(404).json({ message: "Worker not found" });
     }
@@ -5114,12 +5124,10 @@ Respond ONLY in this exact JSON format:
     // Avoid duplicate pending direct requests for the same worker + job.
     const existingInquiries = await storage.getDirectJobInquiriesForCompany(profile.id);
     const now = Date.now();
-    const existingPendingInquiry = existingInquiries.find((inq: any) => {
-      if (inq.workerId !== Number(workerId)) return false;
-      if (inq.convertedJobId !== job.id) return false;
-      if (inq.status !== "pending") return false;
-      if (!inq.expiresAt) return true;
-      return new Date(inq.expiresAt).getTime() > now;
+    const existingPendingInquiry = findExistingPendingInquiryForWorkerJob(existingInquiries as any[], {
+      workerId: workerIdNum,
+      jobId: job.id,
+      nowMs: now,
     });
     if (existingPendingInquiry) {
       return res.status(409).json({
@@ -5134,7 +5142,7 @@ Respond ONLY in this exact JSON format:
     const responseDeadline = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24 hours
     const inquiry = await storage.createDirectJobInquiry({
       companyId: profile.id,
-      workerId: Number(workerId),
+      workerId: workerIdNum,
       title: job.title,
       description: job.description,
       location: job.location,
@@ -5198,7 +5206,7 @@ Respond ONLY in this exact JSON format:
       application: {
         id: inquiry.id,
         jobId: job.id,
-        workerId: Number(workerId),
+        workerId: workerIdNum,
         status: "pending",
       },
     });
@@ -5581,20 +5589,19 @@ Respond ONLY in this exact JSON format:
     }
 
     const existingMessages = await storage.getJobMessages(jobId);
-    const latestActiveCallMessage = [...existingMessages]
-      .sort((a: any, b: any) => new Date(b.createdAt!).getTime() - new Date(a.createdAt!).getTime())
-      .find((m: any) => {
-        const meta = m.metadata as { type?: string; callStatus?: string } | undefined;
-        return meta?.type === "video_call" && meta?.callStatus !== "ended";
-      });
+    const latestActiveCallMessage = getLatestActiveVideoCallMessage(existingMessages as any[]);
     const hasActiveCall = !!latestActiveCallMessage;
 
     // Ensure the call URL is absolute so email and push action buttons open the exact call
-    const trimmed = roomUrl.trim();
-    const callUrl =
-      trimmed.startsWith("http://") || trimmed.startsWith("https://")
-        ? trimmed
-        : `${(process.env.PEERCALLS_BASE_URL || process.env.FRONTEND_URL || "").replace(/\/$/, "")}${trimmed.startsWith("/") ? trimmed : `/${trimmed}`}`;
+    const callUrl = resolveCallInviteUrl(roomUrl, {
+      peerCallsBaseUrl: process.env.PEERCALLS_BASE_URL,
+      frontEndUrl: process.env.FRONTEND_URL,
+    });
+    if (!callUrl) {
+      return res.status(400).json({
+        message: "roomUrl must be absolute (http/https) or resolvable via PEERCALLS_BASE_URL/FRONTEND_URL",
+      });
+    }
 
     const inviterName = profile.firstName || profile.companyName || profile.email || "Someone";
     const pushTitle = `${inviterName} invited you to a video call`;

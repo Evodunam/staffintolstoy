@@ -66,7 +66,11 @@ function tryLoadIdriveE2FromEnvFiles(): boolean {
 export function registerObjectStorageRoutes(app: Express): void {
   const objectStorageService = new ObjectStorageService();
   // Buckets allowed for explicit unauthenticated onboarding media only.
-  const publicOnboardingBuckets = new Set<StorageBucket>(["avatar", "bio", "reviews"]);
+  const publicOnboardingBuckets = new Set<StorageBucket>([
+    StorageBucket.AVATAR,
+    StorageBucket.BIO,
+    StorageBucket.REVIEWS,
+  ]);
 
   /**
    * Request a presigned URL for file upload.
