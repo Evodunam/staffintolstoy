@@ -24,8 +24,8 @@ jobs:
       - name: Install
         run: npm ci
 
-      - name: Typecheck
-        run: npm run check
+      - name: Typecheck + runtime guard tests
+        run: npm run test:ci:runtime-guards
 
       - name: SEO smoke test
         run: npm run seo:smoke:ci

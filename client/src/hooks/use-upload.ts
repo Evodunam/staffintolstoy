@@ -120,6 +120,35 @@ export function useUpload(options: UseUploadOptions = {}) {
     []
   );
 
+  const uploadViaDirectFallback = useCallback(
+    async (file: File, bucket: StorageBucket): Promise<UploadResponse> => {
+      const response = await fetch(
+        `/api/uploads/upload-direct?bucket=${encodeURIComponent(bucket)}&onboardingUpload=${options.onboardingUpload ? "true" : "false"}&name=${encodeURIComponent(file.name)}`,
+        {
+          method: "POST",
+          credentials: "include",
+          headers: {
+            "Content-Type": file.type || "application/octet-stream",
+          },
+          body: file,
+        }
+      );
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}));
+        throw new Error(errorData.error || "Failed to upload file via fallback");
+      }
+
+      const data = await response.json();
+      return {
+        uploadURL: "",
+        objectPath: data.objectPath,
+        metadata: data.metadata,
+      };
+    },
+    [options.onboardingUpload]
+  );
+
   /**
    * Upload a file using the presigned URL flow.
    * Images (jpg, png, webp) are compressed before upload. Max upload size is 10 GB.
@@ -141,17 +170,35 @@ export function useUpload(options: UseUploadOptions = {}) {
         setProgress(5);
         const fileToUpload = await compressImageIfNeeded(file);
 
+        const bucketToUse = bucket || options.defaultBucket || "avatar";
+
         // Step 1: Request presigned URL (send metadata as JSON)
         setProgress(10);
-        const uploadResponse = await requestUploadUrl(fileToUpload, bucket);
+        const uploadResponse = await requestUploadUrl(fileToUpload, bucketToUse);
 
         // Step 2: Upload file directly to presigned URL
         setProgress(30);
-        await uploadToPresignedUrl(fileToUpload, uploadResponse.uploadURL);
+        let finalResponse = uploadResponse;
+        try {
+          await uploadToPresignedUrl(fileToUpload, uploadResponse.uploadURL);
+        } catch (directUploadError) {
+          // Worker/company onboarding uploads can fail on browser-side CORS/privacy blocks.
+          // For onboarding flows, fallback to server-side direct upload to keep UX reliable.
+          const canFallback =
+            options.onboardingUpload === true &&
+            (fileToUpload.type || "").startsWith("image/");
+          if (!canFallback) {
+            throw directUploadError;
+          }
+          finalResponse = await uploadViaDirectFallback(fileToUpload, bucketToUse);
+          if (import.meta.env.DEV) {
+            console.warn("Presigned upload failed; using direct upload fallback", directUploadError);
+          }
+        }
 
         setProgress(100);
-        options.onSuccess?.(uploadResponse);
-        return uploadResponse;
+        options.onSuccess?.(finalResponse);
+        return finalResponse;
       } catch (err) {
         const error = err instanceof Error ? err : new Error("Upload failed");
         setError(error);
@@ -161,7 +208,7 @@ export function useUpload(options: UseUploadOptions = {}) {
         setIsUploading(false);
       }
     },
-    [requestUploadUrl, uploadToPresignedUrl, options]
+    [requestUploadUrl, uploadToPresignedUrl, uploadViaDirectFallback, options]
   );
 
   /**

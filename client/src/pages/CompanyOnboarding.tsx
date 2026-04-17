@@ -908,13 +908,37 @@ export default function CompanyOnboarding() {
         onboardingUpload: true,
       });
       const { uploadURL, objectPath } = await urlResponse.json();
-      const uploadResponse = await fetch(uploadURL, {
-        method: "PUT",
-        body: fileToUpload,
-        headers: { "Content-Type": fileToUpload.type },
-      });
-      if (!uploadResponse.ok) throw new Error("Upload failed");
-      setCompanyLogoUrl(objectPath);
+      try {
+        const uploadResponse = await fetch(uploadURL, {
+          method: "PUT",
+          body: fileToUpload,
+          headers: { "Content-Type": fileToUpload.type },
+        });
+        if (!uploadResponse.ok) throw new Error(`Upload failed (${uploadResponse.status})`);
+        setCompanyLogoUrl(objectPath);
+      } catch (directUploadError) {
+        // Browser/network policies can block cross-origin presigned PUT; fallback to server-side upload proxy.
+        const fallbackRes = await fetch(
+          `/api/uploads/upload-direct?bucket=avatar&onboardingUpload=true&name=${encodeURIComponent(fileToUpload.name)}`,
+          {
+            method: "POST",
+            credentials: "include",
+            headers: { "Content-Type": fileToUpload.type || "application/octet-stream" },
+            body: fileToUpload,
+          }
+        );
+        if (!fallbackRes.ok) {
+          const fallbackText = await fallbackRes.text().catch(() => "");
+          throw new Error(fallbackText || `Fallback upload failed (${fallbackRes.status})`);
+        }
+        const fallbackJson = await fallbackRes.json();
+        const fallbackPath = String(fallbackJson?.objectPath || "").trim();
+        if (!fallbackPath) {
+          throw new Error("Fallback upload completed but object path was missing");
+        }
+        setCompanyLogoUrl(fallbackPath);
+        console.warn("Presigned upload failed; used direct upload fallback", directUploadError);
+      }
     } catch (error) {
       console.error("Logo upload error:", error);
       toast({ title: "Upload failed", description: "Could not upload logo. Please try again.", variant: "destructive" });

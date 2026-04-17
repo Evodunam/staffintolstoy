@@ -1,4 +1,4 @@
-import type { Express, Request, Response, NextFunction } from "express";
+import express, { type Express, type Request, type Response, type NextFunction } from "express";
 import { ObjectStorageService, ObjectNotFoundError, StorageBucket } from "./objectStorage";
 import { isAuthenticated } from "../auth/middleware";
 import { randomUUID } from "crypto";
@@ -72,6 +72,13 @@ export function registerObjectStorageRoutes(app: Express): void {
     StorageBucket.REVIEWS,
   ]);
 
+  const canUsePublicOnboardingUpload = (req: Request, storageBucket: StorageBucket): boolean => {
+    const isAuthenticatedRequest = !!req.isAuthenticated?.();
+    const onboardingFlag = req.body?.onboardingUpload ?? req.query?.onboardingUpload;
+    const isOnboardingUploadIntent = onboardingFlag === true || onboardingFlag === "true";
+    return !isAuthenticatedRequest && isOnboardingUploadIntent && publicOnboardingBuckets.has(storageBucket);
+  };
+
   /**
    * Request a presigned URL for file upload.
    *
@@ -100,11 +107,7 @@ export function registerObjectStorageRoutes(app: Express): void {
       const fileSizeBytes = Number(req.body.size ?? 0);
       const storageBucket = objectStorageService.determineBucket(bucket);
       const isAuthenticatedRequest = !!req.isAuthenticated?.();
-      const isOnboardingUploadIntent = req.body?.onboardingUpload === true;
-      const allowPublicOnboardingUpload =
-        !isAuthenticatedRequest &&
-        isOnboardingUploadIntent &&
-        publicOnboardingBuckets.has(storageBucket);
+      const allowPublicOnboardingUpload = canUsePublicOnboardingUpload(req, storageBucket);
 
       if (!name) {
         return res.status(400).json({
@@ -274,6 +277,80 @@ export function registerObjectStorageRoutes(app: Express): void {
       });
     }
   });
+
+  // Direct binary upload fallback for onboarding images when browser blocks presigned PUT.
+  app.post(
+    "/api/uploads/upload-direct",
+    express.raw({ type: "*/*", limit: `${MAX_PUBLIC_ONBOARDING_UPLOAD_BYTES}b` }),
+    async (req, res) => {
+      const isDev = process.env.NODE_ENV === "development";
+      try {
+        const bucket = String(req.query?.bucket || req.headers["x-upload-bucket"] || "avatar");
+        const name = String(req.query?.name || req.headers["x-upload-name"] || "upload.bin");
+        const contentType = String(req.headers["content-type"] || "application/octet-stream");
+        const storageBucket = objectStorageService.determineBucket(bucket);
+        const isAuthenticatedRequest = !!req.isAuthenticated?.();
+        const allowPublicOnboardingUpload = canUsePublicOnboardingUpload(req, storageBucket);
+
+        if (!name) {
+          return res.status(400).json({ error: "Missing required upload name" });
+        }
+
+        if (!isDev && !isAuthenticatedRequest && !allowPublicOnboardingUpload) {
+          return res.status(401).json({ error: "Unauthorized" });
+        }
+
+        if (!String(contentType).startsWith("image/")) {
+          return res.status(400).json({ error: "Only image uploads are supported for direct upload fallback." });
+        }
+
+        let fileBuffer: Buffer;
+        if (Buffer.isBuffer(req.body)) {
+          fileBuffer = req.body;
+        } else if (req.body instanceof Uint8Array) {
+          fileBuffer = Buffer.from(req.body);
+        } else if (req.body instanceof ArrayBuffer) {
+          fileBuffer = Buffer.from(new Uint8Array(req.body));
+        } else {
+          fileBuffer = Buffer.alloc(0);
+        }
+        if (!fileBuffer.length) {
+          return res.status(400).json({ error: "Upload body is empty" });
+        }
+        if (fileBuffer.length > MAX_PUBLIC_ONBOARDING_UPLOAD_BYTES) {
+          return res.status(400).json({
+            error: "Image exceeds the 10 MB limit for pre-account onboarding uploads.",
+          });
+        }
+
+        if (!process.env.IDRIVE_E2_ACCESS_KEY_ID || !process.env.IDRIVE_E2_SECRET_ACCESS_KEY) {
+          if (isDev) tryLoadIdriveE2FromEnvFiles();
+        }
+
+        const objectPath = await objectStorageService.uploadObjectEntityBuffer(fileBuffer, contentType, storageBucket);
+        res.json({
+          objectPath,
+          metadata: {
+            name,
+            size: fileBuffer.length,
+            contentType,
+            bucket: storageBucket,
+            directUpload: true,
+          },
+        });
+      } catch (error: any) {
+        console.error("Error in direct upload fallback:", error);
+        const errorMessage = error?.message || "Direct upload fallback failed";
+        res.status(500).json({
+          error: errorMessage,
+          details: process.env.NODE_ENV === "development" ? {
+            name: error?.name,
+            code: error?.code,
+          } : undefined,
+        });
+      }
+    }
+  );
 
   /**
    * Serve uploaded objects.

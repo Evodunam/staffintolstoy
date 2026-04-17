@@ -337,6 +337,47 @@ export class ObjectStorageService {
     }
   }
 
+  // Uploads raw bytes directly to object storage and returns normalized object path.
+  async uploadObjectEntityBuffer(
+    content: Buffer,
+    contentType: string,
+    bucket: StorageBucket = StorageBucket.AVATAR
+  ): Promise<string> {
+    if (!process.env.IDRIVE_E2_ACCESS_KEY_ID || !process.env.IDRIVE_E2_SECRET_ACCESS_KEY) {
+      throw new Error(
+        "IDrive E2 not configured. Please set IDRIVE_E2_ACCESS_KEY_ID and IDRIVE_E2_SECRET_ACCESS_KEY environment variables."
+      );
+    }
+    const objectId = randomUUID();
+    const bucketName = this.getBucketName(bucket);
+    const objectKey = `uploads/${objectId}`;
+
+    const baseEndpoint = process.env.IDRIVE_E2_ENDPOINT || "s3.us-midwest-1.idrivee2.com";
+    const region = process.env.IDRIVE_E2_REGION || "us-midwest-1";
+    const accessKeyId = process.env.IDRIVE_E2_ACCESS_KEY_ID!;
+    const secretAccessKey = process.env.IDRIVE_E2_SECRET_ACCESS_KEY!;
+    const bucketS3Client = new S3Client({
+      endpoint: `https://${baseEndpoint}`,
+      region,
+      credentials: {
+        accessKeyId,
+        secretAccessKey,
+      },
+      forcePathStyle: false,
+    });
+
+    await bucketS3Client.send(
+      new PutObjectCommand({
+        Bucket: bucketName,
+        Key: objectKey,
+        Body: content,
+        ContentType: contentType || "application/octet-stream",
+      })
+    );
+
+    return `/objects/${bucketName}/${objectKey}`;
+  }
+
   // Gets the object entity file from the object path.
   async getObjectEntityFile(objectPath: string): Promise<S3Object> {
     if (!process.env.IDRIVE_E2_ACCESS_KEY_ID || !process.env.IDRIVE_E2_SECRET_ACCESS_KEY) {
