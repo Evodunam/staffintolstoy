@@ -13,6 +13,7 @@ import { eq } from "drizzle-orm";
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
 const BASE_URL = process.env.BASE_URL || process.env.APP_URL || "http://localhost:5000";
+const isGoogleOAuthConfigured = Boolean(GOOGLE_CLIENT_ID && GOOGLE_CLIENT_SECRET);
 
 if (GOOGLE_CLIENT_ID && GOOGLE_CLIENT_SECRET) {
   passport.use(
@@ -113,6 +114,25 @@ if (GOOGLE_CLIENT_ID && GOOGLE_CLIENT_SECRET) {
 
 // Register auth-specific routes
 export function registerAuthRoutes(app: Express): void {
+  if (!isGoogleOAuthConfigured) {
+    const googleNotConfigured = (_req: any, res: any) => {
+      if ((res?.headersSent ?? false) === true) return;
+      const acceptsJson =
+        typeof res?.req?.accepts === "function" &&
+        (res.req.accepts("json") || res.req.accepts("application/json"));
+
+      if (acceptsJson) {
+        return res.status(503).json({
+          message: "Google OAuth is not configured on this environment.",
+        });
+      }
+
+      return res.redirect("/login?error=google_oauth_not_configured");
+    };
+
+    app.get("/api/auth/google", googleNotConfigured);
+    app.get("/api/auth/google/callback", googleNotConfigured);
+  } else {
   // Google OAuth routes
   app.get(
     "/api/auth/google",
@@ -247,6 +267,7 @@ export function registerAuthRoutes(app: Express): void {
       }
     }
   );
+  }
   // Get current authenticated user
   app.get("/api/auth/user", isAuthenticated, async (req: any, res) => {
     try {

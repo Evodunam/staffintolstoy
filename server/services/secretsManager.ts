@@ -21,10 +21,16 @@ class SecretsManagerService {
     if (process.env.NODE_ENV === "production") {
       try {
         const inlineServiceAccount = process.env.GCP_SERVICE_ACCOUNT_JSON?.trim();
+        const base64ServiceAccount = process.env.GCP_SERVICE_ACCOUNT_B64?.trim();
         if (inlineServiceAccount) {
           const credentials = JSON.parse(inlineServiceAccount);
           this.client = new SecretManagerServiceClient({ credentials });
           console.log("[Secrets Manager] Using inline GCP service account credentials (GCP_SERVICE_ACCOUNT_JSON)");
+        } else if (base64ServiceAccount) {
+          const decoded = Buffer.from(base64ServiceAccount, "base64").toString("utf8");
+          const credentials = JSON.parse(decoded);
+          this.client = new SecretManagerServiceClient({ credentials });
+          console.log("[Secrets Manager] Using base64 GCP service account credentials (GCP_SERVICE_ACCOUNT_B64)");
         } else if (process.env.GOOGLE_APPLICATION_CREDENTIALS?.trim()) {
           // Explicit ADC path provided by environment.
           this.client = new SecretManagerServiceClient();
