@@ -21,6 +21,7 @@ interface UseUploadOptions {
   onSuccess?: (response: UploadResponse) => void;
   onError?: (error: Error) => void;
   defaultBucket?: StorageBucket; // Default bucket for uploads
+  onboardingUpload?: boolean; // Marks upload intent as onboarding-only (server enforces scope)
 }
 
 /**
@@ -79,6 +80,7 @@ export function useUpload(options: UseUploadOptions = {}) {
           size: file.size,
           contentType: file.type || "application/octet-stream",
           bucket: bucketToUse,
+          ...(options.onboardingUpload ? { onboardingUpload: true } : {}),
         }),
       });
 
@@ -197,6 +199,7 @@ export function useUpload(options: UseUploadOptions = {}) {
           size: file.size,
           contentType: file.type || "application/octet-stream",
           bucket: bucketToUse,
+          ...(options.onboardingUpload ? { onboardingUpload: true } : {}),
         }),
       });
 

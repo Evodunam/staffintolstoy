@@ -7,6 +7,8 @@ import { existsSync, readFileSync } from "fs";
 
 /** Max allowed upload size: 10 GB (global for all uploads) */
 const MAX_UPLOAD_BYTES = 10 * 1024 * 1024 * 1024;
+/** Max allowed upload size for unauthenticated onboarding uploads: 10 MB */
+const MAX_PUBLIC_ONBOARDING_UPLOAD_BYTES = 10 * 1024 * 1024;
 
 /**
  * In development, re-read .env.development and .env and parse IDRIVE_E2_* into process.env.
@@ -63,6 +65,8 @@ function tryLoadIdriveE2FromEnvFiles(): boolean {
  */
 export function registerObjectStorageRoutes(app: Express): void {
   const objectStorageService = new ObjectStorageService();
+  // Buckets allowed for explicit unauthenticated onboarding media only.
+  const publicOnboardingBuckets = new Set<StorageBucket>(["avatar", "bio", "reviews"]);
 
   /**
    * Request a presigned URL for file upload.
@@ -85,23 +89,43 @@ export function registerObjectStorageRoutes(app: Express): void {
    * Send JSON metadata only, then upload the file directly to uploadURL.
    */
   app.post("/api/uploads/request-url", async (req, res) => {
-    // In dev mode, bypass authentication for testing
     const isDev = process.env.NODE_ENV === "development";
-    if (!isDev) {
-      // Production mode: require authentication
-      if (!req.isAuthenticated || !req.isAuthenticated()) {
-        return res.status(401).json({ error: "Unauthorized" });
-      }
-    }
-    
+
     try {
       const { name, contentType, bucket } = req.body;
       const fileSizeBytes = Number(req.body.size ?? 0);
+      const storageBucket = objectStorageService.determineBucket(bucket);
+      const isAuthenticatedRequest = !!req.isAuthenticated?.();
+      const isOnboardingUploadIntent = req.body?.onboardingUpload === true;
+      const allowPublicOnboardingUpload =
+        !isAuthenticatedRequest &&
+        isOnboardingUploadIntent &&
+        publicOnboardingBuckets.has(storageBucket);
 
       if (!name) {
         return res.status(400).json({
           error: "Missing required field: name",
         });
+      }
+
+      // Production auth policy:
+      // - authenticated users can upload to any bucket (existing behavior)
+      // - unauthenticated users can only upload explicit onboarding avatars/bios
+      if (!isDev && !isAuthenticatedRequest && !allowPublicOnboardingUpload) {
+        return res.status(401).json({ error: "Unauthorized" });
+      }
+
+      if (allowPublicOnboardingUpload) {
+        if (!String(contentType || "").startsWith("image/")) {
+          return res.status(400).json({
+            error: "Only image uploads are allowed before sign in.",
+          });
+        }
+        if (fileSizeBytes > MAX_PUBLIC_ONBOARDING_UPLOAD_BYTES) {
+          return res.status(400).json({
+            error: "Image exceeds the 10 MB limit for pre-account onboarding uploads.",
+          });
+        }
       }
 
       if (typeof fileSizeBytes === "number" && fileSizeBytes > MAX_UPLOAD_BYTES) {
@@ -143,9 +167,6 @@ export function registerObjectStorageRoutes(app: Express): void {
         }
       }
 
-      // Determine the bucket to use
-      const storageBucket = objectStorageService.determineBucket(bucket);
-      
       console.log("Upload request received:", {
         requestedBucket: bucket,
         determinedBucket: storageBucket,

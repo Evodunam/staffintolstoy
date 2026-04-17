@@ -507,7 +507,7 @@ export default function WorkerOnboarding() {
     },
   });
 
-  const { uploadFile: uploadFileToS3 } = useUpload();
+  const { uploadFile: uploadFileToS3 } = useUpload({ onboardingUpload: true });
   const [portfolioFileState, portfolioFileActions] = useFileUpload({
     maxFiles: 12,
     maxSize: 10 * 1024 * 1024,

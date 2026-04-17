@@ -892,14 +892,6 @@ export default function CompanyOnboarding() {
   // Handle logo upload (presigned URL flow - works without profile)
   const handleLogoUpload = async (file: File) => {
     if (!file) return;
-    if (!user?.id) {
-      toast({
-        title: "Please sign in first",
-        description: "Create/sign in to your account before uploading a company logo.",
-        variant: "destructive",
-      });
-      return;
-    }
     if (!file.type.startsWith("image/")) {
       toast({ title: "Invalid file", description: "Please upload an image (PNG, JPG)", variant: "destructive" });
       return;
@@ -912,6 +904,8 @@ export default function CompanyOnboarding() {
         name: fileToUpload.name,
         size: fileToUpload.size,
         contentType: fileToUpload.type,
+        bucket: "avatar",
+        onboardingUpload: true,
       });
       const { uploadURL, objectPath } = await urlResponse.json();
       const uploadResponse = await fetch(uploadURL, {
