@@ -13,6 +13,7 @@ import { useMutation, useQuery } from "@tanstack/react-query";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import { useUpload } from "@/hooks/use-upload";
 import { COMPANY_AGREEMENT_TEXT } from "@/lib/company-agreement-text";
+import { humanizePaymentError } from "@/lib/payment-error";
 import { 
   ArrowRight, 
   ArrowLeft, 
@@ -2778,7 +2779,9 @@ export default function CompanyOnboarding() {
                       }}
                       onError={(err) => {
                         setPaymentSetupError(err);
-                        toast({ title: "Could not save payment method", description: err, variant: "destructive" });
+                        if (!err) return; // empty string is used to clear; don't toast
+                        const { title, description } = humanizePaymentError(err);
+                        toast({ title, description, variant: "destructive" });
                       }}
                       onRetryNeeded={() => {
                         setPaymentSetupError(null);
@@ -3111,7 +3114,9 @@ export default function CompanyOnboarding() {
                       }}
                       onError={(error) => {
                         setCardPaymentError(error);
-                        toast({ title: "Payment failed", description: error, variant: "destructive" });
+                        if (!error) return;
+                        const { title, description } = humanizePaymentError(error);
+                        toast({ title, description, variant: "destructive" });
                       }}
                       isProcessing={cardPaymentProcessing}
                       setIsProcessing={setCardPaymentProcessing}

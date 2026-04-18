@@ -42,6 +42,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { AppLoading } from "@/components/AppLoading";
 import { useToast } from "@/hooks/use-toast";
 import { LoginSecuritySection } from "@/pages/worker/ProfileSettings";
+import { humanizePaymentError } from "@/lib/payment-error";
 import { format, differenceInMinutes, parseISO, addHours, formatDistanceToNow } from "date-fns";
 import InvoicesView from "@/components/InvoicesView";
 import ChatsPage from "@/pages/ChatsPage";
@@ -13192,7 +13193,11 @@ export default function CompanyDashboard() {
                 await queryClient.refetchQueries({ queryKey: ["/api/profile"] });
                 toast({ title: t("settings.bankVerified", "Bank verified"), description: t("settings.bankVerifiedDescription", "Your bank account is now ready to use.") });
               }}
-              onError={(err) => toast({ title: t("common.error", "Error"), description: err, variant: "destructive" })}
+              onError={(err) => {
+                if (!err) return;
+                const { title, description } = humanizePaymentError(err);
+                toast({ title, description, variant: "destructive" });
+              }}
             />
           )}
         </DialogContent>
@@ -13433,7 +13438,9 @@ export default function CompanyDashboard() {
                         }
                       }}
                       onError={(error) => {
-                        toast({ title: "Failed to Save Card", description: error, variant: "destructive" });
+                        if (!error) return;
+                        const { title, description } = humanizePaymentError(error);
+                        toast({ title, description, variant: "destructive" });
                       }}
                     />
                   </Elements>
