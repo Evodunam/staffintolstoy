@@ -152,6 +152,9 @@ class SecretsManagerService {
       { secretName: "STRIPE_PUBLISHABLE_KEY", envVar: "STRIPE_PUBLISHABLE_KEY" },
       { secretName: "STRIPE_TEST_SECRET_KEY", envVar: "STRIPE_TEST_SECRET_KEY" },
       { secretName: "STRIPE_TEST_PUBLISHABLE_KEY", envVar: "STRIPE_TEST_PUBLISHABLE_KEY" },
+      { secretName: "STRIPE_WEBHOOK_SECRET", envVar: "STRIPE_WEBHOOK_SECRET" },
+      { secretName: "STRIPE_WEBHOOK_SECRET_IDENTITY", envVar: "STRIPE_WEBHOOK_SECRET_IDENTITY" },
+      { secretName: "STRIPE_WEBHOOK_SECRET_PAYMENT_METHOD", envVar: "STRIPE_WEBHOOK_SECRET_PAYMENT_METHOD" },
       
       // Firebase
       { secretName: "FIREBASE_PRIVATE_KEY", envVar: "FIREBASE_PRIVATE_KEY" },
@@ -162,10 +165,11 @@ class SecretsManagerService {
       { secretName: "FIREBASE_CLIENT_CERT_URL", envVar: "FIREBASE_CLIENT_CERT_URL" },
       { secretName: "FIREBASE_API_KEY", envVar: "FIREBASE_API_KEY" },
       
-      // Unit Finance (DEPRECATED - migrated to Mercury + Stripe, Jan 2026)
-      // { secretName: "UNIT_API_TOKEN", envVar: "UNIT_API_TOKEN" },
-      // { secretName: "UNIT_API_URL", envVar: "UNIT_API_URL" },
-      
+      // Mercury Bank
+      { secretName: "MERCURY_PRODUCTION_API_TOKEN", envVar: "MERCURY_PRODUCTION_API_TOKEN" },
+      { secretName: "Mercury_Production", envVar: "Mercury_Production" },
+      { secretName: "MERCURY_ACCOUNT_ID", envVar: "MERCURY_ACCOUNT_ID" },
+
       // Modern Treasury
       { secretName: "MODERN_TREASURY_API_KEY", envVar: "MODERN_TREASURY_API_KEY" },
       { secretName: "MODERN_TREASURY_ORG_ID", envVar: "MODERN_TREASURY_ORG_ID" },
@@ -180,11 +184,15 @@ class SecretsManagerService {
       { secretName: "APPLE_APNS_PRIVATE_KEY", envVar: "APPLE_APNS_PRIVATE_KEY" },
       
       // Other APIs
-      { secretName: "GITHUB_ACCESS_TOKEN", envVar: "GITHUB_ACCESS_TOKEN" },
-      { secretName: "GOOGLE_CALENDAR_ACCESS_TOKEN", envVar: "GOOGLE_CALENDAR_ACCESS_TOKEN" },
-      { secretName: "OUTLOOK_ACCESS_TOKEN", envVar: "OUTLOOK_ACCESS_TOKEN" },
       { secretName: "OPENAI_API_KEY", envVar: "OPENAI_API_KEY" },
-      
+      { secretName: "GOOGLE_PLACES_SERVER_KEY", envVar: "GOOGLE_PLACES_SERVER_KEY" },
+      { secretName: "GOOGLE_TRANSLATE_API_KEY", envVar: "GOOGLE_TRANSLATE_API_KEY" },
+      { secretName: "IPAPI_API_KEY", envVar: "IPAPI_API_KEY" },
+
+      // Auth & Admin
+      { secretName: "CRON_SECRET", envVar: "CRON_SECRET" },
+      { secretName: "ADMIN_EMAILS", envVar: "ADMIN_EMAILS" },
+
       // App Configuration
       { secretName: "BASE_URL", envVar: "BASE_URL" },
       { secretName: "APP_URL", envVar: "APP_URL" },
@@ -192,6 +200,12 @@ class SecretsManagerService {
       
       // Optional
       { secretName: "PUBLIC_OBJECT_SEARCH_PATHS", envVar: "PUBLIC_OBJECT_SEARCH_PATHS" },
+
+      // REMOVED: per-user OAuth tokens belong in DB, not Secret Manager:
+      //   GITHUB_ACCESS_TOKEN, GOOGLE_CALENDAR_ACCESS_TOKEN, OUTLOOK_ACCESS_TOKEN
+      // REMOVED: deprecated:
+      //   UNIT_API_TOKEN (migrated to Mercury + Stripe, Jan 2026)
+      //   VITE_GOOGLE_API_KEY (build-time client var, set via Vite env at build)
     ];
 
     let loadedCount = 0;
