@@ -1,4 +1,5 @@
 import { useState, useMemo, useEffect, useRef } from "react";
+import { ActiveShiftToolbox } from "@/components/ActiveShiftToolbox";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { useLocation } from "wouter";
 import { format, parseISO, isToday, isTomorrow, startOfDay, endOfDay, addHours, differenceInMinutes, differenceInDays, isBefore, isAfter, startOfToday, startOfWeek, endOfWeek, startOfMonth, endOfMonth, addDays } from "date-fns";
@@ -2909,6 +2910,17 @@ export default function TodayPage() {
               </Button>
             )}
           </div>
+
+          {/* In-shift toolbar: meal/rest break logging, real-time §512 prompt at 4h/5h, incident report. */}
+          {isClockedIn && assignment.activeTimesheet && (
+            <div onClick={(e) => e.stopPropagation()}>
+              <ActiveShiftToolbox
+                timesheetId={assignment.activeTimesheet.id}
+                jobId={job.id}
+                className="pt-2 border-t border-border"
+              />
+            </div>
+          )}
         </div>
       </Card>
     );

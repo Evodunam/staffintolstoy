@@ -12634,6 +12634,29 @@ Respond ONLY in this exact JSON format:
   });
 
   // Get a single timesheet by ID
+  // === Checkr webhook receiver ===
+  // Updates background_check_orders rows on report.completed / report.consider events.
+  // Path is also exempted from the apex→app redirect upstream (registered as
+  // /api/webhooks/* in server/index.ts).
+  app.post("/api/webhooks/checkr", async (req, res) => {
+    try {
+      const sig = req.headers["x-checkr-signature"] as string | undefined;
+      const raw = (req as any).rawBody?.toString("utf8") ?? JSON.stringify(req.body);
+      const { verifyCheckrWebhook, applyReportEvent } = await import("./services/checkr");
+      if (!verifyCheckrWebhook(raw, sig)) {
+        return res.status(401).json({ message: "Invalid Checkr signature" });
+      }
+      const event = req.body as { type: string; data: { object: any } };
+      if (event?.type?.startsWith("report.")) {
+        await applyReportEvent(event.data.object);
+      }
+      res.json({ received: true });
+    } catch (err: any) {
+      console.error("[Checkr/webhook]", err);
+      res.status(500).json({ message: err.message ?? "Webhook handler failed" });
+    }
+  });
+
   // === Background check (FCRA-compliant) ===
   // Three-step flow per FCRA §604(b)(2):
   //   1. GET /api/background-check/disclosure → returns standalone disclosure text

@@ -366,6 +366,10 @@ export default function AdminDashboard() {
               </div>
             </div>
             <div className="flex items-center gap-2 shrink-0">
+              <Button variant="outline" size="sm" className="h-9 px-2 sm:px-3" onClick={() => navigate("/admin/compliance")} data-testid="button-admin-compliance">
+                <Shield className="h-4 w-4 sm:mr-2" />
+                <span className="hidden sm:inline">Compliance</span>
+              </Button>
               <Button variant="outline" size="sm" className="h-9 px-2 sm:px-3" onClick={() => navigate("/dashboard")} data-testid="button-admin-worker-view">
                 <Users className="h-4 w-4 sm:mr-2" />
                 <span className="hidden sm:inline">Worker View</span>
