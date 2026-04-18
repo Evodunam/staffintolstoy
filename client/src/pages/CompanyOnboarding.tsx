@@ -647,6 +647,28 @@ export default function CompanyOnboarding() {
     setLocation(path);
   }, [step, isAuthenticated, isAuthLoading, setLocation]);
 
+  // Profile must exist before payment/agreement steps. Catches the case where
+  // a user advanced past step 2 but the profile-create call silently failed
+  // (e.g., RLS denial); without this they'd land on step 3 and see opaque
+  // 403s from /api/company/payment-methods.
+  useEffect(() => {
+    if (isAuthLoading) return;
+    if (!isAuthenticated || !user?.id) return;
+    if (step < 3) return;
+    if (!isProfileFetched) return; // wait for the query to resolve
+    if (profile) return; // we have a profile, all good
+    toast({
+      title: "Finish account setup",
+      description: "Complete your business details before adding payment.",
+      variant: "destructive",
+    });
+    setStep(2);
+    setStep2SubStep(0);
+    const path = "/company-onboarding?step=2";
+    window.history.replaceState(null, "", path);
+    setLocation(path);
+  }, [step, isAuthenticated, user?.id, isProfileFetched, profile, isAuthLoading, setLocation, toast]);
+
   const [locations, setLocations] = useState<LocationData[]>([{
     name: "Main Office",
     address: "",
@@ -770,7 +792,7 @@ export default function CompanyOnboarding() {
   });
 
   // Fetch existing profile
-  const { data: profile } = useQuery<Profile>({
+  const { data: profile, isFetched: isProfileFetched } = useQuery<Profile>({
     queryKey: ["/api/profiles", user?.id],
     enabled: !!user?.id,
   });

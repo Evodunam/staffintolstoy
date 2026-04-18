@@ -2624,14 +2624,39 @@ export async function registerRoutes(
         }
       }
       res.status(201).json(profile);
-    } catch (err) {
+    } catch (err: any) {
       if (err instanceof z.ZodError) {
         return res.status(400).json({
           message: err.errors[0].message,
           field: err.errors[0].path.join('.'),
         });
       }
-      throw err;
+      // Surface Postgres error details so failures here are self-diagnosable
+      // (RLS denials, NOT NULL violations, schema drift, etc.).
+      console.error("[ProfileCreate] Failed:", {
+        message: err?.message,
+        code: err?.code,
+        detail: err?.detail,
+        constraint: err?.constraint,
+        column: err?.column,
+        table: err?.table,
+        stack: err?.stack,
+      });
+      const code = err?.code as string | undefined;
+      if (code === "23505") {
+        return res.status(409).json({ message: "Profile already exists for this user" });
+      }
+      if (code === "42501") {
+        return res.status(500).json({
+          message: "Database denied profile creation (RLS/permissions). Try again or contact support.",
+          code,
+        });
+      }
+      return res.status(500).json({
+        message: err?.message || "Failed to create profile",
+        code,
+        detail: err?.detail,
+      });
     }
   });
 
@@ -3469,11 +3494,27 @@ export async function registerRoutes(
           field: err.errors[0].path.join('.'),
         });
       }
-      console.error("[ProfileUpdate] Error:", err?.message ?? err);
-      console.error("[ProfileUpdate] Stack:", err?.stack);
+      console.error("[ProfileUpdate] Error:", {
+        message: err?.message,
+        code: err?.code,
+        detail: err?.detail,
+        constraint: err?.constraint,
+        column: err?.column,
+        table: err?.table,
+        stack: err?.stack,
+      });
       if (!res.headersSent) {
+        const code = err?.code as string | undefined;
+        if (code === "42501") {
+          return res.status(500).json({
+            message: "Database denied profile update (RLS/permissions). Try again or contact support.",
+            code,
+          });
+        }
         return res.status(500).json({
           message: err?.message || "Failed to update profile. Please try again.",
+          code,
+          detail: err?.detail,
         });
       }
     }
