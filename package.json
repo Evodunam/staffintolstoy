@@ -57,6 +57,8 @@
     "migrate:backfill:prod": "dotenv -e .env.production -- tsx script/backfill-migration-history.ts",
     "smoke:prod": "tsx script/prod-smoke-test.ts https://app.tolstoystaffing.com",
     "smoke:dev": "tsx script/prod-smoke-test.ts http://127.0.0.1:5000",
+    "rls:check:prod": "dotenv -e .env.production -- tsx script/check-rls-state.ts",
+    "rls:check:dev": "dotenv -e .env.development -- tsx script/check-rls-state.ts",
     "stripe:cleanup-duplicate-customers": "dotenv -e .env.development -- tsx script/cleanup-duplicate-stripe-customers.ts",
     "stripe:cleanup-duplicate-customers:delete": "dotenv -e .env.development -- tsx script/cleanup-duplicate-stripe-customers.ts --delete",
     "i18n:extract": "i18next-scanner --config i18next-scanner.config.js",
