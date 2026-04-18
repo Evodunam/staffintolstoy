@@ -77,13 +77,16 @@ export function redirectToMainDomain(path: string = '/'): void {
 }
 
 /**
- * Gets the appropriate URL for a given path
- * - Login/auth pages: main domain
- * - App pages: app subdomain
+ * Gets the appropriate URL for a given path.
+ *
+ * NOTE: We intentionally route EVERYTHING (including login/auth) to the app
+ * subdomain. Routing login to apex while the rest of the app lives on app.*
+ * causes a host-bouncing UX bug. Marketing-only pages (landing, /pricing,
+ * etc.) are kept on the apex via server-side redirects, not via this helper.
+ *
+ * The legacy `isLoginPage` parameter is preserved for call-site compatibility
+ * but ignored.
  */
-export function getUrlForPath(path: string, isLoginPage: boolean = false): string {
-  if (isLoginPage) {
-    return `${getMainDomainUrl()}${path}`;
-  }
+export function getUrlForPath(path: string, _isLoginPage: boolean = false): string {
   return `${getAppSubdomainUrl()}${path}`;
 }

@@ -267,6 +267,11 @@ export const profiles = pgTable("profiles", {
   averageRating: decimal("average_rating", { precision: 3, scale: 2 }),
   totalReviews: integer("total_reviews").default(0),
   completedJobs: integer("completed_jobs").default(0),
+  // State paid-sick-leave accrual balance (hours), tracked per worker. Accrues
+  // automatically after each timesheet approval per shared/sickLeave.ts. Reset
+  // on Jan 1 by a year-end cron (sickLeaveYtdAccruedHours back to 0).
+  sickLeaveBalanceHours: decimal("sick_leave_balance_hours", { precision: 6, scale: 2 }).default("0"),
+  sickLeaveYtdAccruedHours: decimal("sick_leave_ytd_accrued_hours", { precision: 6, scale: 2 }).default("0"),
   onboardingStatus: text("onboarding_status", { enum: onboardingStatuses }).default("incomplete"),
   onboardingStep: integer("onboarding_step").default(1),
   onboardingReminder1SentAt: timestamp("onboarding_reminder_1_sent_at"),
@@ -873,6 +878,26 @@ export const timesheets = pgTable("timesheets", {
   
   // Material invoice (worker-submitted receipt for materials; appears on company timesheets)
   timesheetType: text("timesheet_type", { enum: ["labor", "material_invoice"] }).default("labor"),
+  // Meal/rest break tracking — required for CA Labor Code §512 (30-min meal at 5h),
+  // OR ORS 653.077, WA WAC 296-126-092, NY 12 NYCRR §142-2.18, and others.
+  // mealBreaksTakenMinutes is the total minutes of meal breaks the worker logged.
+  // restBreaksTakenCount is the count of paid 10-min rest breaks (CA §226.7).
+  // mealBreakWaived = true when shift was 5–6 hours and worker mutually waived
+  // the meal break per CA §512(a).
+  mealBreaksTakenMinutes: integer("meal_breaks_taken_minutes").default(0),
+  restBreaksTakenCount: integer("rest_breaks_taken_count").default(0),
+  mealBreakWaived: boolean("meal_break_waived").default(false),
+  // Penalty pay added when a state-required meal/rest break was missed (CA §226.7
+  // = 1 hour of pay at the regular rate per missed-break category). Stored in cents.
+  mealBreakPenaltyCents: integer("meal_break_penalty_cents").default(0),
+  restBreakPenaltyCents: integer("rest_break_penalty_cents").default(0),
+  // Time-clock selfie verification — combats buddy-punching wage fraud.
+  // URLs point to IDrive E2 storage; not all companies require this (toggle
+  // per-company). Server stores URLs only, never raw image bytes.
+  clockInSelfieUrl: text("clock_in_selfie_url"),
+  clockOutSelfieUrl: text("clock_out_selfie_url"),
+  clockInSelfieMatchScore: decimal("clock_in_selfie_match_score", { precision: 4, scale: 3 }),
+  clockOutSelfieMatchScore: decimal("clock_out_selfie_match_score", { precision: 4, scale: 3 }),
   receiptUrl: text("receipt_url"),
   
   createdAt: timestamp("created_at").defaultNow(),
@@ -1644,10 +1669,18 @@ export const adminStrikes = pgTable("admin_strikes", {
   resolvedAt: timestamp("resolved_at"),
   resolvedBy: text("resolved_by"),
   resolvedNotes: text("resolved_notes"),
+  // Worker appeal flow (right of contestation; SOC 2 fairness control).
+  appealStatus: text("appeal_status", { enum: ["none", "submitted", "reviewing", "upheld", "overturned"] }).default("none"),
+  appealSubmittedAt: timestamp("appeal_submitted_at"),
+  appealText: text("appeal_text"),
+  appealDecisionAt: timestamp("appeal_decision_at"),
+  appealDecidedBy: text("appeal_decided_by"),
+  appealDecisionNotes: text("appeal_decision_notes"),
   createdAt: timestamp("created_at").defaultNow(),
 }, (table) => [
   index("idx_admin_strikes_worker").on(table.workerId),
   index("idx_admin_strikes_active").on(table.workerId, table.isActive),
+  index("idx_admin_strikes_appeal_status").on(table.appealStatus),
 ]);
 
 // Job suspensions - admin actions on jobs
@@ -1681,6 +1714,115 @@ export const billingActions = pgTable("billing_actions", {
 ]);
 
 // Admin activity log - audit trail for all admin actions
+// FCRA-compliant background check orders. Schema stays vendor-agnostic so we
+// can swap Checkr ↔ Goodhire ↔ Sterling without migrations. Each order is
+// gated by a matching background_check_consents row (FCRA §604(b)(2) requires
+// disclosure + written authorization BEFORE the report is procured).
+export const backgroundCheckConsents = pgTable("background_check_consents", {
+  id: serial("id").primaryKey(),
+  workerId: integer("worker_id").notNull().references(() => profiles.id, { onDelete: "cascade" }),
+  disclosureVersion: text("disclosure_version").notNull(),
+  disclosureSignedAt: timestamp("disclosure_signed_at").notNull(),
+  authSignedAt: timestamp("auth_signed_at").notNull(),
+  signatureName: text("signature_name").notNull(),
+  ipAddress: text("ip_address"),
+  userAgent: text("user_agent"),
+  createdAt: timestamp("created_at").defaultNow(),
+}, (table) => [
+  index("idx_bg_consents_worker").on(table.workerId),
+]);
+
+export const backgroundCheckOrders = pgTable("background_check_orders", {
+  id: serial("id").primaryKey(),
+  workerId: integer("worker_id").notNull().references(() => profiles.id, { onDelete: "cascade" }),
+  consentId: integer("consent_id").notNull().references(() => backgroundCheckConsents.id, { onDelete: "restrict" }),
+  vendor: text("vendor").notNull(), // "checkr" | "goodhire" | "sterling" | "manual"
+  vendorReference: text("vendor_reference"), // candidate id / report id at vendor
+  packageCode: text("package_code"), // e.g. "tasker_standard"
+  status: text("status", { enum: ["draft", "ordered", "pending", "complete", "suspended", "canceled", "expired"] }).default("draft"),
+  result: text("result", { enum: ["clear", "consider", "fail"] }),
+  reportUrl: text("report_url"),
+  orderedAt: timestamp("ordered_at"),
+  completedAt: timestamp("completed_at"),
+  // Adverse action workflow (FCRA §615)
+  adverseActionStartedAt: timestamp("adverse_action_started_at"),
+  adverseActionPreNoticeSentAt: timestamp("adverse_action_pre_notice_sent_at"),
+  adverseActionFinalNoticeSentAt: timestamp("adverse_action_final_notice_sent_at"),
+  adverseActionReason: text("adverse_action_reason"),
+  createdAt: timestamp("created_at").defaultNow(),
+}, (table) => [
+  index("idx_bg_orders_worker").on(table.workerId),
+  index("idx_bg_orders_status").on(table.status),
+]);
+
+// Feature flags — simple per-flag-name toggles with optional percentage rollout
+// and per-profile allowlist. Lets us ship server-side gated changes without
+// a deploy. Reads are cached in-process for 60s.
+export const featureFlags = pgTable("feature_flags", {
+  id: serial("id").primaryKey(),
+  name: text("name").notNull().unique(),
+  enabled: boolean("enabled").notNull().default(false),
+  rolloutPercent: integer("rollout_percent").default(0), // 0–100; deterministic hash on profileId
+  allowlistProfileIds: jsonb("allowlist_profile_ids"), // number[]
+  description: text("description"),
+  updatedAt: timestamp("updated_at").defaultNow(),
+});
+
+// Safety incident reports (OSHA 300 / 301 style data).
+// 29 CFR §1904 requires employers to record work-related injuries and
+// illnesses meeting recording criteria. Even as a marketplace we collect
+// this for every reported worksite incident so we can: (a) help companies
+// satisfy their OSHA recordkeeping obligation, (b) surface unsafe sites in
+// the worker matching algorithm, (c) defend against negligence claims.
+export const safetyIncidents = pgTable("safety_incidents", {
+  id: serial("id").primaryKey(),
+  jobId: integer("job_id").references(() => jobs.id, { onDelete: "set null" }),
+  timesheetId: integer("timesheet_id").references(() => timesheets.id, { onDelete: "set null" }),
+  reporterProfileId: integer("reporter_profile_id").notNull().references(() => profiles.id, { onDelete: "cascade" }),
+  workerProfileId: integer("worker_profile_id").references(() => profiles.id, { onDelete: "set null" }),
+  companyProfileId: integer("company_profile_id").references(() => profiles.id, { onDelete: "set null" }),
+
+  // OSHA 301 fields
+  occurredAt: timestamp("occurred_at").notNull(),
+  description: text("description").notNull(),
+  bodyParts: jsonb("body_parts"), // ["left hand","right knee"]
+  injuryType: text("injury_type", { enum: ["cut", "burn", "fracture", "sprain", "fall", "struck_by", "caught_in", "electrical", "chemical", "heat_illness", "cold_illness", "other"] }).notNull(),
+  severity: text("severity", { enum: ["near_miss", "first_aid", "medical_treatment", "restricted_duty", "days_away", "fatality"] }).notNull(),
+
+  // Location
+  latitude: decimal("latitude", { precision: 10, scale: 7 }),
+  longitude: decimal("longitude", { precision: 10, scale: 7 }),
+  locationDescription: text("location_description"),
+
+  // Evidence (object-storage URLs to photos, witness statements, medical reports)
+  photoUrls: jsonb("photo_urls"), // string[]
+  witnessNames: jsonb("witness_names"), // string[]
+
+  // Treatment + outcome
+  treatedAt: text("treated_at"), // free text — clinic name / hospital / on-site first aid
+  daysAway: integer("days_away").default(0),
+  daysRestricted: integer("days_restricted").default(0),
+
+  // OSHA reporting status
+  oshaRecordable: boolean("osha_recordable").default(false), // Did this meet 1904.7 criteria?
+  oshaReported: boolean("osha_reported").default(false),     // Did we file with OSHA?
+  oshaReportedAt: timestamp("osha_reported_at"),
+  oshaCaseNumber: text("osha_case_number"),
+
+  // Admin handling
+  status: text("status", { enum: ["new", "investigating", "closed", "disputed"] }).default("new"),
+  resolvedAt: timestamp("resolved_at"),
+  resolvedBy: text("resolved_by"),
+  resolvedNotes: text("resolved_notes"),
+  createdAt: timestamp("created_at").defaultNow(),
+}, (table) => [
+  index("idx_safety_incidents_job").on(table.jobId),
+  index("idx_safety_incidents_worker").on(table.workerProfileId),
+  index("idx_safety_incidents_company").on(table.companyProfileId),
+  index("idx_safety_incidents_status").on(table.status),
+  index("idx_safety_incidents_severity").on(table.severity),
+]);
+
 export const adminActivityLog = pgTable("admin_activity_log", {
   id: serial("id").primaryKey(),
   adminEmail: text("admin_email").notNull(),

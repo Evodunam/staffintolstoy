@@ -45,6 +45,7 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/component
 import { Calendar as DateCalendar } from "@/components/ui/calendar";
 import { GooglePlacesAutocomplete } from "@/components/GooglePlacesAutocomplete";
 import { OnDemandScheduleMultiStep } from "@/components/OnDemandScheduleMultiStep";
+import { EeocFeedback } from "@/components/EeocFeedback";
 import { OneDayScheduleMultiStep } from "@/components/OneDayScheduleMultiStep";
 import { RecurringScheduleMultiStep } from "@/components/RecurringScheduleMultiStep";
 import { MonthlyScheduleMultiStep } from "@/components/MonthlyScheduleMultiStep";
@@ -754,6 +755,24 @@ export default function PostJob() {
   } | null>(null);
   const [scheduleSuggestionApplied, setScheduleSuggestionApplied] = useState(false);
 
+  // AI-driven scope estimate (workers, total hours, hourly rate, daily pace).
+  // Populated by /api/ai/estimate-job after description+skillsets are entered.
+  // Drives on-demand budget projection instead of the old blanket 8hrs × $40 default.
+  type AiJobEstimate = {
+    suggestedWorkers: number;
+    suggestedHours: number;            // total hours per worker
+    suggestedHourlyRate: number;       // USD/hour
+    suggestedHoursPerDay: number;      // realistic daily pace
+    estimatedCalendarDays: number;
+    suggestedBudget: number;           // workers × hours × rate × buffer
+    reasoning: string;
+    source: 'ai' | 'rules';
+  };
+  const [aiJobEstimate, setAiJobEstimate] = useState<AiJobEstimate | null>(null);
+  const [aiEstimateLoading, setAiEstimateLoading] = useState(false);
+  const [lastEstimateKey, setLastEstimateKey] = useState<string>("");
+  const [userOverrodeWorkers, setUserOverrodeWorkers] = useState(false);
+
   // Persist draft to sessionStorage so refresh/return restores. Clear on submit or ?new=1.
   const draft: PostJobDraft = useMemo(
     () => ({
@@ -1064,6 +1083,63 @@ export default function PostJob() {
     }
   }, [jobDescription, lastAnalyzedDescription, userModifiedSkills]);
 
+  // Fetch AI scope estimate (workers, hours-to-completion, hourly rate, daily pace).
+  // Replaces the old hardcoded "8hrs/day × $40/hr × calendar days" blanket default for on-demand.
+  useEffect(() => {
+    if (jobDescription.length < 30) return;
+    const key = `${jobDescription}|${selectedSkillsets.join(',')}|${shiftType}|${selectedLocation?.state ?? ''}|${selectedLocation?.city ?? ''}`;
+    if (key === lastEstimateKey) return;
+    setLastEstimateKey(key);
+    setAiEstimateLoading(true);
+    let cancelled = false;
+    const timer = setTimeout(async () => {
+      try {
+        // Calendar deadline window helps the AI bump worker count when the deadline is tight.
+        const deadlineDays = (() => {
+          if (shiftType !== "on-demand" || !onDemandDate || !onDemandDoneByDate) return undefined;
+          const start = parseLocalDate(onDemandDate);
+          const end = parseLocalDate(onDemandDoneByDate);
+          if (end < start) return undefined;
+          return Math.ceil((end.getTime() - start.getTime()) / 86_400_000) + 1;
+        })();
+        const res = await apiRequest("POST", "/api/ai/estimate-job", {
+          description: jobDescription,
+          skillsets: selectedSkillsets,
+          shiftType,
+          state: selectedLocation?.state,
+          city: selectedLocation?.city,
+          deadlineDays,
+        });
+        if (cancelled) return;
+        const data = await res.json();
+        if (data?.suggestedHours && data?.suggestedHourlyRate) {
+          setAiJobEstimate({
+            suggestedWorkers: data.suggestedWorkers,
+            suggestedHours: data.suggestedHours,
+            suggestedHourlyRate: data.suggestedHourlyRate,
+            suggestedHoursPerDay: data.suggestedHoursPerDay ?? 8,
+            estimatedCalendarDays: data.estimatedCalendarDays ?? Math.ceil(data.suggestedHours / 8),
+            suggestedBudget: data.suggestedBudget,
+            reasoning: data.reasoning,
+            source: data.source ?? 'ai',
+          });
+          // Auto-apply suggested worker count unless the user has manually changed it.
+          if (!userOverrodeWorkers && data.suggestedWorkers >= 1) {
+            setWorkersNeeded(Math.min(50, Math.max(1, data.suggestedWorkers)));
+          }
+        }
+      } catch {
+        // Silent — fall back to existing hardcoded defaults.
+      } finally {
+        if (!cancelled) setAiEstimateLoading(false);
+      }
+    }, 1200);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [jobDescription, selectedSkillsets, shiftType, selectedLocation?.state, selectedLocation?.city, onDemandDate, onDemandDoneByDate, lastEstimateKey, userOverrodeWorkers]);
+
   // Apply AI schedule suggestion when entering step 2 (once per suggestion). Default to on-demand if no hint.
   useEffect(() => {
     if (step === 2 && !scheduleSuggestionApplied) {
@@ -1263,16 +1339,70 @@ export default function PostJob() {
     monthlyMonthsCount,
   ]);
 
-  const ON_DEMAND_EST_HOURLY = 40;
-  const ON_DEMAND_EST_HOURS_PER_DAY = 8;
-  const onDemandCalculatedBudget = (() => {
-    if (!onDemandDate || !onDemandDoneByDate) return null;
-    const start = new Date(onDemandDate);
-    const end = new Date(onDemandDoneByDate);
-    if (end < start) return null;
-    const days = Math.ceil((end.getTime() - start.getTime()) / (24 * 60 * 60 * 1000)) + 1;
-    return days * ON_DEMAND_EST_HOURS_PER_DAY * ON_DEMAND_EST_HOURLY * workersNeeded;
-  })();
+  // Fallbacks used when the AI estimate isn't available (description too short, AI off, etc.)
+  const ON_DEMAND_FALLBACK_HOURLY = 40;
+  const ON_DEMAND_FALLBACK_HOURS_PER_DAY = 8;
+
+  // On-demand budget: prefer AI-estimated total worker-hours × AI-estimated hourly rate.
+  // On-demand jobs run "until complete", so total hours (not calendar days × per-day) is the
+  // correct budget driver. The calendar window is treated as a deadline, not a multiplier —
+  // but if the deadline is tighter than the AI's natural pace we surface the conflict.
+  const onDemandBudgetProjection = useMemo(() => {
+    const est = aiJobEstimate;
+    const hourlyRate = est?.suggestedHourlyRate ?? ON_DEMAND_FALLBACK_HOURLY;
+    const hoursPerDay = est?.suggestedHoursPerDay ?? ON_DEMAND_FALLBACK_HOURS_PER_DAY;
+
+    let totalHoursPerWorker: number;
+    let basis: 'ai-total' | 'deadline-window' | 'fallback';
+
+    if (est?.suggestedHours) {
+      // AI gave us a total scope estimate per worker — that's the budget basis.
+      totalHoursPerWorker = est.suggestedHours;
+      basis = 'ai-total';
+    } else if (onDemandDate && onDemandDoneByDate) {
+      // No AI yet — fall back to calendar-window × daily pace.
+      const start = parseLocalDate(onDemandDate);
+      const end = parseLocalDate(onDemandDoneByDate);
+      if (end < start) return null;
+      const days = Math.ceil((end.getTime() - start.getTime()) / 86_400_000) + 1;
+      totalHoursPerWorker = days * hoursPerDay;
+      basis = 'deadline-window';
+    } else {
+      return null;
+    }
+
+    const totalWorkerHours = totalHoursPerWorker * workersNeeded;
+    const budget = Math.ceil(totalWorkerHours * hourlyRate);
+
+    // Deadline tightness check: how many calendar days does the AI think this needs vs. allowed?
+    let deadlineWarning: string | null = null;
+    if (basis === 'ai-total' && onDemandDate && onDemandDoneByDate) {
+      const start = parseLocalDate(onDemandDate);
+      const end = parseLocalDate(onDemandDoneByDate);
+      if (end >= start) {
+        const allowedDays = Math.ceil((end.getTime() - start.getTime()) / 86_400_000) + 1;
+        const naturalDays = Math.max(1, Math.ceil(totalHoursPerWorker / hoursPerDay));
+        if (naturalDays > allowedDays) {
+          const extraWorkersNeeded = Math.ceil(naturalDays / allowedDays);
+          deadlineWarning = `${naturalDays} day${naturalDays === 1 ? '' : 's'} of work compressed into ${allowedDays} day${allowedDays === 1 ? '' : 's'} — consider ${extraWorkersNeeded}× workers or extending the deadline.`;
+        }
+      }
+    }
+
+    return {
+      budget,
+      totalWorkerHours,
+      totalHoursPerWorker,
+      hourlyRate,
+      hoursPerDay,
+      basis,
+      deadlineWarning,
+      reasoning: est?.reasoning,
+      source: est?.source ?? 'fallback',
+    };
+  }, [aiJobEstimate, workersNeeded, onDemandDate, onDemandDoneByDate]);
+
+  const onDemandCalculatedBudget = onDemandBudgetProjection?.budget ?? null;
 
   const minimumJobBudgetUsd = useMemo(
     () =>
@@ -2090,6 +2220,8 @@ export default function PostJob() {
                     </span>
                   )}
                 </div>
+                {/* EEOC compliance feedback — surfaced inline so the user can fix wording before submit. */}
+                <EeocFeedback text={`${companyJobTitle}\n${jobDescription}`} />
               </div>
 
               {/* 3. Location */}
@@ -2327,11 +2459,11 @@ export default function PostJob() {
               <div>
                 <Label>How many workers do you need?</Label>
                 <div className="flex items-center justify-center gap-4 mt-4 py-4">
-                  <Button 
-                    variant="outline" 
+                  <Button
+                    variant="outline"
                     size="icon"
                     disabled={workersNeeded <= 1}
-                    onClick={() => setWorkersNeeded(prev => Math.max(1, prev - 1))}
+                    onClick={() => { setUserOverrodeWorkers(true); setWorkersNeeded(prev => Math.max(1, prev - 1)); }}
                     data-testid="button-workers-minus"
                   >
                     <Minus className="w-4 h-4" />
@@ -2345,16 +2477,33 @@ export default function PostJob() {
                       {workersNeeded === 1 ? "worker" : "workers"}
                     </p>
                   </div>
-                  <Button 
-                    variant="outline" 
+                  <Button
+                    variant="outline"
                     size="icon"
                     disabled={workersNeeded >= 50}
-                    onClick={() => setWorkersNeeded(prev => Math.min(50, prev + 1))}
+                    onClick={() => { setUserOverrodeWorkers(true); setWorkersNeeded(prev => Math.min(50, prev + 1)); }}
                     data-testid="button-workers-plus"
                   >
                     <Plus className="w-4 h-4" />
                   </Button>
                 </div>
+                {aiJobEstimate && shiftType === "on-demand" && (
+                  <div className="mt-2 rounded-md bg-primary/5 border border-primary/20 p-2 text-xs text-muted-foreground">
+                    <div className="flex items-start gap-1.5">
+                      <Sparkles className="w-3.5 h-3.5 text-primary shrink-0 mt-0.5" />
+                      <div>
+                        <span className="font-medium text-foreground">
+                          AI suggests {aiJobEstimate.suggestedWorkers} worker{aiJobEstimate.suggestedWorkers === 1 ? '' : 's'}
+                        </span>
+                        {' · '}
+                        ~{aiJobEstimate.suggestedHours}h each at ${aiJobEstimate.suggestedHourlyRate}/hr
+                        {' · '}
+                        ~{aiJobEstimate.estimatedCalendarDays} day{aiJobEstimate.estimatedCalendarDays === 1 ? '' : 's'} of work
+                        {aiJobEstimate.reasoning && <div className="mt-1 italic">{aiJobEstimate.reasoning}</div>}
+                      </div>
+                    </div>
+                  </div>
+                )}
               </div>
 
               <Separator />
@@ -2462,11 +2611,17 @@ export default function PostJob() {
                     label: "Done",
                     onClick: () => {
                       if (!onDemandBudget) {
-                        const end = onDemandDoneByDate || onDemandDate;
-                        const days = end && onDemandDate
-                          ? Math.ceil((new Date(end).getTime() - new Date(onDemandDate).getTime()) / (24 * 60 * 60 * 1000)) + 1
-                          : 1;
-                        setOnDemandBudget(days * 8 * 40 * workersNeeded);
+                        // Prefer AI-derived projection (workers × est total hours × est rate).
+                        // Fall back to legacy calendar-window × 8h × $40 if AI estimate not ready.
+                        if (onDemandCalculatedBudget) {
+                          setOnDemandBudget(onDemandCalculatedBudget);
+                        } else {
+                          const end = onDemandDoneByDate || onDemandDate;
+                          const days = end && onDemandDate
+                            ? Math.ceil((new Date(end).getTime() - new Date(onDemandDate).getTime()) / (24 * 60 * 60 * 1000)) + 1
+                            : 1;
+                          setOnDemandBudget(days * 8 * 40 * workersNeeded);
+                        }
                       }
                       setShowSchedulePopup(null);
                       setStep(3);
@@ -2555,6 +2710,17 @@ export default function PostJob() {
                   step={onDemandFormStep}
                   onStepChange={setOnDemandFormStep}
                   hideFooter
+                  aiEstimate={aiJobEstimate ? {
+                    hourlyRate: aiJobEstimate.suggestedHourlyRate,
+                    hoursPerDay: aiJobEstimate.suggestedHoursPerDay,
+                    totalHoursPerWorker: aiJobEstimate.suggestedHours,
+                    estimatedCalendarDays: aiJobEstimate.estimatedCalendarDays,
+                    reasoning: aiJobEstimate.reasoning,
+                    source: aiJobEstimate.source,
+                  } : null}
+                  aiEstimateLoading={aiEstimateLoading}
+                  projectedBudget={onDemandCalculatedBudget}
+                  deadlineWarning={onDemandBudgetProjection?.deadlineWarning ?? null}
                 />
               )}
               {showSchedulePopup === "one-day" && (

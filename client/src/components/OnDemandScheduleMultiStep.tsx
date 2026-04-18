@@ -17,12 +17,13 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import { AlertCircle, ChevronDown, ChevronRight, Info } from "lucide-react";
+import { AlertCircle, ChevronDown, ChevronRight, Info, Sparkles, Loader2 } from "lucide-react";
 import { cn, parseLocalDate } from "@/lib/utils";
 import type { DateRange } from "react-day-picker";
 
-const ON_DEMAND_EST_HOURLY = 40;
-const ON_DEMAND_EST_HOURS_PER_DAY = 8;
+// Used only when no AI estimate is available (description too short, AI off, etc.)
+const ON_DEMAND_FALLBACK_HOURLY = 40;
+const ON_DEMAND_FALLBACK_HOURS_PER_DAY = 8;
 
 /** Convert 24h "HH:mm" to 12h display e.g. "9:00 AM", "12:30 PM" */
 function formatTime12h(time24: string): string {
@@ -71,6 +72,20 @@ export interface OnDemandScheduleMultiStepProps {
   onStepChange?: (step: number) => void;
   /** Hide progress bar and footer - use when parent (e.g. ResponsiveDialog) provides footer with progress + actions */
   hideFooter?: boolean;
+  /** AI scope estimate driving budget projection (workers × total hours × rate). */
+  aiEstimate?: {
+    hourlyRate: number;
+    hoursPerDay: number;
+    totalHoursPerWorker: number;
+    estimatedCalendarDays: number;
+    reasoning: string;
+    source: 'ai' | 'rules';
+  } | null;
+  aiEstimateLoading?: boolean;
+  /** Pre-computed budget from parent (workers × AI hours × AI rate). Falls back to internal calc when null. */
+  projectedBudget?: number | null;
+  /** Surfaced when AI-estimated work duration exceeds the chosen deadline window. */
+  deadlineWarning?: string | null;
 }
 
 export function OnDemandScheduleMultiStep({
@@ -93,6 +108,10 @@ export function OnDemandScheduleMultiStep({
   step: controlledStep,
   onStepChange,
   hideFooter = false,
+  aiEstimate = null,
+  aiEstimateLoading = false,
+  projectedBudget = null,
+  deadlineWarning = null,
 }: OnDemandScheduleMultiStepProps) {
   const [internalStep, setInternalStep] = useState(1);
   const step = controlledStep ?? internalStep;
@@ -125,13 +144,19 @@ export function OnDemandScheduleMultiStep({
   };
 
   const calculatedBudget = (() => {
+    // Prefer parent-supplied projection (workers × AI total hours × AI rate).
+    if (projectedBudget != null) return projectedBudget;
+
+    // Fallback: per-day pace × calendar days × rate (used when AI estimate not ready).
+    const hourlyRate = aiEstimate?.hourlyRate ?? ON_DEMAND_FALLBACK_HOURLY;
+    const hoursPerDay = aiEstimate?.hoursPerDay ?? ON_DEMAND_FALLBACK_HOURS_PER_DAY;
     const endDate = doneByDate || date;
-    if (!date || !endDate) return ON_DEMAND_EST_HOURS_PER_DAY * ON_DEMAND_EST_HOURLY * workersNeeded;
+    if (!date || !endDate) return hoursPerDay * hourlyRate * workersNeeded;
     const start = parseLocalDate(date);
     const end = parseLocalDate(endDate);
-    if (end < start) return ON_DEMAND_EST_HOURS_PER_DAY * ON_DEMAND_EST_HOURLY * workersNeeded;
+    if (end < start) return hoursPerDay * hourlyRate * workersNeeded;
     const days = Math.ceil((end.getTime() - start.getTime()) / (24 * 60 * 60 * 1000)) + 1;
-    return days * ON_DEMAND_EST_HOURS_PER_DAY * ON_DEMAND_EST_HOURLY * workersNeeded;
+    return days * hoursPerDay * hourlyRate * workersNeeded;
   })();
 
   const handleTimeSelect = (slot: string) => {
@@ -177,6 +202,68 @@ export function OnDemandScheduleMultiStep({
       </Tooltip>
     </TooltipProvider>
   );
+
+  const aiEstimatePanel = (aiEstimate || aiEstimateLoading) ? (
+    <div className={cn(
+      "rounded-lg border p-3 text-sm",
+      deadlineWarning
+        ? "border-amber-300 bg-amber-50 dark:border-amber-800 dark:bg-amber-950/30"
+        : "border-primary/30 bg-primary/5"
+    )}>
+      <div className="flex items-start gap-2">
+        {aiEstimateLoading ? (
+          <Loader2 className="w-4 h-4 text-primary shrink-0 mt-0.5 animate-spin" />
+        ) : (
+          <Sparkles className="w-4 h-4 text-primary shrink-0 mt-0.5" />
+        )}
+        <div className="flex-1 min-w-0">
+          {aiEstimateLoading && !aiEstimate && (
+            <p className="text-xs text-muted-foreground">Estimating scope, rate, and crew size…</p>
+          )}
+          {aiEstimate && (
+            <>
+              <p className="text-xs font-medium text-foreground">
+                AI projection ({aiEstimate.source === 'ai' ? 'GPT' : 'rules'}):
+                {' '}
+                <span className="font-semibold">${aiEstimate.hourlyRate}/hr</span>
+                {' · '}
+                ~<span className="font-semibold">{aiEstimate.totalHoursPerWorker}h</span> per worker
+                {' · '}
+                ~<span className="font-semibold">{aiEstimate.estimatedCalendarDays} day{aiEstimate.estimatedCalendarDays === 1 ? '' : 's'}</span> at {aiEstimate.hoursPerDay}h/day pace
+              </p>
+              {aiEstimate.reasoning && (
+                <p className="text-xs text-muted-foreground italic mt-1">{aiEstimate.reasoning}</p>
+              )}
+              {deadlineWarning && (
+                <p className="text-xs font-medium text-amber-800 dark:text-amber-300 mt-1.5 flex items-start gap-1">
+                  <AlertCircle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+                  <span>{deadlineWarning}</span>
+                </p>
+              )}
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  ) : null;
+
+  const budgetSummary = (date && doneByDate) ? (
+    <div className="rounded-lg border border-border bg-muted/30 p-3 text-sm">
+      <div className="flex items-baseline justify-between gap-3">
+        <span className="text-muted-foreground">Projected budget</span>
+        <span className="text-lg font-bold text-foreground">${calculatedBudget.toLocaleString()}</span>
+      </div>
+      {aiEstimate ? (
+        <p className="text-xs text-muted-foreground mt-1">
+          {workersNeeded} worker{workersNeeded === 1 ? '' : 's'} × {aiEstimate.totalHoursPerWorker}h × ${aiEstimate.hourlyRate}/hr (+10% buffer in posted budget)
+        </p>
+      ) : (
+        <p className="text-xs text-muted-foreground mt-1">
+          Based on default pace ({ON_DEMAND_FALLBACK_HOURS_PER_DAY}h/day at ${ON_DEMAND_FALLBACK_HOURLY}/hr) — refine the description for an AI estimate.
+        </p>
+      )}
+    </div>
+  ) : null;
 
   const calendarTimeLayout = (
     <div className="space-y-3">
@@ -272,6 +359,8 @@ export function OnDemandScheduleMultiStep({
         {step === 1 && (
           <>
             {calendarTimeLayout}
+            {aiEstimatePanel}
+            {budgetSummary}
           </>
         )}
         {scheduleError && step === 1 && (
@@ -309,6 +398,8 @@ export function OnDemandScheduleMultiStep({
       {step === 1 && (
         <>
           {calendarTimeLayout}
+          {aiEstimatePanel}
+          {budgetSummary}
           {scheduleError && (
             <div className="flex items-center gap-2 text-destructive text-sm">
               <AlertCircle className="w-4 h-4 shrink-0" />

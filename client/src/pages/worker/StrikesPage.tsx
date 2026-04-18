@@ -1,11 +1,16 @@
+import { useState } from "react";
 import { useLocation } from "wouter";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useAuth } from "@/hooks/use-auth";
 import { useProfile } from "@/hooks/use-profiles";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { ArrowLeft, Shield, AlertTriangle, CheckCircle, Loader2 } from "lucide-react";
+import { Textarea } from "@/components/ui/textarea";
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { useToast } from "@/hooks/use-toast";
+import { apiRequest } from "@/lib/queryClient";
+import { ArrowLeft, Shield, AlertTriangle, CheckCircle, Loader2, MessageSquareWarning } from "lucide-react";
 import { format } from "date-fns";
 import { useTranslation } from "react-i18next";
 
@@ -25,6 +30,12 @@ interface Strike {
     firstName?: string;
     lastName?: string;
   };
+  // Appeal workflow (from migrations/048).
+  appealStatus?: "none" | "submitted" | "reviewing" | "upheld" | "overturned";
+  appealText?: string | null;
+  appealSubmittedAt?: string | null;
+  appealDecisionAt?: string | null;
+  appealDecisionNotes?: string | null;
 }
 
 interface StrikesResponse {
@@ -137,28 +148,7 @@ export default function StrikesPage() {
           ) : (
             <div className="space-y-3">
               {strikes.map((strike) => (
-                <Card key={strike.id} className="border-red-500/30">
-                  <CardContent className="py-4">
-                    <div className="flex items-start justify-between gap-4">
-                      <div className="flex-1 min-w-0">
-                        <div className="flex items-center gap-2 mb-2">
-                          <Badge variant="destructive" className="text-xs">
-                            {strike.isStrike ? t("strike") : t("warning")}
-                          </Badge>
-                          <span className="text-xs text-muted-foreground">
-                            {strike.createdAt ? format(new Date(strike.createdAt), "MMM d, yyyy") : ""}
-                          </span>
-                        </div>
-                        <p className="text-sm text-muted-foreground mb-2">
-                          {t("reportedBy")}: {strike.reporter?.companyName || 
-                            `${strike.reporter?.firstName || ''} ${strike.reporter?.lastName || ''}`.trim() || 
-                            t("company")}
-                        </p>
-                        <p className="text-sm">{strike.explanation}</p>
-                      </div>
-                    </div>
-                  </CardContent>
-                </Card>
+                <StrikeCard key={strike.id} strike={strike} />
               ))}
             </div>
           )}
@@ -175,5 +165,104 @@ export default function StrikesPage() {
         )}
       </main>
     </div>
+  );
+}
+
+/** Single-strike card with inline appeal flow. Posts to /api/strikes/:id/appeal. */
+function StrikeCard({ strike }: { strike: Strike }) {
+  const { t } = useTranslation("strikes");
+  const { toast } = useToast();
+  const qc = useQueryClient();
+  const [open, setOpen] = useState(false);
+  const [appealText, setAppealText] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+
+  const submit = async () => {
+    if (appealText.trim().length < 30) {
+      toast({ title: "Tell us your side (≥30 characters)", variant: "destructive" });
+      return;
+    }
+    try {
+      setSubmitting(true);
+      await apiRequest("POST", `/api/strikes/${strike.id}/appeal`, { appealText });
+      toast({ title: "Appeal submitted", description: "An admin will review within 5 business days." });
+      qc.invalidateQueries({ queryKey: ["/api/my-strikes"] });
+      setOpen(false);
+    } catch (err: any) {
+      toast({ title: "Could not submit appeal", description: err.message ?? "", variant: "destructive" });
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const apStatus = strike.appealStatus ?? "none";
+  const canAppeal = apStatus === "none";
+
+  return (
+    <Card className="border-red-500/30">
+      <CardContent className="py-4">
+        <div className="flex items-start justify-between gap-4">
+          <div className="flex-1 min-w-0">
+            <div className="flex items-center gap-2 mb-2 flex-wrap">
+              <Badge variant="destructive" className="text-xs">{strike.isStrike ? t("strike") : t("warning")}</Badge>
+              <span className="text-xs text-muted-foreground">
+                {strike.createdAt ? format(new Date(strike.createdAt), "MMM d, yyyy") : ""}
+              </span>
+              {apStatus === "submitted" && <Badge variant="secondary" className="text-xs">Appeal under review</Badge>}
+              {apStatus === "upheld" && <Badge variant="destructive" className="text-xs">Appeal denied</Badge>}
+              {apStatus === "overturned" && <Badge className="text-xs bg-green-600">Appeal granted — strike removed</Badge>}
+            </div>
+            <p className="text-sm text-muted-foreground mb-2">
+              {t("reportedBy")}: {strike.reporter?.companyName ||
+                `${strike.reporter?.firstName || ''} ${strike.reporter?.lastName || ''}`.trim() ||
+                t("company")}
+            </p>
+            <p className="text-sm">{strike.explanation}</p>
+
+            {strike.appealText && apStatus !== "none" && (
+              <div className="mt-3 p-2 rounded border bg-muted/40">
+                <p className="text-xs font-medium mb-1">Your appeal</p>
+                <p className="text-xs italic">"{strike.appealText}"</p>
+                {strike.appealDecisionNotes && (
+                  <>
+                    <p className="text-xs font-medium mt-2 mb-1">Admin decision</p>
+                    <p className="text-xs">{strike.appealDecisionNotes}</p>
+                  </>
+                )}
+              </div>
+            )}
+
+            {canAppeal && (
+              <Button size="sm" variant="outline" className="mt-3 gap-1" onClick={() => setOpen(true)}>
+                <MessageSquareWarning className="w-3.5 h-3.5" /> Appeal this strike
+              </Button>
+            )}
+          </div>
+        </div>
+      </CardContent>
+
+      <Dialog open={open} onOpenChange={setOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Appeal strike</DialogTitle>
+            <DialogDescription>Tell us what happened from your perspective. An admin will review within 5 business days. Be specific — cite times, locations, and any witnesses.</DialogDescription>
+          </DialogHeader>
+          <Textarea
+            rows={5}
+            value={appealText}
+            onChange={(e) => setAppealText(e.target.value)}
+            placeholder="What's your side of this story?"
+            maxLength={2000}
+          />
+          <p className="text-xs text-muted-foreground">{appealText.length}/2000 · min 30</p>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setOpen(false)} disabled={submitting}>Cancel</Button>
+            <Button onClick={submit} disabled={submitting || appealText.trim().length < 30}>
+              {submitting ? "Submitting…" : "Submit appeal"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </Card>
   );
 }

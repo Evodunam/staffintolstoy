@@ -1,7 +1,9 @@
 import { storage } from "../storage";
 import { db } from "../db";
-import { timesheets } from "@shared/schema";
+import { timesheets, profiles, jobs } from "@shared/schema";
 import { eq } from "drizzle-orm";
+import { calcShiftPayForTimesheet } from "./wagePayCalc";
+import { accrueSickLeave } from "@shared/sickLeave";
 
 const AUTO_APPROVAL_HOURS = 48;
 const COMPANY_MARKUP = 1.52;
@@ -52,10 +54,28 @@ export async function processAutoApprovals(): Promise<{ processed: number; paid:
         }
         
         const hoursWorked = parseFloat(String(ts.adjustedHours || ts.totalHours)) || 0;
-        const totalPay = Math.round(hoursWorked * ts.hourlyRate);
-        const totalAmount = Math.round(totalPay * COMPANY_MARKUP);
+
+        // Per-state OT engine: splits hoursWorked into regular / 1.5x / 2.0x
+        // buckets based on CA daily OT, FLSA weekly OT, etc. NEVER under-pays
+        // due to rounding (Donohue v. AMN Services).
+        const pay = await calcShiftPayForTimesheet({
+          timesheetId: ts.id,
+          workerId: ts.workerId,
+          jobId: ts.jobId,
+          hoursWorked,
+          hourlyRateCents: ts.hourlyRate,
+          clockInTime: ts.clockInTime,
+        });
+        const totalPay = pay.totalPayCents;
+        const totalAmount = Math.ceil(totalPay * COMPANY_MARKUP);
         const platformFee = totalAmount - totalPay;
-        
+
+        if (!pay.meetsMinimumWage) {
+          console.warn(`[AutoApproval] Timesheet ${ts.id} hourlyRate ${ts.hourlyRate}c is BELOW minimum wage ${pay.minimumWageCents}c for jobsite — flagging.`);
+        }
+        if (pay.overtimeHours > 0 || pay.doubleTimeHours > 0) {
+          console.log(`[AutoApproval] Timesheet ${ts.id} OT split: regular=${pay.regularHours}h ot=${pay.overtimeHours}h dt=${pay.doubleTimeHours}h`);
+        }
         console.log(`[AutoApproval] Processing timesheet ${ts.id}: ${hoursWorked}h @ $${(ts.hourlyRate/100).toFixed(2)}/hr = $${(totalPay/100).toFixed(2)} (company pays $${(totalAmount/100).toFixed(2)})`);
         
         await storage.updateTimesheet(ts.id, {
@@ -66,6 +86,26 @@ export async function processAutoApprovals(): Promise<{ processed: number; paid:
           adjustedHours: String(hoursWorked),
         });
         approvedCount++;
+
+        // Accrue state-mandated paid sick leave on the worker's profile (CA SB-616
+        // 1h/30h, NY 1h/30h, etc.). Pure no-op for states without statutory PSL.
+        if (worker && hoursWorked > 0) {
+          const [jobLoc] = await db.select({ state: jobs.state, city: jobs.city })
+            .from(jobs).where(eq(jobs.id, ts.jobId)).limit(1);
+          const accrual = accrueSickLeave({
+            hoursWorked,
+            state: jobLoc?.state ?? null,
+            city: jobLoc?.city ?? null,
+            currentBalanceHours: parseFloat(String(worker.sickLeaveBalanceHours ?? "0")),
+            ytdAccruedHours: parseFloat(String(worker.sickLeaveYtdAccruedHours ?? "0")),
+          });
+          if (accrual.accruedThisShiftHours > 0) {
+            await db.update(profiles).set({
+              sickLeaveBalanceHours: accrual.newBalanceHours.toFixed(2),
+              sickLeaveYtdAccruedHours: (parseFloat(String(worker.sickLeaveYtdAccruedHours ?? "0")) + accrual.accruedThisShiftHours).toFixed(2),
+            }).where(eq(profiles.id, worker.id));
+          }
+        }
         
         const workerName = worker ? `${worker.firstName || ''} ${worker.lastName || ''}`.trim() : 'Worker';
         const invoiceNumber = await storage.getNextInvoiceNumber();

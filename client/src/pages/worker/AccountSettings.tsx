@@ -10,6 +10,8 @@ import { Label } from "@/components/ui/label";
 import { useToast } from "@/hooks/use-toast";
 import { ArrowLeft, Loader2, Check } from "lucide-react";
 import { useTranslation } from "react-i18next";
+import { MfaSettings } from "@/components/MfaSettings";
+import { PrivacySettings } from "@/components/PrivacySettings";
 
 const serviceCategories = [
   { id: "laborer", name: "Laborer", hasLevels: false },
@@ -153,6 +155,16 @@ export default function AccountSettings() {
             )}
           </Button>
         </form>
+
+        <div className="mt-10 pt-6 border-t border-border">
+          <h2 className="text-xl font-semibold mb-4">Security</h2>
+          <MfaSettings initiallyEnabled={(user as any)?.mfaEnabled === "true"} />
+        </div>
+
+        <div className="mt-10 pt-6 border-t border-border">
+          <h2 className="text-xl font-semibold mb-4">Privacy &amp; Data</h2>
+          <PrivacySettings />
+        </div>
       </main>
     </div>
   );

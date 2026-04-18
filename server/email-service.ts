@@ -2111,11 +2111,24 @@ export async function sendEmail(emailData: EmailData): Promise<{ success: boolea
     }
 
     const fromAddress = RESEND_FROM_DEFAULT;
+
+    // CAN-SPAM (15 USC §7704) + RFC 8058 one-click unsubscribe headers.
+    // Gmail/Yahoo's 2024 sender requirements REQUIRE List-Unsubscribe + List-Unsubscribe-Post
+    // for any sender doing >5k messages/day to their users. Adding for all messages now to
+    // future-proof and to suppress spam-folder placement.
+    const unsubBase = process.env.APP_URL || process.env.BASE_URL || 'https://app.tolstoystaffing.com';
+    const unsubToken = encodeURIComponent(Buffer.from(String(originalTo)).toString('base64'));
+    const headers: Record<string, string> = {
+      'List-Unsubscribe': `<${unsubBase}/api/email/unsubscribe?u=${unsubToken}>, <mailto:unsubscribe@tolstoystaffing.com?subject=unsubscribe>`,
+      'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click',
+    };
+
     const payload: Parameters<typeof resend.emails.send>[0] = {
       from: fromAddress,
       to: finalTo,
       subject: isDevelopment && originalTo !== finalTo ? `[DEV] ${subject} (Original: ${originalTo})` : subject,
       html,
+      headers,
     };
     if (emailData.attachments && emailData.attachments.length > 0) {
       payload.attachments = emailData.attachments;

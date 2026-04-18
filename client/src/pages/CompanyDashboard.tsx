@@ -54,7 +54,7 @@ import { SUPPORTED_LANGUAGES, changeLanguage, LanguageCode } from "@/lib/i18n";
 import { Accordion, AccordionContent, AccordionItem, AccordionTrigger } from "@/components/ui/accordion";
 import { INDUSTRY_CATEGORIES } from "@shared/industries";
 import { api as sharedApi } from "@shared/routes";
-import { loadStripe } from "@stripe/stripe-js";
+import { loadStripe } from "@/lib/stripe";
 import { GooglePlacesAutocomplete } from "@/components/GooglePlacesAutocomplete";
 import { Elements, CardElement, PaymentElement, useStripe, useElements } from "@stripe/react-stripe-js";
 import { jsPDF } from "jspdf";

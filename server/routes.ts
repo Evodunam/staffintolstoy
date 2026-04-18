@@ -11,7 +11,7 @@ import { attachRlsDbContext } from "./auth/rls-context";
 import passport from "passport";
 import { db } from "./db";
 import { users } from "@shared/models/auth";
-import { profiles, jobs, type Job, digitalSignatures, deviceTokens, notifications, notificationTypes, insertDeviceTokenSchema, applications, timesheets, companyTeamMembers, teamInvites, locationPings, timesheetEvents, companyPaymentMethods, companyTransactions, teams, workerTeamMembers, jobAssignments, jobSchedules, jobMessages, jobMessageEmailLog, chatMessagePendingDigest, chatMessageDigestSent, jobBudgetReviewEmailSent, reviews, skills, referrals, affiliates, insertAffiliateSchema, companyAgreements } from "@shared/schema";
+import { profiles, jobs, type Job, digitalSignatures, deviceTokens, notifications, notificationTypes, insertDeviceTokenSchema, applications, timesheets, companyTeamMembers, teamInvites, locationPings, timesheetEvents, companyPaymentMethods, companyTransactions, teams, workerTeamMembers, jobAssignments, jobSchedules, jobMessages, jobMessageEmailLog, chatMessagePendingDigest, chatMessageDigestSent, jobBudgetReviewEmailSent, reviews, skills, referrals, affiliates, insertAffiliateSchema, companyAgreements, adminStrikes, safetyIncidents } from "@shared/schema";
 import { eq, and, asc, desc, inArray, isNull, isNotNull, or, gte, lte, sql } from "drizzle-orm";
 import { sendEmail, ALL_EMAIL_TYPES, getSampleDataForType } from "./email-service";
 import { setupWebSocket, notifyNewJob, notifyApplicationUpdate, notifyJobUpdate, notifyTimesheetUpdate, broadcastPresenceUpdate, notifyWorkerTeamPresence } from "./websocket";
@@ -740,6 +740,142 @@ export async function registerRoutes(
   app.get("/api/health", (_req, res) => {
     res.json({ status: "ok", timestamp: new Date().toISOString() });
   });
+
+  // Public status endpoint — checks DB, secret-manager, and counts of in-flight
+  // background jobs. NOT an SLA reporter (use a real status page provider for
+  // that), but useful for buyer-facing trust pages and ops smoke tests.
+  app.get("/api/status", async (_req, res) => {
+    const out: Record<string, any> = {
+      status: "ok",
+      timestamp: new Date().toISOString(),
+      version: process.env.GIT_COMMIT_SHA || "dev",
+      checks: {} as Record<string, { ok: boolean; latencyMs?: number; error?: string }>,
+    };
+
+    // 1) Database
+    const dbStart = Date.now();
+    try {
+      await db.execute(sql`SELECT 1`);
+      out.checks.database = { ok: true, latencyMs: Date.now() - dbStart };
+    } catch (e: any) {
+      out.checks.database = { ok: false, latencyMs: Date.now() - dbStart, error: e.message };
+      out.status = "degraded";
+    }
+
+    // 2) Secret manager (if loaded)
+    out.checks.secretsManager = { ok: !!process.env.DATABASE_URL };
+
+    // 3) Stripe (config, not network)
+    out.checks.stripe = { ok: !!(process.env.STRIPE_SECRET_KEY || process.env.STRIPE_TEST_SECRET_KEY) };
+
+    // 4) Email (config)
+    out.checks.email = { ok: !!process.env.RESEND_API_KEY };
+
+    // 5) Object storage (config)
+    out.checks.objectStorage = { ok: !!(process.env.IDRIVE_E2_ACCESS_KEY_ID && process.env.IDRIVE_E2_SECRET_ACCESS_KEY) };
+
+    // 6) Mercury (config)
+    out.checks.mercury = { ok: !!(process.env.MERCURY_PRODUCTION_API_TOKEN || process.env.Mercury_Production) };
+
+    const allOk = Object.values(out.checks).every((c: any) => c.ok);
+    if (!allOk) out.status = out.status === "ok" ? "degraded" : out.status;
+
+    res.status(out.checks.database.ok ? 200 : 503).json(out);
+  });
+
+  // CCPA §1798.110 / GDPR Art. 15 — Right to Know.
+  // Returns a JSON document of every personal-data row we hold for the
+  // authenticated user. Sensitive partner-internal IDs (Mercury recipient ID,
+  // Stripe customer ID) are redacted; user-provided data is returned verbatim.
+  app.get("/api/privacy/export", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    try {
+      const userId = (req.user as any)?.claims?.sub;
+      if (!userId) return res.status(401).json({ message: "Unauthorized" });
+      const { buildUserDataExport } = await import("./services/dsar");
+      const payload = await buildUserDataExport(userId);
+      res.setHeader("Content-Type", "application/json; charset=utf-8");
+      res.setHeader("Content-Disposition", `attachment; filename="tolstoy-data-export-${userId}-${new Date().toISOString().slice(0,10)}.json"`);
+      res.send(JSON.stringify(payload, null, 2));
+    } catch (err: any) {
+      console.error("[Privacy/Export] error:", err);
+      res.status(500).json({ message: err.message || "Export failed" });
+    }
+  });
+
+  // CCPA §1798.105 / GDPR Art. 17 — Right to Delete.
+  // Schedules account deletion 30 days out (allows recovery + dispute resolution).
+  // Wrapped in step-up re-auth so a stolen cookie can't nuke an account.
+  app.post(
+    "/api/privacy/delete",
+    async (req, res, next) => {
+      const { requireStepUp, STEP_UP_REASONS } = await import("./auth/stepUp");
+      return requireStepUp(STEP_UP_REASONS.ACCOUNT_DELETE)(req, res, next);
+    },
+    async (req, res) => {
+      try {
+        const userId = (req.user as any)?.claims?.sub;
+        if (!userId) return res.status(401).json({ message: "Unauthorized" });
+        const { requestAccountDeletion } = await import("./services/dsar");
+        const result = await requestAccountDeletion(userId);
+        res.json({
+          success: true,
+          message: "Account deletion scheduled. You can cancel by logging in within 30 days.",
+          ...result,
+        });
+      } catch (err: any) {
+        console.error("[Privacy/Delete] error:", err);
+        res.status(500).json({ message: err.message || "Deletion request failed" });
+      }
+    },
+  );
+
+  // CCPA §1798.130 — companies that do not "sell" personal information must
+  // still post a "Do Not Sell or Share My Personal Information" mechanism.
+  // Tolstoy does not sell personal information; this endpoint records the
+  // user's preference for downstream marketing-vendor sync.
+  app.post("/api/privacy/do-not-sell", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    // We don't currently sell, so this is acknowledged-only. Future: write to a
+    // user_privacy_preferences table when marketing vendors come online.
+    res.json({ success: true, acknowledged: true, note: "Tolstoy Staffing does not sell or share personal information for cross-context behavioral advertising." });
+  });
+
+  // RFC 8058 one-click unsubscribe + CAN-SPAM-compliant unsubscribe link target.
+  // Both POST (one-click from Gmail/Yahoo) and GET (link in email body) are accepted.
+  // Sets all-channels emailNotifications=false on the matching profile.
+  const handleUnsubscribe = async (req: any, res: any) => {
+    try {
+      const u = String(req.query.u || req.body?.u || "");
+      if (!u) return res.status(400).send("Missing unsubscribe token");
+      let email: string;
+      try {
+        email = Buffer.from(decodeURIComponent(u), "base64").toString("utf8").toLowerCase();
+      } catch {
+        return res.status(400).send("Invalid unsubscribe token");
+      }
+      if (!email.includes("@")) return res.status(400).send("Invalid unsubscribe token");
+      // Disable all transactional/marketing email for this address. We persist on the profile
+      // (since users table only has the address) — match by lowercased email.
+      await db.update(profiles).set({ emailNotifications: false }).where(eq(sql`LOWER(${profiles.email})`, email));
+      res.setHeader("Content-Type", "text/html; charset=utf-8");
+      res.send(`<!doctype html><meta charset="utf-8"><title>Unsubscribed</title>
+<body style="font-family:-apple-system,sans-serif;max-width:480px;margin:60px auto;padding:24px;text-align:center">
+<h1 style="font-size:20px">You're unsubscribed</h1>
+<p>${escapeHtmlForResponse(email)} won't receive further marketing or notification emails.</p>
+<p style="color:#6b7280;font-size:13px">Transactional messages required to operate your account (payment receipts, password resets, security alerts) may still be sent. Re-enable email anytime in your account settings.</p>
+</body>`);
+    } catch (err) {
+      console.error("[Unsubscribe] error:", err);
+      res.status(500).send("Unsubscribe failed. Please email support@tolstoystaffing.com.");
+    }
+  };
+  app.get("/api/email/unsubscribe", handleUnsubscribe);
+  app.post("/api/email/unsubscribe", handleUnsubscribe);
+
+  function escapeHtmlForResponse(s: string): string {
+    return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }
 
   // Server-side Google API key resolver. Prefers a dedicated unrestricted (or
   // IP-restricted) key for backend calls; falls back to the legacy referrer-
@@ -1969,6 +2105,167 @@ export async function registerRoutes(
     password: z.string().min(1, "Password is required"),
   });
 
+  // ============================================================
+  // MFA (TOTP) — RFC 6238
+  // ============================================================
+  // Step 1: enrollment — generate secret + QR code; secret stored as 'pending'.
+  app.post("/api/auth/mfa/setup", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    try {
+      const userId = (req.user as any)?.claims?.sub;
+      if (!userId) return res.status(401).json({ message: "Unauthorized" });
+      const [user] = await db.select().from(users).where(eq(users.id, userId));
+      if (!user?.email) return res.status(400).json({ message: "User has no email on file" });
+      if (user.mfaEnabled === "true") {
+        return res.status(409).json({ message: "MFA already enabled. Disable it before re-enrolling.", code: "MFA_ALREADY_ENABLED" });
+      }
+      const { generateMfaEnrollment } = await import("./services/mfa");
+      const enrollment = await generateMfaEnrollment(user.email);
+      await db.update(users).set({ mfaSecret: enrollment.secret, mfaEnabled: "pending" }).where(eq(users.id, userId));
+      res.json({
+        otpauthUrl: enrollment.otpauthUrl,
+        qrPngDataUrl: enrollment.qrPngDataUrl,
+        instructions: "Scan the QR with Google Authenticator, 1Password, Authy, or any TOTP app. Then enter the 6-digit code at /api/auth/mfa/verify to finish setup.",
+      });
+    } catch (err: any) {
+      console.error("[MFA/Setup]", err);
+      res.status(500).json({ message: "MFA setup failed" });
+    }
+  });
+
+  // Step 2: verify the user's first TOTP token to confirm enrollment, generate backup codes.
+  app.post("/api/auth/mfa/verify", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    try {
+      const userId = (req.user as any)?.claims?.sub;
+      const { token } = req.body || {};
+      if (!userId || !token) return res.status(400).json({ message: "Missing token" });
+      const [user] = await db.select().from(users).where(eq(users.id, userId));
+      if (!user?.mfaSecret) return res.status(400).json({ message: "Run /api/auth/mfa/setup first." });
+      const { verifyMfaToken, generateBackupCodes } = await import("./services/mfa");
+      if (!verifyMfaToken(user.mfaSecret, String(token))) {
+        return res.status(401).json({ message: "Invalid code", code: "MFA_INVALID_CODE" });
+      }
+      const { plaintext, hashes } = await generateBackupCodes();
+      await db.update(users).set({
+        mfaEnabled: "true",
+        mfaBackupCodes: hashes as any,
+        mfaLastUsedAt: new Date(),
+      }).where(eq(users.id, userId));
+      res.json({
+        success: true,
+        backupCodes: plaintext,
+        warning: "Save these backup codes somewhere safe NOW. Each can be used once if you lose access to your authenticator. They will not be shown again.",
+      });
+    } catch (err: any) {
+      console.error("[MFA/Verify]", err);
+      res.status(500).json({ message: "MFA verify failed" });
+    }
+  });
+
+  // Disable MFA (requires step-up so a stolen session can't disable it).
+  app.post(
+    "/api/auth/mfa/disable",
+    async (req, res, next) => {
+      const { requireStepUp, STEP_UP_REASONS } = await import("./auth/stepUp");
+      return requireStepUp(STEP_UP_REASONS.MFA_DISABLE)(req, res, next);
+    },
+    async (req, res) => {
+      try {
+        const userId = (req.user as any)?.claims?.sub;
+        if (!userId) return res.status(401).json({ message: "Unauthorized" });
+        await db.update(users).set({
+          mfaEnabled: "false",
+          mfaSecret: null,
+          mfaBackupCodes: null,
+          mfaLastUsedAt: null,
+        }).where(eq(users.id, userId));
+        res.json({ success: true });
+      } catch (err: any) {
+        console.error("[MFA/Disable]", err);
+        res.status(500).json({ message: "MFA disable failed" });
+      }
+    },
+  );
+
+  // Login-flow MFA verification: called AFTER password is verified (login-email
+  // sets a flag) when the user has MFA enabled. Accepts TOTP code OR backup code.
+  app.post("/api/auth/mfa/login-verify", async (req, res) => {
+    try {
+      const session = req.session as any;
+      const pendingUserId = session?.pendingMfaUserId;
+      if (!pendingUserId) return res.status(401).json({ message: "No pending MFA challenge", code: "NO_PENDING_MFA" });
+      const { token, backupCode } = req.body || {};
+      const [user] = await db.select().from(users).where(eq(users.id, pendingUserId));
+      if (!user?.mfaSecret || user.mfaEnabled !== "true") return res.status(400).json({ message: "MFA not configured for this account" });
+      const { verifyMfaToken, findMatchingBackupCode } = await import("./services/mfa");
+      let ok = false;
+      if (token && verifyMfaToken(user.mfaSecret, String(token))) ok = true;
+      if (!ok && backupCode && Array.isArray(user.mfaBackupCodes)) {
+        const idx = await findMatchingBackupCode(String(backupCode), user.mfaBackupCodes as string[]);
+        if (idx >= 0) {
+          ok = true;
+          const remaining = [...(user.mfaBackupCodes as string[])];
+          remaining.splice(idx, 1);
+          await db.update(users).set({ mfaBackupCodes: remaining as any }).where(eq(users.id, user.id));
+        }
+      }
+      if (!ok) return res.status(401).json({ message: "Invalid code", code: "MFA_INVALID_CODE" });
+
+      await db.update(users).set({ mfaLastUsedAt: new Date() }).where(eq(users.id, user.id));
+      delete session.pendingMfaUserId;
+      const userObj = {
+        claims: { sub: user.id, email: user.email, first_name: user.firstName, last_name: user.lastName },
+        expires_at: Math.floor(Date.now() / 1000) + SESSION_TTL_SECONDS,
+      };
+      req.login(userObj, (err) => {
+        if (err) return res.status(500).json({ message: "Login failed" });
+        clearProfileSnapshot(req);
+        res.json({ success: true, user: { id: user.id, email: user.email, firstName: user.firstName, lastName: user.lastName } });
+      });
+    } catch (err: any) {
+      console.error("[MFA/LoginVerify]", err);
+      res.status(500).json({ message: "MFA verify failed" });
+    }
+  });
+
+  // Step-up re-authentication: confirms the currently-logged-in user's identity
+  // by requiring a fresh password before granting a 5-minute single-use token
+  // scoped to a specific reason (e.g. PAYMENT_METHOD). Endpoints that mutate
+  // sensitive state wrap themselves in requireStepUp(reason).
+  app.post("/api/auth/step-up", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    try {
+      const { password, reason } = req.body || {};
+      const { STEP_UP_REASONS, grantStepUp } = await import("./auth/stepUp");
+      const validReasons = Object.values(STEP_UP_REASONS);
+      if (!password || typeof password !== "string") {
+        return res.status(400).json({ message: "Password required" });
+      }
+      if (!reason || !validReasons.includes(reason)) {
+        return res.status(400).json({ message: "Unknown step-up reason", validReasons });
+      }
+      const userClaims = (req.user as any)?.claims;
+      if (!userClaims?.sub) return res.status(401).json({ message: "Unauthorized" });
+      const [user] = await db.select().from(users).where(eq(users.id, userClaims.sub));
+      if (!user?.passwordHash) {
+        // No password on file (Google-only or magic-link only): we can't step-up by password.
+        // For now, deny; future: support OTP step-up via email instead.
+        return res.status(403).json({ message: "Step-up requires a password on the account; set one in Account settings.", code: "STEP_UP_NO_PASSWORD" });
+      }
+      const { verifyPassword } = await import("./utils/password");
+      const ok = await verifyPassword(password, user.passwordHash);
+      if (!ok) {
+        return res.status(401).json({ message: "Incorrect password", code: "STEP_UP_BAD_PASSWORD" });
+      }
+      grantStepUp(req, reason);
+      res.json({ success: true, expiresInSeconds: 300 });
+    } catch (err) {
+      console.error("[StepUp] error:", err);
+      res.status(500).json({ message: "Step-up failed" });
+    }
+  });
+
   app.post("/api/auth/login-email", async (req, res) => {
     try {
       const parseResult = loginSchema.safeParse(req.body);
@@ -1996,6 +2293,19 @@ export async function registerRoutes(
       const isValid = await verifyPassword(password, user.passwordHash);
       if (!isValid) {
         return res.status(401).json({ message: "Invalid email or password" });
+      }
+
+      // If MFA is enabled, do NOT complete the login here. Stash the user id
+      // in the session and force the client to call /api/auth/mfa/login-verify
+      // with their TOTP / backup code before we issue the auth cookie.
+      if (user.mfaEnabled === "true") {
+        const session = req.session as any;
+        session.pendingMfaUserId = user.id;
+        return res.status(401).json({
+          message: "MFA required",
+          code: "MFA_REQUIRED",
+          mfaEndpoint: "/api/auth/mfa/login-verify",
+        });
       }
 
       // Log the user in
@@ -4364,28 +4674,29 @@ export async function registerRoutes(
   // AI-powered job estimation endpoint
   app.post("/api/ai/estimate-job", async (req, res) => {
     if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
-    
+
     try {
-      const { description, skillsets, shiftType } = req.body;
-      
+      const { description, skillsets, shiftType, state, city, deadlineDays } = req.body;
+
       if (!description || description.length < 10) {
         return res.status(400).json({ message: "Please provide a detailed job description" });
       }
-      
-      const HOURLY_RATE = 40; // $40/hr basis for estimates
+
+      const DEFAULT_HOURLY_RATE = 40; // fallback only when AI / regional data unavailable
       const BUFFER_PERCENTAGE = 1.10; // 10% buffer for contingencies
-      
-      // Use OpenAI for AI estimation
+
       const openaiKey = process.env.OPENAI_API_KEY;
       if (!openaiKey) {
-        // Fallback to rule-based estimation
-        return res.json(estimateJobWithRules(description, skillsets, shiftType, HOURLY_RATE, BUFFER_PERCENTAGE));
+        return res.json(estimateJobWithRules(description, skillsets, shiftType, DEFAULT_HOURLY_RATE, BUFFER_PERCENTAGE));
       }
-      
+
       try {
+        const isOnDemand = (shiftType || 'on-demand') === 'on-demand';
+        const locationCtx = [city, state].filter(Boolean).join(', ');
+
         const response = await fetch('https://api.openai.com/v1/chat/completions', {
           method: 'POST',
-          headers: { 
+          headers: {
             'Content-Type': 'application/json',
             'Authorization': `Bearer ${openaiKey}`
           },
@@ -4393,77 +4704,93 @@ export async function registerRoutes(
             model: 'gpt-4o-mini',
             messages: [{
               role: 'system',
-              content: 'You are a construction staffing expert. Analyze job descriptions and provide realistic estimates for workers needed and hours to complete tasks. Respond ONLY in valid JSON format.'
+              content: `You are an expert US construction-staffing estimator. Given a job description, predict realistic crew size, total worker-hours to completion, and a fair hourly worker pay rate (USD/hour) reflecting skill complexity and US regional market rates. Respond ONLY in valid JSON.`
             }, {
               role: 'user',
-              content: `Analyze this construction job and provide estimates. Use $40/hr as the labor rate basis.
+              content: `Estimate this job. ${isOnDemand
+                ? 'This is an ON-DEMAND job: it continues until complete (NOT a fixed daily shift). Estimate the TOTAL hours each worker will spend across however many days are needed.'
+                : 'This is a SHIFT-BASED job: estimate hours per shift.'}
 
 Job Description: "${description}"
 ${skillsets?.length > 0 ? `Skill Categories: ${skillsets.join(', ')}` : ''}
+${locationCtx ? `Location: ${locationCtx}` : ''}
+${deadlineDays ? `Deadline window: ${deadlineDays} calendar day${deadlineDays === 1 ? '' : 's'}` : ''}
 Job Type: ${shiftType || 'on-demand'}
 
-Consider both the description AND skill categories when estimating:
-- Specialized skills (electrical, plumbing, HVAC) may require fewer but higher-skill workers
-- General labor or multi-skill projects often need more workers
-- Match hours to scope: quick repairs 2-4hrs, standard tasks 4-8hrs, larger projects 8-20hrs+
+Estimation guidance:
+- Workers (1-15): more workers = parallelism. Account for whether the work is parallelizable (e.g. demo, painting big surfaces, framing crews) or serial (e.g. one electrician on one panel).
+- Total hours per worker (1-500): real scope. Quick repair 2-4h. Half-day task 4-6h. Full day 8h. Multi-day projects 16-80h. Big remodels 80-300h+.
+- Hourly rate USD/hr (18-95): reflects skill premium AND US regional rates.
+  * Unskilled / general labor: $18-24
+  * Semi-skilled (drywall, painting, basic carpentry): $22-32
+  * Skilled trades (framing, tile, flooring): $28-42
+  * Licensed trades (electrical, plumbing, HVAC, welding): $40-65
+  * Specialty / dangerous (high-voltage, confined-space, hazmat, tower work): $55-95
+  * Regional bumps: SF Bay / NYC / Seattle / Boston / DC +20-30%, mid-tier metros +5-15%, rural -10-20%.
+- If deadline is tight relative to total hours, raise worker count and/or note urgency in reasoning.
+${isOnDemand ? '- For on-demand, ALSO suggest a realistic daily pace (hoursPerDay 4-12) so the user can see how many calendar days the work takes; "totalHours" remains the budget driver.' : ''}
 
 Provide:
-1. A short job title (4 words MAX, action-focused, NO skill names - skills will be added as tags)
-2. How many workers are needed (1-10 workers)
-3. Estimated hours to complete the task (1-40 hours, based on scope and complexity)
-4. Brief reasoning for your estimates (1-2 sentences)
+1. title — short job title (max 4 words, action-focused, NO skill names)
+2. workers — integer 1-15
+3. hours — total hours PER WORKER to complete (1-500)
+4. hourlyRate — integer USD/hr (18-95) based on skill complexity AND region
+${isOnDemand ? '5. hoursPerDay — realistic daily pace (4-12)' : ''}
+6. reasoning — 1-2 sentences citing the specific signals (skill, scope, region) you used.
 
-Budget will be calculated as workers × hours × $40/hr.
-
-Respond ONLY in this exact JSON format:
-{"title": "<4 word title>", "workers": <number>, "hours": <number>, "reasoning": "<brief explanation>"}`
+Respond ONLY as JSON:
+{"title": "...", "workers": <int>, "hours": <int>, "hourlyRate": <int>${isOnDemand ? ', "hoursPerDay": <int>' : ''}, "reasoning": "..."}`
             }],
             temperature: 0.3,
-            max_tokens: 200
+            max_tokens: 320
           })
         });
-        
+
         if (!response.ok) {
           const errorData = await response.json().catch(() => ({}));
           console.log('[AI Estimate] OpenAI error:', errorData);
           throw new Error('OpenAI API error');
         }
-        
+
         const data = await response.json();
         const text = data.choices?.[0]?.message?.content || '';
-        
-        // Parse JSON from response
+
         const jsonMatch = text.match(/\{[\s\S]*\}/);
         if (jsonMatch) {
           const parsed = JSON.parse(jsonMatch[0]);
-          const workers = Math.min(10, Math.max(1, parseInt(parsed.workers) || 2));
-          const hours = Math.min(40, Math.max(1, parseInt(parsed.hours) || 8));
-          
-          // Clean and limit title to 4 words
+          const workers = Math.min(15, Math.max(1, parseInt(parsed.workers) || 2));
+          const hours = Math.min(500, Math.max(1, parseInt(parsed.hours) || 8));
+          const hourlyRate = Math.min(95, Math.max(18, parseInt(parsed.hourlyRate) || DEFAULT_HOURLY_RATE));
+          const hoursPerDay = Math.min(12, Math.max(4, parseInt(parsed.hoursPerDay) || 8));
+
           let title = parsed.title || 'Construction Work';
           const titleWords = title.split(/\s+/).slice(0, 4);
           title = titleWords.join(' ');
-          
-          // Calculate budget at $40/hr with buffer
-          const baseBudget = workers * hours * HOURLY_RATE;
+
+          const baseBudget = workers * hours * hourlyRate;
           const budgetWithBuffer = Math.ceil(baseBudget * BUFFER_PERCENTAGE);
-          
+          const estimatedCalendarDays = Math.max(1, Math.ceil(hours / hoursPerDay));
+
           return res.json({
             suggestedTitle: title,
             suggestedWorkers: workers,
-            suggestedHours: hours,
+            suggestedHours: hours, // total hours per worker
+            suggestedHourlyRate: hourlyRate,
+            suggestedHoursPerDay: hoursPerDay,
+            estimatedCalendarDays,
             suggestedBudget: budgetWithBuffer,
-            baseBudget: baseBudget,
+            baseBudget,
             bufferPercentage: 10,
-            reasoning: parsed.reasoning || 'Based on job description and skill categories',
-            hourlyRate: HOURLY_RATE
+            reasoning: parsed.reasoning || 'Based on job description, skill complexity, and region.',
+            hourlyRate, // back-compat alias
+            source: 'ai',
           });
         }
-        
+
         throw new Error('Invalid AI response format');
       } catch (aiError) {
         console.log('[AI Estimate] OpenAI error, falling back to rules:', aiError);
-        return res.json(estimateJobWithRules(description, skillsets, shiftType, HOURLY_RATE, BUFFER_PERCENTAGE));
+        return res.json(estimateJobWithRules(description, skillsets, shiftType, DEFAULT_HOURLY_RATE, BUFFER_PERCENTAGE));
       }
     } catch (error) {
       console.error('[AI Estimate] Error:', error);
@@ -4540,18 +4867,38 @@ Respond ONLY in this exact JSON format:
       hours = Math.floor(Math.random() * 4) + 4; // 4-8 hours
     }
     
-    const baseBudget = workers * hours * hourlyRate;
+    // Estimate hourly rate from skill complexity (rule-based fallback)
+    const skillsLower = (skillsets || []).map(s => s.toLowerCase());
+    const licensedTrades = ['electrical', 'electrician', 'plumb', 'hvac', 'weld'];
+    const skilledTrades = ['framing', 'tile', 'flooring', 'carpentry', 'roof'];
+    const semiSkilled = ['drywall', 'paint', 'finish'];
+    let estHourlyRate = hourlyRate; // base $40
+    if (skillsLower.some(s => licensedTrades.some(t => s.includes(t)))) estHourlyRate = 50;
+    else if (skillsLower.some(s => skilledTrades.some(t => s.includes(t)))) estHourlyRate = 35;
+    else if (skillsLower.some(s => semiSkilled.some(t => s.includes(t)))) estHourlyRate = 28;
+    else if (skillsLower.some(s => s.includes('labor'))) estHourlyRate = 22;
+
+    // Default daily pace based on whether the work sounds tiring/heavy.
+    // Re-uses heavyWorkKeywords declared earlier in this function.
+    const hoursPerDay = heavyWorkKeywords.some(k => lowerDesc.includes(k)) ? 6 : 8;
+    const estimatedCalendarDays = Math.max(1, Math.ceil(hours / hoursPerDay));
+
+    const baseBudget = workers * hours * estHourlyRate;
     const budgetWithBuffer = Math.ceil(baseBudget * bufferPercentage);
-    
+
     return {
       suggestedTitle: title,
       suggestedWorkers: workers,
       suggestedHours: hours,
+      suggestedHourlyRate: estHourlyRate,
+      suggestedHoursPerDay: hoursPerDay,
+      estimatedCalendarDays,
       suggestedBudget: budgetWithBuffer,
-      baseBudget: baseBudget,
+      baseBudget,
       bufferPercentage: 10,
       reasoning,
-      hourlyRate
+      hourlyRate: estHourlyRate,
+      source: 'rules',
     };
   }
 
@@ -4944,6 +5291,56 @@ Respond ONLY in this exact JSON format:
               code: "JOB_BUDGET_BELOW_FLOOR",
             });
           }
+        }
+
+        // Per-state minimum-wage enforcement: hourly rate at this jobsite must
+        // be at or above the local floor (FLSA federal $7.25 + state/city overrides).
+        // CA Labor Code §1182.12, NY Labor Law §652, etc. — wage-theft suit prevention.
+        const { getMinimumWageCents, getMinimumWageUsd } = await import("@shared/wageCompliance");
+        const hr = (input as { hourlyRate?: number | null }).hourlyRate;
+        if (hr != null && hr > 0) {
+          const minWageCents = getMinimumWageCents({ state: input.state, city: input.city });
+          if (hr < minWageCents) {
+            return res.status(400).json({
+              message: `Hourly rate $${(hr / 100).toFixed(2)} is below the minimum wage for ${input.city}, ${input.state} ($${getMinimumWageUsd({ state: input.state, city: input.city }).toFixed(2)}/hr). Raise the rate to comply with state/local wage law.`,
+              code: "HOURLY_RATE_BELOW_MIN_WAGE",
+              minimumWageCents: minWageCents,
+              providedRateCents: hr,
+            });
+          }
+        }
+
+        // Pay-transparency disclosure: NY/CA/CO/WA/IL/MD/MN/NJ require a pay range
+        // on postings visible to their residents. Block posts missing the range.
+        const { requiresPayRangeDisclosure } = await import("@shared/wageCompliance");
+        if (requiresPayRangeDisclosure(input.state)) {
+          const payMin = (input as { payRangeMinCents?: number | null }).payRangeMinCents;
+          const payMax = (input as { payRangeMaxCents?: number | null }).payRangeMaxCents;
+          const hasInlineRate = hr != null && hr > 0;
+          if (!hasInlineRate && (payMin == null || payMax == null || payMin <= 0 || payMax <= 0)) {
+            return res.status(400).json({
+              message: `${input.state} requires a pay range on job postings. Add a min and max hourly pay (or a single hourlyRate) to comply with pay transparency law.`,
+              code: "PAY_RANGE_REQUIRED",
+            });
+          }
+        }
+
+        // EEOC linter on title + description. "block" findings (age caps, race/origin
+        // proxies, sex restrictions, religious preferences, pregnancy exclusions) hard-stop;
+        // "warn" findings are returned as headers so the client can show them but post still goes through.
+        const { lintJobText, hasBlockingFindings } = await import("@shared/eeocJobLinter");
+        const lintTarget = `${input.title ?? ""}\n${input.description ?? ""}`;
+        const findings = lintJobText(lintTarget);
+        if (hasBlockingFindings(findings)) {
+          return res.status(400).json({
+            message: "Job posting contains language that may violate equal-employment law. See findings to fix.",
+            code: "EEOC_BLOCKING_LANGUAGE",
+            findings: findings.filter(f => f.severity === "block"),
+          });
+        }
+        if (findings.length > 0) {
+          // Surface advisory warnings to client without blocking.
+          res.setHeader("X-Eeoc-Advisory-Count", String(findings.length));
         }
       }
 
@@ -10433,7 +10830,16 @@ Respond ONLY in this exact JSON format:
     const { hoursAway, pingCount } = await computeTimeAwayFromSite(workerProfileId, timesheet.jobId, clockInTime, clockOutTime);
     const billableHours = Math.max(0, rawTotalHours - hoursAway);
     const totalHours = rawTotalHours;
-    const totalPay = Math.round(billableHours * timesheet.hourlyRate);
+    const { calcShiftPayForTimesheet: _calc } = await import("./services/wagePayCalc");
+    const _payBreakdown = await _calc({
+      timesheetId,
+      workerId: workerProfileId,
+      jobId: timesheet.jobId,
+      hoursWorked: billableHours,
+      hourlyRateCents: timesheet.hourlyRate,
+      clockInTime,
+    });
+    const totalPay = _payBreakdown.totalPayCents;
     const locationAdjustmentReason = hoursAway > 0
       ? `${Math.round(hoursAway * 60)} min deducted for time away from job site (based on location history${pingCount > 0 ? `, ${pingCount} location points)` : ")"}`
       : null;
@@ -10584,7 +10990,16 @@ Respond ONLY in this exact JSON format:
       );
       const billableHours = Math.max(0, rawTotalHours - hoursAway);
       const totalHours = rawTotalHours;
-      const totalPay = Math.round(billableHours * timesheet.hourlyRate);
+      const { calcShiftPayForTimesheet: _calc2 } = await import("./services/wagePayCalc");
+      const _payBreakdown2 = await _calc2({
+        timesheetId,
+        workerId: profile.id,
+        jobId: timesheet.jobId,
+        hoursWorked: billableHours,
+        hourlyRateCents: timesheet.hourlyRate,
+        clockInTime,
+      });
+      const totalPay = _payBreakdown2.totalPayCents;
       const locationAdjustmentReason = hoursAway > 0
         ? `${Math.round(hoursAway * 60)} min deducted for time away from job site (based on location history${pingCount > 0 ? `, ${pingCount} location points)` : ")"}`
         : null;
@@ -10822,6 +11237,42 @@ Respond ONLY in this exact JSON format:
         distanceFromJob: distanceFromJob ? Math.round(distanceFromJob) : null,
         withinGeofence,
       }).returning();
+
+      // GPS spoof detection: pull the worker's last 5 pings on this job and look
+      // for impossible-velocity / teleport / round-coord patterns. Suspect pings
+      // are logged; the active timesheet is flagged "disputed" so a company can review.
+      // (Async — never blocks ping recording.)
+      void (async () => {
+        try {
+          if (!jobId) return;
+          const recent = await db.select().from(locationPings)
+            .where(and(eq(locationPings.workerProfileId, profile.id), eq(locationPings.jobId, jobId)))
+            .orderBy(desc(locationPings.createdAt))
+            .limit(6);
+          if (recent.length < 2) return;
+          const { detectSpoofSignals } = await import("@shared/gpsSpoofDetect");
+          const signals = detectSpoofSignals(recent.reverse().map(p => ({
+            latitude: parseFloat(String(p.latitude)),
+            longitude: parseFloat(String(p.longitude)),
+            timestamp: new Date(p.createdAt!).getTime(),
+            accuracyMeters: p.accuracy ? parseFloat(String(p.accuracy)) : undefined,
+          })));
+          if (signals.length > 0) {
+            console.warn(`[GPSSpoof] worker=${profile.id} job=${jobId} signals=`, signals);
+            const [activeTs] = await db.select().from(timesheets)
+              .where(and(eq(timesheets.workerId, profile.id), eq(timesheets.jobId, jobId), eq(timesheets.status, "pending")))
+              .limit(1);
+            if (activeTs && !activeTs.locationAdjustmentReason?.includes("spoof")) {
+              await db.update(timesheets).set({
+                status: "disputed",
+                locationAdjustmentReason: `GPS spoof signals detected: ${signals.map(s => s.kind).join(", ")}`,
+              }).where(eq(timesheets.id, activeTs.id));
+            }
+          }
+        } catch (e) {
+          console.error("[GPSSpoof] detection error:", e);
+        }
+      })();
 
       // Server-side auto clock-in when ping is within auto geofence and worker is assigned but not yet clocked in
       if (jobId && job && !job.paymentHoldAt && withinGeofence && isWithinGeofence(distanceFromJob ?? Infinity, true)) {
@@ -11636,11 +12087,20 @@ Respond ONLY in this exact JSON format:
             continue;
           }
           
-          // Calculate amounts
+          // Calculate amounts via per-state OT engine.
           const hoursWorked = parseFloat(String(ts.adjustedHours || ts.totalHours)) || 0;
-          const totalPay = Math.round(hoursWorked * ts.hourlyRate);
+          const { calcShiftPayForTimesheet: _calcLegacy } = await import("./services/wagePayCalc");
+          const _payLegacy = await _calcLegacy({
+            timesheetId: ts.id,
+            workerId: ts.workerId,
+            jobId: ts.jobId,
+            hoursWorked,
+            hourlyRateCents: ts.hourlyRate,
+            clockInTime: ts.clockInTime,
+          });
+          const totalPay = _payLegacy.totalPayCents;
           const COMPANY_MARKUP = 1.52;
-          const totalAmount = Math.round(totalPay * COMPANY_MARKUP);
+          const totalAmount = Math.ceil(totalPay * COMPANY_MARKUP);
           const platformFee = totalAmount - totalPay;
           
           console.log(`[AutoApproval] Processing timesheet ${ts.id}: ${hoursWorked}h @ $${(ts.hourlyRate/100).toFixed(2)}/hr = $${(totalPay/100).toFixed(2)} (company pays $${(totalAmount/100).toFixed(2)})`);
@@ -12174,6 +12634,404 @@ Respond ONLY in this exact JSON format:
   });
 
   // Get a single timesheet by ID
+  // === Background check (FCRA-compliant) ===
+  // Three-step flow per FCRA §604(b)(2):
+  //   1. GET /api/background-check/disclosure → returns standalone disclosure text
+  //   2. POST /api/background-check/consent { signatureName } → records consent + auth
+  //   3. POST /api/background-check/order → creates a draft order; vendor adapter
+  //      (not implemented here) takes over to actually procure the report.
+  app.get("/api/background-check/disclosure", async (_req, res) => {
+    const { STANDALONE_DISCLOSURE_TEXT, AUTHORIZATION_TEXT, CURRENT_DISCLOSURE_VERSION, FCRA_SUMMARY_OF_RIGHTS_URL } =
+      await import("./services/backgroundCheck");
+    res.json({
+      version: CURRENT_DISCLOSURE_VERSION,
+      disclosureText: STANDALONE_DISCLOSURE_TEXT,
+      authorizationText: AUTHORIZATION_TEXT,
+      summaryOfRightsUrl: FCRA_SUMMARY_OF_RIGHTS_URL,
+      note: "Per FCRA §604(b)(2), the disclosure document must contain ONLY the disclosure text — no waivers, no other terms. The authorization is a SEPARATE document that you sign after reading the disclosure and the Summary of Rights.",
+    });
+  });
+
+  app.post("/api/background-check/consent", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    const profile = req.profile;
+    if (!profile || profile.role !== "worker") return res.status(403).json({ message: "Worker only" });
+    const { signatureName } = req.body || {};
+    if (!signatureName || typeof signatureName !== "string" || signatureName.trim().length < 3) {
+      return res.status(400).json({ message: "signatureName required (your full legal name)" });
+    }
+    const { recordConsent } = await import("./services/backgroundCheck");
+    const consent = await recordConsent({
+      workerId: profile.id,
+      signatureName: signatureName.trim(),
+      ipAddress: (req.headers["x-forwarded-for"] as string)?.split(",")[0]?.trim() || req.ip,
+      userAgent: req.headers["user-agent"] as string | undefined,
+    });
+    res.status(201).json({ success: true, consent });
+  });
+
+  app.post("/api/background-check/order", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    const profile = req.profile;
+    if (!profile || profile.role !== "worker") return res.status(403).json({ message: "Worker only" });
+    const { latestConsentForWorker, createOrder } = await import("./services/backgroundCheck");
+    const consent = await latestConsentForWorker(profile.id);
+    if (!consent) {
+      return res.status(403).json({
+        message: "No signed disclosure + authorization on file. Sign the disclosure first.",
+        code: "FCRA_CONSENT_REQUIRED",
+      });
+    }
+    const { vendor, packageCode } = req.body || {};
+    if (!vendor) return res.status(400).json({ message: "vendor required" });
+    const order = await createOrder({
+      workerId: profile.id,
+      consentId: consent.id,
+      vendor: String(vendor),
+      packageCode: packageCode ? String(packageCode) : undefined,
+    });
+    res.status(201).json({ success: true, order });
+  });
+
+  // === Admin dispute mediation queue ===
+  // Surfaces all timesheets in 'disputed' state with the rich context an admin
+  // needs to mediate: the timesheet, the worker's location pings, both parties'
+  // notes, and any selfie/photo evidence.
+  app.get("/api/admin/disputes", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    const adminAllow = (process.env.ADMIN_EMAILS || process.env.ADMIN_EMAIL || "cairlbrandon@gmail.com")
+      .split(",").map(e => e.trim().toLowerCase()).filter(Boolean);
+    const userEmail = ((req.user as any)?.claims?.email || "").toLowerCase();
+    if (!adminAllow.includes(userEmail)) return res.status(403).json({ message: "Admin only" });
+
+    const disputes = await db.select().from(timesheets).where(eq(timesheets.status, "disputed")).orderBy(desc(timesheets.createdAt)).limit(200);
+    const enriched = await Promise.all(disputes.map(async (ts) => {
+      const [worker] = await db.select().from(profiles).where(eq(profiles.id, ts.workerId));
+      const [company] = await db.select().from(profiles).where(eq(profiles.id, ts.companyId));
+      const job = await storage.getJob(ts.jobId);
+      const pings = await db.select({
+        id: locationPings.id, latitude: locationPings.latitude, longitude: locationPings.longitude,
+        accuracy: locationPings.accuracy, distanceFromJob: locationPings.distanceFromJob,
+        withinGeofence: locationPings.withinGeofence, source: locationPings.source, createdAt: locationPings.createdAt,
+      }).from(locationPings).where(and(
+        eq(locationPings.workerProfileId, ts.workerId),
+        eq(locationPings.jobId, ts.jobId),
+      )).orderBy(desc(locationPings.createdAt)).limit(50);
+      return { timesheet: ts, worker, company, job, pings };
+    }));
+    res.json(enriched);
+  });
+
+  // Admin resolves a dispute. action: "approve_full" | "approve_partial" | "reject".
+  // approve_partial requires adjustedHours.
+  app.patch("/api/admin/disputes/:id/resolve", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    const adminAllow = (process.env.ADMIN_EMAILS || process.env.ADMIN_EMAIL || "cairlbrandon@gmail.com")
+      .split(",").map(e => e.trim().toLowerCase()).filter(Boolean);
+    const userEmail = ((req.user as any)?.claims?.email || "").toLowerCase();
+    if (!adminAllow.includes(userEmail)) return res.status(403).json({ message: "Admin only" });
+    const id = Number(req.params.id);
+    const { action, adjustedHours, reasoning } = req.body || {};
+    if (!["approve_full", "approve_partial", "reject"].includes(action)) {
+      return res.status(400).json({ message: 'action must be approve_full | approve_partial | reject' });
+    }
+    if (!reasoning || typeof reasoning !== "string" || reasoning.trim().length < 30) {
+      return res.status(400).json({ message: "reasoning (≥30 chars) required for the audit log" });
+    }
+
+    const ts = await storage.getTimesheet(id);
+    if (!ts) return res.status(404).json({ message: "Timesheet not found" });
+    if (ts.status !== "disputed") return res.status(409).json({ message: "Only disputed timesheets can be mediated" });
+
+    if (action === "reject") {
+      await storage.updateTimesheet(id, {
+        status: "rejected",
+        rejectionReason: `[Admin mediation] ${reasoning.trim()}`,
+      });
+    } else {
+      const finalHours = action === "approve_partial" && adjustedHours != null
+        ? Math.max(0, parseFloat(String(adjustedHours)))
+        : parseFloat(String(ts.totalHours ?? "0"));
+      const { calcShiftPayForTimesheet: _calc } = await import("./services/wagePayCalc");
+      const pay = await _calc({
+        timesheetId: ts.id,
+        workerId: ts.workerId,
+        jobId: ts.jobId,
+        hoursWorked: finalHours,
+        hourlyRateCents: ts.hourlyRate,
+        clockInTime: ts.clockInTime,
+      });
+      await storage.updateTimesheet(id, {
+        status: "approved",
+        adjustedHours: String(finalHours),
+        totalPay: pay.totalPayCents,
+        approvedAt: new Date(),
+        companyNotes: `[Admin mediation by ${userEmail}] ${reasoning.trim()}`,
+      });
+    }
+
+    await storage.logAdminActivity({
+      adminEmail: userEmail,
+      action: `dispute_${action}`,
+      entityType: "timesheet",
+      entityId: id,
+      details: { adjustedHours, reasoning },
+    });
+
+    res.json({ success: true });
+  });
+
+  // === Time-clock selfie verification ===
+  // Worker captures a selfie at clock-in / clock-out. URL is uploaded via the
+  // existing object-storage upload flow; this endpoint just attaches it to the
+  // timesheet. matchScore (0.0–1.0) is OPTIONAL — if a face-match service is
+  // configured (AWS Rekognition / Persona), the client can include the score
+  // returned by that service. Below 0.85 flags the timesheet for company review.
+  app.post("/api/timesheets/:id/selfie", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    const id = Number(req.params.id);
+    const profile = req.profile;
+    if (!profile) return res.status(403).json({ message: "Forbidden" });
+    const ts = await storage.getTimesheet(id);
+    if (!ts) return res.status(404).json({ message: "Timesheet not found" });
+    if (ts.workerId !== profile.id) return res.status(403).json({ message: "You can only attach selfies to your own timesheets" });
+    const { selfieUrl, when, matchScore } = req.body || {};
+    if (!selfieUrl || typeof selfieUrl !== "string") return res.status(400).json({ message: "selfieUrl required" });
+    if (when !== "clock_in" && when !== "clock_out") return res.status(400).json({ message: 'when must be "clock_in" or "clock_out"' });
+    const updates: any = {};
+    if (when === "clock_in") {
+      updates.clockInSelfieUrl = selfieUrl;
+      if (typeof matchScore === "number") updates.clockInSelfieMatchScore = String(Math.max(0, Math.min(1, matchScore)));
+    } else {
+      updates.clockOutSelfieUrl = selfieUrl;
+      if (typeof matchScore === "number") updates.clockOutSelfieMatchScore = String(Math.max(0, Math.min(1, matchScore)));
+    }
+    // Low-confidence match auto-flags as disputed for company review.
+    if (typeof matchScore === "number" && matchScore < 0.85) {
+      updates.status = "disputed";
+      updates.locationAdjustmentReason = `Selfie face-match score ${matchScore.toFixed(2)} below threshold (0.85). Possible buddy-punch.`;
+    }
+    await db.update(timesheets).set(updates).where(eq(timesheets.id, id));
+    res.json({ success: true, flagged: typeof matchScore === "number" && matchScore < 0.85 });
+  });
+
+  // === Safety incident reports (OSHA 300/301-style) ===
+  // Workers and companies can both file. The incident is associated with the
+  // worksite job (and timesheet, if active) so it surfaces in both parties' records.
+  // 29 CFR §1904.7 recordability is auto-flagged based on severity; admins
+  // confirm before filing with OSHA.
+  app.post("/api/safety-incidents", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    const profile = req.profile;
+    if (!profile) return res.status(403).json({ message: "Forbidden" });
+    try {
+      const {
+        jobId, timesheetId, occurredAt, description, bodyParts, injuryType, severity,
+        latitude, longitude, locationDescription, photoUrls, witnessNames,
+        treatedAt, daysAway, daysRestricted, workerProfileId,
+      } = req.body || {};
+      if (!occurredAt || !description || !injuryType || !severity) {
+        return res.status(400).json({ message: "occurredAt, description, injuryType, severity are required" });
+      }
+      // Recordability per 29 CFR §1904.7: medical_treatment, restricted_duty, days_away, fatality.
+      const oshaRecordable = ["medical_treatment", "restricted_duty", "days_away", "fatality"].includes(severity);
+
+      // Resolve worker + company links (worker filing on themselves, or company filing on a worker)
+      const resolvedWorkerProfileId = profile.role === "worker" ? profile.id : (workerProfileId ?? null);
+      const job = jobId ? await storage.getJob(jobId) : null;
+      const resolvedCompanyProfileId = job?.companyId ?? (profile.role === "company" ? profile.id : null);
+
+      const [row] = await db.insert(safetyIncidents).values({
+        jobId: jobId ?? null,
+        timesheetId: timesheetId ?? null,
+        reporterProfileId: profile.id,
+        workerProfileId: resolvedWorkerProfileId,
+        companyProfileId: resolvedCompanyProfileId,
+        occurredAt: new Date(occurredAt),
+        description: String(description).slice(0, 5000),
+        bodyParts: Array.isArray(bodyParts) ? bodyParts : null,
+        injuryType,
+        severity,
+        latitude: latitude != null ? String(latitude) : null,
+        longitude: longitude != null ? String(longitude) : null,
+        locationDescription: locationDescription ? String(locationDescription).slice(0, 500) : null,
+        photoUrls: Array.isArray(photoUrls) ? photoUrls : null,
+        witnessNames: Array.isArray(witnessNames) ? witnessNames : null,
+        treatedAt: treatedAt ? String(treatedAt).slice(0, 200) : null,
+        daysAway: typeof daysAway === "number" ? daysAway : 0,
+        daysRestricted: typeof daysRestricted === "number" ? daysRestricted : 0,
+        oshaRecordable,
+        status: "new",
+      }).returning();
+
+      res.status(201).json({ success: true, incident: row, oshaRecordable });
+    } catch (err: any) {
+      console.error("[SafetyIncidents/Create]", err);
+      res.status(500).json({ message: err.message || "Failed to file incident" });
+    }
+  });
+
+  // List incidents — company sees their own jobsites, worker sees their own,
+  // admin sees all.
+  app.get("/api/safety-incidents", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    const profile = req.profile;
+    if (!profile) return res.status(403).json({ message: "Forbidden" });
+    const adminAllow = (process.env.ADMIN_EMAILS || process.env.ADMIN_EMAIL || "cairlbrandon@gmail.com")
+      .split(",").map(e => e.trim().toLowerCase()).filter(Boolean);
+    const userEmail = ((req.user as any)?.claims?.email || "").toLowerCase();
+    const isAdmin = adminAllow.includes(userEmail);
+    let rows;
+    if (isAdmin) {
+      rows = await db.select().from(safetyIncidents).orderBy(desc(safetyIncidents.occurredAt)).limit(500);
+    } else if (profile.role === "company") {
+      rows = await db.select().from(safetyIncidents).where(eq(safetyIncidents.companyProfileId, profile.id)).orderBy(desc(safetyIncidents.occurredAt));
+    } else {
+      rows = await db.select().from(safetyIncidents).where(eq(safetyIncidents.workerProfileId, profile.id)).orderBy(desc(safetyIncidents.occurredAt));
+    }
+    res.json(rows);
+  });
+
+  // Admin updates incident status / OSHA case number after filing.
+  app.patch("/api/admin/safety-incidents/:id", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    const adminAllow = (process.env.ADMIN_EMAILS || process.env.ADMIN_EMAIL || "cairlbrandon@gmail.com")
+      .split(",").map(e => e.trim().toLowerCase()).filter(Boolean);
+    const userEmail = ((req.user as any)?.claims?.email || "").toLowerCase();
+    if (!adminAllow.includes(userEmail)) return res.status(403).json({ message: "Admin only" });
+    const id = Number(req.params.id);
+    const { status, resolvedNotes, oshaReported, oshaCaseNumber } = req.body || {};
+    const updates: any = {};
+    if (status) updates.status = status;
+    if (resolvedNotes != null) updates.resolvedNotes = String(resolvedNotes);
+    if (status === "closed") { updates.resolvedAt = new Date(); updates.resolvedBy = userEmail; }
+    if (oshaReported === true) { updates.oshaReported = true; updates.oshaReportedAt = new Date(); }
+    if (oshaCaseNumber != null) updates.oshaCaseNumber = String(oshaCaseNumber);
+    await db.update(safetyIncidents).set(updates).where(eq(safetyIncidents.id, id));
+    res.json({ success: true });
+  });
+
+  // Worker logs a meal or rest break taken during a shift. CA §512 requires this
+  // be tracked. Companies cannot edit; only the worker can log their own breaks.
+  app.post("/api/timesheets/:id/log-break", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    const id = Number(req.params.id);
+    const profile = req.profile;
+    if (!profile) return res.status(403).json({ message: "Forbidden" });
+    const ts = await storage.getTimesheet(id);
+    if (!ts) return res.status(404).json({ message: "Timesheet not found" });
+    if (ts.workerId !== profile.id) return res.status(403).json({ message: "You can only log breaks on your own timesheets" });
+    if (ts.status !== "pending") return res.status(409).json({ message: "Cannot edit breaks on a finalized timesheet" });
+
+    const { kind, durationMinutes, waiveMeal } = req.body || {};
+    if (waiveMeal === true) {
+      await db.update(timesheets).set({ mealBreakWaived: true }).where(eq(timesheets.id, id));
+      return res.json({ success: true, mealBreakWaived: true });
+    }
+    if (kind === "meal") {
+      const dur = Math.max(0, Math.min(120, Number(durationMinutes) || 30));
+      await db.update(timesheets).set({
+        mealBreaksTakenMinutes: (ts.mealBreaksTakenMinutes ?? 0) + dur,
+      }).where(eq(timesheets.id, id));
+      return res.json({ success: true, totalMealBreakMinutes: (ts.mealBreaksTakenMinutes ?? 0) + dur });
+    }
+    if (kind === "rest") {
+      await db.update(timesheets).set({
+        restBreaksTakenCount: (ts.restBreaksTakenCount ?? 0) + 1,
+      }).where(eq(timesheets.id, id));
+      return res.json({ success: true, totalRestBreaks: (ts.restBreaksTakenCount ?? 0) + 1 });
+    }
+    return res.status(400).json({ message: 'kind must be "meal" or "rest", or set waiveMeal=true.' });
+  });
+
+  // Returns break-compliance status for the worker's currently-active timesheet:
+  // whether a meal break is required by their state, when they should take it,
+  // and whether they're currently in violation. Client uses this to show
+  // an in-shift prompt at the 4h / 5h mark.
+  app.get("/api/timesheets/:id/break-status", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    const id = Number(req.params.id);
+    const profile = req.profile;
+    if (!profile) return res.status(403).json({ message: "Forbidden" });
+    const ts = await storage.getTimesheet(id);
+    if (!ts) return res.status(404).json({ message: "Timesheet not found" });
+    if (ts.workerId !== profile.id && ts.companyId !== profile.id) return res.status(403).json({ message: "Unauthorized" });
+    const job = await storage.getJob(ts.jobId);
+    const elapsedMs = (ts.clockOutTime ? new Date(ts.clockOutTime) : new Date()).getTime() - new Date(ts.clockInTime).getTime();
+    const hoursWorked = Math.max(0, elapsedMs / 3_600_000);
+    const { evaluateBreakCompliance } = await import("@shared/mealRestBreaks");
+    const result = evaluateBreakCompliance({
+      hoursWorked,
+      state: job?.state ?? null,
+      mealBreaksTakenMinutes: ts.mealBreaksTakenMinutes ?? 0,
+      restBreaksTakenCount: ts.restBreaksTakenCount ?? 0,
+      mealBreakWaived: ts.mealBreakWaived ?? false,
+      hourlyRateCents: ts.hourlyRate,
+    });
+    res.json({
+      hoursWorked: Number(hoursWorked.toFixed(2)),
+      ...result,
+    });
+  });
+
+  // Wage theft prevention notice — required by CA Labor Code §2810.5,
+  // NY Labor Law §195.1, WA RCW 49.46, and MA G.L. c.149 §148B at the start
+  // of any engagement. Generated per (job, worker) pair from the live job +
+  // company + worker data so signatures map to a specific shift.
+  app.get("/api/jobs/:jobId/workers/:workerId/wage-notice", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).send("Unauthorized");
+    const jobId = Number(req.params.jobId);
+    const workerId = Number(req.params.workerId);
+    if (!Number.isFinite(jobId) || !Number.isFinite(workerId)) return res.status(400).send("Bad ids");
+    const profile = req.profile;
+    if (!profile) return res.status(403).send("Forbidden");
+    // Auth: worker themselves OR the company posting the job.
+    const job = await storage.getJob(jobId);
+    if (!job) return res.status(404).send("Job not found");
+    const isCompanyOwner = profile.id === job.companyId;
+    const isWorker = profile.id === workerId;
+    if (!isCompanyOwner && !isWorker) return res.status(403).send("Unauthorized");
+
+    const { buildWageTheftNoticeHtml } = await import("./services/wageTheftNotice");
+    const html = await buildWageTheftNoticeHtml({ jobId, workerId });
+    if (!html) return res.status(404).send("Notice could not be generated");
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.setHeader("Cache-Control", "private, no-cache");
+    res.send(html);
+  });
+
+  // Itemized wage statement (CA Labor Code §226 / NY 195.3 layout). Returns
+  // printable HTML so workers can save/print at any time. Auth-checked the
+  // same way as the timesheet itself: only the worker, company owner, or
+  // company team member can view.
+  app.get("/api/timesheets/:id/wage-statement", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).send("Unauthorized");
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) return res.status(400).send("Bad timesheet id");
+    const ts = await storage.getTimesheet(id);
+    if (!ts) return res.status(404).send("Timesheet not found");
+    const profile = req.profile;
+    if (!profile) return res.status(403).send("Unauthorized");
+    const isOwner = profile.id === ts.companyId;
+    const isWorker = profile.id === ts.workerId;
+    let isTeamMember = false;
+    if (!isOwner && !isWorker) {
+      const [tm] = await db.select().from(companyTeamMembers).where(and(
+        eq(companyTeamMembers.companyProfileId, ts.companyId),
+        eq(companyTeamMembers.userId, profile.userId!),
+        eq(companyTeamMembers.isActive, true),
+      )).limit(1);
+      isTeamMember = !!tm;
+    }
+    if (!isOwner && !isWorker && !isTeamMember) return res.status(403).send("Unauthorized");
+    const { buildWageStatementHtml } = await import("./services/wageStatement");
+    const html = await buildWageStatementHtml({ timesheetId: id, workerView: isWorker });
+    if (!html) return res.status(404).send("Wage statement could not be generated");
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.setHeader("Cache-Control", "private, no-cache");
+    res.send(html);
+  });
+
   app.get("/api/timesheets/:id", async (req, res) => {
     if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
     
@@ -12504,7 +13362,17 @@ Respond ONLY in this exact JSON format:
     const originalHours = timesheet.totalHours ?? "0";
     const finalHours = adjustedHours ?? timesheet.adjustedHours ?? timesheet.totalHours ?? "0";
     const hoursNum = parseFloat(String(finalHours)) || 0;
-    const totalPay = Math.round(hoursNum * timesheet.hourlyRate);
+    // Per-state OT engine (CA daily/double-time, FLSA weekly, 7th-day premium).
+    const { calcShiftPayForTimesheet: _calcShiftPay } = await import("./services/wagePayCalc");
+    const _payBreakdown = await _calcShiftPay({
+      timesheetId: timesheet.id,
+      workerId: timesheet.workerId,
+      jobId: timesheet.jobId,
+      hoursWorked: hoursNum,
+      hourlyRateCents: timesheet.hourlyRate,
+      clockInTime: timesheet.clockInTime,
+    });
+    const totalPay = _payBreakdown.totalPayCents;
     const wasEdited = adjustedHours && parseFloat(adjustedHours) !== parseFloat(String(originalHours));
     if (wasEdited) {
       const notes = typeof companyNotes === "string" ? companyNotes.trim() : "";
@@ -14243,6 +15111,132 @@ Respond ONLY in this exact JSON format:
     }
   });
 
+  // Admin: 1099-NEC reportable workers for a given year. Returns the canonical
+  // list of contractors paid >= $600 in the year, ready for hand-off to
+  // Track1099 / Stripe Tax Reporting / direct IRS e-file.
+  // (Authed via the same ADMIN_EMAILS path-based check used by other admin routes.)
+  app.get("/api/admin/tax/1099-reportable", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    const userEmail = ((req.user as any)?.claims?.email || "").toLowerCase();
+    const adminAllow = (process.env.ADMIN_EMAILS || process.env.ADMIN_EMAIL || "cairlbrandon@gmail.com")
+      .split(",").map(e => e.trim().toLowerCase()).filter(Boolean);
+    if (!adminAllow.includes(userEmail)) return res.status(403).json({ message: "Admin only" });
+    const year = parseInt(String(req.query.year || new Date().getFullYear()), 10);
+    if (!Number.isFinite(year) || year < 2020 || year > 2100) {
+      return res.status(400).json({ message: "Bad year" });
+    }
+    const { aggregate1099Reportable, IRS_1099_NEC_THRESHOLD_CENTS } = await import("./services/tax1099");
+    const all = await aggregate1099Reportable({ year });
+    const reportable = all.filter(r => r.reportable);
+    const total = reportable.reduce((s, r) => s + r.totalPaidCents, 0);
+    res.json({
+      year,
+      thresholdCents: IRS_1099_NEC_THRESHOLD_CENTS,
+      thresholdUsd: IRS_1099_NEC_THRESHOLD_CENTS / 100,
+      reportableCount: reportable.length,
+      reportableTotalCents: total,
+      reportableTotalUsd: total / 100,
+      missingW9Count: reportable.filter(r => !r.hasW9).length,
+      reportable,
+      belowThreshold: all.filter(r => !r.reportable),
+    });
+  });
+
+  // Worker → company review (two-sided marketplace ratings).
+  // Lets workers rate the company, surfacing bad-actor companies before other
+  // workers accept their jobs. Re-uses the same `reviews` table with the columns
+  // remapped: qualityRating=jobAccuracy, punctualityRating=paymentTimeliness,
+  // communicationRating=communication, effortRating=safety.
+  app.post("/api/reviews/company", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    try {
+      const { companyId, jobId, jobAccuracy, paymentTimeliness, communication, safety, comment } = req.body || {};
+      if (!companyId || !jobId) return res.status(400).json({ message: "companyId and jobId are required" });
+
+      const profile = req.profile;
+      if (!profile || profile.role !== "worker") {
+        return res.status(403).json({ message: "Only workers can review companies via this endpoint" });
+      }
+
+      // Verify the worker actually worked this job — prevents review-bombing.
+      const [tsRow] = await db.select({ id: timesheets.id })
+        .from(timesheets)
+        .where(and(
+          eq(timesheets.jobId, jobId),
+          eq(timesheets.workerId, profile.id),
+          inArray(timesheets.status, ["approved", "rejected", "disputed"]),
+        ))
+        .limit(1);
+      if (!tsRow) {
+        return res.status(403).json({ message: "You can only review companies for jobs you've worked." });
+      }
+
+      const parseR = (v: any): number => {
+        const n = Number(v);
+        return !isNaN(n) && n >= 1 && n <= 5 ? Math.round(n) : 0;
+      };
+      const r1 = parseR(jobAccuracy), r2 = parseR(paymentTimeliness), r3 = parseR(communication), r4 = parseR(safety);
+      if (r1 === 0 || r2 === 0 || r3 === 0 || r4 === 0) {
+        return res.status(400).json({ message: "All four ratings must be 1–5." });
+      }
+      const overall = Math.round((r1 + r2 + r3 + r4) / 4);
+
+      const existing = await db.select()
+        .from(reviews)
+        .where(and(eq(reviews.jobId, jobId), eq(reviews.reviewerId, profile.id), eq(reviews.revieweeId, companyId)))
+        .limit(1);
+
+      if (existing.length > 0) {
+        await db.update(reviews).set({
+          rating: overall, qualityRating: r1, punctualityRating: r2,
+          communicationRating: r3, effortRating: r4, comment: comment || null,
+        }).where(eq(reviews.id, existing[0].id));
+      } else {
+        await db.insert(reviews).values({
+          jobId, reviewerId: profile.id, revieweeId: companyId,
+          rating: overall, qualityRating: r1, punctualityRating: r2,
+          communicationRating: r3, effortRating: r4, comment: comment || null,
+        });
+      }
+
+      const allCompanyReviews = await db.select().from(reviews).where(eq(reviews.revieweeId, companyId));
+      const cnt = allCompanyReviews.length;
+      const avg = cnt > 0 ? allCompanyReviews.reduce((s, r) => s + r.rating, 0) / cnt : 0;
+      await db.update(profiles).set({ averageRating: avg.toFixed(2), totalReviews: cnt }).where(eq(profiles.id, companyId));
+
+      res.json({ success: true, rating: overall, newAverageRating: parseFloat(avg.toFixed(2)), totalReviews: cnt });
+    } catch (err: any) {
+      console.error("[Reviews/Company]", err);
+      res.status(500).json({ message: err.message || "Review failed" });
+    }
+  });
+
+  // Public-ish (auth required) company aggregate rating.
+  app.get("/api/companies/:companyId/rating", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    const companyId = Number(req.params.companyId);
+    if (!Number.isFinite(companyId)) return res.status(400).json({ message: "Bad companyId" });
+    const allReviews = await db.select().from(reviews).where(eq(reviews.revieweeId, companyId));
+    const workerSubmittedOnly = allReviews.filter(r => r.reviewerId != null);
+    const cnt = workerSubmittedOnly.length;
+    const avg = cnt > 0 ? workerSubmittedOnly.reduce((s, r) => s + r.rating, 0) / cnt : 0;
+    const avgN = (arr: (number | null)[]) => {
+      const filt = arr.filter((v): v is number => v != null);
+      return filt.length === 0 ? null : parseFloat((filt.reduce((s, n) => s + n, 0) / filt.length).toFixed(2));
+    };
+    res.json({
+      companyId,
+      totalReviews: cnt,
+      averageRating: cnt > 0 ? parseFloat(avg.toFixed(2)) : null,
+      breakdown: {
+        jobAccuracy: avgN(workerSubmittedOnly.map(r => r.qualityRating)),
+        paymentTimeliness: avgN(workerSubmittedOnly.map(r => r.punctualityRating)),
+        communication: avgN(workerSubmittedOnly.map(r => r.communicationRating)),
+        safety: avgN(workerSubmittedOnly.map(r => r.effortRating)),
+      },
+    });
+  });
+
   // Get reviews for a worker (legacy endpoint)
   app.get("/api/workers/:workerId/reviews", async (req, res) => {
     try {
@@ -14769,6 +15763,57 @@ Respond ONLY in this exact JSON format:
       console.error("Admin issue strike error:", err);
       res.status(500).json({ message: err.message });
     }
+  });
+
+  // Worker submits an appeal of a strike. Right of contestation — workers should
+  // be able to push back before a strike permanently affects matching/payout eligibility.
+  // Appeal text becomes part of the audit trail.
+  app.post("/api/strikes/:id/appeal", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    const profile = req.profile;
+    if (!profile || profile.role !== "worker") return res.status(403).json({ message: "Worker only" });
+    const strikeId = Number(req.params.id);
+    const { appealText } = req.body || {};
+    if (!appealText || typeof appealText !== "string" || appealText.trim().length < 30) {
+      return res.status(400).json({ message: "Appeal must include at least 30 characters explaining your side." });
+    }
+    const [strike] = await db.select().from(adminStrikes).where(eq(adminStrikes.id, strikeId));
+    if (!strike) return res.status(404).json({ message: "Strike not found" });
+    if (strike.workerId !== profile.id) return res.status(403).json({ message: "You can only appeal your own strikes" });
+    if (strike.appealStatus && strike.appealStatus !== "none") {
+      return res.status(409).json({ message: "Appeal already submitted for this strike", currentStatus: strike.appealStatus });
+    }
+    await db.update(adminStrikes).set({
+      appealStatus: "submitted",
+      appealSubmittedAt: new Date(),
+      appealText: appealText.trim(),
+    }).where(eq(adminStrikes.id, strikeId));
+    res.json({ success: true, status: "submitted", message: "Appeal submitted. An admin will review within 5 business days." });
+  });
+
+  // Admin reviews/decides an appeal.
+  app.patch("/api/admin/strikes/:id/appeal", requireAdmin, async (req, res) => {
+    const strikeId = Number(req.params.id);
+    const { decision, notes } = req.body || {};
+    if (!["upheld", "overturned"].includes(decision)) {
+      return res.status(400).json({ message: 'decision must be "upheld" or "overturned"' });
+    }
+    const adminEmail = getAdminEmail(req) || ADMIN_EMAILS[0];
+    const [strike] = await db.select().from(adminStrikes).where(eq(adminStrikes.id, strikeId));
+    if (!strike) return res.status(404).json({ message: "Strike not found" });
+    await db.update(adminStrikes).set({
+      appealStatus: decision,
+      appealDecisionAt: new Date(),
+      appealDecidedBy: adminEmail,
+      appealDecisionNotes: typeof notes === "string" ? notes : null,
+      // Overturning a strike also resolves it.
+      ...(decision === "overturned" ? { isActive: false, resolvedAt: new Date(), resolvedBy: adminEmail, resolvedNotes: `Overturned on appeal: ${notes ?? ""}` } : {}),
+    }).where(eq(adminStrikes.id, strikeId));
+    await storage.logAdminActivity({
+      adminEmail, action: `appeal_${decision}`, entityType: "worker",
+      entityId: strike.workerId, details: { strikeId, notes },
+    });
+    res.json({ success: true, decision });
   });
 
   // Resolve strike

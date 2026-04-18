@@ -1,6 +1,11 @@
 // Load env before any other server code (so db.ts sees DATABASE_URL)
 import "./env-loader";
 
+// Sentry must be required as early as possible so it can hook the runtime
+// before any other module wraps async/error-handling primitives.
+import { initSentry, Sentry } from "./observability/sentry";
+initSentry();
+
 // Suppress PostCSS "from option" warning (harmless; printed by plugins during Vite transform)
 const _stderrWrite = process.stderr.write.bind(process.stderr);
 process.stderr.write = (chunk: any, enc?: any, cb?: any) => {
@@ -181,12 +186,49 @@ const authLimiter = rateLimit({
 app.use("/api/auth", authLimiter);
 app.use("/api/login", authLimiter);
 
-// Security headers
+// Security headers + Content-Security-Policy.
+//
+// CSP is intentionally permissive on script-src/img-src to keep Stripe, Google
+// Maps, Firebase Cloud Messaging, and Resend trackers working without
+// rebuilding nonce infra. The strict pieces — frame-ancestors, base-uri,
+// form-action, object-src — block the common XSS / clickjacking attack
+// surface. Tighten further in a follow-up by switching to a nonce-based CSP
+// once Vite SSR/streaming HTML support lands.
 app.use((req, res, next) => {
   res.setHeader("X-Content-Type-Options", "nosniff");
   res.setHeader("X-Frame-Options", "SAMEORIGIN");
   res.setHeader("X-XSS-Protection", "1; mode=block");
   res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
+  res.setHeader("Cross-Origin-Opener-Policy", "same-origin-allow-popups"); // Stripe redirect popups need allow-popups
+  res.setHeader("Cross-Origin-Resource-Policy", "same-site");
+
+  // HSTS: 1 year + subdomains + preload-eligible. Only emit in production over HTTPS.
+  if (process.env.NODE_ENV === "production") {
+    res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains; preload");
+  }
+
+  // CSP — start in report-only mode so we observe violations before enforcing.
+  // Flip to "Content-Security-Policy" header (without "-Report-Only" suffix)
+  // after a 1-week monitoring window confirms no false positives.
+  const csp = [
+    "default-src 'self'",
+    "script-src 'self' 'unsafe-inline' 'unsafe-eval' https://js.stripe.com https://*.stripe.com https://*.googleapis.com https://maps.gstatic.com https://www.google.com https://www.gstatic.com https://*.firebaseio.com https://*.firebasedatabase.app",
+    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+    "font-src 'self' data: https://fonts.gstatic.com",
+    "img-src 'self' data: blob: https: https://*.googleusercontent.com https://*.gstatic.com",
+    "media-src 'self' blob: https:",
+    "connect-src 'self' https://api.stripe.com https://r.stripe.com https://*.googleapis.com https://maps.googleapis.com https://*.firebaseio.com https://*.firebasedatabase.app https://*.cloudfunctions.net https://api.resend.com https://api.openai.com https://ipapi.co wss://*.tolstoystaffing.com",
+    "frame-src 'self' https://js.stripe.com https://hooks.stripe.com https://*.stripe.com",
+    "frame-ancestors 'self'",
+    "base-uri 'self'",
+    "form-action 'self' https://api.stripe.com",
+    "object-src 'none'",
+    "worker-src 'self' blob:",
+    "manifest-src 'self'",
+    "upgrade-insecure-requests",
+  ].join("; ");
+  res.setHeader("Content-Security-Policy-Report-Only", csp);
+
   next();
 });
 
@@ -208,6 +250,54 @@ app.use((req, res, next) => {
   // This prevents browser warnings about unrecognized features
   res.setHeader('Permissions-Policy', permissionsPolicy);
   next();
+});
+
+// Apex → app subdomain redirect for app/auth routes.
+// Marketing pages (/, /about, /jobs, etc.) and static assets stay on apex.
+// Everything else (login, dashboards, chats, onboarding, /api/*) lives on app.*.
+const APP_ONLY_PATH_PREFIXES = [
+  "/login",
+  "/reset-password",
+  "/dashboard",
+  "/company-dashboard",
+  "/post-job",
+  "/accepted-job",
+  "/chats",
+  "/onboarding",
+  "/worker-onboarding",
+  "/company-onboarding",
+  "/affiliate-onboarding",
+  "/affiliate-dashboard",
+  "/admin",
+  "/company/join",
+  "/team/join",
+  "/team/onboard",
+  "/api/", // all API calls go to app.* so cookies + CORS stay coherent
+];
+const APEX_HOSTS = new Set(["tolstoystaffing.com", "www.tolstoystaffing.com"]);
+const APP_HOST = "app.tolstoystaffing.com";
+// Endpoints that MUST resolve on either host (no redirect).
+//   - webhooks: 308 would drop the signed POST body
+//   - public health/status: external monitors and uptime checkers hit apex
+//   - one-click unsubscribe: must be reachable from any email-rendering MUA
+const APEX_REDIRECT_EXEMPT_PREFIXES = [
+  "/api/webhooks/",
+  "/api/health",
+  "/api/status",
+  "/api/email/unsubscribe",
+];
+app.use((req, res, next) => {
+  if (process.env.NODE_ENV !== "production") return next();
+  const host = String(req.headers.host || "").toLowerCase().split(":")[0];
+  if (!APEX_HOSTS.has(host)) return next();
+  const path = req.path;
+  if (APEX_REDIRECT_EXEMPT_PREFIXES.some((p) => path === p || path.startsWith(p))) return next();
+  const isAppPath = APP_ONLY_PATH_PREFIXES.some(
+    (p) => path === p || path.startsWith(p === "/api/" ? p : `${p}/`) || path === p,
+  );
+  if (!isAppPath) return next();
+  const target = `https://${APP_HOST}${req.originalUrl}`;
+  return res.redirect(308, target);
 });
 
 export function log(message: string, source = "express") {
@@ -250,10 +340,12 @@ app.use((req, res, next) => {
 // Keep process alive on background-job promise failures; log and continue serving requests.
 process.on("unhandledRejection", (reason) => {
   console.error("[Process] Unhandled promise rejection:", reason);
+  Sentry.captureException(reason);
 });
 
 process.on("uncaughtException", (error) => {
   console.error("[Process] Uncaught exception:", error);
+  Sentry.captureException(error);
 });
 
 (async () => {
@@ -292,6 +384,8 @@ process.on("uncaughtException", (error) => {
 
   registerSeoRoutes(app);
   await registerRoutes(httpServer, app);
+
+  Sentry.setupExpressErrorHandler(app);
 
   app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
     const status = err.status || err.statusCode || 500;

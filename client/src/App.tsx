@@ -40,6 +40,7 @@ import JoinTeam from "@/pages/JoinTeam";
 import JoinWorkerTeam from "@/pages/JoinWorkerTeam";
 import TeamOnboard from "@/pages/TeamOnboard";
 import AdminDashboard from "@/pages/AdminDashboard";
+import AdminCompliance from "@/pages/admin/AdminCompliance";
 import AcceptedJobPage from "@/pages/AcceptedJobPage";
 import ChatsPage from "@/pages/ChatsPage";
 import NotificationsCenter from "@/pages/NotificationsCenter";
@@ -55,6 +56,7 @@ import Press from "@/pages/Press";
 import TermsOfServicePublic from "@/pages/legal/TermsOfService";
 import PrivacyPolicyPublic from "@/pages/legal/PrivacyPolicy";
 import Legal from "@/pages/legal/Legal";
+import Subprocessors from "@/pages/legal/Subprocessors";
 import Support from "@/pages/Support";
 import ContactUs from "@/pages/ContactUs";
 import ForServiceProfessionals from "@/pages/ForServiceProfessionals";
@@ -62,12 +64,14 @@ import ForAffiliates from "@/pages/ForAffiliates";
 import AffiliateOnboarding from "@/pages/AffiliateOnboarding";
 import AffiliateDashboard from "@/pages/AffiliateDashboard";
 import HowTimeKeepingWorks from "@/pages/HowTimeKeepingWorks";
+import StatusPage from "@/pages/StatusPage";
 import { WorkerOnboardingRequiredModal } from "@/components/WorkerOnboardingRequiredModal";
 import { WorkerLocationRequiredModal } from "@/components/WorkerLocationRequiredModal";
 import { IncomingCallPopup } from "@/components/IncomingCallPopup";
 import { DevServerStatus } from "@/components/DevServerStatus";
 import { ImpersonationBanner } from "@/components/ImpersonationBanner";
 import { CombinedGlobalBanners } from "@/components/CombinedGlobalBanners";
+import { CookieConsent } from "@/components/CookieConsent";
 import { TimesheetApprovalInvoiceProvider } from "@/contexts/TimesheetApprovalInvoiceContext";
 
 // Protected Route Wrapper
@@ -291,6 +295,9 @@ function Router() {
       <Route path="/terms" component={TermsOfServicePublic} />
       <Route path="/privacy" component={PrivacyPolicyPublic} />
       <Route path="/legal" component={Legal} />
+      <Route path="/legal/subprocessors" component={Subprocessors} />
+      <Route path="/subprocessors" component={Subprocessors} />
+      <Route path="/status" component={StatusPage} />
       <Route path="/support" component={Support} />
       <Route path="/contact" component={ContactUs} />
       <Route path="/for-service-professionals" component={ForServiceProfessionals} />
@@ -310,7 +317,10 @@ function Router() {
       </Route>
       <Route path="/how-time-keeping-works" component={HowTimeKeepingWorks} />
       
-      {/* Admin Route */}
+      {/* Admin Routes */}
+      <Route path="/admin/compliance">
+        {() => <ProtectedRoute component={AdminCompliance} />}
+      </Route>
       <Route path="/admin">
         {() => <ProtectedRoute component={AdminDashboard} />}
       </Route>
@@ -336,6 +346,7 @@ function AppContent() {
         {/* Skip WorkerOnboardingRequiredModal on worker-onboarding to avoid Radix Presence max update depth */}
         {!isWorkerOnboarding && <WorkerOnboardingRequiredModal />}
         <WorkerLocationRequiredModal />
+        <CookieConsent />
         <Router />
       </TimesheetApprovalInvoiceProvider>
     </TooltipProvider>

@@ -1,8 +1,17 @@
 import session from "express-session";
 import connectPg from "connect-pg-simple";
 
-/** Session duration: 10 years (stay logged in; no auto logout). In seconds for expires_at. */
-export const SESSION_TTL_SECONDS = 10 * 365 * 24 * 60 * 60;
+/**
+ * Session duration: 30 days rolling. Sliding window — every request that hits
+ * an authenticated route refreshes the cookie expiry (see saveUninitialized=false
+ * + resave=false + cookie.maxAge). Old "10 year never expire" sessions
+ * have been retired because:
+ *   1. Stolen-device attack window was effectively infinite.
+ *   2. SOC 2 CC6 controls expect bounded session lifetimes with re-auth.
+ *   3. Step-up re-auth (server/auth/stepUp.ts) handles sensitive actions
+ *      separately, so a 30-day idle window doesn't hurt UX for everyday flows.
+ */
+export const SESSION_TTL_SECONDS = 30 * 24 * 60 * 60;
 
 export function getSession() {
   const sessionTtl = SESSION_TTL_SECONDS * 1000; // same duration in ms for cookie and store
@@ -30,6 +39,7 @@ export function getSession() {
     proxy: isProduction,
     resave: false,
     saveUninitialized: false,
+    rolling: true, // sliding window — refresh expiry on every authenticated request
     cookie: {
       httpOnly: true,
       secure: cookieSecure,
