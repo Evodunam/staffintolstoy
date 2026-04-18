@@ -740,6 +740,48 @@ export async function registerRoutes(
     res.json({ status: "ok", timestamp: new Date().toISOString() });
   });
 
+  // Server-side Google API key resolver. Prefers a dedicated unrestricted (or
+  // IP-restricted) key for backend calls; falls back to the legacy referrer-
+  // restricted browser key only as a last resort. Set GOOGLE_PLACES_SERVER_KEY
+  // (or GOOGLE_SERVER_API_KEY) in prod env / GSM to a key created in GCP with
+  // "Application restrictions: None" or "IP addresses".
+  const serverGoogleApiKey = (): string | undefined =>
+    process.env.GOOGLE_PLACES_SERVER_KEY ||
+    process.env.GOOGLE_SERVER_API_KEY ||
+    process.env.GOOGLE_API_KEY ||
+    process.env.VITE_GOOGLE_API_KEY;
+
+  // Build an allowed-origin Referer to forward to Google so HTTP-referrer-
+  // restricted API keys accept our server-side calls. Falls back to the app's
+  // own BASE_URL/APP_URL when the browser didn't send one (e.g. native app).
+  // Only used as belt-and-suspenders for when the server key is still the
+  // legacy referrer-restricted one.
+  const allowedReferers = [
+    process.env.BASE_URL,
+    process.env.APP_URL,
+    "https://tolstoystaffing.com",
+    "https://app.tolstoystaffing.com",
+  ].filter(Boolean) as string[];
+
+  const pickReferer = (req: any): string => {
+    const incoming =
+      (req.get?.("referer") as string | undefined) ||
+      (req.get?.("origin") as string | undefined) ||
+      "";
+    try {
+      if (incoming) {
+        const u = new URL(incoming);
+        const origin = `${u.protocol}//${u.host}`;
+        if (allowedReferers.some((a) => a.startsWith(origin) || origin.startsWith(a.replace(/\/$/, "")))) {
+          return incoming;
+        }
+      }
+    } catch {
+      // ignore malformed
+    }
+    return allowedReferers[0] || "https://tolstoystaffing.com";
+  };
+
   // Google Places proxy endpoints (server-side key) for reliable prod autocomplete/details.
   // This avoids client-side key/env drift and browser referrer restriction issues.
   app.post("/api/google/places/autocomplete", async (req, res) => {
@@ -753,7 +795,7 @@ export async function registerRoutes(
         return res.status(400).json({ message: "Invalid request body" });
       }
 
-      const apiKey = process.env.GOOGLE_API_KEY || process.env.VITE_GOOGLE_API_KEY;
+      const apiKey = serverGoogleApiKey();
       if (!apiKey) {
         return res.status(503).json({ message: "Google Places is not configured" });
       }
@@ -766,6 +808,7 @@ export async function registerRoutes(
         requestBody.includedPrimaryTypes = ["street_address", "premise", "subpremise"];
       }
 
+      const referer = pickReferer(req);
       const response = await fetch("https://places.googleapis.com/v1/places:autocomplete", {
         method: "POST",
         headers: {
@@ -773,6 +816,9 @@ export async function registerRoutes(
           "X-Goog-Api-Key": apiKey,
           "X-Goog-FieldMask":
             "suggestions.placePrediction.placeId,suggestions.placePrediction.text,suggestions.placePrediction.structuredFormat",
+          // Forward an allowed Referer so HTTP-referrer-restricted keys pass.
+          Referer: referer,
+          Origin: new URL(referer).origin,
         },
         body: JSON.stringify(requestBody),
       });
@@ -800,17 +846,21 @@ export async function registerRoutes(
         return res.status(400).json({ message: "Missing placeId" });
       }
 
-      const apiKey = process.env.GOOGLE_API_KEY || process.env.VITE_GOOGLE_API_KEY;
+      const apiKey = serverGoogleApiKey();
       if (!apiKey) {
         return res.status(503).json({ message: "Google Places is not configured" });
       }
 
+      const referer = pickReferer(req);
       const response = await fetch(`https://places.googleapis.com/v1/places/${encodeURIComponent(placeId)}`, {
         method: "GET",
         headers: {
           "X-Goog-Api-Key": apiKey,
           "X-Goog-FieldMask":
             "id,displayName,formattedAddress,addressComponents.longText,addressComponents.shortText,addressComponents.types,location.latitude,location.longitude",
+          // Forward an allowed Referer so HTTP-referrer-restricted keys pass.
+          Referer: referer,
+          Origin: new URL(referer).origin,
         },
       });
 
@@ -894,8 +944,9 @@ export async function registerRoutes(
     }
     // Build map URL server-side only; never store or expose the Google API key in DB or email
     let mapUrl = (job as any).mapThumbnailUrl || null;
-    if (!mapUrl && job.latitude && job.longitude && process.env.GOOGLE_API_KEY) {
-      mapUrl = `https://maps.googleapis.com/maps/api/staticmap?center=${job.latitude},${job.longitude}&zoom=13&size=600x260&maptype=roadmap&markers=color:red%7Csize:mid%7C${job.latitude},${job.longitude}&key=${process.env.GOOGLE_API_KEY}`;
+    const staticMapKey = serverGoogleApiKey();
+    if (!mapUrl && job.latitude && job.longitude && staticMapKey) {
+      mapUrl = `https://maps.googleapis.com/maps/api/staticmap?center=${job.latitude},${job.longitude}&zoom=13&size=600x260&maptype=roadmap&markers=color:red%7Csize:mid%7C${job.latitude},${job.longitude}&key=${staticMapKey}`;
     }
     if (!mapUrl) return res.status(404).json({ message: "No map image for this job" });
     try {
@@ -1824,8 +1875,17 @@ export async function registerRoutes(
 
       req.login(userObj, (err) => {
         if (err) {
-          console.error("Login error after registration:", err);
-          return res.status(500).json({ message: "Registration succeeded but login failed" });
+          console.error("Login error after registration:", {
+            message: (err as any)?.message,
+            code: (err as any)?.code,
+            detail: (err as any)?.detail,
+            stack: (err as any)?.stack,
+          });
+          return res.status(500).json({
+            message: "Registration succeeded but login failed",
+            detail: (err as any)?.message,
+            code: (err as any)?.code,
+          });
         }
         const session = req.session as any;
         const finalize = () => {
@@ -1845,15 +1905,61 @@ export async function registerRoutes(
         }
         session.save((saveErr: unknown) => {
           if (saveErr) {
-            console.error("Session save error after registration:", saveErr);
-            return res.status(500).json({ message: "Registration succeeded but session persistence failed" });
+            console.error("Session save error after registration:", {
+              message: (saveErr as any)?.message,
+              code: (saveErr as any)?.code,
+              detail: (saveErr as any)?.detail,
+              stack: (saveErr as any)?.stack,
+            });
+            return res.status(500).json({
+              message: "Registration succeeded but session persistence failed",
+              detail: (saveErr as any)?.message,
+              code: (saveErr as any)?.code,
+            });
           }
           return finalize();
         });
       });
     } catch (error: any) {
-      console.error("Registration error:", error);
-      res.status(500).json({ message: error.message || "Registration failed" });
+      // Log everything we can — Postgres puts the useful stuff on properties
+      // that JSON.stringify drops, so log them explicitly.
+      console.error("Registration error:", {
+        message: error?.message,
+        code: error?.code,
+        detail: error?.detail,
+        constraint: error?.constraint,
+        column: error?.column,
+        table: error?.table,
+        stack: error?.stack,
+      });
+
+      // Map common Postgres errors to actionable client messages.
+      const code = error?.code as string | undefined;
+      if (code === "23505") {
+        // unique_violation — race against the existence check above
+        return res.status(409).json({ message: "An account with this email already exists" });
+      }
+      if (code === "23502") {
+        // not_null_violation
+        return res.status(500).json({
+          message: `Database is missing a value for "${error?.column ?? "a required column"}"`,
+        });
+      }
+      if (code === "42703") {
+        // undefined_column — schema drift
+        return res.status(500).json({
+          message: `Schema drift: column "${error?.column ?? "unknown"}" does not exist on prod DB. Run db:push.`,
+        });
+      }
+      if (code === "42P01") {
+        // undefined_table
+        return res.status(500).json({ message: "Schema drift: users table missing on prod DB. Run db:push." });
+      }
+
+      res.status(500).json({
+        message: error?.message || "Registration failed",
+        code,
+      });
     }
   });
 
@@ -4796,7 +4902,7 @@ Respond ONLY in this exact JSON format:
         const jobStartDate = job.startDate ? new Date(job.startDate) : null;
         const datesStr = jobStartDate ? jobStartDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) : 'TBD';
         const estimatedHoursStr = job.estimatedHours != null ? (job.estimatedHours <= 5 ? `${job.estimatedHours} hour(s)` : `${job.estimatedHours} hours`) : undefined;
-        const googleKey = process.env.GOOGLE_API_KEY;
+        const googleKey = serverGoogleApiKey();
         // Reuse stored map thumbnail if present (generated once on create); otherwise generate once and save to avoid API usage charges
         let mapThumbnailUrlStored: string | undefined = (job as any).mapThumbnailUrl || undefined;
         if (!mapThumbnailUrlStored && job.latitude && job.longitude && googleKey) {
@@ -10775,12 +10881,12 @@ Respond ONLY in this exact JSON format:
         return res.status(400).json({ message: "Waypoints array is required" });
       }
       
-      const apiKey = process.env.GOOGLE_API_KEY;
+      const apiKey = serverGoogleApiKey();
       if (!apiKey) {
-        console.error("[Fleet Routing] GOOGLE_API_KEY environment variable is not set");
-        return res.status(500).json({ 
+        console.error("[Fleet Routing] No Google API key configured (GOOGLE_PLACES_SERVER_KEY / GOOGLE_API_KEY)");
+        return res.status(500).json({
           success: false,
-          message: "Google API key not configured. Please set GOOGLE_API_KEY in your environment variables." 
+          message: "Google API key not configured. Please set GOOGLE_PLACES_SERVER_KEY (preferred) or GOOGLE_API_KEY."
         });
       }
       
@@ -10956,7 +11062,7 @@ Respond ONLY in this exact JSON format:
     }
 
     try {
-      const apiKey = process.env.GOOGLE_API_KEY;
+      const apiKey = serverGoogleApiKey();
       if (!apiKey) {
         return driveTimeFallback(originLat, originLng, destLat, destLng, res);
       }
@@ -11023,7 +11129,7 @@ Respond ONLY in this exact JSON format:
   // IP-based geolocation chain: Google → ipapi → ip-api. Each step isolated; failures never stop the chain.
   app.post("/api/geolocation/ip", async (req, res) => {
     // 1. Try Google
-    const googleKey = process.env.GOOGLE_API_KEY || process.env.VITE_GOOGLE_API_KEY;
+    const googleKey = serverGoogleApiKey();
     if (googleKey) {
       try {
         const gResponse = await fetch(`https://www.googleapis.com/geolocation/v1/geolocate?key=${googleKey}`, {
