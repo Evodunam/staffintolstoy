@@ -115,10 +115,12 @@ export async function sendPushNotification(
   };
   
   try {
-    const response = await admin.messaging().sendEachForMulticast(message);
-    
+    // sendEachForMulticast was added in firebase-admin@11; we're on v10 which
+    // only exposes sendMulticast. Same return shape (BatchResponse).
+    const response = await admin.messaging().sendMulticast(message);
+
     const failedTokens: string[] = [];
-    response.responses.forEach((res, idx) => {
+    response.responses.forEach((res: admin.messaging.SendResponse, idx: number) => {
       if (!res.success) {
         failedTokens.push(tokens[idx]);
         console.error("Push notification failed for token:", tokens[idx], res.error);
