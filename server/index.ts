@@ -311,6 +311,46 @@ export function log(message: string, source = "express") {
   console.log(`${formattedTime} [${source}] ${message}`);
 }
 
+// === Ghost-cookie clearer (TEMPORARY — remove after ~7 days, around 2026-04-25) ===
+//
+// Background: we recently switched the session cookie from host-only on
+// app.tolstoystaffing.com to `Domain=.tolstoystaffing.com`. Browsers do NOT
+// delete the old host-only cookie when a new Domain-scoped one with the same
+// name is set (RFC 6265 §5.3). The browser then sends BOTH on every request
+// in undefined order, and express-session reads whichever happens to come
+// first. Result: random session bouncing → 401s on every action.
+//
+// This middleware emits a Set-Cookie that explicitly deletes the legacy
+// host-only `connect.sid` (Max-Age=0, no Domain attribute, exact path match).
+// Runs only on document-ish navigations (not /api, not assets) so we don't
+// pile this header onto every XHR. After ~7 days everyone's old cookie is
+// gone and we can delete this block.
+const APP_LIKE_HOSTS = new Set([
+  "app.tolstoystaffing.com",
+  "tolstoystaffing.com",
+  "www.tolstoystaffing.com",
+]);
+app.use((req, res, next) => {
+  if (process.env.NODE_ENV !== "production") return next();
+  const host = String(req.headers.host || "").toLowerCase().split(":")[0];
+  if (!APP_LIKE_HOSTS.has(host)) return next();
+  const p = req.path;
+  const isNavigation =
+    p === "/" ||
+    (!p.startsWith("/api/") &&
+      !p.startsWith("/assets/") &&
+      !p.includes("." /* extension-bearing requests = static asset */));
+  if (!isNavigation) return next();
+  // Clear the legacy host-only cookie (no Domain attribute → matches host-only).
+  // The new Domain-scoped cookie (`.tolstoystaffing.com`) is unaffected
+  // because cookies are keyed by (name, path, domain).
+  res.append(
+    "Set-Cookie",
+    "connect.sid=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax",
+  );
+  next();
+});
+
 app.use((req, res, next) => {
   const start = Date.now();
   const path = req.path;

@@ -16,9 +16,12 @@ export const SESSION_TTL_SECONDS = 30 * 24 * 60 * 60;
 export function getSession() {
   const sessionTtl = SESSION_TTL_SECONDS * 1000; // same duration in ms for cookie and store
   const isProduction = process.env.NODE_ENV === "production";
-  // Behind cloud/load balancer proxies, secure cookies can be silently dropped unless proxy mode is enabled.
-  // Keep this aligned with app.set("trust proxy", 1) in routes bootstrap.
-  const cookieSecure: boolean | "auto" = isProduction ? "auto" : false;
+  // Pin to `true` in production rather than `'auto'`. With `'auto'` + a Domain
+  // attribute, if the upstream proxy drops X-Forwarded-Proto we silently emit a
+  // non-Secure Set-Cookie over HTTPS, which modern browsers store but refuse
+  // to send back on subsequent requests when SameSite=Lax + cross-host. Pinning
+  // `true` makes the failure mode loud (cookie not stored at all) so we catch it.
+  const cookieSecure: boolean = isProduction ? true : false;
   // Share the session cookie across apex + app.* (e.g. tolstoystaffing.com and
   // app.tolstoystaffing.com) by setting a leading-dot Domain. Required because
   // client/src/lib/subdomain-utils.ts intentionally bounces between hosts

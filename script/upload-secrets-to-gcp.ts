@@ -49,36 +49,39 @@ try {
   process.exit(1);
 }
 
-// List of all secrets to upload
-const secretsToUpload = [
-  // Database
+// REQUIRED in production. Boot or critical features break if missing.
+const REQUIRED_SECRETS = [
   "DATABASE_URL",
-  
-  // Session
   "SESSION_SECRET",
-  
-  // IDrive E2 Storage
+  "RESEND_API_KEY",
+  "STRIPE_SECRET_KEY",
+  "STRIPE_PUBLISHABLE_KEY",
+  "STRIPE_WEBHOOK_SECRET",
+  // Cookie scoping — added during the apex/app session-cookie unification.
+  // If unset, the session falls back to the hardcoded default in
+  // server/auth/session.ts but be explicit anyway.
+  "SESSION_COOKIE_DOMAIN",
+];
+
+// OPTIONAL but recommended. Specific features 500 if missing; rest of app fine.
+const OPTIONAL_SECRETS = [
+  // IDrive E2 Storage (file uploads)
   "IDRIVE_E2_ENDPOINT",
   "IDRIVE_E2_REGION",
   "IDRIVE_E2_ACCESS_KEY_ID",
   "IDRIVE_E2_SECRET_ACCESS_KEY",
-  
-  // Google OAuth
+  // Google OAuth + Maps + Translate
   "GOOGLE_CLIENT_ID",
   "GOOGLE_CLIENT_SECRET",
   "GOOGLE_API_KEY",
-  
-  // Email (Resend)
-  "RESEND_API_KEY",
+  "GOOGLE_PLACES_SERVER_API_KEY",
+  "GOOGLE_TRANSLATE_KEY",
+  // Email
   "RESEND_FROM_EMAIL",
-  
-  // Stripe
-  "STRIPE_SECRET_KEY",
-  "STRIPE_PUBLISHABLE_KEY",
+  // Stripe extras
   "STRIPE_TEST_SECRET_KEY",
   "STRIPE_TEST_PUBLISHABLE_KEY",
-  
-  // Firebase
+  // Firebase (push notifications + admin SDK)
   "FIREBASE_PRIVATE_KEY",
   "FIREBASE_PROJECT_ID",
   "FIREBASE_CLIENT_EMAIL",
@@ -86,38 +89,45 @@ const secretsToUpload = [
   "FIREBASE_CLIENT_ID",
   "FIREBASE_CLIENT_CERT_URL",
   "FIREBASE_API_KEY",
-  
-  // Unit Finance
+  // Unit Finance (legacy)
   "UNIT_API_TOKEN",
   "UNIT_API_URL",
-  
-  // Modern Treasury
+  // Mercury (banking — replaced Modern Treasury)
+  "MERCURY_API_KEY",
+  "MERCURY_API_URL",
+  // Modern Treasury (deprecated, kept while migrating)
   "MODERN_TREASURY_API_KEY",
   "MODERN_TREASURY_ORG_ID",
   "MODERN_TREASURY_SANDBOX_API_KEY",
   "MODERN_TREASURY_SANDBOX_ORG_ID",
   "MT_PLATFORM_INTERNAL_ACCOUNT_ID",
-  
-  // Apple
+  // Apple push
   "APPLE_BUNDLE_ID",
   "APPLE_APNS_KEY_ID",
   "APPLE_TEAM_ID",
   "APPLE_APNS_PRIVATE_KEY",
-  
   // Other APIs
   "GITHUB_ACCESS_TOKEN",
-  "GOOGLE_CALENDAR_ACCESS_TOKEN",
-  "OUTLOOK_ACCESS_TOKEN",
   "OPENAI_API_KEY",
-  
-  // App Configuration
+  "IPAPI_KEY",
+  // Background-check vendor (added in megacommit 2fa06d6)
+  "CHECKR_API_KEY",
+  "CHECKR_WEBHOOK_SECRET",
+  // Admin allow-list (added in admin-host work)
+  "SUPER_ADMIN_EMAILS",
+  "ADMIN_EMAILS",
+  "ADMIN_SESSION_COOKIE_DOMAIN",
+  // Cron auth
+  "CRON_SECRET",
+  // App configuration
   "BASE_URL",
   "APP_URL",
   "PORT",
-  
   // Optional
   "PUBLIC_OBJECT_SEARCH_PATHS",
 ];
+
+const secretsToUpload = [...REQUIRED_SECRETS, ...OPTIONAL_SECRETS];
 
 async function createOrUpdateSecret(secretName: string, secretValue: string): Promise<void> {
   const parent = `projects/${projectId}`;
@@ -176,15 +186,22 @@ async function main() {
   }
 
   let successCount = 0;
-  let skippedCount = 0;
+  let skippedOptional = 0;
+  const missingRequired: string[] = [];
   let failedCount = 0;
 
   for (const secretName of secretsToUpload) {
     const secretValue = process.env[secretName];
-    
+    const isRequired = REQUIRED_SECRETS.includes(secretName);
+
     if (!secretValue) {
-      console.log(`   ⚠️  Skipping "${secretName}" (not found in .env.production)`);
-      skippedCount++;
+      if (isRequired) {
+        console.log(`   ❌ MISSING REQUIRED "${secretName}" — production will not boot/function correctly.`);
+        missingRequired.push(secretName);
+      } else {
+        console.log(`   ⚠️  Skipping optional "${secretName}" (not in .env.production)`);
+        skippedOptional++;
+      }
       continue;
     }
 
@@ -197,18 +214,26 @@ async function main() {
   }
 
   console.log(`\n📊 Summary:`);
-  console.log(`   ✅ Successfully uploaded: ${successCount}`);
-  console.log(`   ⚠️  Skipped (not in .env): ${skippedCount}`);
-  console.log(`   ❌ Failed: ${failedCount}`);
-  
+  console.log(`   ✅ Uploaded:                ${successCount}`);
+  console.log(`   ⚠️  Skipped (optional):      ${skippedOptional}`);
+  console.log(`   ❌ Missing (REQUIRED):       ${missingRequired.length}`);
+  console.log(`   ❌ Failed to upload:         ${failedCount}`);
+
+  if (missingRequired.length > 0) {
+    console.log(`\n❌ The following REQUIRED secrets are missing from .env.production:`);
+    for (const s of missingRequired) console.log(`     - ${s}`);
+    console.log(`\n   Production WILL be broken until these are set. Add them to .env.production`);
+    console.log(`   and re-run this script.`);
+    process.exit(2);
+  }
   if (failedCount > 0) {
     console.log(`\n⚠️  Some secrets failed to upload. Make sure:`);
     console.log(`   1. You've run: gcloud auth application-default login`);
     console.log(`   2. Secret Manager API is enabled for project ${projectId}`);
     console.log(`   3. You have the "Secret Manager Admin" role on the project`);
-  } else {
-    console.log(`\n✨ Done! Your secrets are now in Google Cloud Secret Manager.\n`);
+    process.exit(1);
   }
+  console.log(`\n✨ Done! Your secrets are now in Google Cloud Secret Manager.\n`);
 }
 
 main().catch((error) => {
