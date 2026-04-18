@@ -29,6 +29,7 @@ import { isLocalDevHostFromRequest } from "./lib/isLocalDevRequest";
 import { minimumLaborBudgetCentsForWorkerHours } from "@shared/postJobBillableHours";
 import { workerFacingJobHourlyCents } from "@shared/platformPayPolicy";
 import { sanitizeProfileForViewer } from "./lib/sanitizeProfile";
+import { stripServerControlledProfileFields } from "./lib/protectProfileWrite";
 import { Client as GoogleMapsClient } from "@googlemaps/google-maps-services-js";
 import {
   triggerAutoReplenishmentForCompany,
@@ -2566,19 +2567,26 @@ export async function registerRoutes(
       const user = req.user as any;
       
       // Pre-process date strings to Date objects before validation
-      const processedBody = { ...req.body, userId: user.claims.sub };
-      const affiliateRef = (processedBody.ref ?? processedBody.affiliateRef) as string | undefined;
-      if (affiliateRef) {
-        delete (processedBody as any).ref;
-        delete (processedBody as any).affiliateRef;
-      }
+      const sanitizedBody = stripServerControlledProfileFields(req.body ?? {}, {
+        userId: user?.claims?.sub,
+        route: "POST /api/profiles",
+      });
+      // userId always comes from session, never client. role is allowed on
+      // create only because the client picks worker vs company at signup.
+      const allowedRole = (req.body && (req.body as any).role) as string | undefined;
+      const processedBody: Record<string, unknown> = {
+        ...sanitizedBody,
+        userId: user.claims.sub,
+        ...(allowedRole === "worker" || allowedRole === "company" ? { role: allowedRole } : {}),
+      };
+      const affiliateRef = ((req.body as any)?.ref ?? (req.body as any)?.affiliateRef) as string | undefined;
       const dateFields = ['contractSignedAt', 'faceVerifiedAt', 'insuranceStartDate', 'insuranceEndDate', 'w9UploadedAt'];
       for (const field of dateFields) {
         if (typeof processedBody[field] === 'string') {
-          processedBody[field] = new Date(processedBody[field]);
+          processedBody[field] = new Date(processedBody[field] as string);
         }
       }
-      
+
       const input = api.profiles.create.input.parse(processedBody);
       
       // Check if profile exists
@@ -3080,24 +3088,38 @@ export async function registerRoutes(
     if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
     try {
       const id = Number(req.params.id);
-      
+      const userIdForLog = (req.user as any)?.claims?.sub as string | undefined;
+
+      // Strip server-controlled fields BEFORE schema parse so we never accept
+      // client-supplied stripeCustomerId / mercuryRecipientId / depositAmount /
+      // faceVerified / identityVerified / userId / etc. Server-side flows
+      // inside this handler (W-9 attached, Mercury recipient persisted) set
+      // those fields directly on `input` after the parse, so this strip does
+      // not block legitimate server writes.
+      const sanitizedBody = stripServerControlledProfileFields(req.body ?? {}, {
+        profileId: id,
+        userId: userIdForLog,
+        route: "PUT /api/profiles/:id",
+      });
+
       // Pre-process date strings to Date objects and decimal fields to strings before validation
-      const processedBody = { ...req.body };
+      const processedBody = { ...sanitizedBody } as Record<string, unknown>;
       const dateFields = ['contractSignedAt', 'faceVerifiedAt', 'insuranceStartDate', 'insuranceEndDate', 'w9UploadedAt'];
       for (const field of dateFields) {
-        if (typeof processedBody[field] === 'string') {
-          processedBody[field] = new Date(processedBody[field]);
+        const v = processedBody[field];
+        if (typeof v === 'string') {
+          processedBody[field] = new Date(v);
         }
       }
-      if (processedBody.latitude !== undefined && processedBody.latitude !== null && typeof processedBody.latitude === 'number') {
+      if (typeof processedBody.latitude === 'number') {
         processedBody.latitude = String(processedBody.latitude);
       }
-      if (processedBody.longitude !== undefined && processedBody.longitude !== null && typeof processedBody.longitude === 'number') {
+      if (typeof processedBody.longitude === 'number') {
         processedBody.longitude = String(processedBody.longitude);
       }
-      
+
       // Validate bio if it's being updated
-      if ('bio' in processedBody && processedBody.bio) {
+      if ('bio' in processedBody && typeof processedBody.bio === 'string' && processedBody.bio) {
         const bioValidation = validateBio(processedBody.bio);
         if (!bioValidation.isValid) {
           return res.status(400).json({ 
