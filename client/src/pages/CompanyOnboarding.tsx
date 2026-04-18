@@ -1009,28 +1009,6 @@ export default function CompanyOnboarding() {
     }
   };
 
-  // Scroll contract to bottom and enable signing
-  const scrollToBottomOfContract = () => {
-    const el = contractScrollRef.current;
-    if (!el) return;
-    const maxScroll = el.scrollHeight - el.clientHeight;
-    if (maxScroll <= 0) {
-      // No overflow – already “at bottom”, enable signing
-      setHasScrolledContract(true);
-      return;
-    }
-    el.scrollTo({ top: maxScroll, behavior: "smooth" });
-    // Ensure signing enables after smooth scroll completes (scroll event may not fire in some cases)
-    const done = () => setHasScrolledContract(true);
-    el.addEventListener("scroll", function onScroll() {
-      if (el.scrollHeight - el.scrollTop <= el.clientHeight + 50) {
-        el.removeEventListener("scroll", onScroll);
-        done();
-      }
-    }, { once: true });
-    setTimeout(done, 900);
-  };
-
   const clearSignaturePad = () => {
     const canvas = signatureCanvasRef.current;
     if (!canvas) return;
@@ -1047,16 +1025,16 @@ export default function CompanyOnboarding() {
     completeOnboarding(dataUrl);
   };
 
-  // Draw signature pad: canvas and mouse/touch when step 4, scrolled, and no signature yet
+  // Draw signature pad: canvas and mouse/touch when step 4 and no signature yet.
+  // Scroll-to-bottom gating was removed — signing is enabled immediately.
   useEffect(() => {
     const canvas = signatureCanvasRef.current;
     const container = signaturePadContainerRef.current;
     if (!canvas || !container || step !== 4 || signatureData || signatureText) return;
-    if (!hasScrolledContract) return;
 
     const dpr = window.devicePixelRatio || 1;
     const width = container.clientWidth || 400;
-    const height = 100;
+    const height = 160;
     canvas.width = width * dpr;
     canvas.height = height * dpr;
     canvas.style.width = `${width}px`;
@@ -1113,7 +1091,7 @@ export default function CompanyOnboarding() {
       canvas.removeEventListener("touchmove", move);
       canvas.removeEventListener("touchend", end);
     };
-  }, [step, hasScrolledContract, signatureData, signatureText, setShowSignatureDoneButton]);
+  }, [step, signatureData, signatureText, setShowSignatureDoneButton]);
 
   // Bank account validation
   const validateBankAccount = () => {
@@ -1138,13 +1116,12 @@ export default function CompanyOnboarding() {
     }
   };
   
-  // Auto-sign for agreement (like worker onboarding)
+  // Auto-sign for agreement: opens the edit-name confirm popup with the
+  // signer's full name pre-filled. Available immediately (no scroll-to-bottom
+  // gate).
   const handleAutoSign = () => {
-    if (hasScrolledContract) {
-      // Show edit mode with suggested name
-      setPendingSignatureName(`${businessInfo.firstName} ${businessInfo.lastName}`);
-      setIsEditingSignature(true);
-    }
+    setPendingSignatureName(`${businessInfo.firstName} ${businessInfo.lastName}`);
+    setIsEditingSignature(true);
   };
   
   const confirmSignature = async () => {
@@ -3146,44 +3123,12 @@ export default function CompanyOnboarding() {
           </div>
         )}
 
-        {/* Step 4: Hiring Agreement – 1:1 worker agreement style: scroll-to-bottom, draw-to-sign, compact signature, full-height right col */}
+        {/* Step 4: Hiring Agreement – contract is shown for reference; signing is enabled immediately (no scroll-to-bottom gate). */}
         {step === 4 && (
           <div className="flex-1 flex flex-col min-h-0 gap-4">
-            {!hasScrolledContract && (
-              <div className="p-3 bg-amber-50 border border-amber-200 rounded-xl flex items-center gap-3 shrink-0">
-                <ChevronDown className="w-5 h-5 text-amber-700 shrink-0" />
-                <p className="text-sm text-amber-800 font-medium">
-                  Please scroll to the bottom of the document to enable signing.
-                </p>
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  className="ml-auto shrink-0 border-amber-300 text-amber-800 hover:bg-amber-100"
-                  onClick={scrollToBottomOfContract}
-                  data-testid="button-scroll-to-bottom"
-                >
-                  <ChevronDown className="w-4 h-4 mr-1" />
-                  Scroll to bottom
-                </Button>
-              </div>
-            )}
             <div className="flex-1 min-h-0 flex flex-col bg-white rounded-2xl shadow-lg overflow-hidden border border-gray-200">
               <div className="h-1.5 bg-gray-800" />
               <div className="relative flex-1 min-h-0 flex flex-col">
-                <div className="flex items-center justify-end gap-2 px-4 py-2 border-b border-gray-100 bg-gray-50/80 shrink-0">
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="sm"
-                    className="text-stone-600 hover:text-stone-900 hover:bg-stone-100"
-                    onClick={scrollToBottomOfContract}
-                    data-testid="button-scroll-to-bottom"
-                  >
-                    <ChevronDown className="w-4 h-4 mr-1" />
-                    Scroll to bottom
-                  </Button>
-                </div>
                 <div
                   ref={contractScrollRef}
                   onScroll={handleContractScroll}
@@ -3194,19 +3139,19 @@ export default function CompanyOnboarding() {
                       {COMPANY_AGREEMENT_TEXT}
                     </pre>
                   </div>
-                  {!hasScrolledContract && (
-                    <div className="absolute bottom-0 left-0 right-0 h-12 bg-gradient-to-t from-white to-transparent pointer-events-none" aria-hidden />
-                  )}
                 </div>
-                <div className="border-t-2 border-stone-200 bg-stone-50/80 p-2 md:p-3 shrink-0">
-                  {!hasScrolledContract && (
-                    <p className="text-xs text-stone-600 mb-2 italic">Please scroll through the entire document to enable signing, or use the &quot;Scroll to bottom&quot; button above.</p>
-                  )}
+                <div className="border-t-2 border-stone-200 bg-stone-50/80 p-3 md:p-4 shrink-0">
                   <div
-                    className={`p-2.5 text-center relative transition-all bg-white rounded-lg group ${(signatureText || signatureData) ? "border-2 border-stone-900" : isEditingSignature ? "border-2 border-[#00A86B]" : "border-2 border-dashed border-stone-300"}`}
+                    className={`p-4 md:p-5 text-center relative transition-all bg-white rounded-xl group ${
+                      (signatureText || signatureData)
+                        ? "border-2 border-stone-900"
+                        : isEditingSignature
+                        ? "border-2 border-[#00A86B]"
+                        : "border-2 border-dashed border-stone-300 skeleton-shimmer cursor-pointer"
+                    }`}
                     onMouseEnter={() => setSignatureHovered(true)}
                     onMouseLeave={() => setSignatureHovered(false)}
-                    onClick={() => !signatureText && !signatureData && !isEditingSignature && hasScrolledContract && handleAutoSign()}
+                    onClick={() => !signatureText && !signatureData && !isEditingSignature && handleAutoSign()}
                   >
                     {signatureData ? (
                       <div className="space-y-0.5">
@@ -3263,7 +3208,7 @@ export default function CompanyOnboarding() {
                           </Button>
                         </div>
                       </div>
-                    ) : hasScrolledContract ? (
+                    ) : (
                       <div
                         ref={signaturePadContainerRef}
                         className="relative"
@@ -3271,11 +3216,11 @@ export default function CompanyOnboarding() {
                         onMouseDown={(e) => e.stopPropagation()}
                         onTouchStart={(e) => e.stopPropagation()}
                       >
-                        <p className="text-[10px] text-stone-600 mb-1">Draw your signature below</p>
+                        <p className="text-xs text-stone-600 mb-2">Draw your signature below, or tap to type your name</p>
                         <canvas
                           ref={signatureCanvasRef}
                           className="block w-full border border-stone-300 rounded bg-white touch-none cursor-crosshair"
-                          style={{ height: 100 }}
+                          style={{ height: 160 }}
                           data-testid="signature-canvas"
                         />
                         {showSignatureDoneButton && signatureHovered && (
@@ -3292,12 +3237,6 @@ export default function CompanyOnboarding() {
                             <button type="button" className="w-full text-sm font-medium py-2.5 rounded-lg bg-gray-900 text-white hover:bg-gray-800" onClick={(e) => { e.stopPropagation(); captureSignature(); }} data-testid="button-done-signature">Done</button>
                           </div>
                         )}
-                      </div>
-                    ) : (
-                      <div>
-                        <p className="text-stone-500 text-sm mb-1">Scroll to bottom first to enable signing</p>
-                        <div className="border-t border-stone-300 mx-auto max-w-[180px]" />
-                        <p className="text-xs text-stone-400 mt-1">Signature Line</p>
                       </div>
                     )}
                   </div>
@@ -3629,17 +3568,12 @@ export default function CompanyOnboarding() {
                 <ArrowLeft className="w-4 h-4 mr-1" /> Back
               </Button>
               {!signatureText && !signatureData && !isEditingSignature && (
-                <Button 
+                <Button
                   onClick={handleAutoSign}
-                  disabled={!hasScrolledContract}
                   className="h-11 min-w-64 px-8 bg-gray-900 text-white hover:bg-gray-800 rounded-xl"
                   data-testid="button-sign-agreement-footer"
                 >
-                  {hasScrolledContract ? (
-                    <>Sign as {businessInfo.firstName} {businessInfo.lastName}</>
-                  ) : (
-                    <>Scroll agreement to enable signing</>
-                  )}
+                  Sign as {businessInfo.firstName} {businessInfo.lastName}
                 </Button>
               )}
               {(signatureText || signatureData) && (
