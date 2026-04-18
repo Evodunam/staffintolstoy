@@ -28,6 +28,7 @@ import {
 import { isLocalDevHostFromRequest } from "./lib/isLocalDevRequest";
 import { minimumLaborBudgetCentsForWorkerHours } from "@shared/postJobBillableHours";
 import { workerFacingJobHourlyCents } from "@shared/platformPayPolicy";
+import { sanitizeProfileForViewer } from "./lib/sanitizeProfile";
 import { Client as GoogleMapsClient } from "@googlemaps/google-maps-services-js";
 import {
   triggerAutoReplenishmentForCompany,
@@ -2546,17 +2547,17 @@ export async function registerRoutes(
       if (Number.isInteger(id) && id > 0) return res.status(404).json({ message: "Profile not found" });
       return res.status(200).json(null);
     }
-    // Redact sensitive PII (email, phone) when unauthenticated or when viewing another user's profile
-    const isOwnProfile = req.isAuthenticated() && ((): boolean => {
-      const user = req.user as any;
-      if (!user?.claims?.sub) return false;
-      return (profile as any).userId === user.claims.sub;
-    })();
-    if (!isOwnProfile) {
-      const { email, phone, ...safe } = profile as any;
-      return res.json({ ...safe, email: null, phone: null });
-    }
-    res.json(profile);
+    // Sanitize for viewer. Whitelist of safe fields lives in lib/sanitizeProfile.
+    // Owner → full profile; authenticated stranger → safe public-ish view; anonymous → minimal public card.
+    const isAuthed = req.isAuthenticated();
+    const viewerSub = isAuthed ? (req.user as any)?.claims?.sub : undefined;
+    const isOwnProfile = !!viewerSub && (profile as any).userId === viewerSub;
+    const viewerKind = isOwnProfile
+      ? "owner"
+      : isAuthed
+      ? "authenticated"
+      : "public";
+    res.json(sanitizeProfileForViewer(profile as any, viewerKind));
   });
 
   app.post(api.profiles.create.path, async (req, res) => {
