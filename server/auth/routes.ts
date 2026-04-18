@@ -38,6 +38,23 @@ if (GOOGLE_CLIENT_ID && GOOGLE_CLIENT_SECRET) {
             .where(eq(users.email, email));
 
           if (existingUser) {
+            // Account-link mode is allowed regardless of authProvider — handled in the callback.
+            const isLinkingFlow = !!(req.session as any)?.linkGoogleForUserId;
+
+            // If the user has explicitly disconnected Google (has a password and
+            // authProvider !== "google"), refuse to log them in via Google. They
+            // need to re-link from settings. Google-only users (no password)
+            // are never blocked, to avoid lockout.
+            if (
+              !isLinkingFlow &&
+              existingUser.passwordHash &&
+              existingUser.authProvider !== "google"
+            ) {
+              return done(null, false, {
+                message: "google_disconnected",
+              } as any);
+            }
+
             // Update user's profile image if available and not set
             if (profile.photos?.[0]?.value && !existingUser.profileImageUrl) {
               await db
@@ -176,7 +193,32 @@ export function registerAuthRoutes(app: Express): void {
 
   app.get(
     "/api/auth/google/callback",
-    passport.authenticate("google", { failureRedirect: "/login?error=google_auth_failed" }),
+    (req: any, res, next) => {
+      (passport.authenticate as any)("google", (err: any, user: any, info: any) => {
+        if (err || !user) {
+          const reason: string =
+            (info && typeof info === "object" && info.message) ||
+            (err && err.message) ||
+            "google_auth_failed";
+          // Preserve the originating context so the UI can show a useful error.
+          const linkUserId = (req.session as any)?.linkGoogleForUserId;
+          const returnTo = (req.session as any)?.returnTo;
+          delete (req.session as any).linkGoogleForUserId;
+          delete (req.session as any).returnTo;
+          delete (req.session as any).onboardingData;
+
+          if (linkUserId && returnTo) {
+            const sep = returnTo.includes("?") ? "&" : "?";
+            return res.redirect(`${returnTo}${sep}googleLinked=error&reason=${encodeURIComponent(reason)}`);
+          }
+          return res.redirect(`/login?error=${encodeURIComponent(reason)}`);
+        }
+        req.login(user, (loginErr: any) => {
+          if (loginErr) return res.redirect("/login?error=google_auth_failed");
+          next();
+        });
+      })(req, res, next);
+    },
     async (req, res) => {
       try {
         // Get return URL and onboarding data from session

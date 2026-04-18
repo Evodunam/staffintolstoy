@@ -1257,6 +1257,51 @@ export function LoginSecuritySection({ embedded = true }: { embedded?: boolean }
     }
   };
 
+  const [confirmRemovePw, setConfirmRemovePw] = useState(false);
+  const [confirmDisconnectGoogle, setConfirmDisconnectGoogle] = useState(false);
+  const [removingPassword, setRemovingPassword] = useState(false);
+  const [disconnectingGoogle, setDisconnectingGoogle] = useState(false);
+
+  const removePassword = async () => {
+    setRemovingPassword(true);
+    try {
+      const res = await fetch("/api/auth/remove-password", {
+        method: "POST",
+        credentials: "include",
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        toast({ title: "Couldn't remove password", description: body?.message || "Try again.", variant: "destructive" });
+        return;
+      }
+      toast({ title: "Password removed", description: body?.message || "You can now only sign in with Google." });
+      setConfirmRemovePw(false);
+      refetch();
+    } finally {
+      setRemovingPassword(false);
+    }
+  };
+
+  const disconnectGoogle = async () => {
+    setDisconnectingGoogle(true);
+    try {
+      const res = await fetch("/api/auth/disconnect-google", {
+        method: "POST",
+        credentials: "include",
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        toast({ title: "Couldn't disconnect Google", description: body?.message || "Try again.", variant: "destructive" });
+        return;
+      }
+      toast({ title: "Google disconnected", description: body?.message || "Sign in with email + password from now on." });
+      setConfirmDisconnectGoogle(false);
+      refetch();
+    } finally {
+      setDisconnectingGoogle(false);
+    }
+  };
+
   const connectGoogle = () => {
     const returnTo = window.location.pathname + window.location.search;
     window.location.href = `/api/auth/google?link=true&returnTo=${encodeURIComponent(returnTo)}`;
@@ -1295,20 +1340,33 @@ export function LoginSecuritySection({ embedded = true }: { embedded?: boolean }
                   </p>
                 </div>
               </div>
-              <Button
-                size="sm"
-                variant="outline"
-                onClick={() => {
-                  setPwError(null);
-                  setCurrentPassword("");
-                  setNewPassword("");
-                  setConfirmNewPassword("");
-                  setPwOpen(true);
-                }}
-                data-testid={hasPassword ? "button-change-password" : "button-set-password"}
-              >
-                {hasPassword ? "Change" : "Set password"}
-              </Button>
+              <div className="flex items-center gap-2 shrink-0">
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => {
+                    setPwError(null);
+                    setCurrentPassword("");
+                    setNewPassword("");
+                    setConfirmNewPassword("");
+                    setPwOpen(true);
+                  }}
+                  data-testid={hasPassword ? "button-change-password" : "button-set-password"}
+                >
+                  {hasPassword ? "Change" : "Set password"}
+                </Button>
+                {hasPassword && hasGoogle && (
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    className="text-destructive hover:text-destructive hover:bg-destructive/10"
+                    onClick={() => setConfirmRemovePw(true)}
+                    data-testid="button-remove-password"
+                  >
+                    Remove
+                  </Button>
+                )}
+              </div>
             </div>
 
             {/* Google row */}
@@ -1329,15 +1387,34 @@ export function LoginSecuritySection({ embedded = true }: { embedded?: boolean }
                   </p>
                 </div>
               </div>
-              <Button
-                size="sm"
-                variant="outline"
-                onClick={connectGoogle}
-                data-testid={hasGoogle ? "button-reconnect-google" : "button-connect-google"}
-              >
-                {hasGoogle ? "Reconnect" : "Connect Google"}
-              </Button>
+              <div className="flex items-center gap-2 shrink-0">
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={connectGoogle}
+                  data-testid={hasGoogle ? "button-reconnect-google" : "button-connect-google"}
+                >
+                  {hasGoogle ? "Reconnect" : "Connect Google"}
+                </Button>
+                {hasGoogle && hasPassword && (
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    className="text-destructive hover:text-destructive hover:bg-destructive/10"
+                    onClick={() => setConfirmDisconnectGoogle(true)}
+                    data-testid="button-disconnect-google"
+                  >
+                    Disconnect
+                  </Button>
+                )}
+              </div>
             </div>
+
+            {!hasPassword && !hasGoogle && (
+              <div className="px-4 pb-4 text-xs text-muted-foreground">
+                You currently have no sign-in method beyond your active session. Set a password or connect Google so you can sign back in later.
+              </div>
+            )}
           </div>
         )}
       </div>
@@ -1424,6 +1501,54 @@ export function LoginSecuritySection({ embedded = true }: { embedded?: boolean }
             </Button>
             <Button onClick={submitPassword} disabled={pwSubmitting} data-testid="button-submit-password">
               {pwSubmitting ? <Loader2 className="w-4 h-4 animate-spin" /> : hasPassword ? "Update password" : "Set password"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={confirmRemovePw} onOpenChange={setConfirmRemovePw}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>Remove password?</DialogTitle>
+            <DialogDescription>
+              You'll only be able to sign in with Google ({data?.email}). You can set a new password anytime from this page.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setConfirmRemovePw(false)} disabled={removingPassword}>
+              Cancel
+            </Button>
+            <Button
+              onClick={removePassword}
+              disabled={removingPassword}
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+              data-testid="button-confirm-remove-password"
+            >
+              {removingPassword ? <Loader2 className="w-4 h-4 animate-spin" /> : "Remove password"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={confirmDisconnectGoogle} onOpenChange={setConfirmDisconnectGoogle}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>Disconnect Google?</DialogTitle>
+            <DialogDescription>
+              You'll only be able to sign in with email + password. You can reconnect Google anytime from this page.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setConfirmDisconnectGoogle(false)} disabled={disconnectingGoogle}>
+              Cancel
+            </Button>
+            <Button
+              onClick={disconnectGoogle}
+              disabled={disconnectingGoogle}
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+              data-testid="button-confirm-disconnect-google"
+            >
+              {disconnectingGoogle ? <Loader2 className="w-4 h-4 animate-spin" /> : "Disconnect"}
             </Button>
           </DialogFooter>
         </DialogContent>

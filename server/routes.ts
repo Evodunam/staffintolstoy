@@ -2077,6 +2077,69 @@ export async function registerRoutes(
     }
   });
 
+  // === Remove password (authenticated) ===
+  // Only allowed if Google sign-in is still enabled, so the user keeps a way in.
+  app.post("/api/auth/remove-password", async (req: any, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    try {
+      const userId = req.user.claims.sub;
+      const [user] = await db.select().from(users).where(eq(users.id, userId));
+      if (!user) return res.status(404).json({ message: "User not found" });
+
+      if (!user.passwordHash) {
+        return res.status(400).json({ message: "No password is set on this account" });
+      }
+      if (user.authProvider !== "google") {
+        return res.status(400).json({
+          message: "Connect Google before removing your password, or you'll be locked out.",
+        });
+      }
+
+      await db
+        .update(users)
+        .set({ passwordHash: null, updatedAt: new Date() })
+        .where(eq(users.id, user.id));
+
+      res.json({ success: true, message: "Password removed. You can now sign in with Google." });
+    } catch (error: any) {
+      console.error("Remove password error:", error);
+      res.status(500).json({ message: "Failed to remove password" });
+    }
+  });
+
+  // === Disconnect Google (authenticated) ===
+  // Only allowed if a password is set, so the user keeps a way in.
+  // Sets authProvider="email"; the Google OAuth strategy refuses to log in
+  // accounts whose authProvider !== "google" (when they have a password),
+  // so this actually enforces the disconnect.
+  app.post("/api/auth/disconnect-google", async (req: any, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    try {
+      const userId = req.user.claims.sub;
+      const [user] = await db.select().from(users).where(eq(users.id, userId));
+      if (!user) return res.status(404).json({ message: "User not found" });
+
+      if (user.authProvider !== "google") {
+        return res.status(400).json({ message: "Google is not connected" });
+      }
+      if (!user.passwordHash) {
+        return res.status(400).json({
+          message: "Set a password before disconnecting Google, or you'll be locked out.",
+        });
+      }
+
+      await db
+        .update(users)
+        .set({ authProvider: "email", updatedAt: new Date() })
+        .where(eq(users.id, user.id));
+
+      res.json({ success: true, message: "Google disconnected." });
+    } catch (error: any) {
+      console.error("Disconnect Google error:", error);
+      res.status(500).json({ message: "Failed to disconnect Google" });
+    }
+  });
+
   // === OTP / Magic Link Login ===
   app.post("/api/auth/login/email-otp/request", async (req, res) => {
     try {
