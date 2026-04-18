@@ -41,6 +41,7 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Skeleton } from "@/components/ui/skeleton";
 import { AppLoading } from "@/components/AppLoading";
 import { useToast } from "@/hooks/use-toast";
+import { LoginSecuritySection } from "@/pages/worker/ProfileSettings";
 import { format, differenceInMinutes, parseISO, addHours, formatDistanceToNow } from "date-fns";
 import InvoicesView from "@/components/InvoicesView";
 import ChatsPage from "@/pages/ChatsPage";
@@ -1846,6 +1847,10 @@ function CompanyMenuPanelProfileFormView(props: {
           {updateProfile.isPending ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : null}
           {t("settings.saveChanges")}
         </Button>
+      </div>
+
+      <div className="pt-6 border-t border-border">
+        <LoginSecuritySection embedded />
       </div>
     </div>
   );

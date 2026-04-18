@@ -34,6 +34,9 @@ export const users = pgTable("users", {
 
 export type UpsertUser = typeof users.$inferInsert;
 export type User = typeof users.$inferSelect & {
+  // Derived flag exposed on the API instead of leaking passwordHash.
+  // Optional so server-side internal usage of the raw row type is unaffected.
+  hasPassword?: boolean;
   impersonation?: {
     isImpersonating: boolean;
     isEmployee: boolean;

@@ -2018,6 +2018,65 @@ export async function registerRoutes(
     }
   });
 
+  // === Login methods status (for settings UI) ===
+  app.get("/api/auth/methods", async (req: any, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    try {
+      const userId = req.user.claims.sub;
+      const [user] = await db.select().from(users).where(eq(users.id, userId));
+      if (!user) return res.status(404).json({ message: "User not found" });
+      res.json({
+        email: user.email,
+        hasPassword: !!user.passwordHash,
+        hasGoogle: user.authProvider === "google",
+      });
+    } catch (error: any) {
+      console.error("Error fetching auth methods:", error);
+      res.status(500).json({ message: "Failed to fetch login methods" });
+    }
+  });
+
+  // === Set / Change password (authenticated) ===
+  // Used from settings: a Google-only user can SET a password (no current required).
+  // A user with an existing password must provide currentPassword to change it.
+  app.post("/api/auth/set-password", async (req: any, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    try {
+      const { currentPassword, newPassword } = req.body ?? {};
+      if (!newPassword || typeof newPassword !== "string") {
+        return res.status(400).json({ message: "newPassword is required" });
+      }
+
+      const userId = req.user.claims.sub;
+      const [user] = await db.select().from(users).where(eq(users.id, userId));
+      if (!user) return res.status(404).json({ message: "User not found" });
+
+      const { hashPassword, verifyPassword, validatePassword } = await import("./utils/password");
+
+      if (user.passwordHash) {
+        if (!currentPassword || typeof currentPassword !== "string") {
+          return res.status(400).json({ message: "currentPassword is required to change your password" });
+        }
+        const ok = await verifyPassword(currentPassword, user.passwordHash);
+        if (!ok) return res.status(401).json({ message: "Current password is incorrect" });
+      }
+
+      const validation = validatePassword(newPassword);
+      if (!validation.valid) return res.status(400).json({ message: validation.error });
+
+      const passwordHash = await hashPassword(newPassword);
+      await db
+        .update(users)
+        .set({ passwordHash, updatedAt: new Date() })
+        .where(eq(users.id, user.id));
+
+      res.json({ success: true, message: user.passwordHash ? "Password updated" : "Password set" });
+    } catch (error: any) {
+      console.error("Set password error:", error);
+      res.status(500).json({ message: "Failed to set password" });
+    }
+  });
+
   // === OTP / Magic Link Login ===
   app.post("/api/auth/login/email-otp/request", async (req, res) => {
     try {

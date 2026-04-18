@@ -521,6 +521,12 @@ export default function CompanyOnboarding() {
   const { user, isAuthenticated, isLoading: isAuthLoading } = useAuth();
   const { toast } = useToast();
   const [step, setStep] = useState(0);
+  // NOTE: step2SubStep / step3SubStep declared up here (instead of further below
+  // with the rest of the form state) because setStepAndUrl/navigateToStepAndSub
+  // reference their setters. Bundlers can hoist/inline early helpers in ways
+  // that hit a Temporal Dead Zone if these are declared further down.
+  const [step2SubStep, setStep2SubStep] = useState(0); // 0=account, 1=locations, 2=teammates
+  const [step3SubStep, setStep3SubStep] = useState(0); // 0=how billing works, 1=add payment method
 
   // Sync URL ?step=N -> step state (direct link or browser back)
   useEffect(() => {
@@ -595,9 +601,18 @@ export default function CompanyOnboarding() {
           if (data.lastName) setBusinessInfo(prev => ({ ...prev, lastName: data.lastName || prev.lastName }));
           if (data.companyEmail) setBusinessInfo(prev => ({ ...prev, companyEmail: data.companyEmail || prev.companyEmail }));
           if (data.stepAtAuth !== undefined) {
-            const targetStep = Number(data.stepAtAuth) === 0 ? 1 : Number(data.stepAtAuth);
-            if (!Number.isNaN(targetStep) && targetStep >= 0 && targetStep <= TOTAL_STEPS) {
-              setStepAndUrl(targetStep);
+            const sa = Number(data.stepAtAuth);
+            if (!Number.isNaN(sa) && sa >= 0 && sa <= TOTAL_STEPS) {
+              if (sa === 0) {
+                // From welcome step: land on industries (step 1)
+                setStepAndUrl(1);
+              } else if (sa === 2) {
+                // From Business details (account) substep: skip past it to Locations (step 2 substep 1)
+                setStepAndUrl(2);
+                setStep2SubStep(1);
+              } else {
+                setStepAndUrl(sa);
+              }
             }
           }
         } catch (e) {
@@ -609,7 +624,7 @@ export default function CompanyOnboarding() {
       window.history.replaceState({}, "", newUrl);
     } else if (isAuthenticated && user) {
       // Check if user is Google-only (no passwordHash or authProvider is google)
-      if (!user.passwordHash || user.authProvider === "google") {
+      if (!user.hasPassword || user.authProvider === "google") {
         setIsGoogleAuth(true);
       }
       // If user is authenticated via Google and on step 0, go to step 1
@@ -652,8 +667,7 @@ export default function CompanyOnboarding() {
     locationIds: string[];
   }[]>([]);
   const [inviteWizardStep, setInviteWizardStep] = useState(0); // 0=list, 1=details, 2=role, 3=locations, 4=review
-  const [step2SubStep, setStep2SubStep] = useState(0); // 0=account, 1=locations, 2=teammates
-  const [step3SubStep, setStep3SubStep] = useState(0); // 0=how billing works, 1=add payment method
+  // step2SubStep / step3SubStep are declared at the top of the component (next to `step`).
   
   // Payment step state (SetupIntent)
   const [stripePromise, setStripePromise] = useState<ReturnType<typeof loadStripe> | null>(null);
@@ -3478,20 +3492,11 @@ export default function CompanyOnboarding() {
               {isMobile ? (
                 <>
                   <Button
-                    onClick={() => continueWithGoogle(0)}
-                    variant="outline"
-                    className="w-full h-12 rounded-xl border-gray-300 text-gray-700 hover:bg-gray-50 text-base font-medium"
-                    data-testid="button-google-signup"
-                  >
-                    <SiGoogle className="w-4 h-4 mr-2" />
-                    Continue with Google
-                  </Button>
-                  <Button
                     onClick={() => { setIsEmailSignupMode(true); setStepAndUrl(1); }}
                     className="w-full h-12 rounded-xl bg-gray-900 text-white hover:bg-gray-800 font-semibold text-base"
                     data-testid="button-begin-signup"
                   >
-                    Continue with Email
+                    Continue
                   </Button>
                   <Button
                     variant="ghost"
@@ -3516,20 +3521,11 @@ export default function CompanyOnboarding() {
                   </Button>
                   <div className="flex gap-3 flex-1 justify-end">
                     <Button
-                      onClick={() => continueWithGoogle(0)}
-                      variant="outline"
-                      className="h-10 border-gray-300 text-gray-700 hover:bg-gray-50"
-                      data-testid="button-google-signup"
-                    >
-                      <SiGoogle className="w-4 h-4 mr-2" />
-                      Continue with Google
-                    </Button>
-                    <Button
                       onClick={() => { setIsEmailSignupMode(true); setStepAndUrl(1); }}
                       className="h-10 bg-gray-900 text-white hover:bg-gray-800"
                       data-testid="button-begin-signup"
                     >
-                      Continue with Email
+                      Continue
                     </Button>
                   </div>
                 </>

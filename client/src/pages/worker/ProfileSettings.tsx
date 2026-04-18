@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from "react";
 import { useLocation } from "wouter";
-import { useMutation } from "@tanstack/react-query";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import { useAuth } from "@/hooks/use-auth";
 import { useProfile, invalidateSessionProfileQueries, profileMeQueryKey } from "@/hooks/use-profiles";
 import { apiRequest, queryClient } from "@/lib/queryClient";
@@ -10,7 +10,9 @@ import { Label } from "@/components/ui/label";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { useToast } from "@/hooks/use-toast";
 import { useUpload } from "@/hooks/use-upload";
-import { ArrowLeft, Camera, Loader2, Check, CheckCircle, X, Upload, ChevronRight, MapPin, Briefcase, Calendar, Mail, Phone, Home, Shield, FileText, Heart, Search, Building2 } from "lucide-react";
+import { ArrowLeft, Camera, Loader2, Check, CheckCircle, X, Upload, ChevronRight, MapPin, Briefcase, Calendar, Mail, Phone, Home, Shield, FileText, Heart, Search, Building2, Key, Eye, EyeOff } from "lucide-react";
+import { SiGoogle } from "react-icons/si";
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import * as faceapi from "@vladmandic/face-api";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useTranslation } from "react-i18next";
@@ -1140,6 +1142,9 @@ export function ProfileSettingsContent({ embedded = false }: { embedded?: boolea
           </div>
         </div>
       </div>
+
+      {/* Login & Security */}
+      <LoginSecuritySection embedded={embedded} />
     </div>
   );
 
@@ -1156,6 +1161,273 @@ export function ProfileSettingsContent({ embedded = false }: { embedded?: boolea
         </div>
       </header>
       <main>{main}</main>
+    </div>
+  );
+}
+
+type AuthMethods = { email: string | null; hasPassword: boolean; hasGoogle: boolean };
+
+export function LoginSecuritySection({ embedded = true }: { embedded?: boolean }) {
+  const { toast } = useToast();
+  const { data, isLoading, refetch } = useQuery<AuthMethods>({
+    queryKey: ["/api/auth/methods"],
+    queryFn: async () => {
+      const res = await fetch("/api/auth/methods", { credentials: "include" });
+      if (!res.ok) throw new Error("Failed to load login methods");
+      return res.json();
+    },
+  });
+
+  const [pwOpen, setPwOpen] = useState(false);
+  const [currentPassword, setCurrentPassword] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmNewPassword, setConfirmNewPassword] = useState("");
+  const [showCurrent, setShowCurrent] = useState(false);
+  const [showNew, setShowNew] = useState(false);
+  const [pwSubmitting, setPwSubmitting] = useState(false);
+  const [pwError, setPwError] = useState<string | null>(null);
+
+  // Surface result of Google linking redirect (?googleLinked=success|error)
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const linked = params.get("googleLinked");
+    if (!linked) return;
+    if (linked === "success") {
+      toast({ title: "Google connected", description: "You can now sign in with Google." });
+      refetch();
+    } else {
+      const reason = params.get("reason");
+      const desc =
+        reason === "email_mismatch"
+          ? "That Google account doesn't match the email on this account."
+          : reason === "no_user"
+          ? "We couldn't find your account. Please sign in again."
+          : "We couldn't connect your Google account. Try again.";
+      toast({ title: "Couldn't connect Google", description: desc, variant: "destructive" });
+    }
+    params.delete("googleLinked");
+    params.delete("reason");
+    const qs = params.toString();
+    window.history.replaceState({}, "", window.location.pathname + (qs ? `?${qs}` : ""));
+  }, [toast, refetch]);
+
+  const hasPassword = !!data?.hasPassword;
+  const hasGoogle = !!data?.hasGoogle;
+
+  const submitPassword = async () => {
+    setPwError(null);
+    if (newPassword.length < 8) return setPwError("Password must be at least 8 characters");
+    if (!/[A-Z]/.test(newPassword)) return setPwError("Password must contain an uppercase letter");
+    if (!/[a-z]/.test(newPassword)) return setPwError("Password must contain a lowercase letter");
+    if (!/[0-9]/.test(newPassword)) return setPwError("Password must contain a number");
+    if (newPassword !== confirmNewPassword) return setPwError("Passwords don't match");
+    if (hasPassword && !currentPassword) return setPwError("Enter your current password");
+
+    setPwSubmitting(true);
+    try {
+      const res = await fetch("/api/auth/set-password", {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          newPassword,
+          ...(hasPassword ? { currentPassword } : {}),
+        }),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setPwError(body?.message || "Failed to update password");
+        return;
+      }
+      toast({
+        title: hasPassword ? "Password updated" : "Password set",
+        description: hasPassword
+          ? "Your password has been changed."
+          : "You can now sign in with email + password.",
+      });
+      setPwOpen(false);
+      setCurrentPassword("");
+      setNewPassword("");
+      setConfirmNewPassword("");
+      refetch();
+    } catch (e: any) {
+      setPwError(e?.message || "Network error");
+    } finally {
+      setPwSubmitting(false);
+    }
+  };
+
+  const connectGoogle = () => {
+    const returnTo = window.location.pathname + window.location.search;
+    window.location.href = `/api/auth/google?link=true&returnTo=${encodeURIComponent(returnTo)}`;
+  };
+
+  return (
+    <div className={embedded ? "" : "container mx-auto px-4 max-w-3xl"}>
+      <div className="bg-background rounded-2xl shadow-sm border border-border overflow-hidden">
+        <div className="p-6 border-b border-border">
+          <h3 className="text-lg font-semibold">Login & Security</h3>
+          <p className="text-sm text-muted-foreground mt-1">
+            Choose how you sign in. You can use email + password, Google, or both.
+          </p>
+        </div>
+
+        {isLoading ? (
+          <div className="p-6 flex justify-center">
+            <Loader2 className="w-5 h-5 animate-spin text-muted-foreground" />
+          </div>
+        ) : (
+          <div className="divide-y divide-border">
+            {/* Password row */}
+            <div className="p-4 hover:bg-muted/50 transition-colors flex items-center justify-between gap-3">
+              <div className="flex items-center gap-3 min-w-0">
+                <Key className="w-5 h-5 text-muted-foreground shrink-0" />
+                <div className="min-w-0">
+                  <p className="text-sm font-medium text-muted-foreground">Password login</p>
+                  <p className="text-base font-medium mt-0.5 flex items-center gap-2">
+                    {hasPassword ? (
+                      <>
+                        <CheckCircle className="w-4 h-4 text-green-600" /> Enabled
+                      </>
+                    ) : (
+                      <span className="text-muted-foreground">Not set</span>
+                    )}
+                  </p>
+                </div>
+              </div>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => {
+                  setPwError(null);
+                  setCurrentPassword("");
+                  setNewPassword("");
+                  setConfirmNewPassword("");
+                  setPwOpen(true);
+                }}
+                data-testid={hasPassword ? "button-change-password" : "button-set-password"}
+              >
+                {hasPassword ? "Change" : "Set password"}
+              </Button>
+            </div>
+
+            {/* Google row */}
+            <div className="p-4 hover:bg-muted/50 transition-colors flex items-center justify-between gap-3">
+              <div className="flex items-center gap-3 min-w-0">
+                <SiGoogle className="w-5 h-5 text-muted-foreground shrink-0" />
+                <div className="min-w-0">
+                  <p className="text-sm font-medium text-muted-foreground">Google sign-in</p>
+                  <p className="text-base font-medium mt-0.5 flex items-center gap-2 truncate">
+                    {hasGoogle ? (
+                      <>
+                        <CheckCircle className="w-4 h-4 text-green-600 shrink-0" />
+                        <span className="truncate">Connected{data?.email ? ` · ${data.email}` : ""}</span>
+                      </>
+                    ) : (
+                      <span className="text-muted-foreground">Not connected</span>
+                    )}
+                  </p>
+                </div>
+              </div>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={connectGoogle}
+                data-testid={hasGoogle ? "button-reconnect-google" : "button-connect-google"}
+              >
+                {hasGoogle ? "Reconnect" : "Connect Google"}
+              </Button>
+            </div>
+          </div>
+        )}
+      </div>
+
+      <Dialog open={pwOpen} onOpenChange={setPwOpen}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>{hasPassword ? "Change password" : "Set a password"}</DialogTitle>
+            <DialogDescription>
+              {hasPassword
+                ? "Enter your current password and a new one."
+                : "Add a password so you can sign in with email + password too."}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4 pt-2">
+            {hasPassword && (
+              <div>
+                <Label htmlFor="current-password">Current password</Label>
+                <div className="relative mt-1">
+                  <Input
+                    id="current-password"
+                    type={showCurrent ? "text" : "password"}
+                    value={currentPassword}
+                    onChange={(e) => setCurrentPassword(e.target.value)}
+                    autoComplete="current-password"
+                    className="pr-10"
+                    data-testid="input-current-password"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowCurrent((v) => !v)}
+                    className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                  >
+                    {showCurrent ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                  </button>
+                </div>
+              </div>
+            )}
+            <div>
+              <Label htmlFor="new-password">New password</Label>
+              <div className="relative mt-1">
+                <Input
+                  id="new-password"
+                  type={showNew ? "text" : "password"}
+                  value={newPassword}
+                  onChange={(e) => setNewPassword(e.target.value)}
+                  autoComplete="new-password"
+                  className="pr-10"
+                  data-testid="input-new-password"
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowNew((v) => !v)}
+                  className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                >
+                  {showNew ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                </button>
+              </div>
+              <p className="text-xs text-muted-foreground mt-1">
+                Min 8 chars, with uppercase, lowercase, and a number.
+              </p>
+            </div>
+            <div>
+              <Label htmlFor="confirm-new-password">Confirm new password</Label>
+              <Input
+                id="confirm-new-password"
+                type={showNew ? "text" : "password"}
+                value={confirmNewPassword}
+                onChange={(e) => setConfirmNewPassword(e.target.value)}
+                autoComplete="new-password"
+                className="mt-1"
+                data-testid="input-confirm-new-password"
+              />
+            </div>
+            {pwError && (
+              <div className="text-sm text-destructive bg-destructive/10 border border-destructive/20 rounded-md p-2">
+                {pwError}
+              </div>
+            )}
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setPwOpen(false)} disabled={pwSubmitting}>
+              Cancel
+            </Button>
+            <Button onClick={submitPassword} disabled={pwSubmitting} data-testid="button-submit-password">
+              {pwSubmitting ? <Loader2 className="w-4 h-4 animate-spin" /> : hasPassword ? "Update password" : "Set password"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

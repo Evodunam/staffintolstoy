@@ -140,14 +140,23 @@ export function registerAuthRoutes(app: Express): void {
       // Store return URL and onboarding data in session
       const returnTo = req.query.returnTo as string | undefined;
       const onboardingData = req.query.onboardingData as string | undefined;
-      
+      const link = req.query.link === "true";
+
       if (returnTo) {
         (req.session as any).returnTo = returnTo;
       }
       if (onboardingData) {
         (req.session as any).onboardingData = onboardingData;
       }
-      
+      // Account-linking mode: only allowed if a user is already signed in.
+      // Capture the originating user id so the callback can verify the email
+      // matches and update authProvider on that user.
+      if (link && req.isAuthenticated() && (req.user as any)?.claims?.sub) {
+        (req.session as any).linkGoogleForUserId = (req.user as any).claims.sub;
+      } else {
+        delete (req.session as any).linkGoogleForUserId;
+      }
+
       next();
     },
     (req, res, next) => {
@@ -173,17 +182,86 @@ export function registerAuthRoutes(app: Express): void {
         // Get return URL and onboarding data from session
         const returnTo = (req.session as any)?.returnTo || "/";
         const onboardingData = (req.session as any)?.onboardingData;
-        
+        const linkGoogleForUserId = (req.session as any)?.linkGoogleForUserId as string | undefined;
+
         // Clear session data and profile cache so next request loads fresh profile
         delete (req.session as any).returnTo;
         delete (req.session as any).onboardingData;
+        delete (req.session as any).linkGoogleForUserId;
         clearProfileSnapshot(req);
+
+        // === Account-linking flow ===
+        // Initiated from settings: just attach Google to the current user, then redirect back.
+        if (linkGoogleForUserId) {
+          try {
+            const googleUser = req.user as any;
+            const googleEmail = (googleUser?.claims?.email || "").toLowerCase();
+            const [originalUser] = await db
+              .select()
+              .from(users)
+              .where(eq(users.id, linkGoogleForUserId));
+
+            const safeReturn = returnTo && typeof returnTo === "string" ? returnTo : "/dashboard/menu";
+            const sep = safeReturn.includes("?") ? "&" : "?";
+
+            if (!originalUser) {
+              return res.redirect(`${safeReturn}${sep}googleLinked=error&reason=no_user`);
+            }
+            if (!googleEmail || googleEmail !== (originalUser.email || "").toLowerCase()) {
+              // Restore original session so we don't strand them as the wrong user
+              await new Promise<void>((resolve) => {
+                req.login(
+                  {
+                    claims: {
+                      sub: originalUser.id,
+                      email: originalUser.email,
+                      first_name: originalUser.firstName,
+                      last_name: originalUser.lastName,
+                    },
+                    expires_at: Math.floor(Date.now() / 1000) + SESSION_TTL_SECONDS,
+                  },
+                  () => resolve()
+                );
+              });
+              return res.redirect(`${safeReturn}${sep}googleLinked=error&reason=email_mismatch`);
+            }
+
+            await db
+              .update(users)
+              .set({ authProvider: "google", updatedAt: new Date() })
+              .where(eq(users.id, originalUser.id));
+
+            // Make sure the session is still the original user (passport may have replaced it)
+            await new Promise<void>((resolve) => {
+              req.login(
+                {
+                  claims: {
+                    sub: originalUser.id,
+                    email: originalUser.email,
+                    first_name: originalUser.firstName,
+                    last_name: originalUser.lastName,
+                  },
+                  expires_at: Math.floor(Date.now() / 1000) + SESSION_TTL_SECONDS,
+                },
+                () => resolve()
+              );
+            });
+
+            return res.redirect(`${safeReturn}${sep}googleLinked=success`);
+          } catch (linkErr) {
+            console.error("Google account-link error:", linkErr);
+            const safeReturn = returnTo && typeof returnTo === "string" ? returnTo : "/dashboard/menu";
+            const sep = safeReturn.includes("?") ? "&" : "?";
+            return res.redirect(`${safeReturn}${sep}googleLinked=error`);
+          }
+        }
 
         // If there's onboarding data, redirect back to onboarding with it
         if (onboardingData) {
           try {
-            // Pass onboarding data in URL params
-            const redirectUrl = `${returnTo}?googleAuth=true&onboardingData=${encodeURIComponent(onboardingData)}`;
+            // Pass onboarding data in URL params (use & if returnTo already has a query string)
+            const separator = returnTo.includes("?") ? "&" : "?";
+            const redirectUrl = `${returnTo}${separator}googleAuth=true&onboardingData=${encodeURIComponent(onboardingData)}`;
             return res.redirect(redirectUrl);
           } catch (e) {
             console.error("Error handling onboarding data:", e);
@@ -268,12 +346,30 @@ export function registerAuthRoutes(app: Express): void {
     }
   );
   }
+  // Strip secrets from user row before sending to the client.
+  // Replaces the boolean intent of `passwordHash` with `hasPassword`.
+  const sanitizeUserForClient = (u: any) => {
+    if (!u) return u;
+    const {
+      passwordHash,
+      passwordResetToken,
+      passwordResetExpires,
+      otpCode,
+      otpExpires,
+      magicLinkToken,
+      magicLinkExpires,
+      ...safe
+    } = u;
+    return { ...safe, hasPassword: !!passwordHash };
+  };
+
   // Get current authenticated user
   app.get("/api/auth/user", isAuthenticated, async (req: any, res) => {
     try {
       const userId = req.user.claims.sub;
-      const user = await authStorage.getUser(userId);
-      
+      const rawUser = await authStorage.getUser(userId);
+      const user = sanitizeUserForClient(rawUser);
+
       // Check if impersonating a team member
       const impersonatingTeamMemberId = (req.session as any)?.impersonatingTeamMemberId;
       const impersonatingAsEmployee = (req.session as any)?.impersonatingAsEmployee;

@@ -955,14 +955,43 @@ export default function WorkerOnboarding() {
   useEffect(() => {
     const searchParams = new URLSearchParams(window.location.search);
     const googleAuth = searchParams.get("googleAuth");
+    const onboardingDataParam = searchParams.get("onboardingData");
     if (googleAuth === "true") {
       setIsGoogleAuth(true);
-      // Clean up URL
-      const newUrl = window.location.pathname;
-      window.history.replaceState({}, "", newUrl);
+
+      // Restore form fields and figure out where to land
+      let advanceTo: number | null = null;
+      if (onboardingDataParam) {
+        try {
+          const data = JSON.parse(decodeURIComponent(onboardingDataParam));
+          setFormData((prev: any) => ({
+            ...prev,
+            firstName: data.firstName || prev.firstName,
+            lastName: data.lastName || prev.lastName,
+            email: data.email || prev.email,
+            phone: data.phone || prev.phone,
+          }));
+          const stepAtAuth = Number(data.stepAtAuth);
+          // If google auth was triggered from the Account Setup tab (step 1), skip past it
+          if (stepAtAuth === 1) advanceTo = 2;
+          else if (stepAtAuth === 0) advanceTo = 1;
+        } catch (e) {
+          console.error("Error parsing onboardingData from URL:", e);
+        }
+      }
+
+      if (advanceTo !== null) {
+        setCurrentStep(advanceTo);
+        const newUrl = `${window.location.pathname}?step=${advanceTo}`;
+        window.history.replaceState({}, "", newUrl);
+      } else {
+        // Clean up URL
+        const newUrl = window.location.pathname;
+        window.history.replaceState({}, "", newUrl);
+      }
     } else if (isAuthenticated && user) {
       // Check if user is Google-only (no passwordHash or authProvider is google)
-      if (!user.passwordHash || user.authProvider === "google") {
+      if (!user.hasPassword || user.authProvider === "google") {
         setIsGoogleAuth(true);
       }
     }
@@ -2416,26 +2445,17 @@ export default function WorkerOnboarding() {
               </div>
             </div>
 
-            {/* Bottom Navigation Bar - mobile: stacked (Google, Email, Exit); desktop: row with Exit left */}
+            {/* Bottom Navigation Bar - mobile: stacked (Email, Exit); desktop: row with Exit left */}
             <footer className="border-t border-gray-200 bg-white shrink-0 sticky bottom-0 shadow-[0_-2px_12px_rgba(0,0,0,0.06)]">
               <div className={`max-w-3xl mx-auto px-4 md:px-8 py-4 md:py-4 flex ${isMobile ? "flex-col gap-4 py-6" : "flex-row items-center gap-3"}`}>
                 {isMobile ? (
                   <>
                     <Button
-                      onClick={() => continueWithGoogle(0)}
-                      variant="outline"
-                      className="w-full h-12 rounded-xl border-gray-300 text-gray-700 hover:bg-gray-50 text-base font-medium"
-                      data-testid="button-google-signup"
-                    >
-                      <SiGoogle className="w-4 h-4 mr-2" />
-                      Continue with Google
-                    </Button>
-                    <Button
                       onClick={nextStep}
                       className="w-full h-12 rounded-xl bg-gray-900 text-white hover:bg-gray-800 font-semibold text-base"
                       data-testid="button-begin-signup"
                     >
-                      Continue with Email
+                      Continue
                     </Button>
                     <Button
                       variant="ghost"
@@ -2462,20 +2482,11 @@ export default function WorkerOnboarding() {
                     </Button>
                     <div className="flex gap-3 flex-1 justify-end">
                       <Button
-                        onClick={() => continueWithGoogle(0)}
-                        variant="outline"
-                        className="h-10 border-gray-300 text-gray-700 hover:bg-gray-50"
-                        data-testid="button-google-signup"
-                      >
-                        <SiGoogle className="w-4 h-4 mr-2" />
-                        Continue with Google
-                      </Button>
-                      <Button
                         onClick={nextStep}
                         className="h-10 bg-gray-900 text-white hover:bg-gray-800"
                         data-testid="button-begin-signup"
                       >
-                        Continue with Email
+                        Continue
                       </Button>
                     </div>
                   </>
