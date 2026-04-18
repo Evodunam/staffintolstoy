@@ -2592,6 +2592,35 @@ export async function registerRoutes(
       }
 
       const profile = await storage.createProfile(input);
+
+      // Pre-create the Stripe customer for company profiles so the payment-method
+      // embed at step 3 always has a valid customer_id ready (avoids cold-start
+      // races and the "Could not save payment method" failure mode where the
+      // SetupIntent endpoint had to lazily create the customer mid-request).
+      if (profile.role === "company") {
+        void (async () => {
+          try {
+            const customerId = await ensureCompanyStripeCustomer({
+              id: profile.id,
+              stripeCustomerId: profile.stripeCustomerId ?? undefined,
+              email: profile.email ?? undefined,
+              companyName: profile.companyName ?? undefined,
+              firstName: profile.firstName ?? undefined,
+              lastName: profile.lastName ?? undefined,
+              userId: String((profile as any).userId ?? ""),
+            });
+            console.log(
+              `[ProfileCreate] Pre-created Stripe customer ${customerId} for company profile ${profile.id}`
+            );
+          } catch (e: any) {
+            console.warn(
+              `[ProfileCreate] Failed to pre-create Stripe customer for profile ${profile.id}:`,
+              e?.message || e
+            );
+          }
+        })();
+      }
+
       if (profile.referredByAffiliateId) {
         const affiliate = await storage.getAffiliate(profile.referredByAffiliateId);
         if (affiliate) {
@@ -3253,6 +3282,33 @@ export async function registerRoutes(
         return res.status(404).json({ message: "Profile not found or update had no effect." });
       }
       if (req.profile && id === req.profile.id) clearProfileSnapshot(req);
+
+      // Pre-create the Stripe customer for company profiles that still don't
+      // have one (covers users who finished step 2 before this code shipped,
+      // or stuck users we manually created profiles for). Fire-and-forget.
+      if (profile.role === "company" && !profile.stripeCustomerId) {
+        void (async () => {
+          try {
+            const customerId = await ensureCompanyStripeCustomer({
+              id: profile.id,
+              stripeCustomerId: profile.stripeCustomerId ?? undefined,
+              email: profile.email ?? undefined,
+              companyName: profile.companyName ?? undefined,
+              firstName: profile.firstName ?? undefined,
+              lastName: profile.lastName ?? undefined,
+              userId: String((profile as any).userId ?? ""),
+            });
+            console.log(
+              `[ProfileUpdate] Pre-created Stripe customer ${customerId} for company profile ${profile.id}`
+            );
+          } catch (e: any) {
+            console.warn(
+              `[ProfileUpdate] Failed to pre-create Stripe customer for profile ${profile.id}:`,
+              e?.message || e
+            );
+          }
+        })();
+      }
 
       const w9WasJustUploaded = Boolean(
         currentProfile &&
