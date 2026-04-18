@@ -756,6 +756,9 @@ export default function Home() {
                 <li><a href="/privacy" className="hover:taskrabbit-green transition-colors">Privacy Policy</a></li>
                 <li><a href="/legal" className="hover:taskrabbit-green transition-colors">Legal</a></li>
                 <li><a href="/llms.txt" className="hover:taskrabbit-green transition-colors">llms.txt</a></li>
+                <li><a href="/llms-full.txt" className="hover:taskrabbit-green transition-colors">llms-full.txt</a></li>
+                <li><a href="/llms.json" className="hover:taskrabbit-green transition-colors">llms.json</a></li>
+                <li><a href="/robots.txt" className="hover:taskrabbit-green transition-colors">robots.txt</a></li>
                 <li><a href="/sitemap.xml" className="hover:taskrabbit-green transition-colors">Sitemap</a></li>
               </ul>
             </div>
