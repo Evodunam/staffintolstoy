@@ -8,9 +8,14 @@
  *   3. Per-file transactions so a failure rolls back cleanly.
  *
  * Usage:
- *   npm run migrate:prod                 # dry-run: lists pending migrations
- *   npm run migrate:prod -- --apply      # actually applies pending migrations
- *   npm run migrate:prod -- --apply --from 046  # only files >= 046
+ *   npm run migrate:prod                                          # dry-run: lists pending migrations
+ *   npm run migrate:prod -- --apply                               # apply ALL pending
+ *   npm run migrate:prod -- --apply --from 046                    # only files >= 046
+ *   npm run migrate:prod -- --apply --from 055 --to 060           # only 055..060
+ *   npm run migrate:prod -- --apply --file 062_disable_rls_remaining_tables.sql
+ *                                                                 # apply exactly one file
+ *   npm run migrate:prod -- --apply --file 062_X.sql --file 064_Y.sql
+ *                                                                 # apply two specific files
  *
  * Tracking table (auto-created if missing):
  *   _schema_migrations(filename TEXT PRIMARY KEY, applied_at TIMESTAMPTZ)
@@ -30,17 +35,20 @@ interface Args {
   from?: string;
   to?: string;
   only?: string;
+  /** Repeatable: --file 062_disable_rls_remaining_tables.sql --file 064_other.sql */
+  files: string[];
 }
 
 function parseArgs(): Args {
   const argv = process.argv.slice(2);
-  const args: Args = { apply: false };
+  const args: Args = { apply: false, files: [] };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--apply") args.apply = true;
     else if (a === "--from") args.from = argv[++i];
     else if (a === "--to") args.to = argv[++i];
     else if (a === "--only") args.only = argv[++i];
+    else if (a === "--file") args.files.push(argv[++i]);
   }
   return args;
 }
@@ -82,6 +90,9 @@ async function main() {
     const applied = new Set(appliedRows.map((r) => r.filename));
 
     const filtered = allFiles.filter((f) => {
+      // --file <name> wins over all other filters (allows applying exactly one
+      // when multiple files share a numeric prefix, e.g. 062_X.sql and 062_Y.sql).
+      if (args.files.length > 0) return args.files.includes(f);
       const n = fileNumberPrefix(f);
       if (args.only) return n === args.only;
       if (args.from && n < args.from) return false;
