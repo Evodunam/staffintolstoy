@@ -257,9 +257,15 @@ app.use((req, res, next) => {
   next();
 });
 
-// Apex → app subdomain redirect for app/auth routes.
+// Apex → app subdomain redirect for app routes (not marketing, not static).
 // Marketing pages (/, /about, /jobs, etc.) and static assets stay on apex.
-// Everything else (login, dashboards, chats, onboarding, /api/*) lives on app.*.
+//
+// IMPORTANT: Do NOT 308 `/api/*` from apex → app. The SPA HTML is often served
+// on apex while `fetch("/api/...")` is same-origin there. A redirect makes the
+// followed request cross-origin (app.*) and fails without CORS — session
+// bootstrap breaks (infinite loading / silent auth failure). Session cookies use
+// `Domain=.tolstoystaffing.com`, so apex and app share the same cookie jar; API
+// can be served on either host on this same Node process.
 const APP_ONLY_PATH_PREFIXES = [
   "/login",
   "/reset-password",
@@ -277,7 +283,6 @@ const APP_ONLY_PATH_PREFIXES = [
   "/company/join",
   "/team/join",
   "/team/onboard",
-  "/api/", // all API calls go to app.* so cookies + CORS stay coherent
 ];
 const APEX_HOSTS = new Set(["tolstoystaffing.com", "www.tolstoystaffing.com"]);
 const APP_HOST = "app.tolstoystaffing.com";
