@@ -56,8 +56,16 @@ const REQUIRED_SECRETS = [
   "RESEND_API_KEY",
   "STRIPE_SECRET_KEY",
   "STRIPE_PUBLISHABLE_KEY",
+  // The fallback used by both webhook routes when the per-endpoint vars
+  // (STRIPE_WEBHOOK_SECRET_IDENTITY / _PAYMENT_METHOD) aren't set.
   "STRIPE_WEBHOOK_SECRET",
-  // Cookie scoping — added during the apex/app session-cookie unification.
+  // Per-endpoint Stripe webhook signing secrets (preferred over the catch-all
+  // STRIPE_WEBHOOK_SECRET because each Stripe webhook endpoint has a unique
+  // signing secret -- using a single shared secret means signature checks
+  // fail for events from the wrong endpoint).
+  "STRIPE_WEBHOOK_SECRET_IDENTITY",
+  "STRIPE_WEBHOOK_SECRET_PAYMENT_METHOD",
+  // Cookie scoping -- added during the apex/app session-cookie unification.
   // If unset, the session falls back to the hardcoded default in
   // server/auth/session.ts but be explicit anyway.
   "SESSION_COOKIE_DOMAIN",
