@@ -68,7 +68,12 @@ export async function notifyNewJobInTerritory(
   jobTitle: string,
   companyName: string,
   lat: number,
-  lng: number
+  lng: number,
+  // Optional shift bounds — when provided, we skip workers whose availability
+  // calendar says they can't take this shift. Caller should pass the job's
+  // start/end times when known so we don't spam off-hours workers.
+  shiftStart?: Date | null,
+  shiftEnd?: Date | null,
 ): Promise<void> {
   const workers = await db.select({
     id: profiles.id,
@@ -83,6 +88,16 @@ export async function notifyNewJobInTerritory(
       sql`${profiles.longitude} IS NOT NULL`
     ));
 
+  let availabilityFn: ((id: number, s: Date, e: Date) => Promise<{ available: boolean }>) | null = null;
+  if (shiftStart && shiftEnd) {
+    try {
+      const mod = await import("./services/availabilityCheck");
+      availabilityFn = mod.checkWorkerAvailable;
+    } catch {
+      // fall back: skip filter
+    }
+  }
+
   for (const worker of workers) {
     if (worker.latitude && worker.longitude) {
       const distance = calculateDistanceMiles(
@@ -93,6 +108,14 @@ export async function notifyNewJobInTerritory(
       );
 
       if (distance <= 20) {
+        if (availabilityFn && shiftStart && shiftEnd) {
+          try {
+            const av = await availabilityFn(worker.id, shiftStart, shiftEnd);
+            if (!av.available) continue;
+          } catch {
+            // don't fail dispatch on availability error
+          }
+        }
         await createNotification({
           profileId: worker.id,
           type: "new_job_in_territory",

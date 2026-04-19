@@ -20,24 +20,33 @@ upgrades available on Pro ($25/mo) and bot-management add-on on Business.
 
 ## 1. DNS — point through Cloudflare (proxied)
 
-You currently host DNS on DigitalOcean. To use Cloudflare's WAF you need
-Cloudflare to be authoritative.
+You currently host DNS on **DigitalOcean** (the apex `tolstoystaffing.com` and
+the `app.tolstoystaffing.com` ALIAS are managed there). To use Cloudflare's WAF
+you need Cloudflare to be authoritative.
 
-1. Sign up at https://cloudflare.com → Add `tolstoystaffing.com`.
+1. Sign up at <https://cloudflare.com> → Add `tolstoystaffing.com`.
 2. Cloudflare imports your existing records. Verify they all came over —
-   especially the `app` CNAME → `oyster-app-uw99i.ondigitalocean.app`.
+   especially:
+   - `tolstoystaffing.com` apex (A or ALIAS pointing at DO App Platform)
+   - `www` CNAME → apex
+   - `app` CNAME → DigitalOcean App Platform target (e.g. `<app>.ondigitalocean.app`)
+   - `admin` CNAME (admin.estimatrix.io) — note this is a separate zone if
+     using estimatrix.io; configure it in its own Cloudflare site
 3. Cloudflare gives you 2 nameservers (e.g. `kim.ns.cloudflare.com` +
    `walt.ns.cloudflare.com`).
-4. **At the registrar (Namecheap)**, change nameservers from the DO ones to
-   the Cloudflare pair. Propagation: 1–24 hours.
+4. **At your domain registrar** (whoever holds the registration; check
+   `whois tolstoystaffing.com`), change nameservers from the DO ones
+   (`ns1.digitalocean.com` etc) to the Cloudflare pair. Propagation: 1–24 hours.
 5. In Cloudflare DNS panel, set the proxy status (orange-cloud) to **ON** for:
    - `tolstoystaffing.com` (apex)
    - `www`
    - `app`
 
 Records that should stay **DNS-only** (gray-cloud):
+
 - MX records pointing to your email provider (Resend doesn't accept proxied)
-- TXT records (SPF, DKIM, DMARC, domain verification)
+- TXT records (SPF, DKIM, DMARC, domain verification) — verify with
+  `/api/admin/dns-health?domain=tolstoystaffing.com` in the admin console
 - Any `_acme-challenge` records
 - DigitalOcean App Platform's internal verification CNAME (if present)
 
@@ -84,47 +93,64 @@ Cloudflare → Security → WAF → Managed rules:
 
 Order matters — first-match wins.
 
-**Rule 1: Block the most-attacked endpoints from abuse-only ASNs**
-```
-(http.request.uri.path in {"/api/auth/login-email" "/api/auth/login/email-otp/verify" "/api/auth/mfa/login-verify"}) and (ip.geoip.asnum in {14618 16509 14061 16276 24940})
+#### Rule 1: Block the most-attacked endpoints from abuse-only ASNs
+
+```text
+(http.request.uri.path in {"/api/auth/login-email" "/api/auth/login/email-otp/verify" "/api/auth/mfa/login-verify" "/api/login"}) and (ip.geoip.asnum in {14618 16509 14061 16276 24940})
 Action: Managed Challenge
 ```
-*ASNs above are the major cloud providers; legitimate workers don't sign in
-from AWS/Azure/Hetzner.*
 
-**Rule 2: Aggressive challenge for /api/login* from outside US/CA**
-```
+ASNs above are the major cloud providers (AWS 14618, AWS 16509, DO 14061,
+Hetzner 16276, Linode/Akamai 24940). Legitimate workers don't sign in
+from server-side IPs. All four endpoints exist in `server/routes.ts`.
+
+#### Rule 2: Aggressive challenge for /api/auth/* from outside US/CA
+
+```text
 (starts_with(http.request.uri.path, "/api/auth/")) and (not ip.geoip.country in {"US" "CA"})
 Action: Managed Challenge
 ```
 
-**Rule 3: Rate-limit `/api/jobs` listing scraping**
-```
+#### Rule 3: Rate-limit `/api/jobs` listing scraping
+
+```text
 (http.request.uri.path eq "/api/jobs") and (cf.threat_score > 10)
 Action: Block
 ```
 
-**Rule 4: Drop requests with no user-agent header**
-```
+#### Rule 4: Drop requests with no user-agent header
+
+```text
 not exists http.user_agent or http.user_agent eq ""
 Action: Block
 ```
-*Caveat: some legit JSON-only API consumers send no user-agent. Add allowlist
-exceptions for partner integrations as they come online.*
 
-**Rule 5: Allowlist Stripe and Resend webhook IPs**
-```
+Caveat: some legit JSON-only API consumers send no user-agent. Add allowlist
+exceptions for partner integrations as they come online.
+
+#### Rule 5: Allowlist webhook source IPs
+
+```text
 (starts_with(http.request.uri.path, "/api/webhooks/")) and (not ip.src in $allowed_webhook_ips)
 Action: Block
 ```
-*Create the IP list `allowed_webhook_ips` from
-https://stripe.com/docs/ips and Resend's published IP ranges.*
+
+Active webhook endpoints (verify in `server/routes.ts`):
+
+- `/api/webhooks/checkr` — see <https://docs.checkr.com/reference/webhooks> (no static IPs published; rely on signature verification and skip this WAF rule for `/api/webhooks/checkr` if needed)
+- `/api/webhooks/stripe-identity` — see <https://stripe.com/docs/ips#webhook-notifications>
+- `/api/webhooks/stripe-payment-method` — same Stripe IP list
+
+Create the IP list `allowed_webhook_ips` from the Stripe URL above. Note
+that Mercury, Resend, and Checkr don't publish static IP ranges — those
+webhook handlers MUST rely on HMAC signature verification (which they do).
+Adjust the rule path to exclude provider routes that lack static IPs.
 
 ## 4. Rate limiting (separate from express-rate-limit)
 
 Cloudflare → Security → WAF → Rate limiting rules. Free plan = 1 rule.
 
-```
+```text
 Name: API auth burst
 Match: (starts_with(http.request.uri.path, "/api/auth/")) or (http.request.uri.path eq "/api/login")
 Characteristics: IP, plus URI path
@@ -149,8 +175,8 @@ Cloudflare → Security → WAF → Tools:
 The DigitalOcean origin should reject any request that didn't come through
 Cloudflare. Do this by:
 
-1. Pulling the Cloudflare IPv4 + IPv6 ranges:
-   https://www.cloudflare.com/ips-v4 / ...ips-v6
+1. Pulling the Cloudflare IPv4 + IPv6 ranges from
+   <https://www.cloudflare.com/ips-v4> and <https://www.cloudflare.com/ips-v6>
 2. In DigitalOcean App Platform → your app → Settings → Networking →
    add a **trusted-source** filter accepting only Cloudflare's ranges
    (DO calls this an "IP allowlist" depending on their UI version).
@@ -166,8 +192,14 @@ After the cutover, monitor:
 
 - Cloudflare → Analytics → Security → look for top blocked rules + top
   source ASNs/countries.
-- Sentry (already wired) for application 4xx/5xx that survived the WAF.
-- /api/status (already wired) for origin liveness.
+- Sentry (already wired in `server/observability/sentry.ts`) for application
+  4xx/5xx that survived the WAF.
+- `/api/status` (already wired at `server/routes.ts:747`) for origin liveness.
+- `/api/admin/metrics/endpoints` (admin SLO dashboard) for in-process
+  per-route p50/p95/p99 + error rate. Cross-reference Cloudflare's edge
+  metrics here when investigating an outage.
+- `/api/admin/dns-health?domain=tolstoystaffing.com` for SPF/DKIM/DMARC/MX/CAA
+  drift detection — re-run after any DNS change in Cloudflare.
 
 ## 8. Subscriber-friendly status page
 
@@ -177,11 +209,11 @@ under their Pages product. Or wire BetterStack/Statuspage.io to ping
 
 ## Cost summary
 
-| Tier | Monthly | What you gain |
-|---|---|---|
-| Free | $0 | DDoS absorption, Bot Fight Mode, 5 custom WAF rules, 1 rate-limit rule, basic managed rules |
-| Pro | $25 | Image polish, full managed ruleset, 20 custom rules, 5 rate-limit rules, mobile redirects |
-| Business | $250 | Bot management ML, 100 custom rules, custom certs, prioritized support |
+| Tier     | Monthly | What you gain                                                                                |
+| -------- | ------- | -------------------------------------------------------------------------------------------- |
+| Free     | $0      | DDoS absorption, Bot Fight Mode, 5 custom WAF rules, 1 rate-limit rule, basic managed rules  |
+| Pro      | $25     | Image polish, full managed ruleset, 20 custom rules, 5 rate-limit rules, mobile redirects    |
+| Business | $250    | Bot management ML, 100 custom rules, custom certs, prioritized support                       |
 
 Free is enough until you hit ~1M req/day or start seeing sophisticated bot abuse.
 

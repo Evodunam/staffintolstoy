@@ -49,6 +49,8 @@
     "db:migrate:035": "dotenv -e .env.development -- tsx script/run-sql-migration.ts migrations/035_job_auto_fulfill.sql",
     "db:migrate:040": "dotenv -e .env.development -- tsx script/run-sql-migration.ts migrations/040_user_auth_columns.sql",
     "db:migrate:040:prod": "dotenv -e .env.production -- tsx script/run-sql-migration.ts migrations/040_user_auth_columns.sql",
+    "db:migrate:064": "dotenv -e .env.development -- tsx script/run-sql-migration.ts migrations/064_scheduler_runs.sql",
+    "db:migrate:064:prod": "dotenv -e .env.production -- tsx script/run-sql-migration.ts migrations/064_scheduler_runs.sql",
     "secrets:upload": "dotenv -e .env.production -- tsx script/upload-secrets-to-gcp.ts",
     "migrate:dev": "dotenv -e .env.development -- tsx script/migrate-prod.ts",
     "migrate:dev:apply": "dotenv -e .env.development -- tsx script/migrate-prod.ts --apply",

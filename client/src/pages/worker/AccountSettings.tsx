@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 import { useLocation } from "wouter";
-import { useMutation } from "@tanstack/react-query";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import { useAuth } from "@/hooks/use-auth";
 import { useProfile, invalidateSessionProfileQueries } from "@/hooks/use-profiles";
 import { apiRequest, queryClient } from "@/lib/queryClient";
@@ -12,6 +12,10 @@ import { ArrowLeft, Loader2, Check } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { MfaSettings } from "@/components/MfaSettings";
 import { PrivacySettings } from "@/components/PrivacySettings";
+import { AvailabilityCalendar } from "@/components/AvailabilityCalendar";
+import { AdminAccessSettings } from "@/components/AdminAccessSettings";
+import { useAdminStatus } from "@/hooks/use-admin-status";
+import { ScanFace, ChevronRight, FlaskConical } from "lucide-react";
 
 const serviceCategories = [
   { id: "laborer", name: "Laborer", hasLevels: false },
@@ -30,6 +34,7 @@ export default function AccountSettings() {
   const { t: tCommon } = useTranslation("common");
   const { user, isLoading: authLoading } = useAuth();
   const { data: profile, isLoading: profileLoading } = useProfile(user?.id);
+  const { data: adminStatus } = useAdminStatus();
   const [, setLocation] = useLocation();
   const { toast } = useToast();
 
@@ -157,15 +162,92 @@ export default function AccountSettings() {
         </form>
 
         <div className="mt-10 pt-6 border-t border-border">
+          <h2 className="text-xl font-semibold mb-2">Availability</h2>
+          <p className="text-xs text-muted-foreground mb-4">
+            Tell us when you're available so companies don't offer you shifts you can't work.
+          </p>
+          <AvailabilityCalendar />
+        </div>
+
+        <div className="mt-10 pt-6 border-t border-border">
           <h2 className="text-xl font-semibold mb-4">Security</h2>
           <MfaSettings initiallyEnabled={(user as any)?.mfaEnabled === "true"} />
+        </div>
+
+        <div className="mt-10 pt-6 border-t border-border">
+          <h2 className="text-xl font-semibold mb-4">Compliance &amp; consent</h2>
+          <div className="space-y-2">
+            <button
+              onClick={() => setLocation("/account/background-check")}
+              className="w-full flex items-center gap-3 py-3 px-3 rounded-lg border border-border hover:bg-muted/50 transition-colors text-left"
+              data-testid="link-background-check"
+            >
+              <ScanFace className="w-5 h-5 text-muted-foreground flex-shrink-0" />
+              <div className="flex-1 min-w-0">
+                <p className="text-sm font-medium">Background check (FCRA disclosure &amp; consent)</p>
+                <p className="text-xs text-muted-foreground">Sign the disclosure to allow companies to order a background check.</p>
+              </div>
+              <ChevronRight className="w-5 h-5 text-muted-foreground flex-shrink-0" />
+            </button>
+
+            <DrugScreensLink />
+          </div>
         </div>
 
         <div className="mt-10 pt-6 border-t border-border">
           <h2 className="text-xl font-semibold mb-4">Privacy &amp; Data</h2>
           <PrivacySettings />
         </div>
+
+        {adminStatus?.isSuperAdmin && (
+          <div className="mt-10 pt-6 border-t border-border">
+            <h2 className="text-xl font-semibold mb-2">Admin Access</h2>
+            <p className="text-xs text-muted-foreground mb-4">
+              Visible only to super-admins. Grant or revoke admin access for other users.
+            </p>
+            <AdminAccessSettings />
+          </div>
+        )}
       </main>
     </div>
   );
 }
+
+/**
+ * Self-attest drug screen entry. Polls /api/worker/drug-screens for an
+ * unread-style count badge so the worker sees pending orders without
+ * navigating in. We don't render a dedicated worker-side drug screen page
+ * yet — clicking takes them to a placeholder that lists statuses.
+ */
+function DrugScreensLink() {
+  const [, setLocation] = useLocation();
+  const { data } = useQuery<any[]>({
+    queryKey: ["/api/worker/drug-screens"],
+    queryFn: async () => {
+      const res = await fetch("/api/worker/drug-screens", { credentials: "include" });
+      if (!res.ok) return [];
+      return res.json();
+    },
+  });
+  const pendingCount = (data ?? []).filter((d) => d.status === "pending" || d.status === "in_progress").length;
+  const completedCount = (data ?? []).filter((d) => String(d.status).startsWith("completed")).length;
+  const description = !data || data.length === 0
+    ? "No drug screens on file. Companies can request one — you'll get an email."
+    : `${pendingCount} active · ${completedCount} completed`;
+
+  return (
+    <button
+      onClick={() => setLocation("/dashboard/settings/drug-screens")}
+      className="w-full flex items-center gap-3 py-3 px-3 rounded-lg border border-border hover:bg-muted/50 transition-colors text-left"
+      data-testid="link-drug-screens"
+    >
+      <FlaskConical className="w-5 h-5 text-muted-foreground flex-shrink-0" />
+      <div className="flex-1 min-w-0">
+        <p className="text-sm font-medium">Drug screens</p>
+        <p className="text-xs text-muted-foreground">{description}</p>
+      </div>
+      <ChevronRight className="w-5 h-5 text-muted-foreground flex-shrink-0" />
+    </button>
+  );
+}
+

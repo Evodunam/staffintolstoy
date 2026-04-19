@@ -57,6 +57,13 @@ import TermsOfServicePublic from "@/pages/legal/TermsOfService";
 import PrivacyPolicyPublic from "@/pages/legal/PrivacyPolicy";
 import Legal from "@/pages/legal/Legal";
 import Subprocessors from "@/pages/legal/Subprocessors";
+import WebhooksSettings from "@/pages/company/WebhooksSettings";
+import CompanyCompliance from "@/pages/company/Compliance";
+import DrugScreenConsent from "@/pages/DrugScreenConsent";
+import WorkerBackgroundCheck from "@/pages/worker/BackgroundCheck";
+import BackgroundCheckConsent from "@/pages/BackgroundCheckConsent";
+import WorkerDrugScreens from "@/pages/worker/DrugScreens";
+import TrustCenter from "@/pages/TrustCenter";
 import Support from "@/pages/Support";
 import ContactUs from "@/pages/ContactUs";
 import ForServiceProfessionals from "@/pages/ForServiceProfessionals";
@@ -297,6 +304,22 @@ function Router() {
       <Route path="/legal" component={Legal} />
       <Route path="/legal/subprocessors" component={Subprocessors} />
       <Route path="/subprocessors" component={Subprocessors} />
+      <Route path="/trust" component={TrustCenter} />
+      <Route path="/trust-center" component={TrustCenter} />
+      <Route path="/drug-screen-consent/:token" component={DrugScreenConsent} />
+      <Route path="/background-check-consent/:token" component={BackgroundCheckConsent} />
+      <Route path="/account/background-check">
+        {() => <ProtectedRoute component={WorkerBackgroundCheck} />}
+      </Route>
+      <Route path="/dashboard/settings/drug-screens">
+        {() => <ProtectedRoute component={WorkerDrugScreens} />}
+      </Route>
+      <Route path="/company/webhooks">
+        {() => <ProtectedRoute component={WebhooksSettings} />}
+      </Route>
+      <Route path="/company/compliance">
+        {() => <ProtectedRoute component={CompanyCompliance} />}
+      </Route>
       <Route path="/status" component={StatusPage} />
       <Route path="/support" component={Support} />
       <Route path="/contact" component={ContactUs} />

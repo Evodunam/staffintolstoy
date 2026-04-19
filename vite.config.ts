@@ -2,6 +2,13 @@ import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react-swc";
 import path from "path";
 
+const gitCommitSha =
+  process.env.VITE_GIT_COMMIT_SHA ||
+  process.env.GIT_COMMIT_SHA ||
+  process.env.GITHUB_SHA ||
+  process.env.SOURCE_VERSION ||
+  "";
+
 export default defineConfig({
   plugins: [
     react(),
@@ -9,6 +16,9 @@ export default defineConfig({
   esbuild: {
     logOverride: { "this-is-undefined-in-esm": "silent" },
     target: "es2020",
+  },
+  define: {
+    "import.meta.env.VITE_GIT_COMMIT_SHA": JSON.stringify(gitCommitSha),
   },
   resolve: {
     alias: {

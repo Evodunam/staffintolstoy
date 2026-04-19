@@ -175,6 +175,7 @@ export async function processAutoApprovals(): Promise<{ processed: number; paid:
             const payment = await mercuryService.sendPayment({
               recipientId: worker.mercuryRecipientId!,
               amount: totalPay,
+              workerProfileId: worker.id,
               description: `Payment for ${job.title} - Auto-approved Timesheet #${ts.id}`,
               idempotencyKey: `timesheet-payout-${ts.id}`,
               note: `Worker: ${worker.id}, Timesheet: ${ts.id}, Company: ${company.id}`,

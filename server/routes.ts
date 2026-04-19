@@ -11,8 +11,8 @@ import { attachRlsDbContext } from "./auth/rls-context";
 import passport from "passport";
 import { db } from "./db";
 import { users } from "@shared/models/auth";
-import { profiles, jobs, type Job, digitalSignatures, deviceTokens, notifications, notificationTypes, insertDeviceTokenSchema, applications, timesheets, companyTeamMembers, teamInvites, locationPings, timesheetEvents, companyPaymentMethods, companyTransactions, teams, workerTeamMembers, jobAssignments, jobSchedules, jobMessages, jobMessageEmailLog, chatMessagePendingDigest, chatMessageDigestSent, jobBudgetReviewEmailSent, reviews, skills, referrals, affiliates, insertAffiliateSchema, companyAgreements, adminStrikes, safetyIncidents } from "@shared/schema";
-import { eq, and, asc, desc, inArray, isNull, isNotNull, or, gte, lte, sql } from "drizzle-orm";
+import { profiles, jobs, type Job, digitalSignatures, deviceTokens, notifications, notificationTypes, insertDeviceTokenSchema, applications, timesheets, companyTeamMembers, teamInvites, locationPings, timesheetEvents, companyPaymentMethods, companyTransactions, teams, workerTeamMembers, jobAssignments, jobSchedules, jobMessages, jobMessageEmailLog, chatMessagePendingDigest, chatMessageDigestSent, jobBudgetReviewEmailSent, reviews, skills, referrals, affiliates, insertAffiliateSchema, companyAgreements, adminStrikes, safetyIncidents, workerAvailabilityWindows, workerAvailabilityBlackouts, releaseNotes, releaseNotesReads, adminGrants, outboundWebhookEvents, subprocessorSubscribers, adminActivityLog, backgroundCheckConsents, backgroundCheckOrders, backgroundCheckConsentRequests, drugScreenOrders, drugScreenConsentRequests, schedulerRuns } from "@shared/schema";
+import { eq, and, asc, desc, inArray, isNull, isNotNull, or, gte, lte, sql, ilike } from "drizzle-orm";
 import { sendEmail, ALL_EMAIL_TYPES, getSampleDataForType } from "./email-service";
 import { setupWebSocket, notifyNewJob, notifyApplicationUpdate, notifyJobUpdate, notifyTimesheetUpdate, broadcastPresenceUpdate, notifyWorkerTeamPresence } from "./websocket";
 import { notifyWorkerInquiry, notifyWorkerAvailabilityUpdated, notifyNewJobInTerritory, createNotification } from "./notification-service";
@@ -222,6 +222,7 @@ async function runW9PayoutReleaseForWorker(profileId: number): Promise<void> {
     const payment = await mercuryService.sendPayment({
       recipientId: profile.mercuryRecipientId,
       amount: netAmountCents,
+      workerProfileId: profileId,
       description: isInstantPayout
         ? `W-9 release (${pendingW9Payouts.length} payouts) - Fee: $${(instantPayoutFeeCents / 100).toFixed(2)}`
         : `W-9 release (${pendingW9Payouts.length} payouts)`,
@@ -745,11 +746,23 @@ export async function registerRoutes(
   // background jobs. NOT an SLA reporter (use a real status page provider for
   // that), but useful for buyer-facing trust pages and ops smoke tests.
   app.get("/api/status", async (_req, res) => {
+    const version =
+      process.env.GIT_COMMIT_SHA ||
+      process.env.GITHUB_SHA ||
+      process.env.SOURCE_VERSION ||
+      process.env.VERCEL_GIT_COMMIT_SHA ||
+      process.env.K_REVISION ||
+      "dev";
     const out: Record<string, any> = {
       status: "ok",
       timestamp: new Date().toISOString(),
-      version: process.env.GIT_COMMIT_SHA || "dev",
+      version,
       checks: {} as Record<string, { ok: boolean; latencyMs?: number; error?: string }>,
+      // Non-blocking hints for ops (do not affect `status` / HTTP code).
+      telemetry: {
+        sentryServer: !!process.env.SENTRY_DSN,
+        externalCronAuth: !!process.env.CRON_SECRET,
+      },
     };
 
     // 1) Database
@@ -5730,12 +5743,24 @@ Respond ONLY in this exact JSON format:
         const jobLat = parseFloat(job.latitude);
         const jobLng = parseFloat(job.longitude);
         
+        // Compute shift bounds for availability filtering. Falls back to
+        // startDate + estimatedHours (or 8h) when endDate isn't set.
+        let shiftStart: Date | null = job.startDate ? new Date(job.startDate as any) : null;
+        let shiftEnd: Date | null = null;
+        if (shiftStart) {
+          const hours = job.estimatedHours ?? 8;
+          shiftEnd = job.endDate
+            ? new Date(job.endDate as any)
+            : new Date(shiftStart.getTime() + hours * 3600_000);
+        }
         await notifyNewJobInTerritory(
           job.id,
           job.title,
           companyName,
           jobLat,
-          jobLng
+          jobLng,
+          shiftStart,
+          shiftEnd,
         );
       }
       
@@ -12412,6 +12437,7 @@ Respond ONLY in this exact JSON format:
               const payment = await mercuryService.sendPayment({
                 recipientId: worker.mercuryRecipientId,
                 amount: totalPay,
+                workerProfileId: worker.id,
                 description: `Payment for ${job.title} - Auto-approved Timesheet #${ts.id}`,
                 idempotencyKey: `timesheet-payout-${ts.id}`,
                 note: `Worker: ${worker.id}, Timesheet: ${ts.id}`,
@@ -12642,13 +12668,44 @@ Respond ONLY in this exact JSON format:
     try {
       const sig = req.headers["x-checkr-signature"] as string | undefined;
       const raw = (req as any).rawBody?.toString("utf8") ?? JSON.stringify(req.body);
-      const { verifyCheckrWebhook, applyReportEvent } = await import("./services/checkr");
+      const { verifyCheckrWebhook, applyReportEvent, getReport } = await import("./services/checkr");
       if (!verifyCheckrWebhook(raw, sig)) {
         return res.status(401).json({ message: "Invalid Checkr signature" });
       }
       const event = req.body as { type: string; data: { object: any } };
-      if (event?.type?.startsWith("report.")) {
-        await applyReportEvent(event.data.object);
+      const eventType = event?.type ?? "";
+
+      if (eventType.startsWith("report.")) {
+        // Webhook payloads can be stale or partial. Refetch by id so the
+        // adverse-action scheduler picks up the authoritative result on its
+        // next tick. Falls back to the webhook payload if the GET fails.
+        const reportId: string | undefined = event.data?.object?.id;
+        let report = event.data?.object;
+        if (reportId) {
+          try { report = await getReport(reportId); }
+          catch (e) { console.warn("[Checkr/webhook] getReport failed; using payload:", e); }
+        }
+        await applyReportEvent(report);
+      } else if (eventType.startsWith("invitation.")) {
+        // Invitation lifecycle: pending → completed / expired. We don't update
+        // any DB row here (the report.* event that follows does that), but
+        // logging makes the placement flow easier to debug end-to-end.
+        const inv = event.data?.object;
+        const candidateId = inv?.candidate_id;
+        if (candidateId) {
+          const [order] = await db.select({ id: backgroundCheckOrders.id, workerId: backgroundCheckOrders.workerId })
+            .from(backgroundCheckOrders)
+            .where(eq(backgroundCheckOrders.vendorReference, candidateId))
+            .limit(1);
+          console.log(`[Checkr/webhook] ${eventType} candidate=${candidateId} status=${inv?.status} order=${order?.id ?? "unknown"}`);
+        } else {
+          console.log(`[Checkr/webhook] ${eventType} (no candidate_id in payload)`);
+        }
+      } else if (eventType.startsWith("candidate.")) {
+        // candidate.* events are mostly informational (created/updated). Log only.
+        console.log(`[Checkr/webhook] ${eventType} candidate=${event.data?.object?.id}`);
+      } else {
+        console.log(`[Checkr/webhook] ignored event type: ${eventType}`);
       }
       res.json({ received: true });
     } catch (err: any) {
@@ -12693,6 +12750,363 @@ Respond ONLY in this exact JSON format:
     res.status(201).json({ success: true, consent });
   });
 
+  // Worker checks their consent status — drives the UI between "sign first"
+  // and "you're already signed".
+  app.get("/api/background-check/consent/status", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    const profile = req.profile;
+    if (!profile || profile.role !== "worker") return res.status(403).json({ message: "Worker only" });
+    const { latestConsentForWorker, CURRENT_DISCLOSURE_VERSION } = await import("./services/backgroundCheck");
+    const consent = await latestConsentForWorker(profile.id);
+    res.json({
+      hasConsent: !!consent,
+      currentVersion: CURRENT_DISCLOSURE_VERSION,
+      // If the disclosure version has bumped since they signed, they need to re-sign.
+      isCurrent: !!consent && consent.disclosureVersion === CURRENT_DISCLOSURE_VERSION,
+      signedAt: consent?.disclosureSignedAt ?? null,
+      signedVersion: consent?.disclosureVersion ?? null,
+      signatureName: consent?.signatureName ?? null,
+    });
+  });
+
+  // ======================================================================
+  // === Company-initiated background check consent flow ===
+  // ======================================================================
+  // Company creates a request → tokenized email → worker reviews FCRA
+  // disclosure + auth + Summary of Rights + signs → canonical consent +
+  // draft order rows are created.
+  app.post("/api/company/background-checks/request", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    const profile = req.profile;
+    if (!profile || profile.role !== "company") return res.status(403).json({ message: "Company only" });
+
+    const { workerEmail, jobId, vendor, packageCode } = req.body || {};
+    if (!workerEmail || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(workerEmail)) {
+      return res.status(400).json({ message: "Valid workerEmail required" });
+    }
+    const lower = String(workerEmail).toLowerCase();
+
+    // Resolve worker profile if they already have an account.
+    const [workerProfile] = await db.select({ id: profiles.id })
+      .from(profiles)
+      .where(and(eq(profiles.role, "worker"), eq(profiles.email, lower)))
+      .limit(1);
+
+    const consentToken = crypto.randomBytes(24).toString("hex");
+    const expiresAt = new Date(Date.now() + 14 * 24 * 60 * 60 * 1000);
+
+    const [row] = await db.insert(backgroundCheckConsentRequests).values({
+      requestedByCompanyId: profile.id,
+      workerId: workerProfile?.id ?? null,
+      workerEmail: lower,
+      jobId: jobId ? Number(jobId) : null,
+      vendor: vendor ? String(vendor) : "checkr",
+      packageCode: packageCode ? String(packageCode) : null,
+      consentToken,
+      expiresAt,
+    }).returning();
+
+    // Best-effort consent invitation email.
+    void (async () => {
+      try {
+        const apiKey = process.env.RESEND_API_KEY;
+        const from = process.env.RESEND_FROM_EMAIL || "support@tolstoystaffing.com";
+        if (!apiKey) return;
+        const { Resend } = await import("resend");
+        const r = new Resend(apiKey);
+        const consentUrl = `https://app.tolstoystaffing.com/background-check-consent/${consentToken}`;
+        const companyDisplay = profile.companyName
+          || [profile.firstName, profile.lastName].filter(Boolean).join(" ").trim()
+          || "A Tolstoy Staffing company";
+        await r.emails.send({
+          from, to: lower,
+          subject: `${companyDisplay} requests your consent for a background check`,
+          html: `
+            <p>Hi,</p>
+            <p><strong>${escapeHtmlForResponse(companyDisplay)}</strong> has requested a background check as part of your hiring/onboarding process.</p>
+            <p>Before they can place the order, federal law (FCRA §604(b)) requires that you:</p>
+            <ol>
+              <li>Receive a standalone <strong>disclosure</strong> describing what the check covers</li>
+              <li>Receive the <strong>Summary of Your Rights Under the FCRA</strong> from the CFPB</li>
+              <li>Sign a separate <strong>authorization</strong></li>
+            </ol>
+            <p><a href="${consentUrl}" style="display:inline-block;padding:10px 20px;background:#0066ff;color:#fff;text-decoration:none;border-radius:6px;">Review &amp; Sign</a></p>
+            <p style="font-size:11px;color:#666;">This link expires in 14 days. If you didn't expect this email, you can safely ignore it — no order is placed without your signed consent.</p>
+          `,
+          text: `${companyDisplay} has requested a background check as part of your hiring process. Review the FCRA disclosure and sign at: ${consentUrl}\n\nThis link expires in 14 days.`,
+        } as any);
+      } catch (e) {
+        console.warn("[BgCheck/ConsentRequest] email failed:", e);
+      }
+    })();
+
+    res.status(201).json({
+      success: true,
+      requestId: row.id,
+      consentUrl: `https://app.tolstoystaffing.com/background-check-consent/${consentToken}`,
+      expiresAt,
+    });
+  });
+
+  // Public: worker fetches request details (token = auth).
+  app.get("/api/background-check/request/:token", async (req, res) => {
+    const token = String(req.params.token || "");
+    if (!token) return res.status(400).json({ message: "Invalid token" });
+    const [row] = await db.select().from(backgroundCheckConsentRequests)
+      .where(eq(backgroundCheckConsentRequests.consentToken, token)).limit(1);
+    if (!row) return res.status(404).json({ message: "Consent request not found" });
+    if (row.cancelledAt) return res.status(410).json({ message: "Cancelled by company", state: "cancelled" });
+    if (row.consentedAt) return res.status(409).json({ message: "Already signed", state: "signed", orderId: row.resultingOrderId });
+    if (new Date(row.expiresAt) < new Date()) return res.status(410).json({ message: "Expired", state: "expired" });
+
+    const [company] = await db.select({
+      firstName: profiles.firstName,
+      lastName: profiles.lastName,
+      companyName: profiles.companyName,
+    }).from(profiles).where(eq(profiles.id, row.requestedByCompanyId)).limit(1);
+    const companyDisplay = company?.companyName
+      || [company?.firstName, company?.lastName].filter(Boolean).join(" ").trim()
+      || "A Tolstoy Staffing company";
+
+    const { STANDALONE_DISCLOSURE_TEXT, AUTHORIZATION_TEXT, FCRA_SUMMARY_OF_RIGHTS_URL, CURRENT_DISCLOSURE_VERSION } =
+      await import("./services/backgroundCheck");
+
+    res.json({
+      companyDisplay,
+      vendor: row.vendor,
+      packageCode: row.packageCode,
+      expiresAt: row.expiresAt,
+      disclosureVersion: CURRENT_DISCLOSURE_VERSION,
+      disclosureText: STANDALONE_DISCLOSURE_TEXT,
+      authorizationText: AUTHORIZATION_TEXT,
+      summaryOfRightsUrl: FCRA_SUMMARY_OF_RIGHTS_URL,
+    });
+  });
+
+  // Public: worker submits signed consent. Creates canonical consent + draft
+  // order rows, links them back to the request.
+  app.post("/api/background-check/request/:token", async (req, res) => {
+    const token = String(req.params.token || "");
+    const { signatureName, accept, acknowledgedRights } = req.body || {};
+    if (!token) return res.status(400).json({ message: "Invalid token" });
+
+    const [row] = await db.select().from(backgroundCheckConsentRequests)
+      .where(eq(backgroundCheckConsentRequests.consentToken, token)).limit(1);
+    if (!row) return res.status(404).json({ message: "Consent request not found" });
+    if (row.cancelledAt) return res.status(410).json({ message: "Cancelled by company" });
+    if (row.consentedAt) return res.status(409).json({ message: "Already signed" });
+    if (new Date(row.expiresAt) < new Date()) return res.status(410).json({ message: "Expired" });
+
+    if (accept === false) {
+      await db.update(backgroundCheckConsentRequests).set({
+        cancelledAt: new Date(),
+        cancelledBy: `declined_by_worker:${row.workerEmail}`,
+      }).where(eq(backgroundCheckConsentRequests.id, row.id));
+      return res.json({ declined: true });
+    }
+
+    if (!signatureName || typeof signatureName !== "string" || signatureName.trim().length < 3) {
+      return res.status(400).json({ message: "signatureName (your full legal name) required" });
+    }
+    if (!acknowledgedRights) {
+      return res.status(400).json({ message: "You must acknowledge the Summary of Rights" });
+    }
+
+    // Worker must already exist as a profile to attach the consent record —
+    // FCRA paper trail must reference a real worker. If they don't have an
+    // account, return a helpful error pointing them to sign up first.
+    const [workerProfile] = await db.select()
+      .from(profiles)
+      .where(and(eq(profiles.role, "worker"), eq(profiles.email, row.workerEmail)))
+      .limit(1);
+    if (!workerProfile) {
+      return res.status(400).json({
+        message: "Create a worker account first, then re-open this link to sign.",
+        code: "NO_WORKER_ACCOUNT",
+      });
+    }
+
+    const ipAddress = (req.headers["x-forwarded-for"] as string)?.split(",")[0]?.trim() || req.ip || null;
+    const { recordConsent, createOrder } = await import("./services/backgroundCheck");
+
+    const consent = await recordConsent({
+      workerId: workerProfile.id,
+      signatureName: signatureName.trim(),
+      ipAddress: ipAddress ?? undefined,
+      userAgent: req.headers["user-agent"] as string | undefined,
+    });
+    const order = await createOrder({
+      workerId: workerProfile.id,
+      consentId: consent.id,
+      vendor: row.vendor,
+      packageCode: row.packageCode || undefined,
+    });
+
+    await db.update(backgroundCheckConsentRequests).set({
+      consentedAt: new Date(),
+      resultingConsentId: consent.id,
+      resultingOrderId: order.id,
+    }).where(eq(backgroundCheckConsentRequests.id, row.id));
+
+    // Real vendor placement when CHECKR_API_KEY is configured. Fire-and-forget
+    // so the worker isn't blocked on Checkr's API latency. On failure the order
+    // stays in 'draft' status and admin can re-run via the placement endpoint.
+    let invitationUrl: string | null = null;
+    if (row.vendor === "checkr") {
+      try {
+        const { placeOrderWithCheckr } = await import("./services/checkr");
+        const placement = await placeOrderWithCheckr(order.id);
+        if (placement.ok) {
+          invitationUrl = placement.invitationUrl ?? null;
+        } else {
+          console.warn("[BgCheck/Consent] Checkr placement failed:", placement.error);
+        }
+      } catch (e) {
+        console.error("[BgCheck/Consent] placement threw:", e);
+      }
+    }
+
+    res.status(201).json({
+      success: true,
+      consentId: consent.id,
+      orderId: order.id,
+      invitationUrl, // null when CHECKR_API_KEY is not configured or placement failed
+    });
+  });
+
+  // ======================================================================
+  // === Company self-serve OFAC SDN screening ===
+  // ======================================================================
+  // Companies screen vendors / contractors / payees against the U.S. Treasury
+  // OFAC SDN list before sending payment. Same engine used internally for
+  // pre-payout enforcement; this endpoint exposes it for in-app due diligence.
+  // Rate limited per company at 30 screens/min to discourage bulk-list abuse
+  // (we're not a sanctions-screening service).
+  const ofacCompanyRateMap = new Map<number, { count: number; resetAt: number }>();
+  const OFAC_COMPANY_RATE_WINDOW_MS = 60 * 1000;
+  const OFAC_COMPANY_RATE_MAX = 30;
+
+  app.post("/api/company/ofac/screen", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    const profile = req.profile;
+    if (!profile || profile.role !== "company") return res.status(403).json({ message: "Company only" });
+
+    // Rate limit per company.
+    const now = Date.now();
+    const bucket = ofacCompanyRateMap.get(profile.id);
+    if (bucket && now < bucket.resetAt) {
+      if (bucket.count >= OFAC_COMPANY_RATE_MAX) {
+        const secs = Math.ceil((bucket.resetAt - now) / 1000);
+        return res.status(429).json({ message: `Rate limit: max ${OFAC_COMPANY_RATE_MAX} screens/min. Try again in ${secs}s.` });
+      }
+      bucket.count++;
+    } else {
+      ofacCompanyRateMap.set(profile.id, { count: 1, resetAt: now + OFAC_COMPANY_RATE_WINDOW_MS });
+    }
+
+    const { fullName, dateOfBirth, country } = req.body || {};
+    if (!fullName || typeof fullName !== "string" || fullName.trim().length < 2) {
+      return res.status(400).json({ message: "fullName required" });
+    }
+    try {
+      const { screenAgainstSdn } = await import("./services/ofacScreening");
+      const result = await screenAgainstSdn({ fullName: fullName.trim(), dateOfBirth, country });
+      // Always log company OFAC usage to the activity log so abuse / audit
+      // trail is preserved.
+      try {
+        await db.insert(adminActivityLog).values({
+          adminEmail: `company:${profile.id}`,
+          action: `ofac_screen_${result.status}_company`,
+          entityType: "company",
+          entityId: profile.id,
+          details: { searchName: fullName.trim().slice(0, 100), matches: result.matches.length },
+        });
+      } catch { /* logging failure must not break screening */ }
+      res.json(result);
+    } catch (err: any) {
+      // Same fail-closed posture as admin: SDN list fetch failure → blocked.
+      res.status(503).json({ message: err?.message || "OFAC list unavailable; treat as blocked", status: "blocked" });
+    }
+  });
+
+  // Company resolves an applicant's email by application id. Used by the
+  // in-context "Request bg check / drug screen" buttons on the applicant
+  // detail panel — pre-fills the worker email so the company doesn't have
+  // to type it. Auth: caller must be the company that posted the job.
+  app.get("/api/company/applicants/:applicationId/email", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    const profile = req.profile;
+    if (!profile || profile.role !== "company") return res.status(403).json({ message: "Company only" });
+    const applicationId = Number(req.params.applicationId);
+    if (!applicationId) return res.status(400).json({ message: "Invalid applicationId" });
+    const [app] = await db.select({
+      workerId: applications.workerId,
+      jobId: applications.jobId,
+    }).from(applications).where(eq(applications.id, applicationId)).limit(1);
+    if (!app) return res.status(404).json({ message: "Application not found" });
+    const [job] = await db.select({ companyId: jobs.companyId }).from(jobs).where(eq(jobs.id, app.jobId)).limit(1);
+    if (!job || job.companyId !== profile.id) {
+      return res.status(403).json({ message: "Not your applicant" });
+    }
+    const [worker] = await db.select({
+      email: profiles.email,
+      firstName: profiles.firstName,
+      lastName: profiles.lastName,
+      state: profiles.state,
+    }).from(profiles).where(eq(profiles.id, app.workerId)).limit(1);
+    if (!worker) return res.status(404).json({ message: "Worker not found" });
+    res.json({
+      email: worker.email,
+      firstName: worker.firstName,
+      lastName: worker.lastName,
+      state: worker.state,
+    });
+  });
+
+  // Company: list their requests.
+  app.get("/api/company/background-checks/requests", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    const profile = req.profile;
+    if (!profile || profile.role !== "company") return res.status(403).json({ message: "Company only" });
+    const rows = await db.select().from(backgroundCheckConsentRequests)
+      .where(eq(backgroundCheckConsentRequests.requestedByCompanyId, profile.id))
+      .orderBy(desc(backgroundCheckConsentRequests.createdAt))
+      .limit(100);
+    res.json(rows.map((r) => ({ ...r, consentToken: undefined })));
+  });
+
+  // Company: cancel a pending request.
+  app.delete("/api/company/background-checks/requests/:id", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    const profile = req.profile;
+    if (!profile || profile.role !== "company") return res.status(403).json({ message: "Company only" });
+    const id = Number(req.params.id);
+    const [row] = await db.select().from(backgroundCheckConsentRequests)
+      .where(eq(backgroundCheckConsentRequests.id, id)).limit(1);
+    if (!row) return res.status(404).json({ message: "Not found" });
+    if (row.requestedByCompanyId !== profile.id) return res.status(403).json({ message: "Not yours" });
+    if (row.consentedAt) return res.status(409).json({ message: "Already signed; cancel order instead" });
+    if (row.cancelledAt) return res.status(409).json({ message: "Already cancelled" });
+    const cancelledBy = ((req.user as any)?.claims?.email || "").toLowerCase();
+    await db.update(backgroundCheckConsentRequests).set({
+      cancelledAt: new Date(),
+      cancelledBy: cancelledBy || "company",
+    }).where(eq(backgroundCheckConsentRequests.id, id));
+    res.json({ success: true });
+  });
+
+  // Worker views their own background check orders.
+  app.get("/api/worker/background-checks", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    const profile = req.profile;
+    if (!profile || profile.role !== "worker") return res.status(403).json({ message: "Worker only" });
+    const rows = await db.select().from(backgroundCheckOrders)
+      .where(eq(backgroundCheckOrders.workerId, profile.id))
+      .orderBy(desc(backgroundCheckOrders.createdAt))
+      .limit(50);
+    res.json(rows);
+  });
+
   app.post("/api/background-check/order", async (req, res) => {
     if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
     const profile = req.profile;
@@ -12713,7 +13127,20 @@ Respond ONLY in this exact JSON format:
       vendor: String(vendor),
       packageCode: packageCode ? String(packageCode) : undefined,
     });
-    res.status(201).json({ success: true, order });
+
+    let invitationUrl: string | null = null;
+    if (vendor === "checkr") {
+      try {
+        const { placeOrderWithCheckr } = await import("./services/checkr");
+        const placement = await placeOrderWithCheckr(order.id);
+        if (placement.ok) invitationUrl = placement.invitationUrl ?? null;
+        else console.warn("[BgCheck/Order] Checkr placement failed:", placement.error);
+      } catch (e) {
+        console.error("[BgCheck/Order] placement threw:", e);
+      }
+    }
+
+    res.status(201).json({ success: true, order, invitationUrl });
   });
 
   // === Admin dispute mediation queue ===
@@ -13659,6 +14086,7 @@ Respond ONLY in this exact JSON format:
               const payment = await mercuryService.sendPayment({
                 recipientId: workerForPayout.mercuryRecipientId!,
                 amount: payoutAmount, // Use net amount after fee
+                workerProfileId: workerForPayout.id,
                 description: isInstantPayout 
                   ? `Instant payment for ${job?.title || 'work'} - Timesheet #${id} (Fee: $${(instantPayoutFee/100).toFixed(2)})`
                   : `Payment for ${job?.title || 'work'} - Timesheet #${id}`,
@@ -14035,6 +14463,7 @@ Respond ONLY in this exact JSON format:
                 const payment = await mercuryService.sendPayment({
                   recipientId: workerForPayout.mercuryRecipientId!,
                   amount: payoutAmount, // Use net amount after fee
+                  workerProfileId: workerForPayout.id,
                   description: isInstantPayout 
                     ? `Instant payment for ${job?.title || 'work'} - Timesheet #${id} (Fee: $${(instantPayoutFee/100).toFixed(2)})`
                     : `Payment for ${job?.title || 'work'} - Timesheet #${id}`,
@@ -17616,6 +18045,7 @@ Respond ONLY in this exact JSON format:
             const payment = await mercuryService.sendPayment({
               recipientId,
               amount: netAmountCents,
+              workerProfileId: profile.id,
               description: isInstantPayout
                 ? `Escrow release (${pendingPayouts.length} payouts) - Fee: $${(instantPayoutFeeCents / 100).toFixed(2)}`
                 : `Escrow release (${pendingPayouts.length} payouts)`,
@@ -17914,6 +18344,7 @@ Respond ONLY in this exact JSON format:
       const payment = await mercuryService.sendPayment({
         recipientId: worker.mercuryRecipientId,
         amount,
+        workerProfileId: worker.id,
         description: description || `Payout to ${worker.firstName} ${worker.lastName}`,
         idempotencyKey: `admin-payout-worker-${workerId}-${Date.now()}`,
         note: `Worker: ${workerId}, Job: ${jobId || 'N/A'}, Timesheet: ${timesheetId || 'N/A'}`,
@@ -18008,6 +18439,7 @@ Respond ONLY in this exact JSON format:
           const payment = await mercuryService.sendPayment({
             recipientId: worker.mercuryRecipientId,
             amount: ts.totalPay,
+            workerProfileId: ts.workerId,
             description: `Payout for ${ts.job?.title || 'job'}`,
             idempotencyKey: `timesheet-payout-${ts.id}`,
             note: `Worker: ${ts.workerId}, Timesheet: ${ts.id}, Job: ${ts.jobId}`,
@@ -20181,6 +20613,1252 @@ Respond ONLY in this exact JSON format:
       return res.status(500).json({ message: "Error processing webhook" });
     }
     res.json({ received: true });
+  });
+
+  // ======================================================================
+  // === Worker availability calendar (recurring weekly + ad-hoc PTO) ===
+  // ======================================================================
+  app.get("/api/worker/availability", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    const profile = req.profile;
+    if (!profile || profile.role !== "worker") return res.status(403).json({ message: "Workers only" });
+    const [windows, blackouts] = await Promise.all([
+      db.select().from(workerAvailabilityWindows).where(eq(workerAvailabilityWindows.profileId, profile.id)),
+      db.select().from(workerAvailabilityBlackouts).where(eq(workerAvailabilityBlackouts.profileId, profile.id)).orderBy(asc(workerAvailabilityBlackouts.startsAt)),
+    ]);
+    res.json({ windows, blackouts });
+  });
+
+  // Replace the entire weekly window set in one PUT (idempotent replace).
+  app.put("/api/worker/availability/windows", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    const profile = req.profile;
+    if (!profile || profile.role !== "worker") return res.status(403).json({ message: "Workers only" });
+    const incoming: { dayOfWeek: number; startMinute: number; endMinute: number }[] = Array.isArray(req.body?.windows) ? req.body.windows : [];
+    const { validateWindows } = await import("@shared/workerAvailability");
+    const err = validateWindows(incoming as any);
+    if (err) return res.status(400).json({ message: err });
+    if (incoming.length > 30) return res.status(400).json({ message: "Too many windows (max 30)" });
+    await db.transaction(async (tx) => {
+      await tx.delete(workerAvailabilityWindows).where(eq(workerAvailabilityWindows.profileId, profile.id));
+      if (incoming.length > 0) {
+        await tx.insert(workerAvailabilityWindows).values(incoming.map((w) => ({
+          profileId: profile.id, dayOfWeek: w.dayOfWeek, startMinute: w.startMinute, endMinute: w.endMinute,
+        })));
+      }
+    });
+    res.json({ success: true, count: incoming.length });
+  });
+
+  app.post("/api/worker/availability/blackouts", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    const profile = req.profile;
+    if (!profile || profile.role !== "worker") return res.status(403).json({ message: "Workers only" });
+    const { startsAt, endsAt, reason } = req.body || {};
+    const start = new Date(startsAt), end = new Date(endsAt);
+    if (isNaN(start.getTime()) || isNaN(end.getTime()) || end <= start) {
+      return res.status(400).json({ message: "Invalid date range" });
+    }
+    const [row] = await db.insert(workerAvailabilityBlackouts).values({
+      profileId: profile.id, startsAt: start, endsAt: end, reason: reason ? String(reason).slice(0, 200) : null,
+    }).returning();
+    res.status(201).json(row);
+  });
+
+  app.delete("/api/worker/availability/blackouts/:id", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    const profile = req.profile;
+    if (!profile || profile.role !== "worker") return res.status(403).json({ message: "Workers only" });
+    const id = Number(req.params.id);
+    const [existing] = await db.select().from(workerAvailabilityBlackouts).where(eq(workerAvailabilityBlackouts.id, id)).limit(1);
+    if (!existing) return res.status(404).json({ message: "Not found" });
+    if (existing.profileId !== profile.id) return res.status(403).json({ message: "Not yours" });
+    await db.delete(workerAvailabilityBlackouts).where(eq(workerAvailabilityBlackouts.id, id));
+    res.json({ success: true });
+  });
+
+  // ======================================================================
+  // === Release notes / in-product changelog ===
+  // ======================================================================
+  app.get("/api/release-notes", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    const profile = req.profile;
+    const userEmail = ((req.user as any)?.claims?.email || "").toLowerCase();
+    const isAdmin = !!userEmail && ADMIN_EMAILS.includes(userEmail);
+    type Aud = "all" | "company" | "worker" | "admin";
+    const allowed: Aud[] = ["all"];
+    if (profile?.role === "company") allowed.push("company");
+    if (profile?.role === "worker") allowed.push("worker");
+    if (isAdmin) allowed.push("admin");
+    const rows = await db.select().from(releaseNotes)
+      .where(and(isNotNull(releaseNotes.publishedAt), inArray(releaseNotes.audience, allowed)))
+      .orderBy(desc(releaseNotes.publishedAt))
+      .limit(50);
+
+    const userId = (req.user as any)?.claims?.sub as string | undefined;
+    let unreadCount = 0;
+    if (userId) {
+      const [r] = await db.select().from(releaseNotesReads).where(eq(releaseNotesReads.userId, userId)).limit(1);
+      const lastRead = r?.lastReadAt ? new Date(r.lastReadAt).getTime() : 0;
+      unreadCount = rows.filter((n) => n.publishedAt && new Date(n.publishedAt).getTime() > lastRead).length;
+    }
+    res.json({ notes: rows, unreadCount });
+  });
+
+  app.post("/api/release-notes/mark-read", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    const userId = (req.user as any)?.claims?.sub as string | undefined;
+    if (!userId) return res.status(401).json({ message: "Unauthorized" });
+    const existing = await db.select().from(releaseNotesReads).where(eq(releaseNotesReads.userId, userId)).limit(1);
+    if (existing.length > 0) {
+      await db.update(releaseNotesReads).set({ lastReadAt: new Date() }).where(eq(releaseNotesReads.userId, userId));
+    } else {
+      await db.insert(releaseNotesReads).values({ userId, lastReadAt: new Date() });
+    }
+    res.json({ success: true });
+  });
+
+  // Admin-only: full list including drafts.
+  app.get("/api/admin/release-notes", requireAdmin, async (_req, res) => {
+    const rows = await db.select().from(releaseNotes).orderBy(desc(releaseNotes.createdAt)).limit(200);
+    res.json({ notes: rows });
+  });
+
+  app.post("/api/admin/release-notes", requireAdmin, async (req, res) => {
+    const { title, bodyHtml, audience, publish } = req.body || {};
+    if (!title || !bodyHtml) return res.status(400).json({ message: "title + bodyHtml required" });
+    if (audience && !["all", "company", "worker", "admin"].includes(audience)) {
+      return res.status(400).json({ message: "audience invalid" });
+    }
+    const adminEmail = ((req.user as any)?.claims?.email || "").toLowerCase();
+    const [row] = await db.insert(releaseNotes).values({
+      title: String(title).slice(0, 200),
+      bodyHtml: String(bodyHtml).slice(0, 50_000),
+      audience: audience || "all",
+      publishedAt: publish ? new Date() : null,
+      createdBy: adminEmail,
+    }).returning();
+    res.status(201).json(row);
+  });
+
+  app.patch("/api/admin/release-notes/:id", requireAdmin, async (req, res) => {
+    const id = Number(req.params.id);
+    const { title, bodyHtml, audience, publish, unpublish } = req.body || {};
+    const updates: any = { updatedAt: new Date() };
+    if (title) updates.title = String(title).slice(0, 200);
+    if (bodyHtml) updates.bodyHtml = String(bodyHtml).slice(0, 50_000);
+    if (audience && ["all", "company", "worker", "admin"].includes(audience)) updates.audience = audience;
+    if (publish === true) updates.publishedAt = new Date();
+    if (unpublish === true) updates.publishedAt = null;
+    await db.update(releaseNotes).set(updates).where(eq(releaseNotes.id, id));
+    res.json({ success: true });
+  });
+
+  app.delete("/api/admin/release-notes/:id", requireAdmin, async (req, res) => {
+    const id = Number(req.params.id);
+    await db.delete(releaseNotes).where(eq(releaseNotes.id, id));
+    res.json({ success: true });
+  });
+
+  // ======================================================================
+  // === SLO/RED metrics snapshot + Email DNS audit ===
+  // ======================================================================
+  app.get("/api/admin/metrics/endpoints", requireAdmin, async (_req, res) => {
+    const { snapshotMetrics } = await import("./observability/sloMetrics");
+    res.json(snapshotMetrics());
+  });
+
+  // Scheduler health snapshot — answers "did the data-retention / adverse-
+  // action / outbound-webhook / meal-break-reminder ticks actually run when
+  // they were supposed to?" Used by the admin Schedulers tab.
+  app.get("/api/admin/schedulers/status", requireAdmin, async (req, res) => {
+    const { snapshotSchedulerHealth } = await import("./observability/schedulerHealth");
+    const raw = typeof req.query.scheduler === "string" ? req.query.scheduler.trim() : "";
+    const needle = raw.slice(0, 64).replace(/[^a-zA-Z0-9-]/g, "");
+    const snapAll = snapshotSchedulerHealth();
+    const schedulers = needle
+      ? snapAll.schedulers.filter((s) => s.name.toLowerCase().includes(needle.toLowerCase()))
+      : snapAll.schedulers;
+    const snap = { ...snapAll, schedulers };
+    let dbRecent: Array<{ schedulerName: string; startedAt: string; durationMs: number; ok: boolean; error: string | null }> = [];
+    try {
+      const base = db
+        .select({
+          schedulerName: schedulerRuns.schedulerName,
+          startedAt: schedulerRuns.startedAt,
+          durationMs: schedulerRuns.durationMs,
+          ok: schedulerRuns.ok,
+          error: schedulerRuns.error,
+        })
+        .from(schedulerRuns);
+      const rows = needle
+        ? await base.where(ilike(schedulerRuns.schedulerName, `%${needle}%`)).orderBy(desc(schedulerRuns.startedAt)).limit(400)
+        : await base.orderBy(desc(schedulerRuns.startedAt)).limit(400);
+      dbRecent = rows.map((r) => ({
+        schedulerName: r.schedulerName,
+        durationMs: r.durationMs,
+        ok: r.ok,
+        error: r.error ?? null,
+        startedAt: r.startedAt instanceof Date ? r.startedAt.toISOString() : String(r.startedAt),
+      }));
+    } catch (e) {
+      console.warn("[schedulers/status] dbRecent query failed:", (e as Error)?.message || e);
+    }
+    res.json({ ...snap, dbRecent, schedulerFilter: needle || null });
+  });
+
+  // SOC 2 audit-log export. Returns a hash-chained JSONL stream that
+  // an auditor can verify with verifyAuditLogJsonl().
+  app.get("/api/admin/audit-log/export", requireAdmin, async (req, res) => {
+    const startStr = String(req.query.startDate || "");
+    const endStr = String(req.query.endDate || "");
+    const start = startStr ? new Date(startStr) : new Date(Date.now() - 24 * 60 * 60 * 1000);
+    const end = endStr ? new Date(endStr) : new Date();
+    if (isNaN(start.getTime()) || isNaN(end.getTime()) || end <= start) {
+      return res.status(400).json({ message: "Invalid date range" });
+    }
+    try {
+      const { exportAuditLogJsonl } = await import("./services/auditLogExport");
+      const result = await exportAuditLogJsonl({ startDate: start, endDate: end });
+      const filename = `audit-${start.toISOString().slice(0, 10)}-to-${end.toISOString().slice(0, 10)}.jsonl`;
+      res.setHeader("Content-Type", "application/x-ndjson");
+      res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+      res.setHeader("X-Audit-Row-Count", String(result.rowCount));
+      res.setHeader("X-Audit-Final-Hash", result.finalHash);
+      res.send(result.jsonl || "");
+    } catch (err: any) {
+      res.status(500).json({ message: err?.message || "Export failed" });
+    }
+  });
+
+  // OFAC SDN screening. POST a name (and optional DOB) and we return
+  // cleared/review/blocked + matches. Used before any payout.
+  app.post("/api/admin/ofac/screen", requireAdmin, async (req, res) => {
+    const { fullName, dateOfBirth, country } = req.body || {};
+    if (!fullName || typeof fullName !== "string") {
+      return res.status(400).json({ message: "fullName required" });
+    }
+    try {
+      const { screenAgainstSdn } = await import("./services/ofacScreening");
+      const result = await screenAgainstSdn({ fullName, dateOfBirth, country });
+      res.json(result);
+    } catch (err: any) {
+      // Fail closed — caller should treat as "blocked" for safety.
+      res.status(503).json({ message: err?.message || "OFAC list unavailable; treat as blocked", status: "blocked" });
+    }
+  });
+
+  // List recent OFAC screening events (read from admin_activity_log).
+  app.get("/api/admin/payout-screening/events", requireAdmin, async (req, res) => {
+    const limit = Math.min(200, Math.max(1, parseInt(String(req.query.limit), 10) || 50));
+    const rows = await db.select().from(adminActivityLog)
+      .where(or(
+        eq(adminActivityLog.action, "ofac_screen_cleared"),
+        eq(adminActivityLog.action, "ofac_screen_review"),
+        eq(adminActivityLog.action, "ofac_screen_blocked"),
+        eq(adminActivityLog.action, "ofac_payee_cleared"),
+      ))
+      .orderBy(desc(adminActivityLog.createdAt))
+      .limit(limit);
+    res.json(rows);
+  });
+
+  // Admin override: clear a payee for the next 7 days. Use only after manual
+  // review of the SDN match (e.g. confirming DOB / identity mismatch).
+  app.post("/api/admin/payout-screening/clear", requireAdmin, async (req, res) => {
+    const { workerProfileId, notes, acknowledgeBlockedMatch } = req.body || {};
+    const id = parseInt(String(workerProfileId), 10);
+    if (!id) return res.status(400).json({ message: "workerProfileId required" });
+    const adminEmail = ((req.user as any)?.claims?.email || "").toLowerCase();
+    try {
+      const { adminClearPayee } = await import("./services/payoutScreening");
+      await adminClearPayee({
+        workerProfileId: id,
+        adminEmail,
+        notes: notes ? String(notes).slice(0, 500) : undefined,
+        acknowledgeBlockedMatch: !!acknowledgeBlockedMatch,
+      });
+      res.json({ success: true, clearedFor: "7 days" });
+    } catch (err: any) {
+      res.status(400).json({ message: err?.message || "Clear failed" });
+    }
+  });
+
+  // Drop the in-memory cache for a payee — forces fresh SDN screen on next
+  // payout. Use after the worker updates their legal name on file.
+  app.post("/api/admin/payout-screening/invalidate/:profileId", requireAdmin, async (req, res) => {
+    const id = parseInt(req.params.profileId, 10);
+    if (!id) return res.status(400).json({ message: "Invalid profileId" });
+    const { invalidateScreeningCache } = await import("./services/payoutScreening");
+    invalidateScreeningCache(id);
+    res.json({ success: true });
+  });
+
+  // Force a refresh of the cached SDN list (24h cache).
+  app.post("/api/admin/ofac/refresh", requireAdmin, async (_req, res) => {
+    const { invalidateSdnCache, screenAgainstSdn } = await import("./services/ofacScreening");
+    invalidateSdnCache();
+    // Trigger a load to confirm the fetch works while admin is watching.
+    try {
+      await screenAgainstSdn({ fullName: "TEST WARMUP" });
+      res.json({ success: true, message: "SDN cache invalidated and reloaded." });
+    } catch (e: any) {
+      res.status(503).json({ success: false, message: e?.message || "Reload failed" });
+    }
+  });
+
+  // Company self-service OSHA Form 300 — companies download their own log.
+  app.get("/api/company/osha/300", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    const profile = req.profile;
+    if (!profile || profile.role !== "company") return res.status(403).json({ message: "Company only" });
+    const year = parseInt(String(req.query.year), 10) || new Date().getFullYear() - 1;
+    const { generateOsha300LogHtml } = await import("./services/osha300Log");
+    const html = await generateOsha300LogHtml({ companyProfileId: profile.id, year });
+    res.setHeader("Content-Type", "text/html");
+    res.send(html);
+  });
+
+  // Company self-service OSHA Form 300A — annual summary.
+  app.get("/api/company/osha/300a", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    const profile = req.profile;
+    if (!profile || profile.role !== "company") return res.status(403).json({ message: "Company only" });
+    const year = parseInt(String(req.query.year), 10) || new Date().getFullYear() - 1;
+    const naicsCode = req.query.naicsCode ? String(req.query.naicsCode) : undefined;
+    const totalHoursWorked = req.query.totalHoursWorked ? Number(req.query.totalHoursWorked) : undefined;
+    const averageEmployees = req.query.averageEmployees ? Number(req.query.averageEmployees) : undefined;
+    const { generateOsha300ASummaryHtml } = await import("./services/osha300A");
+    const html = await generateOsha300ASummaryHtml({
+      companyProfileId: profile.id, year, naicsCode, totalHoursWorked, averageEmployees,
+    });
+    res.setHeader("Content-Type", "text/html");
+    res.send(html);
+  });
+
+  // OSHA Form 300 — printable per-incident log for a company year.
+  // Returns text/html; the company prints and posts on-site (29 CFR §1904).
+  app.get("/api/admin/osha/300", requireAdmin, async (req, res) => {
+    const companyProfileId = parseInt(String(req.query.companyProfileId), 10);
+    const year = parseInt(String(req.query.year), 10) || new Date().getFullYear() - 1;
+    if (!companyProfileId) return res.status(400).json({ message: "companyProfileId required" });
+    const { generateOsha300LogHtml } = await import("./services/osha300Log");
+    const html = await generateOsha300LogHtml({ companyProfileId, year });
+    res.setHeader("Content-Type", "text/html");
+    res.send(html);
+  });
+
+  // OSHA Form 300A — annual summary for posting Feb 1 – Apr 30.
+  app.get("/api/admin/osha/300a", requireAdmin, async (req, res) => {
+    const companyProfileId = parseInt(String(req.query.companyProfileId), 10);
+    const year = parseInt(String(req.query.year), 10) || new Date().getFullYear() - 1;
+    if (!companyProfileId) return res.status(400).json({ message: "companyProfileId required" });
+    const naicsCode = req.query.naicsCode ? String(req.query.naicsCode) : undefined;
+    const totalHoursWorked = req.query.totalHoursWorked ? Number(req.query.totalHoursWorked) : undefined;
+    const averageEmployees = req.query.averageEmployees ? Number(req.query.averageEmployees) : undefined;
+    const { generateOsha300ASummaryHtml } = await import("./services/osha300A");
+    const html = await generateOsha300ASummaryHtml({
+      companyProfileId, year, naicsCode, totalHoursWorked, averageEmployees,
+    });
+    res.setHeader("Content-Type", "text/html");
+    res.send(html);
+  });
+
+  // Admin: list background check orders for triage. Filterable by status
+  // and result. Joins on profiles to surface worker name + email so admin
+  // can act without a separate lookup.
+  app.get("/api/admin/background-checks", requireAdmin, async (req, res) => {
+    const status = String(req.query.status || "");
+    const result = String(req.query.result || "");
+    const limit = Math.min(500, Math.max(1, parseInt(String(req.query.limit), 10) || 100));
+    const conditions: any[] = [];
+    if (status && ["draft", "ordered", "pending", "complete", "suspended", "canceled", "expired"].includes(status)) {
+      conditions.push(eq(backgroundCheckOrders.status, status as any));
+    }
+    if (result && ["clear", "consider", "fail"].includes(result)) {
+      conditions.push(eq(backgroundCheckOrders.result, result as any));
+    }
+    const baseQuery = db.select({
+      order: backgroundCheckOrders,
+      worker: {
+        firstName: profiles.firstName,
+        lastName: profiles.lastName,
+        email: profiles.email,
+      },
+    }).from(backgroundCheckOrders).leftJoin(profiles, eq(profiles.id, backgroundCheckOrders.workerId));
+    const rows = await (conditions.length > 0
+      ? baseQuery.where(and(...conditions))
+      : baseQuery
+    ).orderBy(desc(backgroundCheckOrders.createdAt)).limit(limit);
+    res.json(rows);
+  });
+
+  // Admin: bulk retry placement for many draft orders at once. Useful when
+  // CHECKR_API_KEY was just added and a backlog of draft orders piled up,
+  // or when triaging after a transient vendor outage. Walks each id, calls
+  // placeOrderWithCheckr, and returns a per-id result so the UI can show
+  // which succeeded vs which still need attention.
+  app.post("/api/admin/background-checks/bulk-place", requireAdmin, async (req, res) => {
+    const ids: number[] = Array.isArray(req.body?.ids)
+      ? req.body.ids.map((n: any) => Number(n)).filter((n: any) => Number.isFinite(n))
+      : [];
+    if (ids.length === 0) return res.status(400).json({ message: "ids[] required" });
+    if (ids.length > 100) return res.status(400).json({ message: "Max 100 ids per call" });
+
+    const { placeOrderWithCheckr } = await import("./services/checkr");
+    const results: Array<{ id: number; ok: boolean; candidateId?: string; invitationUrl?: string; error?: string }> = [];
+    let succeeded = 0, failed = 0, skipped = 0;
+    for (const id of ids) {
+      try {
+        const r = await placeOrderWithCheckr(id);
+        results.push({ id, ...r });
+        if (r.ok) {
+          if (r.error === "Already placed") skipped++; else succeeded++;
+        } else {
+          failed++;
+        }
+      } catch (e: any) {
+        results.push({ id, ok: false, error: e?.message || String(e) });
+        failed++;
+      }
+    }
+    res.json({ succeeded, failed, skipped, results });
+  });
+
+  // Admin: retry placement for a draft order. Idempotent — no-op if already
+  // placed at vendor. Useful when CHECKR_API_KEY was added after orders piled
+  // up, or when fixing a transient vendor outage.
+  app.post("/api/admin/background-checks/:id/place", requireAdmin, async (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    if (!id) return res.status(400).json({ message: "Invalid id" });
+    const [order] = await db.select().from(backgroundCheckOrders).where(eq(backgroundCheckOrders.id, id)).limit(1);
+    if (!order) return res.status(404).json({ message: "Order not found" });
+    if (order.vendor !== "checkr") return res.status(400).json({ message: `Vendor is ${order.vendor}, not checkr` });
+    const { placeOrderWithCheckr } = await import("./services/checkr");
+    const result = await placeOrderWithCheckr(id);
+    if (result.ok) return res.json({ success: true, candidateId: result.candidateId, invitationUrl: result.invitationUrl });
+    res.status(502).json({ success: false, error: result.error, candidateId: result.candidateId });
+  });
+
+  // Manual trigger for the adverse-action scheduler (normally hourly).
+  // The Checkr webhook is registered at line ~12653 and updates the order
+  // row; the scheduler then picks up consider/fail results and starts the
+  // FCRA pre-adverse → final-adverse workflow.
+  app.post("/api/admin/adverse-action/run", requireAdmin, async (_req, res) => {
+    try {
+      const { runAdverseActionPass } = await import("./schedulers/adverseActionScheduler");
+      const stats = await runAdverseActionPass();
+      res.json(stats);
+    } catch (err: any) {
+      res.status(500).json({ message: err?.message || "Adverse action pass failed" });
+    }
+  });
+
+  // ======================================================================
+  // === Drug screen orders (vendor-agnostic) ===
+  // ======================================================================
+  // Worker views their own screen history.
+  app.get("/api/worker/drug-screens", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    const profile = req.profile;
+    if (!profile || profile.role !== "worker") return res.status(403).json({ message: "Workers only" });
+    const rows = await db.select().from(drugScreenOrders)
+      .where(eq(drugScreenOrders.workerId, profile.id))
+      .orderBy(desc(drugScreenOrders.createdAt))
+      .limit(50);
+    res.json(rows);
+  });
+
+  // Worker provides consent + we place a drug screen order. Worker may also
+  // be the one initiating it (self-attest). For company-initiated orders,
+  // the worker is sent a separate consent flow first via email.
+  app.post("/api/worker/drug-screens", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    const profile = req.profile;
+    if (!profile || profile.role !== "worker") return res.status(403).json({ message: "Workers only" });
+
+    const { panel, workplaceState, signatureName } = req.body || {};
+    if (!signatureName || typeof signatureName !== "string" || signatureName.trim().length < 3) {
+      return res.status(400).json({ message: "signatureName (your full legal name) required" });
+    }
+    if (!["5_panel", "5_panel_no_thc", "10_panel", "dot_panel"].includes(panel)) {
+      return res.status(400).json({ message: "Invalid panel" });
+    }
+
+    // Auto-strip THC for restricted states unless the role qualifies for an
+    // exemption (DOT-regulated). The caller-supplied panel is overridden.
+    const { shouldStripThcForState, drugScreeningVendor } = await import("./services/drugScreening");
+    let effectivePanel = panel as "5_panel" | "5_panel_no_thc" | "10_panel" | "dot_panel";
+    if (effectivePanel === "5_panel" && shouldStripThcForState(workplaceState || profile.state || "")) {
+      effectivePanel = "5_panel_no_thc";
+    }
+
+    if (!profile.firstName || !profile.lastName) {
+      return res.status(400).json({ message: "Profile must have first + last name before drug screen order" });
+    }
+    const ipAddress = (req.headers["x-forwarded-for"] as string)?.split(",")[0]?.trim() || req.ip || null;
+    const dob = (profile as any).dateOfBirth ? new Date((profile as any).dateOfBirth) : new Date("1970-01-01");
+
+    const vendorResult = await drugScreeningVendor.createOrder({
+      workerProfileId: profile.id,
+      panel: effectivePanel,
+      workplaceState: workplaceState || profile.state || "",
+      workerFirstName: profile.firstName,
+      workerLastName: profile.lastName,
+      workerDateOfBirth: dob,
+      workerEmail: profile.email || "",
+      workerPhone: profile.phone || undefined,
+      workerZip: profile.zipCode || undefined,
+    });
+
+    const [row] = await db.insert(drugScreenOrders).values({
+      workerId: profile.id,
+      orderedByCompanyId: null,
+      vendor: drugScreeningVendor.name.toLowerCase().replace(/\s+/g, "_"),
+      vendorRef: vendorResult.vendorRef,
+      panel: effectivePanel,
+      workplaceState: workplaceState || profile.state || null,
+      status: vendorResult.status,
+      consentGivenAt: new Date(),
+      consentSignatureName: signatureName.trim(),
+      consentIpAddress: ipAddress,
+      schedulingUrl: vendorResult.schedulingUrl,
+      expiresAt: vendorResult.expiresAt,
+    }).returning();
+    res.status(201).json(row);
+  });
+
+  // ======================================================================
+  // === Company-initiated drug screen consent flow ===
+  // ======================================================================
+  // Company submits a request — we create a pending consent row, email the
+  // worker a one-time tokenized link. On click + signature, the actual
+  // drug_screen_orders row is created + vendor order is placed.
+  app.post("/api/company/drug-screens/request", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    const profile = req.profile;
+    if (!profile || profile.role !== "company") return res.status(403).json({ message: "Company only" });
+
+    const { workerEmail, panel, workplaceState, jobId } = req.body || {};
+    if (!workerEmail || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(workerEmail)) {
+      return res.status(400).json({ message: "Valid workerEmail required" });
+    }
+    if (!["5_panel", "5_panel_no_thc", "10_panel", "dot_panel"].includes(panel)) {
+      return res.status(400).json({ message: "Invalid panel" });
+    }
+
+    // Look up the worker profile by email so we can attach the request to
+    // their account when they consent (and so the consent page shows their
+    // legal name from KYC, not what they type into the signature box).
+    const lower = String(workerEmail).toLowerCase();
+    const [workerProfile] = await db.select({ id: profiles.id })
+      .from(profiles)
+      .where(and(eq(profiles.role, "worker"), eq(profiles.email, lower)))
+      .limit(1);
+
+    // Auto-strip THC for restricted states unless DOT-regulated.
+    const { shouldStripThcForState } = await import("./services/drugScreening");
+    let effectivePanel = panel as "5_panel" | "5_panel_no_thc" | "10_panel" | "dot_panel";
+    if (effectivePanel === "5_panel" && shouldStripThcForState(workplaceState || "")) {
+      effectivePanel = "5_panel_no_thc";
+    }
+
+    const consentToken = crypto.randomBytes(24).toString("hex");
+    const expiresAt = new Date(Date.now() + 14 * 24 * 60 * 60 * 1000);
+
+    const [row] = await db.insert(drugScreenConsentRequests).values({
+      requestedByCompanyId: profile.id,
+      workerId: workerProfile?.id ?? null,
+      workerEmail: lower,
+      panel: effectivePanel,
+      workplaceState: workplaceState || null,
+      jobId: jobId ? Number(jobId) : null,
+      consentToken,
+      expiresAt,
+    }).returning();
+
+    // Best-effort consent invitation email via Resend SDK directly.
+    void (async () => {
+      try {
+        const apiKey = process.env.RESEND_API_KEY;
+        const from = process.env.RESEND_FROM_EMAIL || "support@tolstoystaffing.com";
+        if (!apiKey) return;
+        const { Resend } = await import("resend");
+        const r = new Resend(apiKey);
+        const consentUrl = `https://app.tolstoystaffing.com/drug-screen-consent/${consentToken}`;
+        const companyDisplay = profile.companyName
+          || [profile.firstName, profile.lastName].filter(Boolean).join(" ").trim()
+          || "A Tolstoy Staffing company";
+        await r.emails.send({
+          from, to: lower,
+          subject: `${companyDisplay} requests your consent for a drug screen`,
+          html: `
+            <p>Hi,</p>
+            <p><strong>${escapeHtmlForResponse(companyDisplay)}</strong> has requested a drug screen as part of your hiring/onboarding process.</p>
+            <p>Before they can place the order, you'll need to:</p>
+            <ol>
+              <li>Review the disclosure of what the test covers</li>
+              <li>Sign your consent (or decline)</li>
+            </ol>
+            <p><a href="${consentUrl}" style="display:inline-block;padding:10px 20px;background:#0066ff;color:#fff;text-decoration:none;border-radius:6px;">Review &amp; Sign</a></p>
+            <p style="font-size:11px;color:#666;">This link expires in 14 days. If you didn't expect this email, you can safely ignore it — no order is placed without your signed consent.</p>
+            <p style="font-size:11px;color:#666;">Test panel: <strong>${effectivePanel.replace(/_/g, " ")}</strong>${workplaceState ? ` · Workplace: ${escapeHtmlForResponse(workplaceState)}` : ""}</p>
+          `,
+          text: `${companyDisplay} has requested a drug screen as part of your hiring process. Review and sign at: ${consentUrl}\n\nThis link expires in 14 days.`,
+        } as any);
+      } catch (e) {
+        console.warn("[Drug/ConsentRequest] email failed:", e);
+      }
+    })();
+
+    res.status(201).json({
+      success: true,
+      requestId: row.id,
+      consentUrl: `https://app.tolstoystaffing.com/drug-screen-consent/${consentToken}`,
+      expiresAt,
+    });
+  });
+
+  // Public: worker fetches consent request details by token (no auth — the
+  // token IS the auth). Returns minimal safe data: panel, company name,
+  // workplace state, expiration. Doesn't reveal worker details.
+  app.get("/api/drug-screens/consent/:token", async (req, res) => {
+    const token = String(req.params.token || "");
+    if (!token) return res.status(400).json({ message: "Invalid token" });
+    const [row] = await db.select().from(drugScreenConsentRequests)
+      .where(eq(drugScreenConsentRequests.consentToken, token)).limit(1);
+    if (!row) return res.status(404).json({ message: "Consent request not found" });
+    if (row.cancelledAt) return res.status(410).json({ message: "Cancelled by company", state: "cancelled" });
+    if (row.consentedAt) return res.status(409).json({ message: "Already signed", state: "signed", orderId: row.resultingOrderId });
+    if (new Date(row.expiresAt) < new Date()) return res.status(410).json({ message: "Expired", state: "expired" });
+
+    const [company] = await db.select({
+      firstName: profiles.firstName,
+      lastName: profiles.lastName,
+      companyName: profiles.companyName,
+    }).from(profiles).where(eq(profiles.id, row.requestedByCompanyId)).limit(1);
+    const companyDisplay = company?.companyName
+      || [company?.firstName, company?.lastName].filter(Boolean).join(" ").trim()
+      || "A Tolstoy Staffing company";
+
+    res.json({
+      panel: row.panel,
+      workplaceState: row.workplaceState,
+      companyDisplay,
+      expiresAt: row.expiresAt,
+      // Disclosure text shown to the worker before they sign.
+      disclosure: [
+        `${companyDisplay} has requested a drug screen as part of your hiring or onboarding process.`,
+        `The selected test panel is "${row.panel.replace(/_/g, " ")}".`,
+        `By signing below, you authorize the testing laboratory to collect a specimen from you, perform the analysis, and report the results to ${companyDisplay} and to Tolstoy Staffing for the limited purpose of evaluating your eligibility for work.`,
+        `Federal law (FCRA §604(b)) and certain state laws (CA AB 1008, NY Lab. Law §201-d, NJ Cannabis REM Act, WA SB 5123, RI, MN, DC) provide additional protections that may limit how results are used. THC detection is automatically disabled in restricted states unless the role qualifies for an exemption (DOT-regulated work).`,
+        `You may decline this request without retaliation in jurisdictions where it is unlawful to require pre-employment marijuana testing. Declining may affect your eligibility for the position.`,
+      ],
+    });
+  });
+
+  // Public: worker submits signed consent. Creates the actual drug_screen_orders
+  // row + places the vendor order. Returns the new order id + scheduling URL.
+  app.post("/api/drug-screens/consent/:token", async (req, res) => {
+    const token = String(req.params.token || "");
+    const { signatureName, accept } = req.body || {};
+    if (!token) return res.status(400).json({ message: "Invalid token" });
+
+    const [row] = await db.select().from(drugScreenConsentRequests)
+      .where(eq(drugScreenConsentRequests.consentToken, token)).limit(1);
+    if (!row) return res.status(404).json({ message: "Consent request not found" });
+    if (row.cancelledAt) return res.status(410).json({ message: "Cancelled by company" });
+    if (row.consentedAt) return res.status(409).json({ message: "Already signed" });
+    if (new Date(row.expiresAt) < new Date()) return res.status(410).json({ message: "Expired" });
+
+    // Worker can decline — we mark cancelled with a clear reason.
+    if (accept === false) {
+      await db.update(drugScreenConsentRequests).set({
+        cancelledAt: new Date(),
+        cancelledBy: `declined_by_worker:${row.workerEmail}`,
+      }).where(eq(drugScreenConsentRequests.id, row.id));
+      return res.json({ declined: true });
+    }
+
+    if (!signatureName || typeof signatureName !== "string" || signatureName.trim().length < 3) {
+      return res.status(400).json({ message: "signatureName (your full legal name) required" });
+    }
+
+    // Resolve worker profile fresh in case they registered between request + consent.
+    const [workerProfile] = await db.select()
+      .from(profiles)
+      .where(and(eq(profiles.role, "worker"), eq(profiles.email, row.workerEmail)))
+      .limit(1);
+
+    const ipAddress = (req.headers["x-forwarded-for"] as string)?.split(",")[0]?.trim() || req.ip || null;
+    const dob = (workerProfile as any)?.dateOfBirth ? new Date((workerProfile as any).dateOfBirth) : new Date("1970-01-01");
+    const firstName = workerProfile?.firstName || signatureName.trim().split(/\s+/)[0] || "Worker";
+    const lastName = workerProfile?.lastName || signatureName.trim().split(/\s+/).slice(1).join(" ") || "";
+
+    // Place vendor order (or fall back to stub if API key missing).
+    const { drugScreeningVendor } = await import("./services/drugScreening");
+    let vendorResult;
+    try {
+      vendorResult = await drugScreeningVendor.createOrder({
+        workerProfileId: workerProfile?.id ?? 0,
+        panel: row.panel as any,
+        workplaceState: row.workplaceState || workerProfile?.state || "",
+        workerFirstName: firstName,
+        workerLastName: lastName,
+        workerDateOfBirth: dob,
+        workerEmail: row.workerEmail,
+        workerPhone: workerProfile?.phone || undefined,
+        workerZip: workerProfile?.zipCode || undefined,
+      });
+    } catch (e: any) {
+      console.error("[Drug/Consent] vendor order failed:", e);
+      return res.status(502).json({ message: `Vendor order failed: ${e?.message || e}` });
+    }
+
+    // Create the canonical order row + link consent request to it.
+    const [order] = await db.insert(drugScreenOrders).values({
+      workerId: workerProfile?.id ?? row.requestedByCompanyId, // fallback prevents NOT NULL violation; admin should reconcile
+      orderedByCompanyId: row.requestedByCompanyId,
+      vendor: drugScreeningVendor.name.toLowerCase().replace(/\s+/g, "_"),
+      vendorRef: vendorResult.vendorRef,
+      panel: row.panel as any,
+      workplaceState: row.workplaceState,
+      status: vendorResult.status,
+      consentGivenAt: new Date(),
+      consentSignatureName: signatureName.trim(),
+      consentIpAddress: ipAddress,
+      schedulingUrl: vendorResult.schedulingUrl,
+      expiresAt: vendorResult.expiresAt,
+    }).returning();
+
+    await db.update(drugScreenConsentRequests).set({
+      consentedAt: new Date(),
+      consentSignatureName: signatureName.trim(),
+      consentIpAddress: ipAddress,
+      resultingOrderId: order.id,
+    }).where(eq(drugScreenConsentRequests.id, row.id));
+
+    res.status(201).json({
+      success: true,
+      orderId: order.id,
+      schedulingUrl: vendorResult.schedulingUrl,
+      panel: row.panel,
+    });
+  });
+
+  // Company: list their pending + completed consent requests.
+  app.get("/api/company/drug-screens/requests", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    const profile = req.profile;
+    if (!profile || profile.role !== "company") return res.status(403).json({ message: "Company only" });
+    const rows = await db.select().from(drugScreenConsentRequests)
+      .where(eq(drugScreenConsentRequests.requestedByCompanyId, profile.id))
+      .orderBy(desc(drugScreenConsentRequests.createdAt))
+      .limit(100);
+    // Strip the consent_token before returning — only the worker should see it.
+    res.json(rows.map((r) => ({ ...r, consentToken: undefined })));
+  });
+
+  // Company cancels a pending consent request.
+  app.delete("/api/company/drug-screens/requests/:id", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    const profile = req.profile;
+    if (!profile || profile.role !== "company") return res.status(403).json({ message: "Company only" });
+    const id = Number(req.params.id);
+    const [row] = await db.select().from(drugScreenConsentRequests)
+      .where(eq(drugScreenConsentRequests.id, id)).limit(1);
+    if (!row) return res.status(404).json({ message: "Not found" });
+    if (row.requestedByCompanyId !== profile.id) return res.status(403).json({ message: "Not yours" });
+    if (row.consentedAt) return res.status(409).json({ message: "Already signed; cancel order instead" });
+    if (row.cancelledAt) return res.status(409).json({ message: "Already cancelled" });
+    const cancelledBy = ((req.user as any)?.claims?.email || "").toLowerCase();
+    await db.update(drugScreenConsentRequests).set({
+      cancelledAt: new Date(),
+      cancelledBy: cancelledBy || "company",
+    }).where(eq(drugScreenConsentRequests.id, id));
+    res.json({ success: true });
+  });
+
+  // Admin: list drug screen orders pending or in-progress for triage.
+  // Joins on profiles for the worker so admin sees name + email per row.
+  app.get("/api/admin/drug-screens", requireAdmin, async (req, res) => {
+    const status = String(req.query.status || "");
+    const limit = Math.min(500, Math.max(1, parseInt(String(req.query.limit), 10) || 100));
+    const conditions: any[] = [];
+    if (status && ["pending", "in_progress", "completed_negative", "completed_positive", "completed_mro_negative", "cancelled", "expired"].includes(status)) {
+      conditions.push(eq(drugScreenOrders.status, status as any));
+    }
+    const baseQuery = db.select({
+      order: drugScreenOrders,
+      worker: {
+        firstName: profiles.firstName,
+        lastName: profiles.lastName,
+        email: profiles.email,
+      },
+    }).from(drugScreenOrders).leftJoin(profiles, eq(profiles.id, drugScreenOrders.workerId));
+    const rows = await (conditions.length > 0
+      ? baseQuery.where(and(...conditions))
+      : baseQuery
+    ).orderBy(desc(drugScreenOrders.createdAt)).limit(limit);
+    res.json(rows);
+  });
+
+  // Admin: bulk cancel drug screen orders. Only valid for orders in
+  // 'pending' or 'in_progress' status — completed/cancelled/expired orders
+  // are no-ops. Walks each id, returns a per-id result. Used to clean up
+  // stale orders the worker abandoned (e.g. consent given but never showed
+  // up at the collection site).
+  app.post("/api/admin/drug-screens/bulk-cancel", requireAdmin, async (req, res) => {
+    const ids: number[] = Array.isArray(req.body?.ids)
+      ? req.body.ids.map((n: any) => Number(n)).filter((n: any) => Number.isFinite(n))
+      : [];
+    if (ids.length === 0) return res.status(400).json({ message: "ids[] required" });
+    if (ids.length > 100) return res.status(400).json({ message: "Max 100 ids per call" });
+
+    const results: Array<{ id: number; ok: boolean; reason?: string }> = [];
+    let cancelled = 0, skipped = 0, failed = 0;
+    for (const id of ids) {
+      try {
+        const [order] = await db.select().from(drugScreenOrders).where(eq(drugScreenOrders.id, id)).limit(1);
+        if (!order) {
+          results.push({ id, ok: false, reason: "not_found" }); failed++; continue;
+        }
+        if (!["pending", "in_progress"].includes(order.status)) {
+          results.push({ id, ok: false, reason: `status_is_${order.status}` }); skipped++; continue;
+        }
+        await db.update(drugScreenOrders).set({
+          status: "cancelled",
+          updatedAt: new Date(),
+        }).where(eq(drugScreenOrders.id, id));
+        results.push({ id, ok: true });
+        cancelled++;
+      } catch (e: any) {
+        results.push({ id, ok: false, reason: e?.message || "unknown" });
+        failed++;
+      }
+    }
+    res.json({ cancelled, skipped, failed, results });
+  });
+
+  // Manual meal-break reminder pass (normally runs every 5 min).
+  app.post("/api/admin/meal-break-reminder/run", requireAdmin, async (_req, res) => {
+    try {
+      const { runMealBreakReminderPass } = await import("./schedulers/mealBreakReminder");
+      const stats = await runMealBreakReminderPass();
+      res.json(stats);
+    } catch (err: any) {
+      res.status(500).json({ message: err?.message || "Reminder pass failed" });
+    }
+  });
+
+  // Manual data-retention pass (normally runs every 6h). Useful for
+  // verifying a specific user's deletion has been processed without waiting.
+  app.post("/api/admin/data-retention/run", requireAdmin, async (_req, res) => {
+    try {
+      const { runDataRetentionPass } = await import("./schedulers/dataRetention");
+      const stats = await runDataRetentionPass();
+      res.json(stats);
+    } catch (err: any) {
+      res.status(500).json({ message: err?.message || "Retention pass failed" });
+    }
+  });
+
+  app.get("/api/admin/dns-health", requireAdmin, async (req, res) => {
+    const domain = String(req.query.domain || "tolstoystaffing.com").toLowerCase();
+    try {
+      const { auditDomain } = await import("./services/dnsHealth");
+      const report = await auditDomain(domain);
+      res.json(report);
+    } catch (err: any) {
+      res.status(400).json({ message: err?.message || "DNS audit failed" });
+    }
+  });
+
+  // ======================================================================
+  // === Admin grants (super-admin manages other admins via UI) ===
+  // ======================================================================
+  // Hardcoded super-admin allowlist — only these emails can grant/revoke.
+  // Keep this short; it should be the founder + cofounder accounts only.
+  const SUPER_ADMIN_EMAILS = (process.env.SUPER_ADMIN_EMAILS || "cairlbrandon@gmail.com")
+    .split(",").map((e) => e.trim().toLowerCase()).filter(Boolean);
+  const MFA_GRACE_DAYS = 7;
+
+  // Returns the set of currently-active admin emails: env list ∪ active grants.
+  // Used in /api/release-notes audience filtering above and as the source of
+  // truth for requireAdmin (env-only today; route-level grants honored here).
+  async function listActiveAdminEmails(): Promise<Set<string>> {
+    const out = new Set<string>(ADMIN_EMAILS);
+    try {
+      const rows = await db.select({ email: adminGrants.email })
+        .from(adminGrants)
+        .where(isNull(adminGrants.revokedAt));
+      for (const r of rows) out.add(r.email.toLowerCase());
+    } catch { /* table may not exist yet on first deploy */ }
+    return out;
+  }
+
+  function isSuperAdmin(email: string | undefined): boolean {
+    return !!email && SUPER_ADMIN_EMAILS.includes(email.toLowerCase());
+  }
+
+  function requireSuperAdmin(req: any, res: any, next: any) {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    const email = ((req.user as any)?.claims?.email || "").toLowerCase();
+    if (!isSuperAdmin(email)) return res.status(403).json({ message: "Super-admin access required" });
+    next();
+  }
+
+  // Caller's own admin status — drives client-side UI (admin nav, banners).
+  app.get("/api/me/admin-status", async (req, res) => {
+    if (!req.isAuthenticated()) {
+      return res.json({ isAdmin: false, isSuperAdmin: false, mfaEnrolled: false, mfaRequired: false, mfaGraceDaysLeft: null });
+    }
+    const email = ((req.user as any)?.claims?.email || "").toLowerCase();
+    const activeAdmins = await listActiveAdminEmails();
+    const adm = activeAdmins.has(email);
+    const sup = isSuperAdmin(email);
+    let mfaEnrolled = false;
+    let graceDaysLeft: number | null = null;
+    try {
+      const userRow = await authStorage.getUser((req.user as any)?.claims?.sub);
+      mfaEnrolled = (userRow as any)?.mfaEnabled === "true" || (userRow as any)?.mfaEnabled === true;
+    } catch { /* */ }
+    if (adm && !mfaEnrolled) {
+      // Find when this admin's grace period started. Env-list admins have no
+      // grant row; treat them as in-grace-period from now (they should enroll asap).
+      try {
+        const [g] = await db.select({ startedAt: adminGrants.mfaGraceStartedAt })
+          .from(adminGrants)
+          .where(and(eq(adminGrants.email, email), isNull(adminGrants.revokedAt)))
+          .limit(1);
+        const start = g?.startedAt ? new Date(g.startedAt as any) : new Date();
+        const elapsedDays = Math.floor((Date.now() - start.getTime()) / 86_400_000);
+        graceDaysLeft = Math.max(0, MFA_GRACE_DAYS - elapsedDays);
+      } catch {
+        graceDaysLeft = MFA_GRACE_DAYS;
+      }
+    }
+    res.json({
+      isAdmin: adm,
+      isSuperAdmin: sup,
+      mfaEnrolled,
+      mfaRequired: adm,
+      mfaGraceDaysLeft: graceDaysLeft,
+    });
+  });
+
+  // Super-admin only: list admins (env + DB grants).
+  app.get("/api/super-admin/admins", requireSuperAdmin, async (_req, res) => {
+    const grants = await db.select().from(adminGrants).orderBy(desc(adminGrants.grantedAt));
+    res.json({
+      envAdmins: ADMIN_EMAILS,
+      grants,
+      superAdmins: SUPER_ADMIN_EMAILS,
+    });
+  });
+
+  // Grant admin access. Idempotent: re-granting a revoked email reactivates.
+  app.post("/api/super-admin/admins", requireSuperAdmin, async (req, res) => {
+    const email = String(req.body?.email || "").trim().toLowerCase();
+    const notes = req.body?.notes ? String(req.body.notes).slice(0, 500) : null;
+    if (!email || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
+      return res.status(400).json({ message: "Invalid email" });
+    }
+    const grantedBy = ((req.user as any)?.claims?.email || "").toLowerCase();
+
+    // Look for existing active grant.
+    const existing = await db.select().from(adminGrants)
+      .where(and(eq(adminGrants.email, email), isNull(adminGrants.revokedAt)))
+      .limit(1);
+    if (existing.length > 0) {
+      return res.status(409).json({ message: "Already an admin", grant: existing[0] });
+    }
+
+    // Reactivate prior grant or insert new one.
+    const prior = await db.select().from(adminGrants)
+      .where(and(eq(adminGrants.email, email), isNotNull(adminGrants.revokedAt)))
+      .orderBy(desc(adminGrants.revokedAt)).limit(1);
+    let row;
+    if (prior.length > 0) {
+      [row] = await db.update(adminGrants).set({
+        revokedAt: null, revokedBy: null, grantedBy, grantedAt: new Date(),
+        mfaGraceStartedAt: new Date(), notes,
+      }).where(eq(adminGrants.id, prior[0].id)).returning();
+    } else {
+      [row] = await db.insert(adminGrants).values({
+        email, grantedBy, notes, mfaGraceStartedAt: new Date(),
+      }).returning();
+    }
+
+    // Best-effort welcome email via Resend SDK directly. The templated
+    // sendEmail() only supports the registered EmailType list; admin grants
+    // are admin-internal and don't need a full template entry.
+    void (async () => {
+      try {
+        const apiKey = process.env.RESEND_API_KEY;
+        const from = process.env.RESEND_FROM_EMAIL || "support@tolstoystaffing.com";
+        if (!apiKey) return;
+        const { Resend } = await import("resend");
+        const r = new Resend(apiKey);
+        await r.emails.send({
+          from,
+          to: email,
+          subject: "You're now a Tolstoy Staffing admin",
+          html: `<p>Hi,</p><p><strong>${grantedBy}</strong> granted you admin access to Tolstoy Staffing. Sign in at <a href="https://admin.estimatrix.io/login">admin.estimatrix.io</a>.</p><p><strong>Heads-up:</strong> admins must enroll in two-factor auth within ${MFA_GRACE_DAYS} days. Set it up at <a href="https://app.tolstoystaffing.com/dashboard/settings/account">your account settings</a>.</p>`,
+          text: `${grantedBy} granted you Tolstoy Staffing admin access. Sign in at https://admin.estimatrix.io/login. Enroll in 2FA within ${MFA_GRACE_DAYS} days.`,
+        } as any);
+      } catch (e) { console.warn("[Admin/Grant] welcome email failed:", e); }
+    })();
+
+    res.status(201).json(row);
+  });
+
+  // ======================================================================
+  // === Company outbound webhooks (config + events browser) ===
+  // ======================================================================
+  // Read current config. Secret is never returned in full — only its last 4
+  // chars so the user can confirm it's set without us re-exposing it.
+  app.get("/api/company/webhook-config", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    const profile = req.profile;
+    if (!profile || profile.role !== "company") return res.status(403).json({ message: "Company only" });
+    const [row] = await db.select({
+      webhookUrl: profiles.webhookUrl,
+      webhookSecret: profiles.webhookSecret,
+      webhookEventsEnabled: profiles.webhookEventsEnabled,
+    }).from(profiles).where(eq(profiles.id, profile.id)).limit(1);
+    res.json({
+      webhookUrl: row?.webhookUrl ?? null,
+      webhookSecretSet: !!row?.webhookSecret,
+      webhookSecretLastChars: row?.webhookSecret ? row.webhookSecret.slice(-4) : null,
+      webhookEventsEnabled: row?.webhookEventsEnabled ?? null,
+    });
+  });
+
+  // Update URL or regenerate the signing secret. Pass `regenerateSecret: true`
+  // to mint a new one — the response includes `newSecret` (shown ONCE).
+  app.put("/api/company/webhook-config", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    const profile = req.profile;
+    if (!profile || profile.role !== "company") return res.status(403).json({ message: "Company only" });
+    const { webhookUrl, regenerateSecret, eventsEnabled } = req.body || {};
+    const updates: any = {};
+    if (typeof webhookUrl === "string") {
+      const u = webhookUrl.trim();
+      if (u && !u.startsWith("https://")) {
+        return res.status(400).json({ message: "Webhook URL must be https://" });
+      }
+      updates.webhookUrl = u || null;
+    }
+    if (Array.isArray(eventsEnabled)) {
+      updates.webhookEventsEnabled = eventsEnabled.filter((s: unknown) => typeof s === "string").slice(0, 50);
+    }
+    let newSecret: string | null = null;
+    if (regenerateSecret === true) {
+      newSecret = crypto.randomBytes(32).toString("hex");
+      updates.webhookSecret = newSecret;
+    }
+    if (Object.keys(updates).length === 0) return res.status(400).json({ message: "No updates" });
+    await db.update(profiles).set(updates).where(eq(profiles.id, profile.id));
+    res.json({ success: true, ...(newSecret ? { newSecret } : {}) });
+  });
+
+  // Send a test event to the configured endpoint (queued, not synchronous —
+  // delivery happens within ~30s on the next scheduler tick).
+  app.post("/api/company/webhook-config/test", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    const profile = req.profile;
+    if (!profile || profile.role !== "company") return res.status(403).json({ message: "Company only" });
+    const { enqueueWebhook } = await import("./services/outboundWebhooks");
+    const result = await enqueueWebhook({
+      recipientProfileId: profile.id,
+      eventType: "webhook.test",
+      payload: { message: "This is a test event from Tolstoy Staffing", at: new Date().toISOString() },
+    });
+    if (!result) {
+      return res.status(400).json({ message: "Configure webhook URL and secret first." });
+    }
+    res.json({ queued: true, eventId: result.id, idempotencyKey: result.idempotencyKey });
+  });
+
+  // List recent delivery attempts.
+  app.get("/api/company/webhook-events", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    const profile = req.profile;
+    if (!profile || profile.role !== "company") return res.status(403).json({ message: "Company only" });
+    const limit = Math.min(200, Math.max(1, parseInt(String(req.query.limit), 10) || 50));
+    const status = String(req.query.status || "");
+    const conditions = [eq(outboundWebhookEvents.recipientProfileId, profile.id)];
+    if (status && ["pending", "delivered", "failed", "abandoned"].includes(status)) {
+      conditions.push(eq(outboundWebhookEvents.status, status as any));
+    }
+    const rows = await db.select().from(outboundWebhookEvents)
+      .where(conditions.length > 1 ? and(...conditions) : conditions[0])
+      .orderBy(desc(outboundWebhookEvents.createdAt))
+      .limit(limit);
+    res.json(rows);
+  });
+
+  // Force-retry a failed/abandoned event. Resets attempts to 0 and re-queues.
+  app.post("/api/company/webhook-events/:id/retry", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    const profile = req.profile;
+    if (!profile || profile.role !== "company") return res.status(403).json({ message: "Company only" });
+    const id = Number(req.params.id);
+    const [evt] = await db.select().from(outboundWebhookEvents).where(eq(outboundWebhookEvents.id, id)).limit(1);
+    if (!evt) return res.status(404).json({ message: "Event not found" });
+    if (evt.recipientProfileId !== profile.id) return res.status(403).json({ message: "Not your event" });
+    if (evt.status === "delivered") return res.status(409).json({ message: "Already delivered; nothing to retry" });
+    await db.update(outboundWebhookEvents).set({
+      status: "pending",
+      attempts: 0,
+      nextAttemptAt: new Date(),
+      lastError: null,
+      lastResponseStatus: null,
+      lastResponseBody: null,
+    }).where(eq(outboundWebhookEvents.id, id));
+    res.json({ success: true, queued: true });
+  });
+
+  // ======================================================================
+  // === Subprocessor change-notice mailing list ===
+  // ======================================================================
+  // Public: subscribe to change notices. Sends a confirmation email; the
+  // address isn't considered subscribed until they click the confirm link.
+  app.post("/api/subprocessors/subscribe", async (req, res) => {
+    const email = String(req.body?.email || "").trim().toLowerCase();
+    if (!email || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
+      return res.status(400).json({ message: "Invalid email" });
+    }
+    try {
+      const existing = await db.select().from(subprocessorSubscribers)
+        .where(eq(subprocessorSubscribers.email, email)).limit(1);
+      let confirmToken: string;
+      if (existing.length > 0) {
+        const row = existing[0];
+        if (row.unsubscribedAt) {
+          // Reactivate: new token, clear unsubscribe.
+          confirmToken = crypto.randomBytes(24).toString("hex");
+          await db.update(subprocessorSubscribers).set({
+            confirmToken, confirmedAt: null, unsubscribedAt: null,
+          }).where(eq(subprocessorSubscribers.id, row.id));
+        } else if (row.confirmedAt) {
+          return res.json({ alreadyConfirmed: true });
+        } else {
+          confirmToken = row.confirmToken;
+        }
+      } else {
+        confirmToken = crypto.randomBytes(24).toString("hex");
+        await db.insert(subprocessorSubscribers).values({
+          email, confirmToken,
+          source: req.body?.source ? String(req.body.source).slice(0, 50) : "subprocessor_page",
+        });
+      }
+      // Best-effort confirmation email (Resend SDK directly).
+      void (async () => {
+        try {
+          const apiKey = process.env.RESEND_API_KEY;
+          const from = process.env.RESEND_FROM_EMAIL || "support@tolstoystaffing.com";
+          if (!apiKey) return;
+          const { Resend } = await import("resend");
+          const r = new Resend(apiKey);
+          const confirmUrl = `https://app.tolstoystaffing.com/api/subprocessors/confirm?token=${confirmToken}`;
+          await r.emails.send({
+            from, to: email,
+            subject: "Confirm your subscription to Tolstoy Staffing subprocessor notices",
+            html: `<p>Click below to confirm your subscription. We'll email you 30 days before any subprocessor change.</p><p><a href="${confirmUrl}">Confirm subscription</a></p><p>Didn't subscribe? Ignore this — you won't be added.</p>`,
+            text: `Confirm your subscription: ${confirmUrl}\n\nDidn't subscribe? Ignore this email.`,
+          } as any);
+        } catch (e) { console.warn("[Subprocessor] confirm email failed:", e); }
+      })();
+      res.json({ pending: true });
+    } catch (e: any) {
+      console.error("[Subprocessor/subscribe]", e);
+      res.status(500).json({ message: "Subscribe failed" });
+    }
+  });
+
+  // Click-through confirmation. Public endpoint hit from email link.
+  app.get("/api/subprocessors/confirm", async (req, res) => {
+    const token = String(req.query.token || "");
+    if (!token) return res.status(400).send("Invalid token");
+    const [row] = await db.select().from(subprocessorSubscribers)
+      .where(eq(subprocessorSubscribers.confirmToken, token)).limit(1);
+    if (!row) return res.status(404).send("Token not found or expired");
+    if (!row.confirmedAt) {
+      await db.update(subprocessorSubscribers).set({ confirmedAt: new Date() })
+        .where(eq(subprocessorSubscribers.id, row.id));
+    }
+    res.redirect("/legal/subprocessors?subscribed=1");
+  });
+
+  // RFC 8058 one-click unsubscribe. Linked from List-Unsubscribe header on
+  // every blast. POST per spec; we also support GET for click-throughs.
+  const handleSubprocessorUnsubscribe = async (req: any, res: any) => {
+    const token = String(req.query.token || req.body?.token || "");
+    if (!token) return res.status(400).send("Invalid token");
+    const [row] = await db.select().from(subprocessorSubscribers)
+      .where(eq(subprocessorSubscribers.confirmToken, token)).limit(1);
+    if (!row) return res.status(404).send("Token not found");
+    await db.update(subprocessorSubscribers).set({ unsubscribedAt: new Date() })
+      .where(eq(subprocessorSubscribers.id, row.id));
+    res.send("Unsubscribed.");
+  };
+  app.post("/api/subprocessors/unsubscribe", handleSubprocessorUnsubscribe);
+  app.get("/api/subprocessors/unsubscribe", handleSubprocessorUnsubscribe);
+
+  // Admin-only: blast a change notice to all confirmed subscribers.
+  app.post("/api/admin/subprocessors/notify", requireAdmin, async (req, res) => {
+    const subject = String(req.body?.subject || "").trim();
+    const html = String(req.body?.html || "").trim();
+    if (subject.length < 5) return res.status(400).json({ message: "Subject too short" });
+    if (html.length < 50) return res.status(400).json({ message: "Body too short" });
+
+    const apiKey = process.env.RESEND_API_KEY;
+    const from = process.env.RESEND_FROM_EMAIL || "support@tolstoystaffing.com";
+    if (!apiKey) return res.status(500).json({ message: "RESEND_API_KEY not configured" });
+
+    const subs = await db.select().from(subprocessorSubscribers)
+      .where(and(isNotNull(subprocessorSubscribers.confirmedAt), isNull(subprocessorSubscribers.unsubscribedAt)));
+    if (subs.length === 0) return res.json({ totalSubscribers: 0, sent: 0, failed: 0 });
+
+    const { Resend } = await import("resend");
+    const r = new Resend(apiKey);
+    let sent = 0, failed = 0;
+    // Sequential to respect Resend rate limits (~10/s default). For lists >1k,
+    // swap this for a queued background job.
+    for (const sub of subs) {
+      const unsubUrl = `https://app.tolstoystaffing.com/api/subprocessors/unsubscribe?token=${sub.confirmToken}`;
+      const fullHtml = `${html}<hr/><p style="font-size:11px;color:#888;">You're receiving this because you subscribed to Tolstoy Staffing subprocessor change notices. <a href="${unsubUrl}">Unsubscribe</a>.</p>`;
+      try {
+        await r.emails.send({
+          from, to: sub.email, subject, html: fullHtml,
+          headers: {
+            "List-Unsubscribe": `<${unsubUrl}>, <mailto:unsubscribe@tolstoystaffing.com?subject=unsubscribe>`,
+            "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
+          },
+        } as any);
+        sent++;
+      } catch (e) {
+        console.warn("[Subprocessor blast] send failed for", sub.email, e);
+        failed++;
+      }
+    }
+    res.json({ totalSubscribers: subs.length, sent, failed });
+  });
+
+  // Revoke admin access (soft-delete).
+  app.delete("/api/super-admin/admins/:id", requireSuperAdmin, async (req, res) => {
+    const id = Number(req.params.id);
+    const revokedBy = ((req.user as any)?.claims?.email || "").toLowerCase();
+    const [grant] = await db.select().from(adminGrants).where(eq(adminGrants.id, id)).limit(1);
+    if (!grant) return res.status(404).json({ message: "Grant not found" });
+    if (grant.revokedAt) return res.status(409).json({ message: "Already revoked" });
+    if (grant.email.toLowerCase() === revokedBy) {
+      return res.status(400).json({ message: "Can't revoke yourself" });
+    }
+    await db.update(adminGrants).set({ revokedAt: new Date(), revokedBy }).where(eq(adminGrants.id, id));
+    res.json({ success: true });
   });
 
   return httpServer;

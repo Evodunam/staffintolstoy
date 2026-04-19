@@ -95,8 +95,135 @@ export async function createReport(candidateId: string, packageCode: string): Pr
   return report;
 }
 
+/**
+ * Checkr "Invitation" — the recommended modern flow. We create a candidate
+ * with minimal PII, then create an invitation that prompts Checkr to send
+ * the candidate a hosted form to collect SSN/DOB/etc directly. Once the
+ * candidate completes the form, Checkr automatically creates the report and
+ * fires `report.created` → `report.completed` webhooks.
+ *
+ * Why prefer invitations over direct `createReport`:
+ *   - We never touch SSN, eliminating PCI-style compliance scope.
+ *   - Checkr handles the hosted FCRA disclosure (alongside our own — both
+ *     are valid, doubling protection).
+ *   - Reduces our liability for typos in DOB / address.
+ *
+ * Reference: https://docs.checkr.com/reference/createinvitation
+ */
+export interface CheckrInvitation {
+  id: string;
+  object: "invitation";
+  status: "pending" | "completed" | "expired";
+  candidate_id: string;
+  package: string;
+  invitation_url: string;
+  expires_at: string;
+}
+
+export async function createInvitation(candidateId: string, packageCode: string): Promise<CheckrInvitation> {
+  const body = new URLSearchParams();
+  body.append("candidate_id", candidateId);
+  body.append("package", packageCode);
+  return callCheckr<CheckrInvitation>("/invitations", { method: "POST", body });
+}
+
 export async function getReport(reportId: string): Promise<CheckrReport> {
   return callCheckr<CheckrReport>(`/reports/${reportId}`, { method: "GET" });
+}
+
+/**
+ * High-level placement: take a draft order row, push the worker to Checkr
+ * via createCandidate + createInvitation, persist the resulting candidate id
+ * + invitation URL on the order. Marks status="ordered" on success or leaves
+ * "draft" on failure (with the error logged + persisted in adverseActionReason
+ * so admin triage can see it).
+ *
+ * If CHECKR_API_KEY isn't set, this is a no-op that logs a warning.
+ * Idempotent: re-calling on a row that already has a vendorReference is a
+ * no-op (treats it as already placed).
+ */
+export async function placeOrderWithCheckr(orderId: number): Promise<{
+  ok: boolean;
+  candidateId?: string;
+  invitationUrl?: string;
+  error?: string;
+}> {
+  if (!process.env.CHECKR_API_KEY) {
+    return { ok: false, error: "CHECKR_API_KEY not configured (order left as draft)" };
+  }
+
+  const [order] = await db.select().from(backgroundCheckOrders).where(eq(backgroundCheckOrders.id, orderId)).limit(1);
+  if (!order) return { ok: false, error: "Order not found" };
+  if (order.vendorReference) {
+    return { ok: true, candidateId: order.vendorReference, error: "Already placed" };
+  }
+  if (order.vendor !== "checkr") {
+    return { ok: false, error: `Order vendor is ${order.vendor}, not checkr` };
+  }
+  if (!order.packageCode) {
+    return { ok: false, error: "packageCode required for Checkr orders" };
+  }
+
+  // Pull worker profile lazily to keep this module's import surface narrow.
+  const { profiles } = await import("@shared/schema");
+  const [worker] = await db.select({
+    firstName: profiles.firstName,
+    lastName: profiles.lastName,
+    email: profiles.email,
+    phone: profiles.phone,
+    zipCode: profiles.zipCode,
+    state: profiles.state,
+  }).from(profiles).where(eq(profiles.id, order.workerId)).limit(1);
+  if (!worker) return { ok: false, error: "Worker profile not found" };
+  if (!worker.firstName || !worker.lastName || !worker.email) {
+    return { ok: false, error: "Worker profile missing first/last name or email — cannot place order" };
+  }
+
+  let candidate: CheckrCandidate;
+  try {
+    candidate = await createCandidate({
+      firstName: worker.firstName,
+      lastName: worker.lastName,
+      email: worker.email,
+      phone: worker.phone || undefined,
+      zipcode: worker.zipCode || undefined,
+      workLocations: worker.state ? [{ country: "US", state: worker.state }] : undefined,
+    });
+  } catch (e: any) {
+    const msg = `createCandidate failed: ${e?.message || e}`;
+    console.error("[Checkr/place]", msg);
+    await db.update(backgroundCheckOrders).set({ adverseActionReason: msg }).where(eq(backgroundCheckOrders.id, orderId));
+    return { ok: false, error: msg };
+  }
+
+  let invitation: CheckrInvitation;
+  try {
+    invitation = await createInvitation(candidate.id, order.packageCode);
+  } catch (e: any) {
+    const msg = `createInvitation failed: ${e?.message || e}`;
+    console.error("[Checkr/place]", msg);
+    // Persist the candidate id even though invitation failed — admin can retry
+    // invitation manually once the underlying issue is fixed.
+    await db.update(backgroundCheckOrders).set({
+      vendorReference: candidate.id,
+      adverseActionReason: msg,
+    }).where(eq(backgroundCheckOrders.id, orderId));
+    return { ok: false, candidateId: candidate.id, error: msg };
+  }
+
+  await db.update(backgroundCheckOrders).set({
+    vendorReference: candidate.id,
+    status: "ordered",
+    orderedAt: new Date(),
+    // Stash the invitation URL in reportUrl so the worker can be re-pointed
+    // at it from the worker UI. Once the invitation is completed by the
+    // worker, the report.completed webhook will overwrite this with the
+    // dashboard URL.
+    reportUrl: invitation.invitation_url,
+    adverseActionReason: null,
+  }).where(eq(backgroundCheckOrders.id, orderId));
+
+  return { ok: true, candidateId: candidate.id, invitationUrl: invitation.invitation_url };
 }
 
 /**
@@ -153,3 +280,4 @@ export async function applyReportEvent(report: CheckrReport): Promise<void> {
   if (Object.keys(updates).length === 0) return;
   await db.update(backgroundCheckOrders).set(updates).where(eq(backgroundCheckOrders.id, order.id));
 }
+

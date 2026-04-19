@@ -295,7 +295,14 @@ export const profiles = pgTable("profiles", {
   googleBusinessRefreshToken: text("google_business_refresh_token"),
   googleBusinessTokenExpiresAt: timestamp("google_business_token_expires_at"),
   googleBusinessLocationId: text("google_business_location_id"), // The location ID from My Business API
-  
+
+  // Per-company outbound webhook configuration. URL must be HTTPS. Secret is
+  // generated server-side at first set; UI only sees last 4 chars after that.
+  // events_enabled is a JSONB array of event-type strings ([] / null = all).
+  webhookUrl: text("webhook_url"),
+  webhookSecret: text("webhook_secret"),
+  webhookEventsEnabled: jsonb("webhook_events_enabled"),
+
   createdAt: timestamp("created_at").defaultNow(),
   updatedAt: timestamp("updated_at").defaultNow(),
 }, (table) => [
@@ -1821,6 +1828,214 @@ export const safetyIncidents = pgTable("safety_incidents", {
   index("idx_safety_incidents_company").on(table.companyProfileId),
   index("idx_safety_incidents_status").on(table.status),
   index("idx_safety_incidents_severity").on(table.severity),
+]);
+
+// === Worker availability calendar ===
+// Recurring weekly windows (e.g. "Mon 9am-5pm") + ad-hoc blackouts (PTO).
+// Empty windows list = "no preference, always available".
+export const workerAvailabilityWindows = pgTable("worker_availability_windows", {
+  id: serial("id").primaryKey(),
+  profileId: integer("profile_id").notNull().references(() => profiles.id, { onDelete: "cascade" }),
+  dayOfWeek: integer("day_of_week").notNull(), // 0=Sun … 6=Sat
+  startMinute: integer("start_minute").notNull(),
+  endMinute: integer("end_minute").notNull(),
+  createdAt: timestamp("created_at").defaultNow(),
+}, (table) => [index("idx_wa_windows_profile").on(table.profileId)]);
+
+export const workerAvailabilityBlackouts = pgTable("worker_availability_blackouts", {
+  id: serial("id").primaryKey(),
+  profileId: integer("profile_id").notNull().references(() => profiles.id, { onDelete: "cascade" }),
+  startsAt: timestamp("starts_at").notNull(),
+  endsAt: timestamp("ends_at").notNull(),
+  reason: text("reason"),
+  createdAt: timestamp("created_at").defaultNow(),
+}, (table) => [
+  index("idx_wa_blackouts_profile").on(table.profileId),
+  index("idx_wa_blackouts_range").on(table.startsAt, table.endsAt),
+]);
+
+// === In-product release notes / changelog ===
+// Admin-published entries surfaced via the bell icon to all eligible users.
+// per-user "last read at" so the bell shows an unread badge until opened.
+export const releaseNotes = pgTable("release_notes", {
+  id: serial("id").primaryKey(),
+  title: text("title").notNull(),
+  bodyHtml: text("body_html").notNull(),
+  audience: text("audience", { enum: ["all", "company", "worker", "admin"] }).default("all"),
+  publishedAt: timestamp("published_at"),
+  createdBy: text("created_by"),
+  createdAt: timestamp("created_at").defaultNow(),
+  updatedAt: timestamp("updated_at").defaultNow(),
+}, (table) => [
+  index("idx_release_notes_published").on(table.publishedAt),
+  index("idx_release_notes_audience").on(table.audience),
+]);
+
+export const releaseNotesReads = pgTable("release_notes_reads", {
+  id: serial("id").primaryKey(),
+  userId: text("user_id").notNull().references(() => users.id, { onDelete: "cascade" }).unique(),
+  lastReadAt: timestamp("last_read_at").notNull().defaultNow(),
+});
+
+// === Background check consent requests (company-initiated) ===
+// Company sends a request → worker gets tokenized email → on signature we
+// create the canonical backgroundCheckConsents row + draft backgroundCheckOrders
+// row. Failed/abandoned attempts live here only — they don't pollute the
+// canonical consents table.
+export const backgroundCheckConsentRequests = pgTable("background_check_consent_requests", {
+  id: serial("id").primaryKey(),
+  requestedByCompanyId: integer("requested_by_company_id").notNull().references(() => profiles.id, { onDelete: "cascade" }),
+  workerId: integer("worker_id").references(() => profiles.id, { onDelete: "cascade" }),
+  workerEmail: text("worker_email").notNull(),
+  jobId: integer("job_id").references(() => jobs.id, { onDelete: "set null" }),
+  vendor: text("vendor").notNull().default("checkr"),
+  packageCode: text("package_code"),
+  consentToken: text("consent_token").notNull().unique(),
+  expiresAt: timestamp("expires_at").notNull(),
+  consentedAt: timestamp("consented_at"),
+  resultingConsentId: integer("resulting_consent_id"),
+  resultingOrderId: integer("resulting_order_id"),
+  cancelledAt: timestamp("cancelled_at"),
+  cancelledBy: text("cancelled_by"),
+  createdAt: timestamp("created_at").defaultNow(),
+}, (table) => [
+  index("idx_bccr_company").on(table.requestedByCompanyId),
+  index("idx_bccr_worker").on(table.workerId),
+]);
+
+// === Drug screen consent requests ===
+// Company-initiated drug screen flow. Company creates a request → worker
+// receives a tokenized email link → on click, reviews disclosure + signs →
+// we create the actual drug_screen_orders row with full FCRA paper trail.
+// Tokens expire 14 days after issue.
+export const drugScreenConsentRequests = pgTable("drug_screen_consent_requests", {
+  id: serial("id").primaryKey(),
+  requestedByCompanyId: integer("requested_by_company_id").notNull().references(() => profiles.id, { onDelete: "cascade" }),
+  workerId: integer("worker_id").references(() => profiles.id, { onDelete: "cascade" }),
+  workerEmail: text("worker_email").notNull(),
+  panel: text("panel", { enum: ["5_panel", "5_panel_no_thc", "10_panel", "dot_panel"] }).notNull(),
+  workplaceState: text("workplace_state"),
+  jobId: integer("job_id").references(() => jobs.id, { onDelete: "set null" }),
+  consentToken: text("consent_token").notNull().unique(),
+  expiresAt: timestamp("expires_at").notNull(),
+  consentedAt: timestamp("consented_at"),
+  consentSignatureName: text("consent_signature_name"),
+  consentIpAddress: text("consent_ip_address"),
+  /** Once consented, the resulting drug_screen_orders.id (FK set on consent). */
+  resultingOrderId: integer("resulting_order_id"),
+  cancelledAt: timestamp("cancelled_at"),
+  cancelledBy: text("cancelled_by"),
+  createdAt: timestamp("created_at").defaultNow(),
+}, (table) => [
+  index("idx_dscr_company").on(table.requestedByCompanyId),
+  index("idx_dscr_worker").on(table.workerId),
+]);
+
+// === Drug screen orders ===
+// One row per drug test ordered through the vendor-agnostic drugScreening
+// service. Worker consent (signed name + timestamp + IP) recorded inline so
+// the FCRA + state-law disclosure paper trail lives with the order itself.
+export const drugScreenOrders = pgTable("drug_screen_orders", {
+  id: serial("id").primaryKey(),
+  workerId: integer("worker_id").notNull().references(() => profiles.id, { onDelete: "cascade" }),
+  orderedByCompanyId: integer("ordered_by_company_id").references(() => profiles.id, { onDelete: "set null" }),
+  vendor: text("vendor").notNull().default("accurate"),
+  vendorRef: text("vendor_ref"),
+  panel: text("panel", { enum: ["5_panel", "5_panel_no_thc", "10_panel", "dot_panel"] }).notNull(),
+  workplaceState: text("workplace_state"),
+  status: text("status", {
+    enum: ["pending", "in_progress", "completed_negative", "completed_positive", "completed_mro_negative", "cancelled", "expired"],
+  }).notNull().default("pending"),
+  consentGivenAt: timestamp("consent_given_at").notNull(),
+  consentSignatureName: text("consent_signature_name").notNull(),
+  consentIpAddress: text("consent_ip_address"),
+  schedulingUrl: text("scheduling_url"),
+  collectedAt: timestamp("collected_at"),
+  completedAt: timestamp("completed_at"),
+  expiresAt: timestamp("expires_at"),
+  resultSummary: text("result_summary"),
+  positiveAnalytes: jsonb("positive_analytes"),
+  adverseActionPreNoticeSentAt: timestamp("adverse_action_pre_notice_sent_at"),
+  adverseActionFinalNoticeSentAt: timestamp("adverse_action_final_notice_sent_at"),
+  createdAt: timestamp("created_at").defaultNow(),
+  updatedAt: timestamp("updated_at").defaultNow(),
+}, (table) => [
+  index("idx_drug_screen_orders_worker").on(table.workerId),
+  index("idx_drug_screen_orders_status").on(table.status),
+]);
+
+// === Subprocessor change-notice mailing list ===
+// Double opt-in subscribers who get notified when we add/change subprocessors.
+// 30-day advance notice is required by most enterprise DPAs.
+export const subprocessorSubscribers = pgTable("subprocessor_subscribers", {
+  id: serial("id").primaryKey(),
+  email: text("email").notNull(),
+  confirmToken: text("confirm_token").notNull(),
+  confirmedAt: timestamp("confirmed_at"),
+  unsubscribedAt: timestamp("unsubscribed_at"),
+  source: text("source"),
+  createdAt: timestamp("created_at").defaultNow(),
+}, (table) => [
+  index("idx_subprocessor_subscribers_confirmed").on(table.confirmedAt),
+]);
+
+// === Outbound webhooks ===
+// Per-company webhook delivery queue. Scheduler walks pending rows in
+// next_attempt_at order, signs with HMAC-SHA256 and POSTs. Failed rows
+// retry with exponential backoff up to maxAttempts.
+export const outboundWebhookEvents = pgTable("outbound_webhook_events", {
+  id: serial("id").primaryKey(),
+  recipientProfileId: integer("recipient_profile_id").notNull().references(() => profiles.id, { onDelete: "cascade" }),
+  eventType: text("event_type").notNull(),
+  idempotencyKey: text("idempotency_key").notNull().unique(),
+  url: text("url").notNull(),
+  payload: jsonb("payload").notNull(),
+  status: text("status", { enum: ["pending", "delivered", "failed", "abandoned"] }).notNull().default("pending"),
+  attempts: integer("attempts").notNull().default(0),
+  maxAttempts: integer("max_attempts").notNull().default(8),
+  nextAttemptAt: timestamp("next_attempt_at").notNull().defaultNow(),
+  lastResponseStatus: integer("last_response_status"),
+  lastResponseBody: text("last_response_body"),
+  lastError: text("last_error"),
+  deliveredAt: timestamp("delivered_at"),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+}, (table) => [
+  index("idx_outbound_webhook_recipient").on(table.recipientProfileId),
+  index("idx_outbound_webhook_status").on(table.status),
+  index("idx_outbound_webhook_due").on(table.nextAttemptAt),
+]);
+
+// === Scheduler run audit trail ===
+// One row per scheduler tick (success or failure). Written async from
+// server/observability/schedulerHealth.ts — used for compliance dashboards
+// when in-process counters are insufficient.
+export const schedulerRuns = pgTable("scheduler_runs", {
+  id: serial("id").primaryKey(),
+  schedulerName: text("scheduler_name").notNull(),
+  startedAt: timestamp("started_at").notNull(),
+  durationMs: integer("duration_ms").notNull(),
+  ok: boolean("ok").notNull(),
+  error: text("error"),
+  stats: jsonb("stats"),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+}, (table) => [
+  index("idx_scheduler_runs_name_started").on(table.schedulerName, table.startedAt),
+]);
+
+// === Admin grants ===
+// DB-managed admin access. Supplements env ADMIN_EMAILS so super-admins can
+// grant/revoke without redeploying. Soft-delete via revokedAt preserves audit.
+export const adminGrants = pgTable("admin_grants", {
+  id: serial("id").primaryKey(),
+  email: text("email").notNull(),
+  grantedBy: text("granted_by").notNull(),
+  grantedAt: timestamp("granted_at").notNull().defaultNow(),
+  revokedAt: timestamp("revoked_at"),
+  revokedBy: text("revoked_by"),
+  notes: text("notes"),
+  mfaGraceStartedAt: timestamp("mfa_grace_started_at").defaultNow(),
+}, (table) => [
+  index("idx_admin_grants_email").on(table.email),
 ]);
 
 export const adminActivityLog = pgTable("admin_activity_log", {

@@ -1,4 +1,8 @@
+import { useState, useEffect } from "react";
 import { Link } from "wouter";
+import { Input } from "@/components/ui/input";
+import { Button } from "@/components/ui/button";
+import { CheckCircle2, MailCheck, Loader2 } from "lucide-react";
 
 interface Subprocessor {
   name: string;
@@ -70,15 +74,15 @@ export default function Subprocessors() {
         </div>
 
         <h2 className="text-xl font-semibold mt-10 mb-3">Subprocessor change notifications</h2>
-        <p className="text-sm leading-relaxed mb-2">
-          Customers on our enterprise tier may subscribe to advance notice of subprocessor
-          changes. Email <a className="text-primary underline" href="mailto:legal@tolstoystaffing.com">legal@tolstoystaffing.com</a> to opt in.
-        </p>
-        <p className="text-sm leading-relaxed">
+        <p className="text-sm leading-relaxed mb-4">
           We will provide at least 30 days' notice before adding a new subprocessor that
-          will process customer personal data. Customers may object to the addition by
-          notifying us during the notice period; if we cannot resolve the objection, the
-          customer may terminate the affected services for cause.
+          will process customer personal data. Customers may object during the notice
+          period; if we can't resolve the objection, you may terminate the affected
+          services for cause.
+        </p>
+        <SubscribeForm />
+        <p className="text-xs text-muted-foreground mt-2">
+          Or email <a className="text-primary underline" href="mailto:legal@tolstoystaffing.com">legal@tolstoystaffing.com</a> for enterprise DPA-style notice.
         </p>
 
         <h2 className="text-xl font-semibold mt-10 mb-3">Changelog</h2>
@@ -87,5 +91,89 @@ export default function Subprocessors() {
         </ul>
       </div>
     </div>
+  );
+}
+
+/**
+ * Double opt-in subscribe form. Shows a "check your inbox" confirmation
+ * after submit; if the user already confirmed, says so and short-circuits.
+ * Reads ?subscribed=1 from the URL on mount to show a one-time success
+ * banner after click-through confirmation.
+ */
+function SubscribeForm() {
+  const [email, setEmail] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [state, setState] = useState<"idle" | "pending" | "already" | "confirmed" | "error">("idle");
+  const [errorMsg, setErrorMsg] = useState("");
+
+  useEffect(() => {
+    if (typeof window !== "undefined") {
+      const params = new URLSearchParams(window.location.search);
+      if (params.get("subscribed") === "1") {
+        setState("confirmed");
+        // Strip the param so a refresh doesn't re-show the banner.
+        window.history.replaceState({}, "", window.location.pathname);
+      }
+    }
+  }, []);
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setErrorMsg("");
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) { setErrorMsg("Invalid email"); return; }
+    setSubmitting(true);
+    try {
+      const res = await fetch("/api/subprocessors/subscribe", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email, source: "subprocessor_page" }),
+      });
+      const data = await res.json();
+      if (!res.ok) { setState("error"); setErrorMsg(data?.message || "Failed"); return; }
+      setState(data.alreadyConfirmed ? "already" : "pending");
+      setEmail("");
+    } catch (err: any) {
+      setState("error"); setErrorMsg(err?.message || "Network error");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  if (state === "confirmed") {
+    return (
+      <div className="rounded-lg border border-green-300 bg-green-50 dark:bg-green-950/30 p-3 flex items-center gap-2 text-sm">
+        <CheckCircle2 className="w-4 h-4 text-green-600" />
+        Subscription confirmed. We'll email you 30 days before any subprocessor change.
+      </div>
+    );
+  }
+  if (state === "pending") {
+    return (
+      <div className="rounded-lg border border-blue-300 bg-blue-50 dark:bg-blue-950/30 p-3 flex items-center gap-2 text-sm">
+        <MailCheck className="w-4 h-4 text-blue-600" />
+        Check your inbox — click the confirmation link to finish subscribing.
+      </div>
+    );
+  }
+  if (state === "already") {
+    return <p className="text-sm text-muted-foreground">You're already subscribed.</p>;
+  }
+
+  return (
+    <form onSubmit={submit} className="flex gap-2 max-w-md">
+      <Input
+        type="email"
+        placeholder="you@company.com"
+        value={email}
+        onChange={(e) => setEmail(e.target.value)}
+        required
+        disabled={submitting}
+      />
+      <Button type="submit" disabled={submitting} className="gap-1">
+        {submitting && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+        Subscribe
+      </Button>
+      {errorMsg && <span className="text-xs text-destructive self-center">{errorMsg}</span>}
+    </form>
   );
 }

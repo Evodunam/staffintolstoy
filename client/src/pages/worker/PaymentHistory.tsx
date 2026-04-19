@@ -14,6 +14,7 @@ import {
   Landmark,
   Info,
   Link2,
+  FileText,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -536,6 +537,22 @@ export function PaymentHistoryContent({ embedded = false }: { embedded?: boolean
                           </p>
                         </div>
                         <div className="flex items-center gap-1 flex-shrink-0">
+                          {canOpenInvoice && (
+                            <Button
+                              type="button"
+                              variant="ghost"
+                              size="icon"
+                              className="h-9 w-9 shrink-0 text-muted-foreground hover:text-foreground"
+                              aria-label="Download itemized wage statement (CA Labor Code §226 / NY §195.3)"
+                              title="Itemized wage statement"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                window.open(`/api/timesheets/${tsId}/wage-statement`, "_blank", "noopener");
+                              }}
+                            >
+                              <FileText className="h-4 w-4" />
+                            </Button>
+                          )}
                           {canOpenJob && (
                             <Button
                               type="button"

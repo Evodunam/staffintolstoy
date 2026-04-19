@@ -359,6 +359,22 @@ export interface CreatePaymentParams {
   description?: string;
   idempotencyKey?: string;
   note?: string;
+  /**
+   * Worker profile id of the payee — used by OFAC pre-payout screening.
+   * If omitted, sendPayment will look it up from profiles.mercuryRecipientId.
+   * Pass directly when you already have it for a small perf win.
+   */
+  workerProfileId?: number;
+  /**
+   * Email of the operator initiating this payment. Recorded in admin
+   * activity log on screening events. Use "system" for autoApproval.
+   */
+  actor?: string;
+  /**
+   * Skip OFAC screening (admin override / bypass). Caller MUST log a
+   * justification — the bypass itself shows up in the audit log.
+   */
+  bypassOfacScreening?: boolean;
 }
 
 export interface CreateDebitParams {
@@ -1038,6 +1054,59 @@ export const mercuryService = {
    * See: https://docs.mercury.com/reference/createtransaction and https://docs.mercury.com/reference/requestsendmoney
    */
   async sendPayment(params: CreatePaymentParams): Promise<MercuryPayment> {
+    // === OFAC pre-payout sanctions screening ===
+    // Fail closed: throws OfacBlockedError if not cleared. Admin can override
+    // a "review" status via /api/admin/payout-screening/clear after manual
+    // review of the false-positive match.
+    try {
+      const { ensureClearedForPayout } = await import("./payoutScreening");
+      let workerProfileId = params.workerProfileId;
+      // Resolve from mercury_recipient_id column when caller didn't pass it.
+      if (!workerProfileId) {
+        try {
+          const { db } = await import("../db");
+          const { profiles } = await import("@shared/schema");
+          const { eq } = await import("drizzle-orm");
+          const [match] = await db.select({ id: profiles.id })
+            .from(profiles).where(eq(profiles.mercuryRecipientId, params.recipientId)).limit(1);
+          if (match) workerProfileId = match.id;
+        } catch (lookupErr) {
+          console.warn("[Mercury/sendPayment] profile lookup for OFAC screen failed:", lookupErr);
+        }
+      }
+      if (workerProfileId) {
+        await ensureClearedForPayout(
+          { workerProfileId },
+          { bypass: params.bypassOfacScreening, actor: params.actor },
+        );
+      } else {
+        // No profile id — fall back to fetching the recipient name from Mercury.
+        try {
+          const recipient = await this.getRecipient(params.recipientId);
+          await ensureClearedForPayout(
+            { rawName: recipient?.name },
+            { bypass: params.bypassOfacScreening, actor: params.actor },
+          );
+        } catch (recipErr) {
+          if ((recipErr as any)?.name === "OfacBlockedError") throw recipErr;
+          console.warn("[Mercury/sendPayment] recipient lookup for OFAC fallback failed:", recipErr);
+          // If we genuinely can't determine a name and screening wasn't bypassed,
+          // refuse rather than disburse.
+          if (!params.bypassOfacScreening) {
+            throw new Error(`OFAC screening required but recipient name could not be resolved (${params.recipientId})`);
+          }
+        }
+      }
+    } catch (screenErr: any) {
+      if (screenErr?.name === "OfacBlockedError") {
+        log(`[Mercury] Payment BLOCKED by OFAC screening: ${screenErr.message}`, "mercury");
+        throw screenErr;
+      }
+      // Other unexpected errors during screening setup — fail closed.
+      log(`[Mercury] OFAC screening errored, blocking payment: ${screenErr?.message || screenErr}`, "mercury");
+      throw screenErr;
+    }
+
     try {
       let accountId = process.env.MERCURY_ACCOUNT_ID || process.env.Mercury_Account_Id || cachedDefaultAccountId;
       if (!accountId) {
@@ -1289,12 +1358,15 @@ export const mercuryService = {
     workerName: string;
     payoutAmountCents: number;
     description: string;
+    /** When known, skips a DB lookup inside OFAC screening. */
+    workerProfileId?: number;
     metadata?: Record<string, string>;
   }): Promise<MercuryPayment> {
     try {
       const payment = await this.sendPayment({
         recipientId: params.workerRecipientId,
         amount: params.payoutAmountCents,
+        workerProfileId: params.workerProfileId,
         description: params.description,
         idempotencyKey: `worker-payout-${params.workerRecipientId}-${Date.now()}`,
       });

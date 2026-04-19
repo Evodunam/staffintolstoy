@@ -1,0 +1,29 @@
+title = "Tolstoy Staffing gitleaks config"
+
+# Inherit gitleaks defaults (AWS keys, GitHub tokens, generic secrets, etc).
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Paths and patterns we deliberately exclude from secret scanning"
+
+paths = [
+  '''(^|/)node_modules/''',
+  '''(^|/)dist/''',
+  '''(^|/)build/''',
+  '''(^|/)coverage/''',
+  '''(^|/)package-lock\.json$''',
+  '''(^|/).next/''',
+  # Migrations sometimes contain dummy test customer IDs that match generic patterns.
+  '''(^|/)migrations/.*\.sql$''',
+]
+
+# Public/publishable keys that match secret heuristics but are intentionally public.
+regexes = [
+  '''pk_live_[0-9a-zA-Z]{20,}''',         # Stripe publishable
+  '''pk_test_[0-9a-zA-Z]{20,}''',         # Stripe test publishable
+  '''AIza[0-9A-Za-z_-]{35}''',            # Firebase/Google web API key (publishable in client config)
+  '''[a-z0-9-]+\.firebaseapp\.com''',
+  '''[a-z0-9-]+\.appspot\.com''',
+]
+

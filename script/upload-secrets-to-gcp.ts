@@ -127,6 +127,9 @@ const OPTIONAL_SECRETS = [
   "ADMIN_SESSION_COOKIE_DOMAIN",
   // Cron auth
   "CRON_SECRET",
+  // Error tracking (server + client bundles)
+  "SENTRY_DSN",
+  "VITE_SENTRY_DSN",
   // App configuration
   "BASE_URL",
   "APP_URL",

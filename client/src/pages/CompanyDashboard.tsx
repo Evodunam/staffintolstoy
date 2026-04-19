@@ -8,10 +8,11 @@ import { useProfile, useUpdateProfile, profileMeQueryKey, invalidateSessionProfi
 import { useAdminCheck } from "@/hooks/use-admin";
 import { useCompanyTimesheets, useApproveTimesheet, useRejectTimesheet, useBulkApproveTimesheets, type TimesheetWithDetails, type TimesheetApprovalResponse, type BulkApprovalResponse } from "@/hooks/use-timesheets";
 import { TimesheetMap } from "@/components/TimesheetMap";
+import { RequestScreeningMenu } from "@/components/RequestScreeningMenu";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import { useCompanyJobs, type CompanyJob } from "@/hooks/use-jobs";
-import { Loader2, Briefcase, Users, Clock, Menu, Plus, Minus, ChevronDown, ChevronRight, ChevronLeft, ChevronUp, MapPin, Check, CheckCircle, X, XCircle, AlertCircle, AlertTriangle, DollarSign, Star, Send, Eye, UserPlus, UserMinus, Calendar, CalendarDays, RefreshCw, RotateCcw, Settings, LogOut, LogIn, HelpCircle, FileText, CreditCard, Bell, Building, Building2, Map as MapIcon, MoreVertical, Edit, Flag, Download, Trash2, Globe, Image, Phone, Mail, MapPinned, FileCheck, Landmark, Home, ArrowLeft, ArrowRight, Shield, Zap, User, Monitor, Smartphone, MessageSquare } from "lucide-react";
+import { Loader2, Briefcase, Users, Clock, Menu, Plus, Minus, ChevronDown, ChevronRight, ChevronLeft, ChevronUp, MapPin, Check, CheckCircle, X, XCircle, AlertCircle, AlertTriangle, DollarSign, Star, Send, Eye, UserPlus, UserMinus, Calendar, CalendarDays, RefreshCw, RotateCcw, Settings, LogOut, LogIn, HelpCircle, FileText, CreditCard, Bell, Building, Building2, Map as MapIcon, MoreVertical, Edit, Flag, Download, Trash2, Globe, Image, Phone, Mail, MapPinned, FileCheck, Landmark, Home, ArrowLeft, ArrowRight, Shield, Zap, User, Monitor, Smartphone, MessageSquare, Webhook } from "lucide-react";
 import { useIsMobile } from "@/hooks/use-mobile";
 import { useScrollHeader } from "@/hooks/use-scroll-header";
 import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetDescription, SheetFooter } from "@/components/ui/sheet";
@@ -6578,7 +6579,13 @@ export default function CompanyDashboard() {
                         </div>
                       </div>
                     </div>
-                    <div className="flex gap-2 p-3 pt-0">
+                    <div className="flex gap-2 p-3 pt-0 items-center">
+                      <RequestScreeningMenu
+                        variant="compact"
+                        prefilledEmail={String(member.worker?.email || (member.worker as any)?.user_email || "").trim()}
+                        prefilledState={String(loc.state || "").trim().slice(0, 2).toUpperCase()}
+                        workerName={`${member.worker?.firstName} ${member.worker?.lastName}`}
+                      />
                       <Button 
                         variant="outline" 
                         size="sm" 
@@ -6693,6 +6700,11 @@ export default function CompanyDashboard() {
                             </div>
                           </div>
                           <div className="flex items-center gap-2">
+                            <RequestScreeningMenu
+                              variant="compact"
+                              prefilledEmail={String((worker as any).email || "").trim()}
+                              workerName={`${firstName} ${lastName}`}
+                            />
                             <DropdownMenu>
                               <DropdownMenuTrigger asChild>
                                 <Button variant="ghost" size="icon" className="h-8 w-8">
@@ -7302,6 +7314,19 @@ export default function CompanyDashboard() {
                     <span className="font-medium flex-1">{t("settings.signOut")}</span>
                   </button>
                 </div>
+                <div className="border-t border-border my-5" />
+                <div className="space-y-1">
+                  <button onClick={() => setLocation("/company/compliance")} className="w-full flex items-center gap-3 py-3 px-2 rounded-lg hover:bg-muted/50 transition-colors text-left" data-testid="menu-compliance">
+                    <Shield className="w-5 h-5 text-muted-foreground flex-shrink-0" />
+                    <span className="font-medium flex-1">Compliance &amp; reports</span>
+                    <ChevronRight className="w-5 h-5 text-muted-foreground flex-shrink-0" />
+                  </button>
+                  <button onClick={() => setLocation("/company/webhooks")} className="w-full flex items-center gap-3 py-3 px-2 rounded-lg hover:bg-muted/50 transition-colors text-left" data-testid="menu-webhooks">
+                    <Webhook className="w-5 h-5 text-muted-foreground flex-shrink-0" />
+                    <span className="font-medium flex-1">Webhooks</span>
+                    <ChevronRight className="w-5 h-5 text-muted-foreground flex-shrink-0" />
+                  </button>
+                </div>
                 {isAdmin && (
                   <>
                     <div className="border-t border-border my-5" />
@@ -7367,6 +7392,16 @@ export default function CompanyDashboard() {
                           );
                         })}
                         <div className="border-t border-border my-3" />
+                        <button onClick={() => setLocation("/company/compliance")} className="w-full flex items-center gap-3 py-3 px-3 rounded-lg hover:bg-muted/50 transition-colors text-left" data-testid="menu-compliance">
+                          <Shield className="w-5 h-5 text-muted-foreground flex-shrink-0" />
+                          <span>Compliance &amp; reports</span>
+                          <ChevronRight className="w-5 h-5 text-muted-foreground flex-shrink-0 ml-auto" />
+                        </button>
+                        <button onClick={() => setLocation("/company/webhooks")} className="w-full flex items-center gap-3 py-3 px-3 rounded-lg hover:bg-muted/50 transition-colors text-left" data-testid="menu-webhooks">
+                          <Webhook className="w-5 h-5 text-muted-foreground flex-shrink-0" />
+                          <span>Webhooks</span>
+                          <ChevronRight className="w-5 h-5 text-muted-foreground flex-shrink-0 ml-auto" />
+                        </button>
                         <button onClick={() => setLocation("/admin")} className="w-full flex items-center gap-3 py-3 px-3 rounded-lg hover:bg-muted/50 transition-colors text-left" data-testid="menu-admin-tools">
                           <Shield className="w-5 h-5 text-red-600 dark:text-red-400 flex-shrink-0" />
                           <span>{t("settings.adminTools")}</span>
@@ -7672,7 +7707,17 @@ export default function CompanyDashboard() {
                     </div>
                   </div>
                 </div>
-                
+
+                <div className="flex items-center justify-between gap-2 -mt-2">
+                  <p className="text-xs text-muted-foreground">
+                    Run pre-hire compliance checks (worker signs consent first):
+                  </p>
+                  <RequestScreeningMenu
+                    applicationId={selectedApplication.id}
+                    workerName={`${selectedApplication.worker.firstName} ${selectedApplication.worker.lastName}`}
+                  />
+                </div>
+
                 <div>
                   <Label className="text-muted-foreground">Bio</Label>
                   <p className="text-sm mt-1">{selectedApplication.worker.bio}</p>
