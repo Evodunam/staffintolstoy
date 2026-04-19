@@ -5,7 +5,7 @@ export async function fetchWithTimeout(
   input: RequestInfo | URL,
   init?: RequestInit & { timeoutMs?: number },
 ): Promise<Response> {
-  const { timeoutMs = 20_000, signal: outer, ...rest } = init ?? {};
+  const { timeoutMs = 20_000, signal: outer, cache, ...rest } = init ?? {};
   const ctrl = new AbortController();
   const id = setTimeout(() => {
     ctrl.abort(new DOMException(`Request exceeded ${timeoutMs}ms`, "TimeoutError"));
@@ -24,7 +24,8 @@ export async function fetchWithTimeout(
   }
 
   try {
-    return await fetch(input, { ...rest, signal: ctrl.signal });
+    // Avoid stale "308 from disk cache" / CDN for credentialed API probes (esp. apex → app).
+    return await fetch(input, { ...rest, cache: cache ?? "no-store", signal: ctrl.signal });
   } finally {
     clearTimeout(id);
     if (outer) outer.removeEventListener("abort", onOuterAbort);

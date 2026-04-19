@@ -175,13 +175,26 @@ app.use(express.urlencoded({ extended: false, limit: '10mb' }));
 // Compress responses (gzip) — reduces payload size and improves load times; no frontend change
 app.use(compression());
 
-// Rate limit auth endpoints to prevent brute force
+// Do not let browsers or Cloudflare cache API responses (stale 308 redirects, stale JSON).
+app.use("/api", (_req, res, next) => {
+  res.setHeader("Cache-Control", "private, no-store, must-revalidate");
+  next();
+});
+
+// Rate limit auth/login write-heavy paths — do NOT count GET /api/auth/user (session probe).
+// That route runs on every mount + window focus + parallel routes; sharing a 50/15m bucket with
+// POST /login caused production 429 and an infinite splash screen.
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 50, // 50 requests per window per IP
+  max: 300,
   message: { message: "Too many attempts, please try again later" },
   standardHeaders: true,
   legacyHeaders: false,
+  skip: (req) => {
+    if (req.method !== "GET") return false;
+    const path = (req.originalUrl || "").split("?")[0];
+    return path === "/api/auth/user" || path === "/api/auth/methods";
+  },
 });
 app.use("/api/auth", authLimiter);
 app.use("/api/login", authLimiter);

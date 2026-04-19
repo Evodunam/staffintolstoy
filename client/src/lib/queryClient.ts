@@ -21,7 +21,7 @@ async function throwIfResNotOk(res: Response) {
  * Use for endpoints that may not exist yet (e.g. /api/worker/payouts).
  */
 export async function fetchJsonOrFallback<T>(url: string, fallback: T): Promise<T> {
-  const res = await fetch(url, { method: "GET", credentials: "include" });
+  const res = await fetch(url, { method: "GET", credentials: "include", cache: "no-store" });
   if (res.status === 404) return fallback;
   await throwIfResNotOk(res);
   return res.json();
@@ -32,7 +32,7 @@ export async function fetchJsonOrFallback<T>(url: string, fallback: T): Promise<
  * Server returns 200 with null when no affiliate (no 404), so no console error.
  */
 export async function fetchAffiliateMe(): Promise<Record<string, unknown> | null> {
-  const res = await fetch("/api/affiliates/me", { credentials: "include" });
+  const res = await fetch("/api/affiliates/me", { credentials: "include", cache: "no-store" });
   await throwIfResNotOk(res);
   const data = await res.json();
   return data ?? null;
@@ -104,6 +104,7 @@ export function getQueryFn<T>(options: { on401: UnauthorizedBehavior }): QueryFu
     try {
       const res = await fetch(queryKey.join("/") as string, {
         credentials: "include",
+        cache: "no-store",
       });
 
       if (unauthorizedBehavior === "returnNull" && res.status === 401) {
