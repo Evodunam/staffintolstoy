@@ -283,7 +283,7 @@ export function Navigation({ tabs, sidebarNavItems, onSidebarNavSelect, hidePost
                 <button
                   onClick={() => {
                     const loginUrl = getUrlForPath("/api/login", true);
-                    window.location.href = loginUrl;
+                    window.location.replace(loginUrl);
                   }}
                   className="w-8 h-8 rounded-full bg-primary/10 hover:bg-primary/20 flex items-center justify-center text-primary transition-all duration-200 cursor-pointer hover-avatar hover-shadow-lift"
                   title={t("nav.signIn")}
@@ -329,7 +329,7 @@ export function Navigation({ tabs, sidebarNavItems, onSidebarNavSelect, hidePost
                 )
               ) : (
                 <button
-                  onClick={() => { const u = getUrlForPath("/api/login", true); window.location.href = u; }}
+                  onClick={() => { const u = getUrlForPath("/api/login", true); window.location.replace(u); }}
                   className="w-8 h-8 rounded-full bg-primary/10 hover:bg-primary/20 flex items-center justify-center text-primary"
                   aria-label={t("nav.signIn")}
                 >
@@ -374,7 +374,7 @@ export function Navigation({ tabs, sidebarNavItems, onSidebarNavSelect, hidePost
                 <button
                   onClick={() => {
                     const loginUrl = getUrlForPath("/api/login", true);
-                    window.location.href = loginUrl;
+                    window.location.replace(loginUrl);
                   }}
                   className="w-full text-left flex items-center gap-3 px-3 py-2 rounded-md text-base font-medium text-primary hover:bg-secondary"
                 >
@@ -481,7 +481,7 @@ export function Navigation({ tabs, sidebarNavItems, onSidebarNavSelect, hidePost
                     {t("company.postJob")}
                   </Link>
                   <button
-                    onClick={() => { const u = getUrlForPath("/api/login", true); window.location.href = u; closeSidebar(); }}
+                    onClick={() => { const u = getUrlForPath("/api/login", true); window.location.replace(u); closeSidebar(); }}
                     className="w-full text-left flex items-center gap-3 px-4 py-3 rounded-lg text-sm font-medium text-primary hover:bg-muted transition-colors"
                   >
                     <UserIcon className="w-5 h-5 flex-shrink-0" />

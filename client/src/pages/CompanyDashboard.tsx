@@ -2919,7 +2919,7 @@ export default function CompanyDashboard() {
         });
         // Redirect to login after a short delay
         setTimeout(() => {
-          window.location.href = "/login";
+          window.location.replace("/login");
         }, 2000);
       } else {
         toast({ 

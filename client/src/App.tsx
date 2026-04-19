@@ -121,7 +121,7 @@ function ProtectedRoute({ component: Component }: { component: React.ComponentTy
       const loginUrl = getUrlForPath("/api/login", true);
       // Use setTimeout to prevent immediate re-render loops
       setTimeout(() => {
-        window.location.href = loginUrl;
+        window.location.replace(loginUrl);
       }, 0);
     }
     return null;

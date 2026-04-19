@@ -1922,7 +1922,7 @@ export default function WorkerOnboarding() {
         }));
         safeToast({ title: "Please sign in with Google to continue", description: "You'll be redirected to complete your profile." });
         const loginUrl = getUrlForPath("/api/login?returnTo=/worker-onboarding", true);
-        window.location.href = loginUrl;
+        window.location.replace(loginUrl);
         return;
       }
     }

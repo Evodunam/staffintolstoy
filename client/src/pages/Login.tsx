@@ -41,11 +41,8 @@ export default function Login() {
   const { t } = useTranslation("auth");
   const { t: tCommon } = useTranslation("common");
 
+  /** Always home — `history.back()` often lands on /dashboard etc. with no session (loop / blank). */
   const handleBack = () => {
-    if (window.history.length > 1) {
-      window.history.back();
-      return;
-    }
     setLocation("/");
   };
 
