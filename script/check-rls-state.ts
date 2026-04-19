@@ -38,13 +38,26 @@ interface PolicyRow {
   roles: string[] | null;
 }
 
+function rewriteForMigrations(url: string): string {
+  if (process.env.MIGRATIONS_DATABASE_URL) return process.env.MIGRATIONS_DATABASE_URL;
+  if (/\.neon\.tech/.test(url)) {
+    return url.replace(/-pooler(\.[^@/]+\.neon\.tech)/, "$1");
+  }
+  return url;
+}
+
 async function main() {
-  const dbUrl = process.env.DATABASE_URL;
-  if (!dbUrl) {
+  const rawDbUrl = process.env.DATABASE_URL;
+  if (!rawDbUrl) {
     console.error("DATABASE_URL not set.");
     process.exit(1);
   }
-  const pool = new Pool({ connectionString: dbUrl });
+  const dbUrl = rewriteForMigrations(rawDbUrl);
+  const pool = new Pool({
+    connectionString: dbUrl,
+    max: 1,
+    connectionTimeoutMillis: 30_000,
+  } as any);
   try {
     const tables = await pool.query<TableRow>(`
       SELECT

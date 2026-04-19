@@ -30,6 +30,60 @@ import { resolve, join } from "path";
 
 const { Pool } = pg;
 
+/**
+ * Neon-specific connection rewrite.
+ *
+ * Neon offers two endpoint variants per branch:
+ *   - DIRECT  (e.g. ep-misty-salad-aje4lu09.c-3.us-east-2.aws.neon.tech)
+ *   - POOLED  (e.g. ep-misty-salad-aje4lu09-pooler.c-3.us-east-2.aws.neon.tech)
+ *
+ * App traffic should hit -pooler (PgBouncer transaction mode) for safe
+ * connection scaling. Migrations should hit the DIRECT endpoint because:
+ *   1. PgBouncer transaction mode breaks CREATE INDEX CONCURRENTLY, advisory
+ *      locks held across statements, prepared statements, SET (session-level),
+ *      and large DDL transactions that span multiple statements.
+ *   2. Some `ALTER TABLE ... ADD CONSTRAINT` validations need a session-stable
+ *      catalog snapshot the pooler can't guarantee.
+ *
+ * We auto-strip "-pooler" from the hostname so the user can keep DATABASE_URL
+ * pointed at the pooled endpoint for the app and the migrator just does the
+ * right thing. Override with MIGRATIONS_DATABASE_URL if you have a different
+ * direct endpoint (e.g. a separate Neon branch for migrations).
+ */
+function rewriteForMigrations(url: string): string {
+  if (process.env.MIGRATIONS_DATABASE_URL) {
+    return process.env.MIGRATIONS_DATABASE_URL;
+  }
+  // Replace `<endpoint>-pooler.<rest>` -> `<endpoint>.<rest>` (Neon convention).
+  // Only rewrite if it actually looks like a Neon hostname.
+  if (/\.neon\.tech/.test(url)) {
+    return url.replace(/-pooler(\.[^@/]+\.neon\.tech)/, "$1");
+  }
+  return url;
+}
+
+function maskDbUrl(url: string): string {
+  return url.replace(/(:\/\/[^:]+:)[^@]+@/, "$1***@");
+}
+
+/** Run a query with a single retry to absorb Neon scale-from-zero cold starts. */
+async function withColdStartRetry<T>(label: string, fn: () => Promise<T>): Promise<T> {
+  try {
+    return await fn();
+  } catch (e: any) {
+    const msg = String(e?.message ?? e);
+    const looksLikeColdStart =
+      msg.includes("ECONNRESET") ||
+      msg.includes("ETIMEDOUT") ||
+      msg.includes("Connection terminated unexpectedly") ||
+      msg.includes("Endpoint is in transition");
+    if (!looksLikeColdStart) throw e;
+    console.warn(`  retry ${label} after Neon cold-start: ${msg}`);
+    await new Promise((r) => setTimeout(r, 2_000));
+    return await fn();
+  }
+}
+
 interface Args {
   apply: boolean;
   from?: string;
@@ -66,23 +120,38 @@ function fileNumberPrefix(filename: string): string {
 
 async function main() {
   const args = parseArgs();
-  const dbUrl = process.env.DATABASE_URL;
-  if (!dbUrl) {
+  const rawDbUrl = process.env.DATABASE_URL;
+  if (!rawDbUrl) {
     console.error("DATABASE_URL not set. Run with `dotenv -e .env.production -- tsx script/migrate-prod.ts ...`");
     process.exit(1);
   }
+  const dbUrl = rewriteForMigrations(rawDbUrl);
+  const usingDirect = dbUrl !== rawDbUrl;
 
   const migrationsDir = resolve(process.cwd(), "migrations");
   const allFiles = listMigrationFiles(migrationsDir);
 
-  const pool = new Pool({ connectionString: dbUrl });
+  // max=1 keeps DDL on a single backend session — no PgBouncer surprises and
+  // no parallel query interference. Migrations are inherently sequential.
+  // statement_timeout caps any one statement at 5 minutes so a runaway DDL
+  // doesn't hold the connection forever.
+  const pool = new Pool({
+    connectionString: dbUrl,
+    max: 1,
+    idleTimeoutMillis: 10_000,
+    connectionTimeoutMillis: 30_000, // generous for Neon cold-start
+    statement_timeout: 5 * 60 * 1000,
+  } as any);
+
   try {
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS _schema_migrations (
-        filename TEXT PRIMARY KEY,
-        applied_at TIMESTAMPTZ DEFAULT NOW()
-      );
-    `);
+    await withColdStartRetry("create _schema_migrations", () =>
+      pool.query(`
+        CREATE TABLE IF NOT EXISTS _schema_migrations (
+          filename TEXT PRIMARY KEY,
+          applied_at TIMESTAMPTZ DEFAULT NOW()
+        );
+      `),
+    );
 
     const { rows: appliedRows } = await pool.query<{ filename: string }>(
       "SELECT filename FROM _schema_migrations",
@@ -102,7 +171,11 @@ async function main() {
 
     const pending = filtered.filter((f) => !applied.has(f));
 
-    console.log(`\nMigration plan (DB: ${maskDbUrl(dbUrl)})`);
+    console.log(`\nMigration plan`);
+    console.log(`  DB:                   ${maskDbUrl(dbUrl)}`);
+    if (usingDirect) {
+      console.log(`  endpoint rewrite:     -pooler stripped (using DIRECT for safer DDL)`);
+    }
     console.log(`  files in migrations/: ${allFiles.length}`);
     console.log(`  filtered:             ${filtered.length}`);
     console.log(`  already applied:      ${filtered.length - pending.length}`);
@@ -148,10 +221,6 @@ async function main() {
   } finally {
     await pool.end();
   }
-}
-
-function maskDbUrl(url: string): string {
-  return url.replace(/(:\/\/[^:]+:)[^@]+@/, "$1***@");
 }
 
 main().catch((err) => {

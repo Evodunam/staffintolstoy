@@ -28,17 +28,26 @@ function parseArgs() {
   return { through, commit };
 }
 
+function rewriteForMigrations(url: string): string {
+  if (process.env.MIGRATIONS_DATABASE_URL) return process.env.MIGRATIONS_DATABASE_URL;
+  if (/\.neon\.tech/.test(url)) {
+    return url.replace(/-pooler(\.[^@/]+\.neon\.tech)/, "$1");
+  }
+  return url;
+}
+
 async function main() {
   const { through, commit } = parseArgs();
   if (!through) {
     console.error("Pass --through <migration_number> (e.g. --through 054).");
     process.exit(1);
   }
-  const dbUrl = process.env.DATABASE_URL;
-  if (!dbUrl) {
+  const rawDbUrl = process.env.DATABASE_URL;
+  if (!rawDbUrl) {
     console.error("DATABASE_URL not set.");
     process.exit(1);
   }
+  const dbUrl = rewriteForMigrations(rawDbUrl);
 
   const migrationsDir = resolve(process.cwd(), "migrations");
   const files = readdirSync(migrationsDir)
@@ -57,7 +66,11 @@ async function main() {
     return;
   }
 
-  const pool = new Pool({ connectionString: dbUrl });
+  const pool = new Pool({
+    connectionString: dbUrl,
+    max: 1,
+    connectionTimeoutMillis: 30_000,
+  } as any);
   try {
     await pool.query(`
       CREATE TABLE IF NOT EXISTS _schema_migrations (
