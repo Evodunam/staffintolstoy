@@ -286,9 +286,25 @@ const APEX_REDIRECT_EXEMPT_PREFIXES = [
   "/api/status",
   "/api/email/unsubscribe",
 ];
+
+// Trust the upstream proxy so X-Forwarded-Host / X-Forwarded-Proto are honored.
+// Set HERE (before the apex redirect middleware) rather than inside
+// registerRoutes() because the apex redirect runs first; without trust proxy
+// active, we'd read the DigitalOcean App Platform internal Host header
+// (something like `appplat-...internal`) instead of the user-facing
+// `tolstoystaffing.com` and the redirect would silently never fire.
+// `1` means trust the FIRST proxy in the chain (Cloudflare → DO → us).
+app.set("trust proxy", 1);
+
 app.use((req, res, next) => {
   if (process.env.NODE_ENV !== "production") return next();
-  const host = String(req.headers.host || "").toLowerCase().split(":")[0];
+  // Prefer X-Forwarded-Host (Cloudflare/DO send the real public host here);
+  // fall back to req.hostname (trust-proxy aware) and finally to the raw
+  // Host header. .split(":")[0] strips any port.
+  const xfh = String(req.headers["x-forwarded-host"] || "").split(",")[0].trim();
+  const host = (xfh || req.hostname || String(req.headers.host || ""))
+    .toLowerCase()
+    .split(":")[0];
   if (!APEX_HOSTS.has(host)) return next();
   const path = req.path;
   if (APEX_REDIRECT_EXEMPT_PREFIXES.some((p) => path === p || path.startsWith(p))) return next();
