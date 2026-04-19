@@ -3,6 +3,7 @@ import { queryClient } from "@/lib/queryClient";
 import { api, buildUrl } from "@shared/routes";
 import { type InsertProfile, type Profile } from "@shared/schema";
 import { useToast } from "@/hooks/use-toast";
+import { fetchWithTimeout } from "@/lib/fetchWithTimeout";
 
 /** Session-backed profile (same source as req.profile). userId in key avoids cross-account stale cache. */
 export const PROFILE_ME_QUERY_KEY_PREFIX = "/api/profiles/me";
@@ -23,7 +24,10 @@ export function useProfile(userId?: string) {
     queryKey: profileMeQueryKey(userId),
     queryFn: async () => {
       if (!userId) return null;
-      const res = await fetch(`${PROFILE_ME_QUERY_KEY_PREFIX}`, { credentials: "include" });
+      const res = await fetchWithTimeout(PROFILE_ME_QUERY_KEY_PREFIX, {
+        credentials: "include",
+        timeoutMs: 20_000,
+      });
       if (res.status === 401) return null;
       if (!res.ok) throw new Error("Failed to fetch profile");
       const data = await res.json();

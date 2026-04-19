@@ -217,7 +217,9 @@ app.use((req, res, next) => {
     "font-src 'self' data: https://fonts.gstatic.com",
     "img-src 'self' data: blob: https: https://*.googleusercontent.com https://*.gstatic.com",
     "media-src 'self' blob: https:",
-    "connect-src 'self' https://api.stripe.com https://r.stripe.com https://*.googleapis.com https://maps.googleapis.com https://*.firebaseio.com https://*.firebasedatabase.app https://*.cloudfunctions.net https://api.resend.com https://api.openai.com https://ipapi.co wss://*.tolstoystaffing.com",
+    // Include https://*.tolstoystaffing.com so API calls to app.* work when the
+    // HTML document is served from apex/www (connect-src 'self' is document origin only).
+    "connect-src 'self' https://*.tolstoystaffing.com https://api.stripe.com https://r.stripe.com https://*.googleapis.com https://maps.googleapis.com https://*.firebaseio.com https://*.firebasedatabase.app https://*.cloudfunctions.net https://api.resend.com https://api.openai.com https://ipapi.co wss://*.tolstoystaffing.com",
     "frame-src 'self' https://js.stripe.com https://hooks.stripe.com https://*.stripe.com",
     "frame-ancestors 'self'",
     "base-uri 'self'",
@@ -225,14 +227,17 @@ app.use((req, res, next) => {
     "object-src 'none'",
     "worker-src 'self' blob:",
     "manifest-src 'self'",
-    "upgrade-insecure-requests",
+    // Omit upgrade-insecure-requests in *report-only* CSP — Chromium logs that it
+    // is ignored here; re-add when switching to enforcing Content-Security-Policy.
   ].join("; ");
   res.setHeader("Content-Security-Policy-Report-Only", csp);
 
   next();
 });
 
-// Set proper Permissions-Policy header to avoid browser warnings
+// Permissions-Policy — keep minimal. If DevTools still shows "Unrecognized feature:
+// browsing-topics" etc., that text is coming from another layer (often Cloudflare
+// Transform Rules / Workers merging a second header), not from this list.
 app.use((req, res, next) => {
   // Only include well-supported features that browsers recognize
   // Removed experimental Privacy Sandbox features that cause "unrecognized feature" warnings

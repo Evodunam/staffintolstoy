@@ -1,9 +1,11 @@
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import type { User } from "@shared/models/auth";
+import { fetchWithTimeout } from "@/lib/fetchWithTimeout";
 
 async function fetchUser(): Promise<User | null> {
-  const response = await fetch("/api/auth/user", {
+  const response = await fetchWithTimeout("/api/auth/user", {
     credentials: "include",
+    timeoutMs: 20_000,
   });
 
   if (response.status === 401) {
