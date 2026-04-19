@@ -55,6 +55,7 @@
     "migrate:prod": "dotenv -e .env.production -- tsx script/migrate-prod.ts",
     "migrate:prod:apply": "dotenv -e .env.production -- tsx script/migrate-prod.ts --apply",
     "migrate:backfill:prod": "dotenv -e .env.production -- tsx script/backfill-migration-history.ts",
+    "migrate:backfill:dev": "dotenv -e .env.development -- tsx script/backfill-migration-history.ts",
     "smoke:prod": "tsx script/prod-smoke-test.ts https://app.tolstoystaffing.com",
     "smoke:dev": "tsx script/prod-smoke-test.ts http://127.0.0.1:5000",
     "rls:check:prod": "dotenv -e .env.production -- tsx script/check-rls-state.ts",
