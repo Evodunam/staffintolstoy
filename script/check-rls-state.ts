@@ -35,7 +35,10 @@ interface PolicyRow {
   cmd: string;
   qual: string | null;
   with_check: string | null;
-  roles: string[] | null;
+  // pg returns pg_policies.roles as a Postgres name[] which the node-postgres
+  // default parser sometimes hands back as a string like "{role1,role2}"
+  // instead of a JS array. Accept both shapes.
+  roles: string[] | string | null;
 }
 
 function rewriteForMigrations(url: string): string {
@@ -100,7 +103,12 @@ async function main() {
         const flags = [t.rls_forced ? "FORCED" : ""].filter(Boolean).join(",");
         console.log(`  ${t.table_name}${flags ? ` [${flags}]` : ""}  (${tbPolicies.length} polic${tbPolicies.length === 1 ? "y" : "ies"})`);
         for (const p of tbPolicies) {
-          const rolesStr = p.roles ? `to=${p.roles.join(",")}` : "";
+          const rolesArr = Array.isArray(p.roles)
+            ? p.roles
+            : typeof p.roles === "string"
+              ? p.roles.replace(/^\{|\}$/g, "").split(",").filter(Boolean)
+              : [];
+          const rolesStr = rolesArr.length > 0 ? `to=${rolesArr.join(",")}` : "";
           console.log(`     - ${p.policyname}  cmd=${p.cmd}  ${rolesStr}`);
           if (p.qual) console.log(`         USING(${oneLine(p.qual)})`);
           if (p.with_check) console.log(`         WITH CHECK(${oneLine(p.with_check)})`);
