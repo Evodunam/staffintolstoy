@@ -4523,62 +4523,87 @@ export default function WorkerOnboarding() {
                     </div>
                   </div>
                 </div>
-                <div className="flex w-full min-h-[80dvh] flex-col gap-4 md:min-h-[calc(100dvh-11rem)] md:max-h-[calc(100dvh-10rem)] md:flex-row md:items-stretch md:gap-6">
+                {/** Step 4 choice cards: shorter image strip, dark scrim on photo, CTA copy bottom-center on gradient */}
+                <div className="flex w-full min-h-[52dvh] flex-col gap-3 md:min-h-[calc(100dvh-13rem)] md:max-h-[calc(100dvh-12rem)] md:flex-row md:items-stretch md:gap-5">
                   <Button
                     type="button"
                     variant="outline"
-                    className="flex h-auto min-h-[44dvh] w-full flex-1 flex-col items-stretch justify-start gap-0 overflow-hidden rounded-2xl border-2 p-0 text-center shadow-sm transition-colors hover:border-primary/50 hover:bg-primary/5 md:min-h-[30rem] md:flex-1"
+                    className="group flex h-auto min-h-[26dvh] w-full flex-1 flex-col overflow-hidden rounded-2xl border-2 p-0 shadow-sm transition-colors hover:border-primary/50 hover:bg-primary/5 md:min-h-[19rem] md:flex-1"
                     onClick={() => {
                       setStep4RoleChoice("doing_work");
                       nextStep();
                     }}
                     data-testid="button-doing-work"
                   >
-                    <div className="relative min-h-[16rem] w-full flex-1 bg-muted md:min-h-[20rem]">
+                    <div className="relative min-h-[12.5rem] w-full flex-1 bg-muted md:min-h-[14rem]">
                       <img
                         src="https://corporateweb-v3-corporatewebv3damstrawebassetbuck-1lruglqypgb84.s3-ap-southeast-2.amazonaws.com/public/products-solo-body-2.jpg"
                         alt=""
                         className="absolute inset-0 h-full w-full object-cover object-center"
                       />
-                      <div className="absolute inset-x-0 bottom-0 flex justify-end p-3 md:p-4">
-                        <div className="flex h-12 w-12 items-center justify-center rounded-full bg-white/95 text-[#00A86B] shadow-md ring-1 ring-black/5 md:h-14 md:w-14">
-                          <User className="h-6 w-6 md:h-7 md:w-7" strokeWidth={2.25} />
+                      <div className="absolute inset-0 bg-black/35" aria-hidden />
+                      <div className="absolute right-3 top-3 z-10 md:right-4 md:top-4">
+                        <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-white/92 text-[#00A86B] shadow-md ring-1 ring-black/10 md:h-12 md:w-12">
+                          <User className="h-5 w-5 md:h-6 md:w-6" strokeWidth={2.25} />
                         </div>
                       </div>
-                    </div>
-                    <div className="flex shrink-0 flex-col gap-2 bg-background/95 px-5 py-8 text-center md:bg-background md:px-8 md:py-10">
-                      <span className="inline-flex items-center justify-center gap-2 font-semibold text-xl md:text-2xl">
-                        <User className="h-6 w-6 text-[#00A86B] md:hidden" strokeWidth={2.25} />
-                        I&apos;m doing the work
-                      </span>
-                      <span className="text-sm text-muted-foreground md:text-base">Solo or primary worker</span>
+                      <div className="absolute inset-x-0 bottom-0 z-10 flex flex-col items-center justify-end bg-gradient-to-t from-black/82 via-black/45 to-transparent px-4 pb-5 pt-16 text-center md:pb-6 md:pt-20">
+                        <span className="text-lg font-semibold tracking-tight text-white drop-shadow-sm md:text-xl">
+                          I&apos;m doing the work
+                        </span>
+                        <span className="mt-1 max-w-[18rem] text-xs leading-snug text-white/88 md:text-sm">
+                          Solo or primary worker
+                        </span>
+                      </div>
                     </div>
                   </Button>
                   <Button
                     type="button"
                     variant="outline"
-                    className="flex h-auto min-h-[44dvh] w-full flex-1 flex-col items-stretch justify-start gap-0 overflow-hidden rounded-2xl border-2 p-0 text-center shadow-sm transition-colors hover:border-primary/50 hover:bg-primary/5 md:min-h-[30rem] md:flex-1"
+                    className="group flex h-auto min-h-[26dvh] w-full flex-1 flex-col overflow-hidden rounded-2xl border-2 p-0 shadow-sm transition-colors hover:border-primary/50 hover:bg-primary/5 md:min-h-[19rem] md:flex-1"
                     onClick={() => setStep4RoleChoice("managing_team")}
                     data-testid="button-managing-team"
                   >
-                    <div className="relative min-h-[16rem] w-full flex-1 bg-muted md:min-h-[20rem]">
+                    <div className="relative min-h-[12.5rem] w-full flex-1 bg-muted md:min-h-[14rem]">
                       <img
                         src="https://www.zuper.co/wp-content/uploads/2023/02/63ff262d802b18a12b123490_How-to-Build-and-Maintain-a-Solid-Field-Service-Team-01-2.jpg"
                         alt=""
                         className="absolute inset-0 h-full w-full object-cover object-center"
                       />
-                      <div className="absolute inset-x-0 bottom-0 flex justify-end p-3 md:p-4">
-                        <div className="flex h-12 w-12 items-center justify-center rounded-full bg-white/95 text-[#00A86B] shadow-md ring-1 ring-black/5 md:h-14 md:w-14">
-                          <Users className="h-6 w-6 md:h-7 md:w-7" strokeWidth={2.25} />
+                      <div className="absolute inset-0 bg-black/35" aria-hidden />
+                      {/** Triangle stack of user tiles (1 + 2 + 3) — reads as a small crew */}
+                      <div className="absolute right-2 top-2 z-10 flex flex-col items-end gap-0.5 md:right-3 md:top-3 md:gap-1" aria-hidden>
+                        <div className="flex h-7 w-7 items-center justify-center rounded-lg bg-white/92 text-[#00A86B] shadow ring-1 ring-black/10 md:h-8 md:w-8 md:rounded-xl">
+                          <User className="h-3.5 w-3.5 md:h-4 md:w-4" strokeWidth={2.5} />
+                        </div>
+                        <div className="flex gap-0.5 pr-1 md:gap-1 md:pr-1.5">
+                          <div className="flex h-7 w-7 items-center justify-center rounded-lg bg-white/92 text-[#00A86B] shadow ring-1 ring-black/10 md:h-8 md:w-8 md:rounded-xl">
+                            <User className="h-3.5 w-3.5 md:h-4 md:w-4" strokeWidth={2.5} />
+                          </div>
+                          <div className="flex h-7 w-7 items-center justify-center rounded-lg bg-white/92 text-[#00A86B] shadow ring-1 ring-black/10 md:h-8 md:w-8 md:rounded-xl">
+                            <User className="h-3.5 w-3.5 md:h-4 md:w-4" strokeWidth={2.5} />
+                          </div>
+                        </div>
+                        <div className="flex gap-0.5 md:gap-1">
+                          <div className="flex h-7 w-7 items-center justify-center rounded-lg bg-white/92 text-[#00A86B] shadow ring-1 ring-black/10 md:h-8 md:w-8 md:rounded-xl">
+                            <User className="h-3.5 w-3.5 md:h-4 md:w-4" strokeWidth={2.5} />
+                          </div>
+                          <div className="flex h-7 w-7 items-center justify-center rounded-lg bg-white/92 text-[#00A86B] shadow ring-1 ring-black/10 md:h-8 md:w-8 md:rounded-xl">
+                            <User className="h-3.5 w-3.5 md:h-4 md:w-4" strokeWidth={2.5} />
+                          </div>
+                          <div className="flex h-7 w-7 items-center justify-center rounded-lg bg-white/92 text-[#00A86B] shadow ring-1 ring-black/10 md:h-8 md:w-8 md:rounded-xl">
+                            <User className="h-3.5 w-3.5 md:h-4 md:w-4" strokeWidth={2.5} />
+                          </div>
                         </div>
                       </div>
-                    </div>
-                    <div className="flex shrink-0 flex-col gap-2 bg-background/95 px-5 py-8 text-center md:bg-background md:px-8 md:py-10">
-                      <span className="inline-flex items-center justify-center gap-2 font-semibold text-xl md:text-2xl">
-                        <Users className="h-6 w-6 text-[#00A86B] md:hidden" strokeWidth={2.25} />
-                        I&apos;m managing a team
-                      </span>
-                      <span className="text-sm text-muted-foreground md:text-base">Invite teammates to join</span>
+                      <div className="absolute inset-x-0 bottom-0 z-10 flex flex-col items-center justify-end bg-gradient-to-t from-black/82 via-black/45 to-transparent px-4 pb-5 pt-16 text-center md:pb-6 md:pt-20">
+                        <span className="text-lg font-semibold tracking-tight text-white drop-shadow-sm md:text-xl">
+                          I&apos;m managing a team
+                        </span>
+                        <span className="mt-1 max-w-[18rem] text-xs leading-snug text-white/88 md:text-sm">
+                          Invite teammates to join
+                        </span>
+                      </div>
                     </div>
                   </Button>
                 </div>

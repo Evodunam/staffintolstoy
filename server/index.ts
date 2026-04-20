@@ -506,6 +506,10 @@ process.on("uncaughtException", (error) => {
     listenOptions,
     () => {
       log(`serving on port ${port}`);
+      // Warm Mercury token + base URL so first POST /api/mt/worker/payout-account does not block on GSM inside the request.
+      void import("./services/mercury")
+        .then(({ mercuryService }) => mercuryService.warmConfig())
+        .catch((e) => console.warn("[Mercury] warmConfig:", e?.message ?? e));
       // Defer scheduler startup so "serving" appears first; reduces boot noise and perceived delay
       setTimeout(() => {
         const schedulerStarts: Array<{ name: string; start: () => unknown }> = [

@@ -72,8 +72,8 @@ async function getMercuryConfig(): Promise<MercuryConfig> {
   return cachedConfig;
 }
 
-/** Default ceiling so hung Mercury TCP never blocks Express (e.g. W-9 status polling). Callers may pass `signal` to override or combine. */
-const MERCURY_FETCH_TIMEOUT_MS = Number(process.env.MERCURY_FETCH_TIMEOUT_MS) || 45_000;
+/** Default ceiling so hung Mercury TCP never blocks Express. Keep under common LB limits (~30–60s) so the app returns JSON instead of a 504 from the edge. Override with MERCURY_FETCH_TIMEOUT_MS. */
+const MERCURY_FETCH_TIMEOUT_MS = Number(process.env.MERCURY_FETCH_TIMEOUT_MS) || 28_000;
 
 function defaultMercuryAbortSignal(): AbortSignal {
   if (typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function") {
@@ -1390,6 +1390,19 @@ export const mercuryService = {
     } catch (error: any) {
       log(`Error processing worker payout: ${error.message}`, "mercury");
       throw error;
+    }
+  },
+
+  /**
+   * Resolve and cache Mercury base URL + token at boot so the first payout HTTP request
+   * does not pay GSM/env resolution latency inside the request path (reduces edge 504s).
+   */
+  async warmConfig(): Promise<void> {
+    try {
+      await getMercuryConfig();
+      log("Mercury API config resolved and cached", "mercury");
+    } catch (error: any) {
+      log(`Mercury warmConfig skipped: ${error?.message ?? error}`, "mercury");
     }
   },
 };
