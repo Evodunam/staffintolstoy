@@ -232,7 +232,7 @@ app.use((req, res, next) => {
     "media-src 'self' blob: https:",
     // Include https://*.tolstoystaffing.com so API calls to app.* work when the
     // HTML document is served from apex/www (connect-src 'self' is document origin only).
-    "connect-src 'self' https://*.tolstoystaffing.com https://api.stripe.com https://r.stripe.com https://*.googleapis.com https://maps.googleapis.com https://*.firebaseio.com https://*.firebasedatabase.app https://*.cloudfunctions.net https://api.resend.com https://api.openai.com https://ipapi.co wss://*.tolstoystaffing.com",
+    "connect-src 'self' https://*.tolstoystaffing.com https://cdn.jsdelivr.net https://api.stripe.com https://r.stripe.com https://*.googleapis.com https://maps.googleapis.com https://*.firebaseio.com https://*.firebasedatabase.app https://*.cloudfunctions.net https://api.resend.com https://api.openai.com https://ipapi.co wss://*.tolstoystaffing.com",
     "frame-src 'self' https://js.stripe.com https://hooks.stripe.com https://*.stripe.com",
     "frame-ancestors 'self'",
     "base-uri 'self'",
