@@ -8,6 +8,7 @@ import { useEffect, useState, useRef } from "react";
 import { INDUSTRY_CATEGORIES } from "@shared/industries";
 import { useTranslation } from "react-i18next";
 import { AppLoading } from "@/components/AppLoading";
+import { isWorkerOnboardingComplete, isCompanyOnboardingComplete } from "@/lib/worker-onboarding";
 import TestimonialSection from "@/components/ui/testimonial-section";
 
 // Popular services to display prominently
@@ -99,9 +100,9 @@ export default function Home() {
   useEffect(() => {
     if (!authLoading && isAuthenticated && user?.id) {
       if (!profileLoading && profile) {
-        if (profile.role === "company") {
+        if (profile.role === "company" && isCompanyOnboardingComplete(profile)) {
           setLocation("/company-dashboard");
-        } else if (profile.role === "worker") {
+        } else if (profile.role === "worker" && isWorkerOnboardingComplete(profile)) {
           setLocation("/dashboard");
         }
       }

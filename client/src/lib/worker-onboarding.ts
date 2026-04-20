@@ -96,6 +96,13 @@ export function isWorkerOnboardingComplete(profile: ProfileLike): boolean {
   return hasName && hasEmail && hasPhone && hasFacePhoto && hasSkillSet && hasRate && hasBank;
 }
 
+/** Company wizard completion: backend sets onboardingStatus when /company-onboarding flow finishes. */
+export function isCompanyOnboardingComplete(profile: ProfileLike): boolean {
+  if (!profile || profile.role !== "company") return true;
+  const onboardingStatus = val<string>(profile, "onboardingStatus", "onboarding_status");
+  return String(onboardingStatus ?? "").toLowerCase() === "complete";
+}
+
 export type OnboardingMissingField =
   | "name"
   | "email"

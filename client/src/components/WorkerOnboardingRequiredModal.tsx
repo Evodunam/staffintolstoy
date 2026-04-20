@@ -6,6 +6,37 @@ import { useProfile } from "@/hooks/use-profiles";
 import { isWorkerOnboardingComplete } from "@/lib/worker-onboarding";
 import { fetchAffiliateMe } from "@/lib/queryClient";
 
+/** Marketing / legal / auth pages where incomplete workers may browse without being sent to onboarding. */
+function isWorkerPublicBrowsePath(rawPath: string): boolean {
+  const pathname = rawPath.split("?")[0];
+  if (pathname === "/") return true;
+  const prefixes = [
+    "/about",
+    "/careers",
+    "/press",
+    "/terms",
+    "/privacy",
+    "/legal",
+    "/subprocessors",
+    "/support",
+    "/contact",
+    "/for-service-professionals",
+    "/for-affiliates",
+    "/how-time-keeping-works",
+    "/find-work",
+    "/jobs",
+    "/login",
+    "/api/login",
+    "/reset-password",
+    "/status",
+    "/trust",
+    "/trust-center",
+    "/drug-screen-consent",
+    "/background-check-consent",
+  ];
+  return prefixes.some((p) => pathname === p || pathname.startsWith(`${p}/`));
+}
+
 /**
  * When a worker has incomplete onboarding, redirect them to the full worker onboarding
  * page (/worker-onboarding) instead of showing a modal. All data is pre-filled from their
@@ -59,6 +90,7 @@ export function WorkerOnboardingRequiredModal() {
     isWorker &&
     needsOnboarding &&
     !isWorkerOnboardingPath &&
+    !isWorkerPublicBrowsePath(path) &&
     !isAffiliatePath &&
     !isAffiliate &&
     !isCompanyPath &&

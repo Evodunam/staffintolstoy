@@ -15,6 +15,7 @@ import { useToast } from "@/hooks/use-toast";
 import { Loader2, Mail, Lock, ArrowLeft, ArrowRight, Building2, HardHat, KeyRound, Link as LinkIcon, RefreshCw } from "lucide-react";
 import { queryClient } from "@/lib/queryClient";
 import { getUrlForPath } from "@/lib/subdomain-utils";
+import { isWorkerOnboardingComplete, isCompanyOnboardingComplete } from "@/lib/worker-onboarding";
 import { useTranslation } from "react-i18next";
 
 export default function Login() {
@@ -60,9 +61,9 @@ export default function Login() {
       return;
     }
     if (profile) {
-      if (profile.role === "company") {
+      if (profile.role === "company" && isCompanyOnboardingComplete(profile)) {
         setLocation("/company-dashboard");
-      } else if (profile.role === "worker") {
+      } else if (profile.role === "worker" && isWorkerOnboardingComplete(profile)) {
         setLocation("/dashboard");
       } else {
         setLocation(returnTo);
