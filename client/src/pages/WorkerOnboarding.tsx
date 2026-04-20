@@ -47,7 +47,7 @@ import {
   CreditCard, Check, CheckCircle2, Zap, Droplets, Wind, Hammer, 
   PaintBucket, Building2, Shovel, HardHat, Clock, TrendingUp, DollarSign,
   Share2, Copy, Gift, Briefcase, Star, Shield, Images, X, FileText, Pen, Globe,
-  Rocket, PartyPopper, AlertCircle, Eye, EyeOff, Info,   User, IdCard, ExternalLink, UserPlus
+  Rocket, PartyPopper, AlertCircle, Eye, EyeOff, Info, User, Users, IdCard, ExternalLink, UserPlus
 } from "lucide-react";
 import { SiGoogle } from "react-icons/si";
 import { INDUSTRY_CATEGORIES } from "@shared/industries";
@@ -4501,49 +4501,84 @@ export default function WorkerOnboarding() {
           <div className={step4RoleChoice === null ? "" : "space-y-6"}>
             {step4RoleChoice === null && (
               <>
-                <p className="text-base md:text-lg text-gray-900 font-medium text-center px-2 mb-4 md:mb-6 max-w-xl mx-auto">
-                  Are you the one doing the work or are you managing a team that does the work?
-                </p>
-                <div className="flex flex-col md:flex-row md:items-stretch gap-4 md:gap-5 w-full min-h-[72dvh] md:min-h-[calc(100dvh-12.5rem)] md:max-h-[calc(100dvh-12.5rem)]">
+                <div className="mb-5 md:mb-8 w-full px-1">
+                  <div className="flex flex-col items-center text-center gap-3 md:flex-row md:items-start md:gap-5 md:text-left">
+                    <div className="flex h-14 w-14 shrink-0 items-center justify-center rounded-2xl bg-gradient-to-br from-[#00A86B]/15 to-[#008A57]/10 ring-1 ring-[#00A86B]/20 md:h-16 md:w-16">
+                      <Briefcase className="h-7 w-7 text-[#00A86B] md:h-8 md:w-8" strokeWidth={2.25} />
+                    </div>
+                    <div className="min-w-0 flex-1 space-y-3">
+                      <p className="text-lg font-semibold leading-snug text-gray-900 sm:text-xl md:text-2xl lg:text-3xl md:leading-tight">
+                        Are you the one doing the work, or are you managing a team that does the work?
+                      </p>
+                      <div className="flex flex-col gap-2 text-sm text-muted-foreground sm:flex-row sm:flex-wrap sm:justify-center sm:gap-x-6 sm:gap-y-2 md:justify-start md:text-base">
+                        <span className="inline-flex items-center justify-center gap-2 md:justify-start">
+                          <User className="h-5 w-5 shrink-0 text-[#00A86B]" strokeWidth={2.25} />
+                          <span>Solo / on-the-tools</span>
+                        </span>
+                        <span className="inline-flex items-center justify-center gap-2 md:justify-start">
+                          <Users className="h-5 w-5 shrink-0 text-[#00A86B]" strokeWidth={2.25} />
+                          <span>Lead a crew and invite teammates</span>
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+                <div className="flex w-full min-h-[80dvh] flex-col gap-4 md:min-h-[calc(100dvh-11rem)] md:max-h-[calc(100dvh-10rem)] md:flex-row md:items-stretch md:gap-6">
                   <Button
                     type="button"
                     variant="outline"
-                    className="h-auto min-h-[34dvh] md:min-h-0 md:h-full md:flex-1 w-full p-0 flex flex-col items-stretch justify-start gap-0 text-center rounded-2xl border-2 hover:border-primary/50 hover:bg-primary/5 transition-colors overflow-hidden shadow-sm"
+                    className="flex h-auto min-h-[44dvh] w-full flex-1 flex-col items-stretch justify-start gap-0 overflow-hidden rounded-2xl border-2 p-0 text-center shadow-sm transition-colors hover:border-primary/50 hover:bg-primary/5 md:min-h-[30rem] md:flex-1"
                     onClick={() => {
                       setStep4RoleChoice("doing_work");
                       nextStep();
                     }}
                     data-testid="button-doing-work"
                   >
-                    <div className="relative w-full flex-1 min-h-[10rem] md:min-h-0 bg-muted">
+                    <div className="relative min-h-[16rem] w-full flex-1 bg-muted md:min-h-[20rem]">
                       <img
                         src="https://corporateweb-v3-corporatewebv3damstrawebassetbuck-1lruglqypgb84.s3-ap-southeast-2.amazonaws.com/public/products-solo-body-2.jpg"
                         alt=""
-                        className="absolute inset-0 w-full h-full object-cover object-center"
+                        className="absolute inset-0 h-full w-full object-cover object-center"
                       />
+                      <div className="absolute inset-x-0 bottom-0 flex justify-end p-3 md:p-4">
+                        <div className="flex h-12 w-12 items-center justify-center rounded-full bg-white/95 text-[#00A86B] shadow-md ring-1 ring-black/5 md:h-14 md:w-14">
+                          <User className="h-6 w-6 md:h-7 md:w-7" strokeWidth={2.25} />
+                        </div>
+                      </div>
                     </div>
-                    <div className="py-6 md:py-8 px-5 md:px-8 flex flex-col gap-2 shrink-0 bg-background/95 md:bg-background">
-                      <span className="font-semibold text-xl md:text-2xl">I&apos;m doing the work</span>
-                      <span className="text-sm md:text-base text-muted-foreground">Solo or primary worker</span>
+                    <div className="flex shrink-0 flex-col gap-2 bg-background/95 px-5 py-8 text-center md:bg-background md:px-8 md:py-10">
+                      <span className="inline-flex items-center justify-center gap-2 font-semibold text-xl md:text-2xl">
+                        <User className="h-6 w-6 text-[#00A86B] md:hidden" strokeWidth={2.25} />
+                        I&apos;m doing the work
+                      </span>
+                      <span className="text-sm text-muted-foreground md:text-base">Solo or primary worker</span>
                     </div>
                   </Button>
                   <Button
                     type="button"
                     variant="outline"
-                    className="h-auto min-h-[34dvh] md:min-h-0 md:h-full md:flex-1 w-full p-0 flex flex-col items-stretch justify-start gap-0 text-center rounded-2xl border-2 hover:border-primary/50 hover:bg-primary/5 transition-colors overflow-hidden shadow-sm"
+                    className="flex h-auto min-h-[44dvh] w-full flex-1 flex-col items-stretch justify-start gap-0 overflow-hidden rounded-2xl border-2 p-0 text-center shadow-sm transition-colors hover:border-primary/50 hover:bg-primary/5 md:min-h-[30rem] md:flex-1"
                     onClick={() => setStep4RoleChoice("managing_team")}
                     data-testid="button-managing-team"
                   >
-                    <div className="relative w-full flex-1 min-h-[10rem] md:min-h-0 bg-muted">
+                    <div className="relative min-h-[16rem] w-full flex-1 bg-muted md:min-h-[20rem]">
                       <img
                         src="https://www.zuper.co/wp-content/uploads/2023/02/63ff262d802b18a12b123490_How-to-Build-and-Maintain-a-Solid-Field-Service-Team-01-2.jpg"
                         alt=""
-                        className="absolute inset-0 w-full h-full object-cover object-center"
+                        className="absolute inset-0 h-full w-full object-cover object-center"
                       />
+                      <div className="absolute inset-x-0 bottom-0 flex justify-end p-3 md:p-4">
+                        <div className="flex h-12 w-12 items-center justify-center rounded-full bg-white/95 text-[#00A86B] shadow-md ring-1 ring-black/5 md:h-14 md:w-14">
+                          <Users className="h-6 w-6 md:h-7 md:w-7" strokeWidth={2.25} />
+                        </div>
+                      </div>
                     </div>
-                    <div className="py-6 md:py-8 px-5 md:px-8 flex flex-col gap-2 shrink-0 bg-background/95 md:bg-background">
-                      <span className="font-semibold text-xl md:text-2xl">I&apos;m managing a team</span>
-                      <span className="text-sm md:text-base text-muted-foreground">Invite teammates to join</span>
+                    <div className="flex shrink-0 flex-col gap-2 bg-background/95 px-5 py-8 text-center md:bg-background md:px-8 md:py-10">
+                      <span className="inline-flex items-center justify-center gap-2 font-semibold text-xl md:text-2xl">
+                        <Users className="h-6 w-6 text-[#00A86B] md:hidden" strokeWidth={2.25} />
+                        I&apos;m managing a team
+                      </span>
+                      <span className="text-sm text-muted-foreground md:text-base">Invite teammates to join</span>
                     </div>
                   </Button>
                 </div>

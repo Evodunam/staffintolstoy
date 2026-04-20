@@ -8,7 +8,13 @@ async function throwIfResNotOk(res: Response) {
       const data = JSON.parse(text) as { message?: string };
       if (data?.message) message = data.message;
     } catch {
-      // keep message as status + text
+      // HTML/plain gateway errors (e.g. DO/Cloudflare) — not from our JSON body
+      if (res.status === 504) {
+        message =
+          "Gateway timeout (504): the load balancer gave up waiting for the app (often cold start, crash loop, or a very slow upstream like Mercury). Retry; check host logs and DO/CF timeouts.";
+      } else if (res.status === 502) {
+        message = "Bad gateway (502): app unreachable or overloaded. Retry shortly.";
+      }
     }
     const err = new Error(message) as Error & { status?: number };
     err.status = res.status;
