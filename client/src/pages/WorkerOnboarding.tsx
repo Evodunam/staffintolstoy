@@ -513,7 +513,22 @@ export default function WorkerOnboarding() {
 
   // Bank account setup mutation - connects to Mercury
   const connectBankMutation = useMutation({
-    mutationFn: async (data: { routingNumber: string; accountNumber: string; accountType: string; bankName: string; recipientType?: string; email?: string; address?: string; city?: string; state?: string; zipCode?: string }) => {
+    mutationFn: async (data: {
+      routingNumber: string;
+      accountNumber: string;
+      accountType: string;
+      bankName: string;
+      recipientType?: string;
+      email?: string;
+      firstName?: string;
+      lastName?: string;
+      phone?: string;
+      companyName?: string;
+      address?: string;
+      city?: string;
+      state?: string;
+      zipCode?: string;
+    }) => {
       const response = await apiRequest("POST", "/api/mt/worker/payout-account", data);
       return response.json();
     },
@@ -675,18 +690,26 @@ export default function WorkerOnboarding() {
     }
     
     try {
-      // Connect bank account to Mercury (send email + business + address so recipient has them)
+      const trim = (s?: string | null) => {
+        const t = (s ?? "").trim();
+        return t.length ? t : undefined;
+      };
+      // Prefer onboarding form (step 2) over saved profile / auth claims for Mercury recipient
       const result = await connectBankMutation.mutateAsync({
         routingNumber: bankAccount.routingNumber,
         accountNumber: bankAccount.accountNumber,
         accountType: bankAccount.accountType,
         bankName: bankAccount.bankName,
         recipientType: "business",
-        email: formData.email || existingProfile?.email || (user as any)?.claims?.email || undefined,
-        address: formData.address || undefined,
-        city: formData.city || undefined,
-        state: formData.state || undefined,
-        zipCode: formData.zipCode || undefined,
+        email: trim(formData.email) ?? trim(existingProfile?.email) ?? trim((user as { claims?: { email?: string } })?.claims?.email),
+        firstName: trim(formData.firstName) ?? trim(existingProfile?.firstName),
+        lastName: trim(formData.lastName) ?? trim(existingProfile?.lastName),
+        phone: trim(formData.phone) ?? trim((existingProfile as { phone?: string | null })?.phone),
+        companyName: trim(formData.businessName) ?? trim((existingProfile as { companyName?: string | null })?.companyName),
+        address: trim(formData.address) ?? trim(existingProfile?.address),
+        city: trim(formData.city) ?? trim((existingProfile as { city?: string | null })?.city),
+        state: trim(formData.state) ?? trim((existingProfile as { state?: string | null })?.state),
+        zipCode: trim(formData.zipCode) ?? trim((existingProfile as { zipCode?: string | null })?.zipCode),
       });
       
       const lastFour = bankAccount.accountNumber.slice(-4);
@@ -1958,16 +1981,25 @@ export default function WorkerOnboarding() {
     // Connect bank account to Mercury if provided
     if (bankAccount.routingNumber && bankAccount.accountNumber && !bankConnected) {
       try {
+        const trim = (s?: string | null) => {
+          const t = (s ?? "").trim();
+          return t.length ? t : undefined;
+        };
         await connectBankMutation.mutateAsync({
           routingNumber: bankAccount.routingNumber,
           accountNumber: bankAccount.accountNumber,
           accountType: bankAccount.accountType,
           bankName: bankAccount.bankName,
           recipientType: "business",
-          address: formData.address || undefined,
-          city: formData.city || undefined,
-          state: formData.state || undefined,
-          zipCode: formData.zipCode || undefined,
+          email: trim(formData.email) ?? trim(existingProfile?.email) ?? trim((user as { claims?: { email?: string } })?.claims?.email),
+          firstName: trim(formData.firstName) ?? trim(existingProfile?.firstName),
+          lastName: trim(formData.lastName) ?? trim(existingProfile?.lastName),
+          phone: trim(formData.phone) ?? trim((existingProfile as { phone?: string | null })?.phone),
+          companyName: trim(formData.businessName) ?? trim((existingProfile as { companyName?: string | null })?.companyName),
+          address: trim(formData.address) ?? trim(existingProfile?.address),
+          city: trim(formData.city) ?? trim((existingProfile as { city?: string | null })?.city),
+          state: trim(formData.state) ?? trim((existingProfile as { state?: string | null })?.state),
+          zipCode: trim(formData.zipCode) ?? trim((existingProfile as { zipCode?: string | null })?.zipCode),
         });
         setBankConnected(true);
       } catch (error: any) {

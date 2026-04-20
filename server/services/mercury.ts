@@ -164,6 +164,7 @@ async function mercuryRequest<T>(
     error.status = response.status;
     error.statusText = response.statusText;
     error.details = errorDetails;
+    error.mercuryHttp = true;
     throw error;
   }
 
@@ -218,6 +219,7 @@ async function mercuryMultipartRequest<T>(
     error.status = response.status;
     error.statusText = response.statusText;
     error.details = errorDetails;
+    error.mercuryHttp = true;
     throw error;
   }
   const responseData = await response.json();
@@ -652,6 +654,15 @@ export const mercuryService = {
         emails = [params.email.trim()];
       }
 
+      if (emails.length === 0) {
+        const err: any = new Error(
+          "Mercury requires at least one recipient email (AddRecipientRequest.emails). Add an email to the profile and retry."
+        );
+        err.status = 400;
+        err.localValidation = true;
+        throw err;
+      }
+
       // Map accountType to Mercury's electronicAccountType format
       // Convert "checking"/"savings" to "businessChecking"/"businessSavings" if not already specified
       let electronicAccountType: string = params.accountType;
@@ -689,7 +700,7 @@ export const mercuryService = {
 
       const payload: any = {
         name: params.name,
-        emails: emails.length > 0 ? emails : [], // Worker account email for payment receipts
+        emails, // required by Mercury; non-empty guaranteed above
         electronicRoutingInfo: electronicRoutingInfo,
         paymentMethod: params.paymentMethod || 'ach',
       };

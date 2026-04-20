@@ -17646,12 +17646,46 @@ Respond ONLY in this exact JSON format:
       return res.status(403).json({ message: "Only workers can set up payout accounts" });
     }
 
-    let { routingNumber, accountNumber, accountType, bankName, recipientType = 'business', email: bodyEmail, address: bodyAddress, city: bodyCity, state: bodyState, zipCode: bodyZipCode } = req.body;
+    let {
+      routingNumber,
+      accountNumber,
+      accountType,
+      bankName,
+      recipientType = "business",
+      email: bodyEmail,
+      firstName: bodyFirstName,
+      lastName: bodyLastName,
+      phone: bodyPhone,
+      companyName: bodyCompanyName,
+      businessName: bodyBusinessName,
+      address: bodyAddress,
+      city: bodyCity,
+      state: bodyState,
+      zipCode: bodyZipCode,
+    } = req.body || {};
+
+    const trimStr = (v: unknown): string | undefined => {
+      if (v == null) return undefined;
+      const t = String(v).trim();
+      return t.length ? t : undefined;
+    };
+    /** Prefer values from the request (e.g. worker onboarding form) over saved profile. */
+    const pick = (bodyVal: unknown, profileVal: unknown): string | undefined =>
+      trimStr(bodyVal) ?? trimStr(profileVal);
 
     // Ensure business account and email for recipient: default recipientType to business, resolve email from body then profile then auth
     recipientType = recipientType === 'person' ? 'person' : 'business';
     const userClaims = (req.user as any)?.claims;
-    const recipientEmail = (bodyEmail && String(bodyEmail).trim()) || (profile.email && String(profile.email).trim()) || (userClaims?.email && String(userClaims.email).trim()) || undefined;
+    const recipientEmail =
+      pick(bodyEmail, profile.email) ?? trimStr(userClaims?.email);
+    // Mercury AddRecipientRequest requires non-empty "emails" (https://docs.mercury.com/reference/createrecipient)
+    const emailLooksValid = !!recipientEmail && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(recipientEmail);
+    if (!emailLooksValid) {
+      return res.status(400).json({
+        message:
+          "A valid email on your account is required for bank payouts (Mercury requires it). Complete step 2 with your email, or update your profile, then try again.",
+      });
+    }
 
     // Normalize to digits-only (same as worker PayoutSettings page) so Mercury accepts them
     const routingDigits = typeof routingNumber === "string" ? routingNumber.replace(/\D/g, "") : "";
@@ -17669,11 +17703,11 @@ Respond ONLY in this exact JSON format:
       return res.status(400).json({ message: "Account number must be between 4 and 17 digits" });
     }
 
-    // Address can come from request body (onboarding formData) or profile
-    const address1 = bodyAddress ?? profile.address;
-    const city = bodyCity ?? profile.city;
-    const region = bodyState ?? profile.state;
-    const postalCode = bodyZipCode ?? profile.zipCode;
+    // Address: prefer request body (onboarding) then profile
+    const address1 = pick(bodyAddress, profile.address);
+    const city = pick(bodyCity, profile.city);
+    const region = pick(bodyState, profile.state);
+    const postalCode = pick(bodyZipCode, profile.zipCode);
 
     // Validate address is available (required by Mercury)
     if (!address1 && !city) {
@@ -17689,13 +17723,20 @@ Respond ONLY in this exact JSON format:
       let recipientId: string | null = profile.mercuryRecipientId;
       let externalAccountId: string | null = null;
 
-      // Determine recipient name and nickname
-      const recipientName = profile.firstName && profile.lastName
-        ? `${profile.firstName} ${profile.lastName}`
-        : profile.email || `Worker ${profile.id}`;
+      const firstName = pick(bodyFirstName, profile.firstName);
+      const lastName = pick(bodyLastName, profile.lastName);
+      const recipientName =
+        firstName && lastName
+          ? `${firstName} ${lastName}`
+          : firstName || lastName
+            ? `${firstName ?? ""} ${lastName ?? ""}`.trim()
+            : profile.email || recipientEmail || `Worker ${profile.id}`;
 
-      // Use business/company name as nickname if available, otherwise use recipient name
-      const nickname = profile.companyName || recipientName;
+      const nicknameFromBody = trimStr(bodyCompanyName) ?? trimStr(bodyBusinessName);
+      const nickname =
+        (nicknameFromBody ?? trimStr(profile.companyName)) || recipientName;
+
+      const recipientPhone = pick(bodyPhone, profile.phone);
 
       // Determine if this is a business or personal account
       const isBusiness = recipientType === 'business';
@@ -17830,7 +17871,7 @@ Respond ONLY in this exact JSON format:
           email: workerEmail,
           emails: workerEmail ? [workerEmail] : undefined,
           contactEmail: workerEmail,
-          phoneNumber: profile.phone || undefined,
+          phoneNumber: recipientPhone || undefined,
           isBusiness,
           nickname: nickname,
           accountType: finalAccountType as any,
@@ -17894,7 +17935,7 @@ Respond ONLY in this exact JSON format:
             email: workerEmail,
             emails: workerEmail ? [workerEmail] : undefined,
             contactEmail: workerEmail,
-            phoneNumber: profile.phone || undefined,
+            phoneNumber: recipientPhone || undefined,
             isBusiness,
             nickname: nickname,
             accountType: finalAccountType as any,
@@ -17938,7 +17979,7 @@ Respond ONLY in this exact JSON format:
               email: workerEmail,
               emails: workerEmail ? [workerEmail] : undefined,
               contactEmail: workerEmail,
-              phoneNumber: profile.phone || undefined,
+              phoneNumber: recipientPhone || undefined,
               isBusiness,
               nickname: nickname,
               accountType: finalAccountType as any,
@@ -18108,6 +18149,13 @@ Respond ONLY in this exact JSON format:
       console.error("[PayoutAccountSetup] Error stack:", err?.stack);
       console.error("[PayoutAccountSetup] Error message:", err?.message);
       console.error("[PayoutAccountSetup] Error name:", err?.name);
+
+      if (err?.localValidation && typeof err?.status === "number") {
+        return res.status(err.status).json({
+          message: err.message || "Invalid payout request",
+          error: "validation_error",
+        });
+      }
       
       // Check if it's a Mercury configuration error
       if (err?.message?.includes("Mercury_Sandbox") || err?.message?.includes("MERCURY_PRODUCTION_API_TOKEN")) {
@@ -18119,8 +18167,8 @@ Respond ONLY in this exact JSON format:
         });
       }
       
-      // Check if it's a Mercury API error (service sets err.status and err.details, not err.response)
-      if (err?.status != null || err?.response) {
+      // Mercury HTTP errors from mercuryRequest (has mercuryHttp); avoid treating localValidation 400 as upstream
+      if ((err?.status != null || err?.response) && err?.mercuryHttp) {
         console.error("[PayoutAccountSetup] Mercury API error response:", {
           status: err?.status,
           statusText: err?.statusText,
@@ -18139,10 +18187,22 @@ Respond ONLY in this exact JSON format:
             : invalidRouting && process.env.NODE_ENV === "development"
               ? "Invalid routing number. In sandbox use test routing 021000021 (Chase), or use 123456789 for dev bypass (no Mercury call)."
               : mercuryMessage || "Failed to set up bank account";
-        return res.status(500).json({
+        const upstream = typeof err?.status === "number" ? err.status : 500;
+        // Pass through Mercury 4xx so the client isn’t stuck seeing a generic 500 for validation errors
+        const clientStatus =
+          upstream === 401 ? 502 : upstream >= 400 && upstream < 500 ? upstream : 500;
+        return res.status(clientStatus).json({
           message: userMessage,
           error: "Mercury API error",
           details: process.env.NODE_ENV === "development" ? mercuryDetails : undefined
+        });
+      }
+
+      if (typeof err?.status === "number" && err.status >= 400 && err.status < 500) {
+        return res.status(err.status).json({
+          message: err.message || "Invalid payout request",
+          error: err?.name || "validation_error",
+          details: process.env.NODE_ENV === "development" ? err?.details : undefined,
         });
       }
       
