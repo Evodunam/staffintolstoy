@@ -7038,10 +7038,17 @@ export default function WorkerDashboard() {
                                               onClick={handleToggle}
                                             >
                                               <Checkbox id={`panel-skill-${role.id}`} checked={checked} onCheckedChange={handleToggle} className="mt-0.5" />
-                                              <Label htmlFor={`panel-skill-${role.id}`} className="flex-1 cursor-pointer">
-                                                <span className="font-medium text-sm flex items-center gap-2">{role.label}{role.isElite && <Badge variant="secondary" className="text-xs">Certified</Badge>}</span>
-                                                <span className="text-xs text-muted-foreground block mt-0.5">{role.desc}</span>
-                                              </Label>
+                                              <div className="flex-1 min-w-0 flex items-start gap-2">
+                                                <Label htmlFor={`panel-skill-${role.id}`} className="flex-1 min-w-0 cursor-pointer">
+                                                  <span className="font-medium text-sm flex items-center gap-2 flex-wrap">{role.label}{role.isElite && <Badge variant="secondary" className="text-xs">Certified</Badge>}</span>
+                                                  <span className="text-xs text-muted-foreground block mt-0.5">{role.desc}</span>
+                                                </Label>
+                                                {role.isElite && (
+                                                  <span className="shrink-0 text-[11px] sm:text-xs font-semibold text-red-600 text-right leading-tight max-w-[7.5rem] sm:max-w-none pt-0.5">
+                                                    Requires Verification
+                                                  </span>
+                                                )}
+                                              </div>
                                             </div>
                                           );
                                         })}
@@ -7903,10 +7910,17 @@ export default function WorkerDashboard() {
                             {industry.roles.map((role) => (
                               <div key={role.id} className={cn("flex items-start space-x-3 p-2 rounded-md cursor-pointer", selectedCategories.includes(role.id) ? "bg-primary/10" : "hover:bg-muted/50")} onClick={() => toggleCategory(role.id)}>
                                 <Checkbox id={`qs-skill-${role.id}`} checked={selectedCategories.includes(role.id)} onCheckedChange={() => toggleCategory(role.id)} className="mt-0.5" />
-                                <Label htmlFor={`qs-skill-${role.id}`} className="flex-1 cursor-pointer">
-                                  <span className="font-medium text-sm flex items-center gap-2">{role.label}{role.isElite && <Badge variant="secondary" className="text-xs">Certified</Badge>}</span>
-                                  <span className="text-xs text-muted-foreground block mt-0.5">{role.desc}</span>
-                                </Label>
+                                <div className="flex-1 min-w-0 flex items-start gap-2">
+                                  <Label htmlFor={`qs-skill-${role.id}`} className="flex-1 min-w-0 cursor-pointer">
+                                    <span className="font-medium text-sm flex items-center gap-2 flex-wrap">{role.label}{role.isElite && <Badge variant="secondary" className="text-xs">Certified</Badge>}</span>
+                                    <span className="text-xs text-muted-foreground block mt-0.5">{role.desc}</span>
+                                  </Label>
+                                  {role.isElite && (
+                                    <span className="shrink-0 text-[11px] sm:text-xs font-semibold text-red-600 text-right leading-tight max-w-[7.5rem] sm:max-w-none pt-0.5">
+                                      Requires Verification
+                                    </span>
+                                  )}
+                                </div>
                               </div>
                             ))}
                           </div>
@@ -8207,10 +8221,17 @@ export default function WorkerDashboard() {
                                   onClick={handleToggle}
                                 >
                                   <Checkbox id={`panel-skill-mobile-${role.id}`} checked={checked} onCheckedChange={handleToggle} className="mt-0.5" />
-                                  <Label htmlFor={`panel-skill-mobile-${role.id}`} className="flex-1 cursor-pointer">
-                                    <span className="font-medium text-sm flex items-center gap-2">{role.label}{role.isElite && <Badge variant="secondary" className="text-xs">Certified</Badge>}</span>
-                                    <span className="text-xs text-muted-foreground block mt-0.5">{role.desc}</span>
-                                  </Label>
+                                  <div className="flex-1 min-w-0 flex items-start gap-2">
+                                    <Label htmlFor={`panel-skill-mobile-${role.id}`} className="flex-1 min-w-0 cursor-pointer">
+                                      <span className="font-medium text-sm flex items-center gap-2 flex-wrap">{role.label}{role.isElite && <Badge variant="secondary" className="text-xs">Certified</Badge>}</span>
+                                      <span className="text-xs text-muted-foreground block mt-0.5">{role.desc}</span>
+                                    </Label>
+                                    {role.isElite && (
+                                      <span className="shrink-0 text-[11px] sm:text-xs font-semibold text-red-600 text-right leading-tight max-w-[7.5rem] sm:max-w-none pt-0.5">
+                                        Requires Verification
+                                      </span>
+                                    )}
+                                  </div>
                                 </div>
                               );
                             })}

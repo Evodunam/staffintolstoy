@@ -167,7 +167,6 @@ class SecretsManagerService {
       
       // Mercury Bank
       { secretName: "MERCURY_PRODUCTION_API_TOKEN", envVar: "MERCURY_PRODUCTION_API_TOKEN" },
-      { secretName: "Mercury_Production", envVar: "Mercury_Production" },
       { secretName: "MERCURY_ACCOUNT_ID", envVar: "MERCURY_ACCOUNT_ID" },
 
       // Modern Treasury

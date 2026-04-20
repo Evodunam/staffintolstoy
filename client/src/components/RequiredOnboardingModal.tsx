@@ -1043,13 +1043,20 @@ export function RequiredOnboardingModal({ profile, onComplete }: RequiredOnboard
                             checked={selectedSkills.includes(role.id)}
                             onCheckedChange={() => toggleSkill(role.id)}
                           />
-                          <Label
-                            htmlFor={`skill-${role.id}`}
-                            className="flex-1 cursor-pointer"
-                          >
-                            <div className="font-medium">{role.label}</div>
-                            <div className="text-xs text-muted-foreground">{role.desc}</div>
-                          </Label>
+                          <div className="flex-1 min-w-0 flex items-start gap-2">
+                            <Label
+                              htmlFor={`skill-${role.id}`}
+                              className="flex-1 min-w-0 cursor-pointer"
+                            >
+                              <div className="font-medium">{role.label}</div>
+                              <div className="text-xs text-muted-foreground">{role.desc}</div>
+                            </Label>
+                            {role.isElite && (
+                              <span className="shrink-0 text-[11px] sm:text-xs font-semibold text-red-600 text-right leading-tight max-w-[7.5rem] sm:max-w-none pt-0.5">
+                                Requires Verification
+                              </span>
+                            )}
+                          </div>
                         </div>
                       ))}
                     </CollapsibleContent>

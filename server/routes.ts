@@ -788,7 +788,7 @@ export async function registerRoutes(
     out.checks.objectStorage = { ok: !!(process.env.IDRIVE_E2_ACCESS_KEY_ID && process.env.IDRIVE_E2_SECRET_ACCESS_KEY) };
 
     // 6) Mercury (config)
-    out.checks.mercury = { ok: !!(process.env.MERCURY_PRODUCTION_API_TOKEN || process.env.Mercury_Production) };
+    out.checks.mercury = { ok: !!process.env.MERCURY_PRODUCTION_API_TOKEN };
 
     const allOk = Object.values(out.checks).every((c: any) => c.ok);
     if (!allOk) out.status = out.status === "ok" ? "degraded" : out.status;
@@ -18110,8 +18110,8 @@ Respond ONLY in this exact JSON format:
       console.error("[PayoutAccountSetup] Error name:", err?.name);
       
       // Check if it's a Mercury configuration error
-      if (err?.message?.includes("Mercury_Sandbox") || err?.message?.includes("Mercury_Production")) {
-        console.error("[PayoutAccountSetup] ⚠️ Mercury API token not configured. Please add Mercury_Sandbox to .env.development");
+      if (err?.message?.includes("Mercury_Sandbox") || err?.message?.includes("MERCURY_PRODUCTION_API_TOKEN")) {
+        console.error("[PayoutAccountSetup] ⚠️ Mercury API token not configured. Check MERCURY_SANDBOX_API_TOKEN (dev) or MERCURY_PRODUCTION_API_TOKEN (prod).");
         return res.status(500).json({ 
           message: "Payment service not configured. Please contact support.",
           error: "Mercury API token missing",
@@ -18132,9 +18132,13 @@ Respond ONLY in this exact JSON format:
         const errStr = mercuryDetails?.errors?.message ?? mercuryDetails?.errors ?? "";
         const invalidRouting = (mercuryMessage && String(mercuryMessage).toLowerCase().includes("routing")) ||
           (errStr && String(errStr).toLowerCase().includes("routing"));
-        const userMessage = invalidRouting && process.env.NODE_ENV === "development"
-          ? "Invalid routing number. In sandbox use test routing 021000021 (Chase), or use 123456789 for dev bypass (no Mercury call)."
-          : (mercuryMessage || "Failed to set up bank account");
+        const is401 = err?.status === 401;
+        const userMessage =
+          is401
+            ? "Mercury rejected this request (401). Confirm MERCURY_PRODUCTION_API_TOKEN and that your server’s outbound IP is allowlisted in Mercury."
+            : invalidRouting && process.env.NODE_ENV === "development"
+              ? "Invalid routing number. In sandbox use test routing 021000021 (Chase), or use 123456789 for dev bypass (no Mercury call)."
+              : mercuryMessage || "Failed to set up bank account";
         return res.status(500).json({
           message: userMessage,
           error: "Mercury API error",
@@ -18251,7 +18255,7 @@ Respond ONLY in this exact JSON format:
       });
     } catch (err: any) {
       console.error("[AffiliatePayoutAccount] Error:", err?.message);
-      if (err?.message?.includes("Mercury_Sandbox") || err?.message?.includes("Mercury_Production")) {
+      if (err?.message?.includes("Mercury_Sandbox") || err?.message?.includes("MERCURY_PRODUCTION_API_TOKEN")) {
         return res.status(500).json({
           message: "Payment service not configured. Please contact support.",
           error: "Mercury API token missing",

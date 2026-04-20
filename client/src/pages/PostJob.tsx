@@ -2402,12 +2402,19 @@ export default function PostJob() {
                                   data-testid={`option-skill-mobile-${role.id}`}
                                 >
                                   {isSelected && <Check className="w-4 h-4 text-primary flex-shrink-0 mt-0.5" />}
-                                  <div className="flex-1 min-w-0">
-                                    <div className="flex items-center gap-2">
-                                      <span className="font-medium text-sm">{role.label}</span>
-                                      {role.isElite && <Badge variant="secondary" className="text-xs">Certified</Badge>}
+                                  <div className="flex-1 min-w-0 flex items-start gap-2">
+                                    <div className="flex-1 min-w-0">
+                                      <div className="flex items-center gap-2 flex-wrap">
+                                        <span className="font-medium text-sm">{role.label}</span>
+                                        {role.isElite && <Badge variant="secondary" className="text-xs">Certified</Badge>}
+                                      </div>
+                                      <div className="text-xs text-muted-foreground">{role.desc}</div>
                                     </div>
-                                    <div className="text-xs text-muted-foreground">{role.desc}</div>
+                                    {role.isElite && (
+                                      <span className="shrink-0 text-[11px] sm:text-xs font-semibold text-red-600 text-right leading-tight max-w-[7.5rem] sm:max-w-none pt-0.5">
+                                        Requires Verification
+                                      </span>
+                                    )}
                                   </div>
                                 </div>
                               );

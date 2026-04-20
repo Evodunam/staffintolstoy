@@ -116,16 +116,19 @@ export default function AccountSettings() {
                         <span className="text-sm text-muted-foreground block">{t("upTo30hr")}</span>
                       </Label>
                     </div>
-                    <div className="flex items-center space-x-3 p-3 rounded-lg border border-border">
+                    <div className="flex items-center gap-3 p-3 rounded-lg border border-border">
                       <Checkbox
                         id={`${category.id}-elite`}
                         checked={selectedCategories.includes(`${category.name} Elite`)}
                         onCheckedChange={() => toggleCategory(`${category.name} Elite`)}
                       />
-                      <Label htmlFor={`${category.id}-elite`} className="flex-1 cursor-pointer">
+                      <Label htmlFor={`${category.id}-elite`} className="flex-1 min-w-0 cursor-pointer">
                         <span className="font-medium">{category.name} {t("elite")}</span>
                         <span className="text-sm text-muted-foreground block">{t("upTo60hrCertified")}</span>
                       </Label>
+                      <span className="shrink-0 text-[11px] sm:text-xs font-semibold text-red-600 text-right leading-tight max-w-[7.5rem] sm:max-w-none">
+                        Requires Verification
+                      </span>
                     </div>
                   </div>
                 ) : (

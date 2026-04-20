@@ -6,6 +6,7 @@ import { useLocation, Link } from "wouter";
 import { Button } from "@/components/ui/button";
 import { getUrlForPath } from "@/lib/subdomain-utils";
 import { getIdentityVerificationUrl } from "@/lib/identity-verification-urls";
+import { IdentityVerifyQr } from "@/components/IdentityVerifyQr";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -3301,7 +3302,14 @@ export default function WorkerOnboarding() {
           )}
 
           <div className="flex-1 overflow-y-auto">
-            <div className="max-w-3xl mx-auto px-4 md:px-8 py-4 md:py-8">
+            <div
+              className={cn(
+                "mx-auto py-4 md:py-8",
+                currentStep === 4 && step4RoleChoice === null
+                  ? "w-full max-w-none px-4 md:px-6 lg:px-8"
+                  : "max-w-3xl px-4 md:px-8"
+              )}
+            >
             {/* Mobile: step header inside scroll area so it is not sticky and scrolls with content */}
             {isMobile && (currentStep >= 1 && currentStep <= 7) && (
               <header className="border-b border-gray-200 bg-white shrink-0 mb-4 md:mb-0">
@@ -3623,14 +3631,22 @@ export default function WorkerOnboarding() {
               <div className="w-full">
                 <button
                   type="button"
-                  onClick={(existingProfile as { identityVerified?: boolean } | null)?.identityVerified ? undefined : handleStartIdVerification}
+                  onClick={
+                    (existingProfile as { identityVerified?: boolean } | null)?.identityVerified || !isMobile
+                      ? undefined
+                      : handleStartIdVerification
+                  }
                   disabled={(existingProfile as { identityVerified?: boolean } | null)?.identityVerified}
-                  className="relative w-full rounded-2xl border-2 border-dashed border-primary/30 bg-white overflow-hidden flex flex-col text-left shadow-sm hover:border-primary/50 hover:shadow-md hover:bg-primary/5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:opacity-70 disabled:pointer-events-none cursor-pointer transition-all aspect-[85/54] max-h-44 min-h-[152px] group"
+                  className={`relative w-full rounded-2xl border-2 border-dashed border-primary/30 bg-white overflow-hidden flex flex-col text-left shadow-sm transition-all aspect-[85/54] max-h-44 min-h-[152px] group focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:opacity-70 disabled:pointer-events-none ${
+                    isMobile
+                      ? "hover:border-primary/50 hover:shadow-md hover:bg-primary/5 cursor-pointer"
+                      : "pointer-events-none cursor-default opacity-[0.98]"
+                  }`}
                 >
                   <Skeleton className="absolute inset-0 animate-pulse bg-muted/80 pointer-events-none" />
                   <div className="absolute inset-0 bg-gradient-to-r from-transparent via-white/15 to-transparent bg-[length:200%_100%] animate-shimmer opacity-60 pointer-events-none" />
                   {/* Hover overlay for whole card → identity verification */}
-                  {!(existingProfile as { identityVerified?: boolean } | null)?.identityVerified && (
+                  {!(existingProfile as { identityVerified?: boolean } | null)?.identityVerified && isMobile && (
                     <div className="absolute inset-0 z-20 flex items-center justify-center bg-primary/10 opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none">
                       <span className="rounded-lg bg-primary text-primary-foreground text-sm font-medium px-4 py-2 shadow-lg">
                         Start Identity Verification
@@ -3686,25 +3702,43 @@ export default function WorkerOnboarding() {
                     </div>
                   </div>
                 </button>
-                <p className="text-xs text-muted-foreground text-center mt-2 max-w-md mx-auto align-middle">
-                  Tap the card to start verification. This is what Companies will see when you submit gig applications.
-                </p>
+                {isMobile ? (
+                  <p className="text-xs text-muted-foreground text-center mt-2 max-w-md mx-auto align-middle">
+                    Tap the card to start verification. This is what companies will see when you submit gig applications.
+                  </p>
+                ) : (
+                  <p className="text-xs text-muted-foreground text-center mt-2 max-w-md mx-auto align-middle">
+                    Preview above — what companies see on applications. Scan the QR code below with your phone to complete
+                    verification there.
+                  </p>
+                )}
               </div>
-              {/* CTA: card is primary; button below for clarity */}
+              {/* Phone: primary button. Tablet/desktop: QR (same Stripe Identity URL as new tab). */}
               <div className="flex flex-col sm:flex-row items-center justify-center gap-3 pt-2">
                 {(existingProfile as { identityVerified?: boolean } | null)?.identityVerified ? (
                   <div className="flex items-center gap-2 text-green-600">
                     <CheckCircle2 className="w-5 h-5 flex-shrink-0" />
                     <span className="text-sm font-medium">Identity verified</span>
                   </div>
-                ) : (
-                  <Button
-                    type="button"
-                    onClick={handleStartIdVerification}
-                  >
+                ) : isMobile ? (
+                  <Button type="button" onClick={handleStartIdVerification}>
                     <ExternalLink className="w-4 h-4 mr-2" />
                     Start Identity Verification
                   </Button>
+                ) : (
+                  <div className="flex flex-col items-center gap-3 w-full max-w-sm">
+                    <IdentityVerifyQr url={getIdentityVerificationUrl("onboarding")} />
+                    <p className="text-xs text-center text-muted-foreground max-w-xs">
+                      Scan with your phone camera to open Stripe Identity on your phone.
+                    </p>
+                    <button
+                      type="button"
+                      onClick={handleStartIdVerification}
+                      className="text-sm text-primary underline underline-offset-4 hover:text-primary/80 font-medium"
+                    >
+                      Open verification in this browser instead
+                    </button>
+                  </div>
                 )}
               </div>
             </div>
@@ -3975,26 +4009,33 @@ export default function WorkerOnboarding() {
                                   className="data-[state=checked]:bg-[#00A86B] data-[state=checked]:border-[#00A86B]"
                                 />
                               </div>
-                              <div className="flex-1 min-w-0">
-                                <div className="flex items-center gap-2 mb-0.5">
-                                  {/* Role icon */}
-                                  <div className={`w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0 transition-all ${
-                                    isSelected 
-                                      ? 'bg-gradient-to-br from-[#00A86B] to-[#008A57] shadow-sm' 
-                                      : 'bg-gray-100 hover:bg-gray-200'
-                                  }`}>
-                                    <RoleIcon className={`${
-                                      isSelected ? 'text-white w-4 h-4' : 'text-gray-600 w-3 h-3'
-                                    }`} strokeWidth={isSelected ? 2.5 : 2} />
+                              <div className="flex-1 min-w-0 flex items-start gap-2">
+                                <div className="flex-1 min-w-0">
+                                  <div className="flex items-center gap-2 mb-0.5 flex-wrap">
+                                    {/* Role icon */}
+                                    <div className={`w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0 transition-all ${
+                                      isSelected 
+                                        ? 'bg-gradient-to-br from-[#00A86B] to-[#008A57] shadow-sm' 
+                                        : 'bg-gray-100 hover:bg-gray-200'
+                                    }`}>
+                                      <RoleIcon className={`${
+                                        isSelected ? 'text-white w-4 h-4' : 'text-gray-600 w-3 h-3'
+                                      }`} strokeWidth={isSelected ? 2.5 : 2} />
+                                    </div>
+                                    <span className="font-semibold text-gray-900 text-sm">{role.label}</span>
+                                    {role.isElite && (
+                                      <span className="text-xs font-medium bg-blue-100 text-blue-700 px-2 py-0.5 rounded-md border border-blue-200">
+                                        ELITE
+                                      </span>
+                                    )}
                                   </div>
-                                  <span className="font-semibold text-gray-900 text-sm">{role.label}</span>
-                                  {role.isElite && (
-                                    <span className="text-xs font-medium bg-blue-100 text-blue-700 px-2 py-0.5 rounded-md border border-blue-200">
-                                      ELITE
-                                    </span>
-                                  )}
+                                  <p className="text-xs text-gray-600 leading-snug">{role.desc}</p>
                                 </div>
-                                <p className="text-xs text-gray-600 leading-snug">{role.desc}</p>
+                                {role.isElite && (
+                                  <span className="shrink-0 text-[11px] sm:text-xs font-semibold text-red-600 text-right leading-tight max-w-[7.5rem] sm:max-w-none pt-0.5">
+                                    Requires Verification
+                                  </span>
+                                )}
                               </div>
                             </label>
                           );
@@ -4425,52 +4466,52 @@ export default function WorkerOnboarding() {
 
         {/* Step 4: Business Operator & Teammates (skippable) */}
         {currentStep === 4 && (
-          <div className="space-y-6">
+          <div className={step4RoleChoice === null ? "" : "space-y-6"}>
             {step4RoleChoice === null && (
               <>
-                <p className="text-base text-gray-900 font-medium text-center">
+                <p className="text-base md:text-lg text-gray-900 font-medium text-center px-2 mb-4 md:mb-6 max-w-xl mx-auto">
                   Are you the one doing the work or are you managing a team that does the work?
                 </p>
-                <div className="grid gap-4 sm:gap-6 sm:grid-cols-2 max-w-2xl mx-auto justify-items-center">
+                <div className="flex flex-col md:flex-row md:items-stretch gap-4 md:gap-5 w-full min-h-[72dvh] md:min-h-[calc(100dvh-12.5rem)] md:max-h-[calc(100dvh-12.5rem)]">
                   <Button
                     type="button"
                     variant="outline"
-                    className="h-auto min-h-[200px] w-full max-w-sm p-0 flex flex-col items-stretch text-center rounded-xl border-2 hover:border-primary/50 hover:bg-primary/5 transition-colors overflow-hidden"
+                    className="h-auto min-h-[34dvh] md:min-h-0 md:h-full md:flex-1 w-full p-0 flex flex-col items-stretch justify-start gap-0 text-center rounded-2xl border-2 hover:border-primary/50 hover:bg-primary/5 transition-colors overflow-hidden shadow-sm"
                     onClick={() => {
                       setStep4RoleChoice("doing_work");
                       nextStep();
                     }}
                     data-testid="button-doing-work"
                   >
-                    <div className="w-full h-24 sm:h-28 flex-shrink-0 bg-muted">
+                    <div className="relative w-full flex-1 min-h-[10rem] md:min-h-0 bg-muted">
                       <img
                         src="https://corporateweb-v3-corporatewebv3damstrawebassetbuck-1lruglqypgb84.s3-ap-southeast-2.amazonaws.com/public/products-solo-body-2.jpg"
                         alt=""
-                        className="w-full h-full object-cover object-center"
+                        className="absolute inset-0 w-full h-full object-cover object-center"
                       />
                     </div>
-                    <div className="py-4 px-4 flex flex-col gap-1">
-                      <span className="font-semibold text-lg">I'm doing the work</span>
-                      <span className="text-sm text-muted-foreground">Solo or primary worker</span>
+                    <div className="py-6 md:py-8 px-5 md:px-8 flex flex-col gap-2 shrink-0 bg-background/95 md:bg-background">
+                      <span className="font-semibold text-xl md:text-2xl">I&apos;m doing the work</span>
+                      <span className="text-sm md:text-base text-muted-foreground">Solo or primary worker</span>
                     </div>
                   </Button>
                   <Button
                     type="button"
                     variant="outline"
-                    className="h-auto min-h-[200px] w-full max-w-sm p-0 flex flex-col items-stretch text-center rounded-xl border-2 hover:border-primary/50 hover:bg-primary/5 transition-colors overflow-hidden"
+                    className="h-auto min-h-[34dvh] md:min-h-0 md:h-full md:flex-1 w-full p-0 flex flex-col items-stretch justify-start gap-0 text-center rounded-2xl border-2 hover:border-primary/50 hover:bg-primary/5 transition-colors overflow-hidden shadow-sm"
                     onClick={() => setStep4RoleChoice("managing_team")}
                     data-testid="button-managing-team"
                   >
-                    <div className="w-full h-24 sm:h-28 flex-shrink-0 bg-muted">
+                    <div className="relative w-full flex-1 min-h-[10rem] md:min-h-0 bg-muted">
                       <img
                         src="https://www.zuper.co/wp-content/uploads/2023/02/63ff262d802b18a12b123490_How-to-Build-and-Maintain-a-Solid-Field-Service-Team-01-2.jpg"
                         alt=""
-                        className="w-full h-full object-cover object-center"
+                        className="absolute inset-0 w-full h-full object-cover object-center"
                       />
                     </div>
-                    <div className="py-4 px-4 flex flex-col gap-1">
-                      <span className="font-semibold text-lg">I'm managing a team</span>
-                      <span className="text-sm text-muted-foreground">Invite teammates to join</span>
+                    <div className="py-6 md:py-8 px-5 md:px-8 flex flex-col gap-2 shrink-0 bg-background/95 md:bg-background">
+                      <span className="font-semibold text-xl md:text-2xl">I&apos;m managing a team</span>
+                      <span className="text-sm md:text-base text-muted-foreground">Invite teammates to join</span>
                     </div>
                   </Button>
                 </div>

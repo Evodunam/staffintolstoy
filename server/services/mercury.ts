@@ -48,14 +48,18 @@ async function getMercuryConfig(): Promise<MercuryConfig> {
     };
     log("Using Mercury SANDBOX environment", "mercury");
   } else {
-    // Production: Use production token from Google Secrets Manager
-    const raw = await secretsManager.getSecret('Mercury_Production', 'Mercury_Production');
+    // Production: MERCURY_PRODUCTION_API_TOKEN (env and/or GCP secret of the same name)
+    const raw =
+      (process.env.MERCURY_PRODUCTION_API_TOKEN || "").trim() ||
+      (await secretsManager.getSecret("MERCURY_PRODUCTION_API_TOKEN", "MERCURY_PRODUCTION_API_TOKEN"))?.trim();
     if (!raw) {
-      throw new Error("Mercury_Production secret not found in Google Secrets Manager");
+      throw new Error(
+        "MERCURY_PRODUCTION_API_TOKEN missing: set it on the app host or create GCP secret MERCURY_PRODUCTION_API_TOKEN"
+      );
     }
     const apiToken = normalizeMercuryToken(raw);
     if (!apiToken) {
-      throw new Error("Mercury_Production is empty after normalizing");
+      throw new Error("MERCURY_PRODUCTION_API_TOKEN is empty after normalizing");
     }
     cachedConfig = {
       apiToken,
@@ -400,8 +404,7 @@ export const mercuryService = {
     if (isDev) {
       return !!(process.env.Mercury_Sandbox || process.env.MERCURY_SANDBOX_API_TOKEN);
     }
-    // In production, check for production token
-    return !!(process.env.Mercury_Production || process.env.MERCURY_PRODUCTION_API_TOKEN);
+    return !!process.env.MERCURY_PRODUCTION_API_TOKEN;
   },
 
   /**

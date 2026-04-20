@@ -2069,17 +2069,24 @@ export function BusinessOperatorContent({ embedded = false }: { embedded?: boole
                                         className="mt-0.5"
                                         onClick={(e) => e.stopPropagation()}
                                       />
-                                      <Label htmlFor={`wizard-skill-${role.id}`} className="flex-1 cursor-pointer">
-                                        <span className="font-medium text-sm flex items-center gap-2">
-                                          {role.label}
-                                          {role.isElite && (
-                                            <Badge variant="secondary" className="text-xs">
-                                              Certified
-                                            </Badge>
-                                          )}
-                                        </span>
-                                        <span className="text-xs text-muted-foreground block mt-0.5">{role.desc}</span>
-                                      </Label>
+                                      <div className="flex-1 min-w-0 flex items-start gap-2">
+                                        <Label htmlFor={`wizard-skill-${role.id}`} className="flex-1 min-w-0 cursor-pointer">
+                                          <span className="font-medium text-sm flex items-center gap-2 flex-wrap">
+                                            {role.label}
+                                            {role.isElite && (
+                                              <Badge variant="secondary" className="text-xs">
+                                                Certified
+                                              </Badge>
+                                            )}
+                                          </span>
+                                          <span className="text-xs text-muted-foreground block mt-0.5">{role.desc}</span>
+                                        </Label>
+                                        {role.isElite && (
+                                          <span className="shrink-0 text-[11px] sm:text-xs font-semibold text-red-600 text-right leading-tight max-w-[7.5rem] sm:max-w-none pt-0.5">
+                                            Requires Verification
+                                          </span>
+                                        )}
+                                      </div>
                                     </div>
                                   );
                                 })}
@@ -2477,15 +2484,22 @@ export function BusinessOperatorContent({ embedded = false }: { embedded?: boole
                                     onCheckedChange={() => toggleSkillsetCategory(role.id)}
                                     className="mt-0.5"
                                   />
-                                  <Label htmlFor={`member-skill-${role.id}`} className="flex-1 cursor-pointer">
-                                    <span className="font-medium text-sm flex items-center gap-2">
-                                      {role.label}
-                                      {role.isElite && (
-                                        <Badge variant="secondary" className="text-xs">{t("certified")}</Badge>
-                                      )}
-                                    </span>
-                                    <span className="text-xs text-muted-foreground block mt-0.5">{role.desc}</span>
-                                  </Label>
+                                  <div className="flex-1 min-w-0 flex items-start gap-2">
+                                    <Label htmlFor={`member-skill-${role.id}`} className="flex-1 min-w-0 cursor-pointer">
+                                      <span className="font-medium text-sm flex items-center gap-2 flex-wrap">
+                                        {role.label}
+                                        {role.isElite && (
+                                          <Badge variant="secondary" className="text-xs">{t("certified")}</Badge>
+                                        )}
+                                      </span>
+                                      <span className="text-xs text-muted-foreground block mt-0.5">{role.desc}</span>
+                                    </Label>
+                                    {role.isElite && (
+                                      <span className="shrink-0 text-[11px] sm:text-xs font-semibold text-red-600 text-right leading-tight max-w-[7.5rem] sm:max-w-none pt-0.5">
+                                        Requires Verification
+                                      </span>
+                                    )}
+                                  </div>
                                 </div>
                               );
                             })}

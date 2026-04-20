@@ -7009,12 +7009,19 @@ function TeammateSettingsPopup({
                                       onCheckedChange={() => toggleSkillset(role.id)}
                                       className="mt-0.5"
                                     />
-                                    <label htmlFor={`skill-${role.id}`} className="flex-1 cursor-pointer text-sm font-medium">
-                                      {role.label}
+                                    <div className="flex-1 min-w-0 flex items-start gap-2">
+                                      <label htmlFor={`skill-${role.id}`} className="flex-1 min-w-0 cursor-pointer text-sm font-medium flex flex-wrap items-center gap-2">
+                                        {role.label}
+                                        {role.isElite && (
+                                          <Badge variant="secondary" className="text-xs">Certified</Badge>
+                                        )}
+                                      </label>
                                       {role.isElite && (
-                                        <Badge variant="secondary" className="text-xs ml-2">Certified</Badge>
+                                        <span className="shrink-0 text-[11px] sm:text-xs font-semibold text-red-600 text-right leading-tight max-w-[7.5rem] sm:max-w-none pt-0.5">
+                                          Requires Verification
+                                        </span>
                                       )}
-                                    </label>
+                                    </div>
                                   </div>
                                 );
                               })}
